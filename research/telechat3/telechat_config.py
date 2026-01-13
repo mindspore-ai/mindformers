@@ -1,4 +1,4 @@
-# Copyright 2025 TeleAI Technologies Co., Ltd
+# Copyright 2026 TeleAI and Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -149,6 +149,7 @@ class TelechatConfig(PretrainedConfig):
                  mean: float = 0.0,
                  layers_group: int = 1,
                  eod_reset: bool = False,
+                 net_name: str = 'telechat3_36b',
                  tie_word_embeddings: bool = False,
                  return_hidden_states: bool = False,
                  **kwargs):
@@ -210,5 +211,6 @@ class TelechatConfig(PretrainedConfig):
         self.layers_group = layers_group
         self.eod_reset = eod_reset
         self.embedding_size = embedding_size
+        self.net_name = net_name
         self.tie_word_embeddings = tie_word_embeddings
         self.return_hidden_states = return_hidden_states

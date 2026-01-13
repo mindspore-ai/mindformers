@@ -1,4 +1,4 @@
-# Copyright 2024 Huawei Technologies Co., Ltd
+# Copyright 2026 TeleAI and Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -30,11 +30,12 @@ from research.telechat3.telechat_config import TelechatConfig
 
 from mindformers.core.loss.loss import CrossEntropyLoss
 from mindformers.models.modeling_utils import PreTrainedModel
-from mindformers.models.utils import LayerSetting, lazy_inline, check_fine_grain_interleave_valid
+from mindformers.models.utils import lazy_inline, check_fine_grain_interleave_valid
 from mindformers.models.llama.llama_layer import LlamaRMSNorm
 from mindformers.modules.layers import Linear, FreqsMgr
 from mindformers.modules.transformer import LowerTriangularMaskWithDynamic
 from mindformers.modules.transformer.op_parallel_config import _check_config, default_dpmp_config
+from mindformers.parallel_core.training_graph.transformer.utils import LayerSetting
 from mindformers.tools.logger import logger
 from mindformers.tools.register.register import MindFormerModuleType, MindFormerRegister
 from mindformers.tools.utils import get_predict_run_mode
@@ -170,14 +171,36 @@ class TelechatModel(TelechatPreTrainedModel):
                                                              use_flash_attention=config.use_flash_attention,
                                                              use_attn_mask_compression=config.use_attn_mask_compression,
                                                              use_past=config.use_past)
-        self.tok_embeddings = TelechatEmbedding(vocab_table_size=config.vocab_size,
-                                                sigma=config.sigma,
-                                                mean=config.mean,
-                                                embedding_size=config.hidden_size,
-                                                param_init_type=config.embedding_init_type,
-                                                parallel_optimizer=config.parallel_optimizer)
-        self.norm_out = LlamaRMSNorm(config.hidden_size, config.rms_norm_eps,
-                                        compute_type=config.layernorm_compute_type)
+        if self.model_name != 'telechat3_36b':
+            self.tok_embeddings = TelechatEmbedding(vocab_table_size=config.vocab_size,
+                                                    sigma=config.sigma,
+                                                    mean=config.mean,
+                                                    embedding_size=config.embedding_size,
+                                                    param_init_type=config.embedding_init_type,
+                                                    parallel_optimizer=config.parallel_optimizer)
+            self.norm_out = LlamaRMSNorm(config.embedding_size, config.rms_norm_eps,
+                                         compute_type=config.layernorm_compute_type)
+            self.embedding_hidden_mapping_in = Linear(in_channels=config.embedding_size,
+                                                      out_channels=config.hidden_size,
+                                                      has_bias=False,
+                                                      compute_dtype=config.compute_dtype,
+                                                      param_init_type=config.param_init_type,
+                                                      weight_init="normal")
+            self.embedding_hidden_mapping_out = Linear(in_channels=config.hidden_size,
+                                                       out_channels=config.embedding_size,
+                                                       has_bias=False,
+                                                       compute_dtype=config.compute_dtype,
+                                                       param_init_type=config.param_init_type,
+                                                       weight_init="normal")
+        else:
+            self.tok_embeddings = TelechatEmbedding(vocab_table_size=config.vocab_size,
+                                                    sigma=config.sigma,
+                                                    mean=config.mean,
+                                                    embedding_size=config.hidden_size,
+                                                    param_init_type=config.embedding_init_type,
+                                                    parallel_optimizer=config.parallel_optimizer)
+            self.norm_out = LlamaRMSNorm(config.hidden_size, config.rms_norm_eps,
+                                         compute_type=config.layernorm_compute_type)
         self.fine_grain_interleave = check_fine_grain_interleave_valid(config.fine_grain_interleave,
                                                                        config.parallel_config)
         self.layers = nn.CellList()
@@ -186,6 +209,13 @@ class TelechatModel(TelechatPreTrainedModel):
                                           config.parallel_config,
                                           config.pp_interleave_num)
         for layer_id in range(config.num_layers):
+            wq, wk, wv, wo = None, None, None, None
+            if layer_id % config.layers_group != 0:
+                layer_index = int((layer_id // config.layers_group) * config.layers_group)
+                wq = self.layers[layer_index].attention.wq
+                wk = self.layers[layer_index].attention.wk
+                wv = self.layers[layer_index].attention.wv
+                wo = self.layers[layer_index].attention.wo
             if self.fine_grain_interleave:
                 layer = TelechatDecodeLayerInterleave(config.seq_length,
                                                       layer_id,
@@ -208,6 +238,10 @@ class TelechatModel(TelechatPreTrainedModel):
                                                       use_attn_mask_compression=config.use_attn_mask_compression,
                                                       use_rope_slice=config.use_rope_slice,
                                                       fine_grain_interleave=config.fine_grain_interleave,
+                                                      wq=wq,
+                                                      wk=wk,
+                                                      wv=wv,
+                                                      wo=wo,
                                                       parallel_config=config.parallel_config)
             else:
                 layer = TelechatDecodeLayer(layer_id,
@@ -237,11 +271,20 @@ class TelechatModel(TelechatPreTrainedModel):
                                             num_blocks=config.num_blocks,
                                             is_dynamic=config.is_dynamic,
                                             use_rope_slice=config.use_rope_slice,
+                                            wq=wq,
+                                            wk=wk,
+                                            wv=wv,
+                                            wo=wo,
                                             parallel_config=config.parallel_config)
+            if wq is None and wk is None and wv is None:
+                self.layer_setting(layer, layer_id)
             self.layers.append(layer)
         dp = config.parallel_config.data_parallel
         sp = config.parallel_config.context_parallel
         self.sp = sp
+        if self.model_name != 'telechat3_36b':
+            self.embedding_hidden_mapping_in.shard(strategy_matmul=((dp * sp, 1), (1, 1)))
+            self.embedding_hidden_mapping_out.shard(strategy_matmul=((dp * sp, 1), (1, 1)))
         self.expert_num = 1 if config.moe_config is None else config.moe_config.expert_num
         if not (_get_parallel_mode() in (ParallelMode.AUTO_PARALLEL,) and _is_sharding_propagation()):
             self.tok_embeddings.pipeline_stage = 0
@@ -310,7 +353,9 @@ class TelechatModel(TelechatPreTrainedModel):
                     mask = self.concat((prefix_mask, mask))
 
         # tokens: [bs, seq/1]
-        h = self.tok_embeddings(tokens)
+        h, embedding_weight = self.tok_embeddings(tokens)
+        if self.model_name != 'telechat3_36b':
+            h = self.embedding_hidden_mapping_in(h)
         h = self.reshape(h, (bs, seq_len, -1))
         # h: [bs, seq/1, hidden_dim]
         for i in range(self.num_layers):
@@ -322,8 +367,10 @@ class TelechatModel(TelechatPreTrainedModel):
             else:
                 h = self.layers[i](h, freqs_cis, mask, batch_valid_length=batch_valid_length, block_tables=block_tables,
                                    slot_mapping=slot_mapping, prefix_keys_values=prefix_kv)
+        if self.model_name != 'telechat3_36b':
+            h = self.embedding_hidden_mapping_out(h)
         output = self.norm_out(h)
-        return output
+        return output, embedding_weight
 
 
 class TelechatHead(nn.Cell):
@@ -393,7 +440,6 @@ class TelechatForCausalLM(TelechatPreTrainedModel):
         self.pad_token_id = config.pad_token_id
         self.use_past = config.use_past
         self.vocab_size = config.vocab_size
-        self.rl_config = config.rl_config
         self.is_first_iteration = True
 
         self.dp = config.parallel_config.data_parallel
@@ -411,12 +457,18 @@ class TelechatForCausalLM(TelechatPreTrainedModel):
         self.gather = P.Gather()
         self.sub_batch_valid_len = P.Sub()
         self.model = TelechatModel(config=config)
-        self.lm_head = Linear(in_channels=config.hidden_size,
-                                out_channels=config.vocab_size,
-                                has_bias=False,
-                                compute_dtype=config.compute_dtype,
-                                param_init_type=config.param_init_type,
-                                weight_init="normal")  # meta default: xavier_normal
+        if self.model_name != 'telechat3_36b':
+            self.lm_head = TelechatHead(in_channels=config.embedding_size,
+                                        out_channels=config.vocab_size,
+                                        compute_dtype=config.compute_dtype,
+                                        parallel_config=config.parallel_config)
+        else:
+            self.lm_head = Linear(in_channels=config.hidden_size,
+                                  out_channels=config.vocab_size,
+                                  has_bias=False,
+                                  compute_dtype=config.compute_dtype,
+                                  param_init_type=config.param_init_type,
+                                  weight_init="normal")  # meta default: xavier_normal
 
         mp = config.parallel_config.model_parallel
         sp = config.parallel_config.context_parallel
@@ -442,10 +494,11 @@ class TelechatForCausalLM(TelechatPreTrainedModel):
             self.add.shard(((dp, 1), ()))
             self.gather.shard(((dp, 1, 1), (dp,)))
             self.sub_batch_valid_len.shard(((1,), ()))
-            if config.parallel_config.vocab_emb_dp or (vocab_size % mp != 0):
-                self.lm_head.shard(strategy_matmul=((dp * sp, 1), (1, 1)))
-            else:
-                self.lm_head.shard(strategy_matmul=((dp * sp, 1), (mp, 1)))
+            if self.model_name == 'telechat3_36b':
+                if config.parallel_config.vocab_emb_dp or (vocab_size % mp != 0):
+                    self.lm_head.shard(strategy_matmul=((dp * sp, 1), (1, 1)))
+                else:
+                    self.lm_head.shard(strategy_matmul=((dp * sp, 1), (mp, 1)))
             if config.parallel_config.pipeline_stage > 1:
                 self.lm_head.pipeline_stage = config.parallel_config.pipeline_stage - 1
 
@@ -522,18 +575,17 @@ class TelechatForCausalLM(TelechatPreTrainedModel):
         tokens = input_ids
         if batch_valid_length is not None:
             batch_valid_length = self.reshape(batch_valid_length, (-1,))
-        if self.expert_num == 1:
-            output = self.model(tokens, batch_valid_length, batch_index, zactivate_len, block_tables=block_tables, \
-                                attention_mask=attention_mask, slot_mapping=slot_mapping, \
-                                prefix_keys_values=prefix_keys_values)
+        output, embedding_weight = self.model(tokens, batch_valid_length, batch_index, zactivate_len,
+                                              block_tables=block_tables, attention_mask=attention_mask, \
+                                              slot_mapping=slot_mapping, prefix_keys_values=prefix_keys_values)
         pre_gather = (not self.use_past or self.is_first_iteration) and batch_valid_length is not None
         if pre_gather:
             batch_valid_length = mint.cumsum(batch_valid_length, 0)
             output = self.gather(output, self.sub_batch_valid_len(batch_valid_length, 1), 1)
-        logits = self.lm_head(output)
-
-        if self.rl_config is not None:
-            return logits
+        if self.model_name != 'telechat3_36b':
+            logits = self.lm_head(output, embedding_weight)
+        else:
+            logits = self.lm_head(output)
 
         input_mask = self.cast(self.not_equal(tokens, self.pad_token_id), mstype.float32)
         if labels is None:

@@ -2,7 +2,7 @@
 
 ## 模型描述
 
-- 星辰语义大模型**TeleChat3**是由中国电信人工智能研究院研发训练的大语言模型，包含36B, 105B两种规模，该系列模型**完全基于国产算力**训练。
+- 星辰语义大模型**TeleChat3**是由中国电信人工智能研究院研发训练的大语言模型，包含1.8B, 36B两种规模，该系列模型**完全基于国产算力**训练。
 - 本次开源**TeleChat3-36B**模型采用10万亿Tokens中英文高质量语料进行训练，同步开源对话模型**TeleChat3-36B**的多格式、多平台权重文件。
 - **TeleChat3**在训练数据、训练方法等方面进行了改进，在通用问答和知识类、代码类、数学类榜单上相比**TeleChat2**均有大幅提升。
     - **TeleChat3**完全基于国产算力和国产深度学习框架进行训练，算力和算法框架更自主可控。优化MP、PP、SP实现方式提升模型性能，优化算子来提升训练速度。
@@ -23,6 +23,8 @@ TeleChat3-36b:
 
 | config                                              | task                  | Datasets   | SeqLength | phase           | performance  |
 |-----------------------------------------------------| --------------------- |------------|-----------|-----------------|--------------|
+| [TeleChat3_1.8b](./run_telechat_3_1_8b_finetune.yaml) | text_generation       | example_dataset | 8192      | [finetune](#微调) | 9924 tokens/s/p |
+| [TeleChat3_1.8b](./run_telechat_3_1_8b_predict.yaml)  | text_generation       | example_dataset     | 8192      | [predict](#推理)  | 153 tokens/s   |
 | [TeleChat3_36b](./run_telechat_36b_finetune.yaml) | text_generation       | example_dataset | 8192      | [finetune](#微调) | 516 tokens/s/p |
 | [TeleChat3_36b](./run_telechat_36b_predict.yaml)  | text_generation       | example_dataset     | 8192      | [predict](#推理)  | 27.7 tokens/s   |
 
@@ -48,16 +50,10 @@ TeleChat3-36b:
 
    ```bash
    telechat
-       ├── finetune_telechat_36b.yaml            # 36b全量微调启动配置
-       └── predict_telechat_36b.yaml             # 36b推理启动配置
-   ```
-
-3. 任务启动脚本：`mindformers/research/telechat3`
-
-   ```text
-   telechat
-       ├── run_telechat_predict.py              # 推理脚本
-       └── run_telechat.py                      # telechat高阶接口使用脚本
+       ├── finetune_telechat3_1_8b.yaml           # 1.8b全量微调启动配置
+       ├── finetune_telechat3_1_8b.yaml           # 1.8b全量微调启动配置
+       ├── finetune_telechat3_36b.yaml            # 36b全量微调启动配置
+       └── predict_telechat3_36b.yaml             # 36b推理启动配置
    ```
 
 ## 环境及数据准备
@@ -136,6 +132,7 @@ mindspore_path: 权重保存文件名，可以指定自定义保存路径
 
 2.获取MindFormers提供的已转换权重，可直接从下面的链接获取。
 
+- [TeleChat3-1.8b](https://telechat-docker.obs.cn-north-4.myhuaweicloud.com/model_weight/Telechat_1.8b/Telechat_1.8b.zip)
 - [TeleChat3-36b](https://telechat-docker.obs.cn-north-4.myhuaweicloud.com/model_weight/Telechat_36b/Telechat_36b.zip)
 
 ### [分布式权重切分与合并](https://www.mindspore.cn/mindformers/docs/zh-CN/master/index.html#%E5%88%86%E5%B8%83%E5%BC%8F%E6%9D%83%E9%87%8D%E5%88%87%E5%88%86%E4%B8%8E%E5%90%88%E5%B9%B6)

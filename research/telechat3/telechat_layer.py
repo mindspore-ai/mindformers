@@ -1,4 +1,4 @@
-# Copyright 2025 TeleAI Technologies Co., Ltd
+# Copyright 2026 TeleAI and Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -79,7 +79,7 @@ class TelechatEmbedding(Cell):
         input_ids = F.reshape(input_ids, (-1, 1))
         output = self.gather(self.embedding_weight, input_ids, 0)
         output = F.reshape(output, (shape[0], shape[1], -1))
-        return output
+        return output, self.embedding_weight.value()
 
     def shard(self, parallel_config):
         """sharding for embedding"""
@@ -100,13 +100,11 @@ class TelechatEmbedding(Cell):
                 logger.info(f"Using {dp * sp} data parallel X sequence parallel and {mp} "
                             f"model parallel for the embedding lookup.")
 
-
 class TelechatLinear(Linear):
     # pylint: disable=W0212
     """
     Linear function for Telechat.
     """
-
     def __init__(self,
                  in_channels,
                  out_channels,
@@ -125,7 +123,6 @@ class TelechatLinear(Linear):
             has_bias=has_bias,
             activation=activation,
             transpose_b=transpose_b,
-            outer_batch=outer_batch,
             param_init_type=param_init_type,
             compute_dtype=compute_dtype)
         weight_shape = [out_channels, in_channels] if transpose_b else [in_channels, out_channels]
@@ -283,10 +280,8 @@ class TelechatFeedForward(Cell):
             self.w2.shard(((dp * sp, mp), (1, mp)))
             self.split.add_prim_attr("skip_redistribution", True)
             self.split.shard(((dp * sp, 1, mp),))
-            self.mul.shard(((dp * sp, mp), (dp * sp, mp)))
         else:
             self.w1.shard(((dp * sp, 1), (mp, 1)))
             self.w1.activation.shard(((dp * sp, mp),))
             self.w2.shard(((dp * sp, mp), (1, mp)), ((dp * sp, 1), (1,)))
             self.w3.shard(((dp * sp, 1), (mp, 1)))
-            self.mul.shard(((dp * sp, mp), (dp * sp, mp)))

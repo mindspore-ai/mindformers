@@ -1,4 +1,4 @@
-# Copyright 2025 TeleAI Technologies Co., Ltd
+# Copyright 2026 TeleAI and Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -153,6 +153,10 @@ class TelechatAttentionInterleave(nn.Cell):
                  use_rope_slice=False,
                  use_flash_attention=False,
                  use_attn_mask_compression=False,
+                 wq=None,
+                 wk=None,
+                 wv=None,
+                 wo=None,
                  parallel_config=TransformerOpParallelConfig()):
         super().__init__()
         self.seq_length = seq_length
@@ -203,28 +207,28 @@ class TelechatAttentionInterleave(nn.Cell):
                                  sigma=sigma,
                                  mean=mean,
                                  compute_dtype=compute_dtype,
-                                 param_init_type=param_init_type)
+                                 param_init_type=param_init_type) if wq is None else wq
         self.wk = TelechatLinear(self.hidden_size,
                                  self.n_kv_head * self.head_dim,
                                  has_bias=qkv_has_bias,
                                  sigma=sigma,
                                  mean=mean,
                                  compute_dtype=compute_dtype,
-                                 param_init_type=param_init_type)
+                                 param_init_type=param_init_type) if wk is None else wk
         self.wv = TelechatLinear(self.hidden_size,
                                  self.n_kv_head * self.head_dim,
                                  has_bias=qkv_has_bias,
                                  sigma=sigma,
                                  mean=mean,
                                  compute_dtype=compute_dtype,
-                                 param_init_type=param_init_type)
+                                 param_init_type=param_init_type) if wv is None else wv
         self.wo = TelechatLinear(in_channels=self.hidden_size,
                                  out_channels=self.hidden_size,
                                  has_bias=out_proj_has_bias,
                                  sigma=sigma,
                                  mean=mean,
                                  compute_dtype=compute_dtype,
-                                 param_init_type=param_init_type)
+                                 param_init_type=param_init_type) if wo is None else wo
 
         dp = parallel_config.data_parallel
         mp = parallel_config.model_parallel
@@ -482,6 +486,10 @@ class TelechatDecodeLayerInterleave(nn.Cell):
                  use_flash_attention=False,
                  fine_grain_interleave=2,
                  use_attn_mask_compression=False,
+                 wq=None,
+                 wk=None,
+                 wv=None,
+                 wo=None,
                  parallel_config=TransformerOpParallelConfig()):
 
         super().__init__()
@@ -520,6 +528,10 @@ class TelechatDecodeLayerInterleave(nn.Cell):
                                                      use_rope_slice=use_rope_slice,
                                                      use_flash_attention=use_flash_attention,
                                                      use_attn_mask_compression=use_attn_mask_compression,
+                                                     wq=wq,
+                                                     wk=wk,
+                                                     wv=wv,
+                                                     wo=wo,
                                                      parallel_config=parallel_config)
         self.feed_forward = TelechatFeedForward(dim=self.hidden_size,
                                                 intermediate_size=intermediate_size,
