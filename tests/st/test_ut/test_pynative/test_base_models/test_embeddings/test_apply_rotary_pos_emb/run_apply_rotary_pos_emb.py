@@ -23,6 +23,7 @@ from mindspore.communication import init
 from data_gen_utils import get_init_params
 from mindformers.pynative.base_models.common.embeddings.rope_utils import ApplyRotaryPosEmb
 from mindformers.parallel_core.transformer_config import TransformerConfig
+
 SCRIPT_DIR = Path(__file__).parent.resolve()
 
 
@@ -64,6 +65,7 @@ class ApplyRotaryPosEmbRunner:
             tensor_model_parallel_size=self.args.tensor_parallel,
             compute_dtype='bf16',
             params_dtype='fp32',
+            rotary_dtype='bf16',
             num_attention_heads=self.args.tensor_parallel,
             num_layers=1
         )
