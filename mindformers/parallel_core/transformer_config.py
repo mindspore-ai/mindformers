@@ -336,6 +336,9 @@ class TransformerConfig(ModelParallelConfig, MFModelConfig):
     moe_permute_fusion: bool = False
     """Fuse token rearrangement ops during token dispatching."""
 
+    moe_apply_probs_on_input: bool = False
+    """Apply probs on input of experts instead of applying after activation and glu."""
+
     # MindFormers New
     shared_expert_num: int = 0
     """Number of shared experts."""
