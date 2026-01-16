@@ -6,7 +6,7 @@
 """Transformer Block"""
 from dataclasses import dataclass
 from typing import Union, List, Optional
-from mindspore import nn, Tensor, dtype as mstype
+from mindspore import nn, Tensor
 from mindformers.pynative.layers.layer_norm import get_norm_cls
 from mindformers.parallel_core.transformer_config import TransformerConfig
 from mindformers.parallel_core.utils.spec_utils import ModuleSpec, build_module
@@ -86,7 +86,6 @@ class TransformerBlock(nn.Cell):
 
     Outputs:
         - **hidden_states** (Tensor) - Tensor of shape :math:`(S, B, H)`.
-        - **extra_loss** (Tensor) - Extra loss value (e.g., from MoE layers). Default: 0.
 
     Supported Platforms:
         ``Ascend``
@@ -111,8 +110,6 @@ class TransformerBlock(nn.Cell):
         self.seq_length_in_cfg = config.seq_length
 
         self._build_layers(config)
-
-        self.init_extra_loss = Tensor([0], mstype.float32)
 
     def _build_layers(self, config: TransformerConfig):
         """build transformer layers."""
@@ -155,18 +152,15 @@ class TransformerBlock(nn.Cell):
         Returns:
             Tuple[Tensor, Tensor]: A tuple containing:
                 - hidden_states (Tensor): Output tensor of shape (S, B, H).
-                - extra_loss (Tensor): Extra loss value (e.g., from MoE layers).
         """
-        extra_loss = self.init_extra_loss
         for index in range(self.num_layers):
             layer = self._get_layer(index)
             prefix_kv = prefix_keys_values[index] if prefix_keys_values is not None else None
-            hidden_states, _, extra_loss = layer(
+            hidden_states, _, = layer(
                 hidden_states,
                 attention_mask,
                 rotary_pos_emb=rotary_pos_emb,
                 prefix_keys_values=prefix_kv,
-                extra_loss=extra_loss,
                 actual_seq_len=actual_seq_len
             )
 
@@ -174,4 +168,4 @@ class TransformerBlock(nn.Cell):
         if self.post_layer_norm:
             hidden_states = self.final_layernorm(hidden_states)
 
-        return hidden_states, extra_loss
+        return hidden_states

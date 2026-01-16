@@ -46,16 +46,13 @@ def get_init_params(seq_length=DEFAULT_SEQ_LENGTH,
 
 _common_output_shape = (DEFAULT_SEQ_LENGTH, DEFAULT_BATCH_SIZE, DEFAULT_HIDDEN_SIZE)
 _random_output_data = np.random.rand(*_common_output_shape).astype(np.float32)
-_random_extra_loss_data = np.array(np.random.rand() * 0.1, dtype=np.float32) # scalar loss
 
 GOLDEN_DATA = {
     "output_default": _random_output_data,
-    "extra_loss_default": _random_extra_loss_data,
 }
 
 GPU_DATA = {
     "output_default": _random_output_data.copy(),
-    "extra_loss_default": _random_extra_loss_data.copy(),
 }
 
 if __name__ == '__main__':

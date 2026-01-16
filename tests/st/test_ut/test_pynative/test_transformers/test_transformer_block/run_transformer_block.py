@@ -147,14 +147,12 @@ class TransformerLayerRunner:
         net = self.build_model()
         net.set_train(False)  # Set to eval mode
 
-        output, extra_loss = net(
+        output = net(
             self.hidden_states,
             attention_mask=self.attention_mask,
         )
 
         output_ms = {"output": output}
-        if extra_loss is not None:  # MoE or other layers might return extra_loss
-            output_ms["extra_loss"] = extra_loss
 
         if self.rank_id is None or int(self.rank_id) == 0:
             output_np = {}

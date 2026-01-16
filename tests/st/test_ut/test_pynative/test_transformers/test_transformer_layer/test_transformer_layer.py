@@ -35,7 +35,7 @@ SINGLE_CARD_TEST_CASES = [
             "pre_cross_attn_layernorm": "IdentityOp", "cross_attention": "IdentityOp",
             "pre_mlp_layernorm": "Norm", "mlp": "MLP"
         },
-        {"output": "output_default", "extra_loss": "extra_loss_default"},  # Expect output and extra_loss
+        {"output": "output_default"},  # Expect output
         False
     ),
 ]

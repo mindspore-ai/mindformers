@@ -259,7 +259,7 @@ class GPTModel(nn.Cell):
         labels, attention_mask, loss_mask = self._preprocess_input_labels_and_masks(
             input_ids, labels, attention_mask, loss_mask)
 
-        hidden_states, _, extra_loss = self.language_model(
+        hidden_states, _ = self.language_model(
             input_ids,
             position_ids,
             attention_mask,
@@ -290,8 +290,8 @@ class GPTModel(nn.Cell):
 
         if self.calculate_per_token_loss:
             numerator0, denominator0 = loss
-            return numerator0, denominator0, extra_loss * denominator0
-        return loss, extra_loss, logits, hidden_states
+            return numerator0, denominator0
+        return loss, logits, hidden_states
 
     def language_model(
             self,
@@ -346,7 +346,7 @@ class GPTModel(nn.Cell):
             attn_mask = self.concat_prefix((prefix_mask, attn_mask))
 
         # Run decoder.
-        hidden_states, extra_loss = self.decoder(
+        hidden_states = self.decoder(
             decoder_input,
             attn_mask,
             rotary_pos_emb,
@@ -354,7 +354,7 @@ class GPTModel(nn.Cell):
             actual_seq_len
         )
 
-        return hidden_states, rotary_pos_emb, extra_loss
+        return hidden_states, rotary_pos_emb
 
     def shared_embedding_or_output_weight(self):
         """Gets the embedding weight or output logit weights when share embedding and output weights set to True.

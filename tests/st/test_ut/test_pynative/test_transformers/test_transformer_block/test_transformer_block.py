@@ -36,7 +36,7 @@ SINGLE_CARD_TEST_CASES = [
             "pre_cross_attn_layernorm": "IdentityOp", "cross_attention": "IdentityOp",
             "pre_mlp_layernorm": "Norm", "mlp": "MLP", "post_layer_norm": "True", "num_layers": 1,
         },
-        {"output": "output_default", "extra_loss": "extra_loss_default"},  # Expect output and extra_loss
+        {"output": "output_default"},  # Expect output
         False
     ),
     # Case 2: Standard Norm, SelfAttention, Norm, MLP, post_layer_norm, num_layers=2
@@ -46,7 +46,7 @@ SINGLE_CARD_TEST_CASES = [
             "pre_cross_attn_layernorm": "IdentityOp", "cross_attention": "IdentityOp",
             "pre_mlp_layernorm": "Norm", "mlp": "MLP", "post_layer_norm": "True", "num_layers": 2,
         },
-        {"output": "output_default", "extra_loss": "extra_loss_default"},  # Expect output and extra_loss
+        {"output": "output_default"},  # Expect output
         False
     ),
 ]
