@@ -138,15 +138,12 @@ class TransformerLayerRunner:
         net = self.build_model()
         net.set_train(False)  # Set to eval mode
 
-        output, context_output, extra_loss = net(
+        output, context_output = net(
             self.hidden_states,
             attention_mask=self.attention_mask,
-            extra_loss=ms.Tensor(0.0, dtype=self.compute_dtype)  # Initial extra_loss
         )
 
         output_ms = {"output": output}
-        if extra_loss is not None:  # MoE or other layers might return extra_loss
-            output_ms["extra_loss"] = extra_loss
         if context_output is not None:  # If cross attention was used and returned context
             output_ms["context"] = context_output
 

@@ -143,7 +143,6 @@ class TransformerLayer(nn.Cell, BaseTransformerLayer):
             context=None,
             rotary_pos_emb=None,
             prefix_keys_values=None,
-            extra_loss=0.,
             actual_seq_len=None
     ):
         """
@@ -159,7 +158,6 @@ class TransformerLayer(nn.Cell, BaseTransformerLayer):
             context (Tensor, optional): Context tensor for cross-attention. Default: None.
             rotary_pos_emb (Tensor, optional): Rotary positional embeddings. Default: None.
             prefix_keys_values (Tensor, optional): Prefix key-value cache for attention. Default: None.
-            extra_loss (float, optional): Extra loss value. Default: 0.0.
             actual_seq_len (int, optional): Actual sequence length for variable-length sequences. Default: None.
 
         Returns:
@@ -167,7 +165,6 @@ class TransformerLayer(nn.Cell, BaseTransformerLayer):
                 - output (Tensor): Transformed hidden states of shape [s, b, h].
                 - context (Tensor): Updated context tensor if cross-attention is used,
                   otherwise the same as input context.
-                - extra_loss (float): Updated extra loss value.
         """
         # Note: context parameter is currently unused but kept for API compatibility.
         # It may be used in future cross-attention implementations.
@@ -213,10 +210,7 @@ class TransformerLayer(nn.Cell, BaseTransformerLayer):
         else:
             residual = norm_input
 
-        mlp_output, mlp_output_bias, extra_loss = self.mlp(
-            pre_mlp_layernorm_output,
-            extra_loss=extra_loss
-        )
+        mlp_output, mlp_output_bias = self.mlp(pre_mlp_layernorm_output)
 
         if mlp_output_bias is not None:
             mlp_output = self.add(mlp_output, mlp_output_bias)
@@ -227,4 +221,4 @@ class TransformerLayer(nn.Cell, BaseTransformerLayer):
         output = self.add(residual, dropout_output)
         # Note: context parameter is returned for API compatibility but currently unused.
         # It may be deprecated in future versions.
-        return output, context, extra_loss
+        return output, context
