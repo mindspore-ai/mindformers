@@ -74,6 +74,7 @@ class ApplyRotaryPosEmb(nn.Cell):
         self.append_eod = config.use_eod_reset
         self.apply_rope_fusion = config.apply_rope_fusion
         self.for_k_pos_emb = for_k_pos_emb
+        self.rotary_dtype = config.rotary_dtype
 
         self.add = mint.add
         self.mul = mint.mul
@@ -108,6 +109,7 @@ class ApplyRotaryPosEmb(nn.Cell):
         Returns:
             Tensor: Output tensor after applying rotary position embedding.
         """
+        origin_dtype = t.dtype
         seq_len, bs, n_heads, head_dim = t.shape
         freqs, m_scale = freqs
         rot_dim = freqs.shape[-1]
@@ -124,8 +126,9 @@ class ApplyRotaryPosEmb(nn.Cell):
             t_2 = t_reshaped[..., 1]
             t = self.cat((t_1, t_2), dim=-1)
 
-        cos_ = self.cast(self.cos(self.mul_mscale(freqs, m_scale)), t.dtype)
-        sin_ = self.cast(self.sin(self.mul_mscale(freqs, m_scale)), t.dtype)
+        t = self.cast(t, self.rotary_dtype)
+        cos_ = self.cast(self.cos(self.mul_mscale(freqs, m_scale)), self.rotary_dtype)
+        sin_ = self.cast(self.sin(self.mul_mscale(freqs, m_scale)), self.rotary_dtype)
 
         if self.apply_rope_fusion:
             output = self.rope(t, cos_, sin_, 0)
@@ -135,7 +138,7 @@ class ApplyRotaryPosEmb(nn.Cell):
 
         if t_not_rotary is not None:
             output = self.cat((output, t_not_rotary), dim=-1)
-        return output
+        return self.cast(output, origin_dtype)
 
     def _rotate_half(self, t: Tensor, rotary_interleaved: bool = False) -> Tensor:
         """Rotates half of the input tensor for rotary position embeddings.
