@@ -109,6 +109,8 @@ The input parameters of the script are described as follows.
 
 > Note: If you need to specify `device_id` for launching, you can set the environment variable `ASCEND_RT_VISIBLE_DEVICES`. For example, to use devices 2 and 3, input `export ASCEND_RT_VISIBLE_DEVICES=2,3`.
 
+> Note: OBS links for weights and data have been removed in the r1.5.0 branch. For any issues encountered during usage, please refer to ISSUE#IDDCTR.
+
 ### Single-Node Multi-Device
 
 ```shell

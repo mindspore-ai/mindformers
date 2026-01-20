@@ -109,6 +109,8 @@ MindFormers推荐使用分布式方式拉起模型训练、推理等功能，目
 
 > 注：如果需要指定`device_id`启动，可以设置环境变量`ASCEND_RT_VISIBLE_DEVICES`，如要配置使用2、3卡则输入`export ASCEND_RT_VISIBLE_DEVICES=2,3`。
 
+> 注：r1.5.0分支已删除权重和数据的OBS链接，如使用中存在问题，请参考[ISSUE#IDDCTR](https://gitee.com/mindspore/mindformers/issues/IDDCTR?from=project-issue)。
+
 ### 单机多卡
 
 ```shell
