@@ -21,7 +21,7 @@ import numpy as np
 import mindspore as ms
 from mindspore import context
 
-from data_gen_utils import get_init_params, DEFAULT_SEQ_LENGTH, DEFAULT_BATCH_SIZE, DEFAULT_HIDDEN_SIZE, \
+from data_gen_utils import get_init_params, get_fixed_weights, DEFAULT_SEQ_LENGTH, DEFAULT_BATCH_SIZE, DEFAULT_HIDDEN_SIZE, \
     DEFAULT_FFN_HIDDEN_SIZE, DEFAULT_NUM_HEADS
 
 from mindformers.parallel_core.transformer_config import TransformerConfig
@@ -88,7 +88,8 @@ class TransformerLayerRunner:
             layernorm_compute_dtype='fp32',
             normalization="LayerNorm",
             num_layers=1,
-            params_dtype='fp32'
+            params_dtype='fp32',
+            attention_dropout=0.0,
         )
 
 
@@ -123,6 +124,13 @@ class TransformerLayerRunner:
         self.hidden_states = init_input_params.get("hidden_states")
         self.attention_mask = init_input_params.get("attention_mask")
 
+        # Fixed weights (weight_dict with parameter names as keys)
+        self.weight_dict = get_fixed_weights(
+            hidden_size=self.hidden_size,
+            ffn_hidden_size=self.ffn_hidden_size,
+            param_init_dtype=self.param_init_dtype
+        )
+
     def build_model(self):
         """Build and initialize TransformerLayer model"""
         net = TransformerLayer(
@@ -130,6 +138,10 @@ class TransformerLayerRunner:
             submodules=self.submodules_spec,
             layer_number=1
         )
+
+        # Load fixed weights into the model
+        if self.weight_dict:
+            net.load_state_dict(self.weight_dict, strict=False)
 
         return net
 

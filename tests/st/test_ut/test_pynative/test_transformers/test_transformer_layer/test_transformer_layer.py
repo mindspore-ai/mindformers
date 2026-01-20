@@ -204,6 +204,7 @@ class TestTransformerLayer:
             logger.info(f"Loaded output from {output_file_path}. Keys: {list(output_ms_dict.keys())}")
 
             self.check_output_keys(output_ms_dict, data_keys)
+            self.check_acc(output_ms_dict, data_keys)
 
             logger.info("Test passed successfully.")
 
