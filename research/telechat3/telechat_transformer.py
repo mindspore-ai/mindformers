@@ -1,4 +1,4 @@
-# Copyright 2025 TeleAI Technologies Co., Ltd
+# Copyright 2026 TeleAI and Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -74,6 +74,14 @@ class TelechatAttention(nn.Cell):
                 Used for incremental prediction when the use_past is True. Default None.
             - **block_tables** (Tensor[int64]) - Store mapping tables for each sequence.
             - **slot_mapping** (Tensor[int32]) - Store token cache physical slot index.
+            - **wq(Tensor)** - Project the input into the query space, which is used to calculate the query part 
+                of the attention scores.
+            - **wk(Tensor)** - Project the input into the key space, which is used to calculate the key part of 
+                the attention scores.
+            - **wv(Tensor)** - Project the input into the value space, which is used to calculate the value part of
+                the attention scores.
+            - **wo(Tensor)** - Float Tensor, should be `[batch, seq_length, hidden_size] or
+                [batch * seq_length, hidden_size]`.
     Outputs:
             Tuple, a tuple contains(`output`, `layer_present`)
 
@@ -105,6 +113,10 @@ class TelechatAttention(nn.Cell):
                  use_attn_mask_compression=False,
                  block_size: Optional[int] = None,
                  num_blocks: Optional[int] = None,
+                 wq= None,
+                 wk=None,
+                 wv=None,
+                 wo=None,
                  parallel_config=TransformerOpParallelConfig()):
         super().__init__()
         self.hidden_size = dim
@@ -166,21 +178,21 @@ class TelechatAttention(nn.Cell):
                                      mean=self.mean,
                                      has_bias=qkv_has_bias,
                                      compute_dtype=compute_dtype,
-                                     param_init_type=param_init_type)
+                                     param_init_type=param_init_type) if wq is None else wq
             self.wk = TelechatLinear(self.hidden_size,
                                      self.n_kv_head * self.head_dim,
                                      has_bias=qkv_has_bias,
                                      sigma=self.sigma,
                                      mean=self.mean,
                                      compute_dtype=compute_dtype,
-                                     param_init_type=param_init_type)
+                                     param_init_type=param_init_type) if wk is None else wk
             self.wv = TelechatLinear(self.hidden_size,
                                      self.n_kv_head * self.head_dim,
                                      has_bias=qkv_has_bias,
                                      sigma=self.sigma,
                                      mean=self.mean,
                                      compute_dtype=compute_dtype,
-                                     param_init_type=param_init_type)
+                                     param_init_type=param_init_type) if wv is None else wv
 
             if qkv_has_bias:
                 self.wq.shard(((dp * self.sp, 1), (mp, 1)), ((dp * self.sp, mp), (mp,)))
@@ -197,7 +209,7 @@ class TelechatAttention(nn.Cell):
                                  mean=self.mean,
                                  has_bias=out_proj_has_bias,
                                  compute_dtype=compute_dtype,
-                                 param_init_type=param_init_type)
+                                 param_init_type=param_init_type) if wo is None else wo
         if out_proj_has_bias:
             self.wo.shard(((dp * self.sp, mp), (1, mp)), ((dp * self.sp, 1), (1,)),
                           out_strategy_matmul=((dp * self.sp, 1),))
@@ -428,6 +440,13 @@ class TelechatDecodeLayer(nn.Cell):
             parallel_config(OpParallelConfig, MoEParallelConfig): The parallel configure. When MoE is applied,
                 MoEParallelConfig is effective, otherwise OpParallelConfig is effective. Default `default_dpmp_config`,
                 an instance of `OpParallelConfig` with default args.
+            wq(Tensor): - Project the input into the query space, which is used to calculate the query part of the
+                attention scores. Float Tensor, should be `[batch, seq_length, hidden_size]`.
+            wk(Tensor): - Project the input into the key space, which is used to calculate the key part of the
+                attention scores. Float Tensor, should be `[batch, seq_length, hidden_size]`.
+            wv(Tensor): - Project the input into the value space, which is used to calculate the value part of the
+                attention scores. Float Tensor, should be `[batch, seq_length, hidden_size]`.
+            wo(Tensor): - Float Tensor, should be `[batch, seq_length, hidden_size]`.
 
         Inputs:
             - **x** (Tensor) - Float Tensor, shape should be [batch_size, seq_length, hidden_size] or
@@ -483,6 +502,10 @@ class TelechatDecodeLayer(nn.Cell):
                  use_attn_mask_compression=False,
                  block_size: Optional[int] = None,
                  num_blocks: Optional[int] = None,
+                 wq=None,
+                 wk=None,
+                 wv=None,
+                 wo=None,
                  parallel_config=TransformerOpParallelConfig()):
         super().__init__()
         self.layer_id = layer_id
@@ -523,6 +546,10 @@ class TelechatDecodeLayer(nn.Cell):
                                            use_attn_mask_compression=use_attn_mask_compression,
                                            block_size=block_size,
                                            num_blocks=num_blocks,
+                                           wq=wq,
+                                           wk=wk,
+                                           wv=wv,
+                                           wo=wo,
                                            parallel_config=parallel_config)
         self.feed_forward = TelechatFeedForward(dim=self.hidden_size,
                                   intermediate_size=intermediate_size,
@@ -534,7 +561,7 @@ class TelechatDecodeLayer(nn.Cell):
                                   ffn_concat=self.qkv_concat,
                                   compute_dtype=compute_dtype,
                                   param_init_type=param_init_type,
-                                  parallel_config=parallel_config_new)
+                                  parallel_config=parallel_config)
         dp = parallel_config.data_parallel
         mp = parallel_config.model_parallel
         sp = parallel_config.context_parallel
