@@ -46,6 +46,7 @@ class TopKRouter(nn.Cell):
         config: TransformerConfig,
     ):
         super().__init__()
+        self.config = config
         # Extract parameters from config
         dim = config.hidden_size
         num_experts = config.num_moe_experts
@@ -171,9 +172,10 @@ class TopKRouter(nn.Cell):
                     Number of tokens assigned to each expert with shape ``(num_experts,)``.
         """
         # scores shape (bs*slen, num_experts)
-        scores = self.linear(
-            self.cast(x, mstype.float32), self.weight
-        )
+        router_dtype = self.config.moe_router_dtype
+        weight = self.cast(self.weight, router_dtype)
+        x = self.cast(x, router_dtype)
+        scores = self.linear(x, weight)
 
         # By default, sigmoid or softmax is performed in float32 to avoid loss explosion
         if self.score_func == "sigmoid":
@@ -216,6 +218,5 @@ class TopKRouter(nn.Cell):
             min=0,
             max=self.num_experts,
         )
-        num_tokens_per_expert = self.cast(num_tokens_per_expert, mstype.float32)
 
         return top_scores, selected_experts_indices, num_tokens_per_expert
