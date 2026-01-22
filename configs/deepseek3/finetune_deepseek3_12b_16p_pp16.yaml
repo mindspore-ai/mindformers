@@ -1,0 +1,177 @@
+seed: 1234
+output_dir: './output' # path to save checkpoint and strategy
+load_checkpoint: ''
+load_ckpt_format: 'safetensors'  # format of checkpoint files to load
+src_strategy_path_or_dir: ''
+auto_trans_ckpt: True  # If True, auto transform `load_checkpoint` to load in distributed model
+only_save_strategy: False
+resume_training: False
+use_parallel: True
+run_mode: 'train'
+pretrained_model_dir: "/path/to/DeepSeek-V3"  # set to HuggingFace weight folder
+print_separate_loss: True
+
+# trainer config
+trainer:
+  type: CausalLanguageModelingTrainer
+  model_name: 'deepseekV3'
+
+# runner config
+runner_config:
+  epochs: 3
+  batch_size: 1
+  sink_mode: True
+  sink_size: 1
+
+# optimizer
+optimizer:
+  type: AdamW
+  betas: [0.9, 0.95]
+  eps: 1.e-8
+  weight_decay: 0.0
+
+# lr schedule
+lr_schedule:
+  type: CosineWithWarmUpLR
+  learning_rate: 5.e-6
+  warmup_ratio: 0.02
+  total_steps: -1 # -1 means it will load the total steps of the dataset
+
+# dataset
+train_dataset: &train_dataset
+  # dataset
+  data_loader:
+    type: HFDataLoader
+    # datasets load arguments
+    load_func: 'load_dataset'
+    path: "llm-wizard/alpaca-gpt4-data-zh"
+    split: "train"
+
+    # MindFormers dataset arguments
+    create_attention_mask: True
+    create_compressed_eod_mask: False
+    compressed_eod_mask_length: 128
+    use_broadcast_data: True
+    shuffle: False
+
+    # dataset process arguments
+    handler:
+      - type: take
+        n: 8000
+      - type: AlpacaInstructDataHandler
+        seq_length: 4096
+        padding: False
+        tokenizer:
+          trust_remote_code: True
+          padding_side: 'right'
+      - type: PackingHandler
+        seq_length: 4096
+        pack_strategy: 'pack'
+
+  num_parallel_workers: 8
+  python_multiprocessing: False
+  drop_remainder: True
+  numa_enable: False
+  prefetch_size: 1
+  seed: 1234
+train_dataset_task:
+  type: CausalLanguageModelDataset
+  dataset_config: *train_dataset
+
+
+# mindspore context init config
+context:
+  mode: 0 # 0--Graph Mode; 1--Pynative Mode
+  device_target: "Ascend"
+  max_call_depth: 10000
+  max_device_memory: "58GB"
+  save_graphs: False
+  save_graphs_path: "./graph"
+  jit_config:
+    jit_level: "O0"
+
+# parallel config for device num = 1024
+parallel_config:
+  data_parallel: 1
+  model_parallel: 1
+  pipeline_stage: 16
+  expert_parallel: 1
+  micro_batch_num: 16
+  use_seq_parallel: False
+  gradient_aggregation_group: 4
+# when model parallel is greater than 1, we can set micro_batch_interleave_num=2, that may accelerate the train process.
+micro_batch_interleave_num: 1
+
+# parallel context config
+parallel:
+  parallel_mode: 1  # 0-data parallel, 1-semi-auto parallel, 2-auto parallel, 3-hybrid parallel
+  gradients_mean: False
+  enable_alltoall: True
+  search_mode: "sharding_propagation"
+  enable_parallel_optimizer: False
+  strategy_ckpt_config:
+    save_file: "./ckpt_strategy.ckpt"
+    only_trainable_params: False
+  parallel_optimizer_config:
+    gradient_accumulation_shard: False
+    parallel_optimizer_threshold: 8
+
+# recompute config
+recompute_config:
+  recompute: True
+  select_recompute: False
+  mp_comm_recompute: False
+
+# model config
+use_legacy: False
+model:
+  model_config:
+    offset: 0
+    hidden_size: 1792
+    intermediate_size: 3072
+    num_hidden_layers: 16
+    num_attention_heads: 8
+    multi_latent_attention: True
+    mla_qkv_concat: False
+    v_head_dim: 192
+    qk_layernorm: True
+    initializer_range: 0.01
+    mtp_loss_scaling_factor: 0.3
+    position_embedding_type: "yarn"
+    scaling_factor: 40
+    # moe config
+    router_dense_type: "float32"
+    routed_scaling_factor: 1.5
+    first_k_dense_replace: 1
+    n_routed_experts: 64
+    moe_shared_expert_intermediate_size: 2048
+    moe_grouped_gemm: True
+    moe_router_load_balancing_type: 'seq_aux_loss'
+    moe_aux_loss_coeff: 0.001
+    moe_token_drop_policy: probs
+
+# callbacks
+callbacks:
+  - type: MFLossMonitor
+  # balance topk bias with callback
+  - type: TopkBiasBalanceCallback
+  - type: CheckpointMonitor
+    prefix: "deepseekv3"
+    save_checkpoint_steps: 100
+    keep_checkpoint_max: 1
+    integrated_save: False
+    async_save: False
+    checkpoint_format: "safetensors"  # format of checkpoint files to save
+
+# wrapper cell config
+runner_wrapper:
+  type: MFTrainOneStepCell
+  scale_sense: 1.0
+  use_clip_grad: True
+
+profile: False
+profile_start_step: 5
+profile_stop_step: 7
+init_start_profile: False
+profile_communication: False
+profile_memory: True
