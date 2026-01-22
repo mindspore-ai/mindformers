@@ -1,0 +1,193 @@
+seed: 42
+output_dir: './output' # path to save checkpoint and strategy
+load_checkpoint: ''
+load_ckpt_format: 'safetensors'  # format of checkpoint files to load
+src_strategy_path_or_dir: ''
+auto_trans_ckpt: False  # If True, auto transform `load_checkpoint` to load in distributed model
+only_save_strategy: False
+resume_training: False
+use_parallel: True
+run_mode: 'train'
+train_precision_sync: False
+
+# trainer config
+trainer:
+  type: CausalLanguageModelingTrainer
+  model_name: 'deepseekV3'
+
+# runner config
+runner_config:
+  epochs: 1
+  batch_size: 1
+  sink_mode: True
+  sink_size: 1
+
+# optimizer
+optimizer:
+  type: AdamW
+  betas: [0.9, 0.95]
+  eps: 1.e-8
+  weight_decay: 0.01
+  swap: True
+
+# lr schedule
+lr_schedule:
+  type: ConstantWarmUpLR
+  learning_rate: 2.e-5
+  lr_end: 2.e-5
+  warmup_lr_init: 0
+  warmup_steps: 200
+  total_steps: -1 # -1 means it will load the total steps of the dataset
+
+# dataset
+train_dataset: &train_dataset
+  data_loader:
+    type: BlendedMegatronDatasetDataLoader
+    datasets_type: "GPTDataset"
+    shuffle: False
+    sizes:
+      - 128000 # Number of training set data samples.
+      - 0    # Number of test set data samples. Currently, configuration is not supported.
+      - 0    # Number of eval set data samples. Currently, configuration is not supported.
+    config:  # GPTDataset Configs
+      seed: 1234                         # Data sampling random seed
+      split: "1, 0, 0"                   # The usage ratio of training, testing and evaluation sets. Currently, configuration is not supported.
+      seq_length: 4096                   # The sequence length of the data set returned.
+      eod_mask_loss: False               # Whether to calculate loss at eod.
+      reset_position_ids: False          # Whether to reset position_ids at eod.
+      create_attention_mask: False       # Whether to return `attention_mask`.
+      reset_attention_mask: False        # Whether to reset the `attention_mask` at eod and return a stepped `attention_mask`.
+      create_compressed_eod_mask: False  # Whether to return the compressed `attention_mask`.
+      eod_pad_length: 128                # Set the length of the compressed `attention_mask`.
+      eod: 1                             # The token id of `eod` in the dataset.
+      pad: -1                            # The token id of `pad` in the dataset.
+      num_dataset_builder_threads: 1
+      data_path:                         # Megatron dataset sampling ratio and path.
+        - '1'
+        - "/path/megatraon_dataset/wiki103-megatron_text_document"
+  num_parallel_workers: 8
+  python_multiprocessing: False
+  drop_remainder: True
+train_dataset_task:
+  type: CausalLanguageModelDataset
+  dataset_config: *train_dataset
+
+# mindspore context init config
+context:
+  mode: 0 # 0--Graph Mode; 1--Pynative Mode
+  device_target: "Ascend"
+  max_call_depth: 10000
+  max_device_memory: "56GB"
+  mempool_block_size: "56GB"
+  memory_optimize_level: "O0"
+  save_graphs: False
+  save_graphs_path: "./output/graphs"
+  jit_config:
+    jit_level: "O0"
+
+# parallel config
+parallel_config:
+  data_parallel: 4
+  model_parallel: 8
+  pipeline_stage: 8
+  expert_parallel: 32
+  micro_batch_num: 32
+  use_seq_parallel: True
+  gradient_aggregation_group: 4
+# when model parallel is greater than 1, we can set micro_batch_interleave_num=2, that may accelerate the train process.
+micro_batch_interleave_num: 1
+
+# parallel context config
+parallel:
+  parallel_mode: 1 # 0-data parallel, 1-semi-auto parallel, 2-auto parallel, 3-hybrid parallel
+  gradients_mean: False
+  enable_alltoall: True
+  search_mode: "sharding_propagation"
+  enable_parallel_optimizer: True
+  pipeline_config:
+    pipeline_interleave: True
+    pipeline_scheduler: seqpipe
+  strategy_ckpt_config:
+    save_file: "./ckpt_strategy.ckpt"
+    only_trainable_params: False
+  parallel_optimizer_config:
+    gradient_accumulation_shard: False
+    parallel_optimizer_threshold: 64
+    optimizer_weight_shard_size: 256
+
+# recompute config
+recompute_config:
+  recompute: True
+  select_recompute: False
+  mp_comm_recompute: True
+
+# model config
+use_legacy: False
+model:
+  model_config:
+    model_type: "deepseek_v3"
+    architectures: ["DeepseekV3ForCausalLM"]
+    offset: [[1, 1, 1, 1, 1, 1, 1, 1], [1, 1, 1, 1, 1, 1, 1, -2]]
+    pp_interleave_num: 2
+    seq_length: 4096
+    num_hidden_layers: 61
+    vocab_size: 129280
+    hidden_size: 7168
+    intermediate_size: 18432
+    add_bias_linear: False
+    use_flash_attention: True
+    use_attn_mask_compression: True
+    multi_latent_attention: True
+    mla_qkv_concat: False
+    qk_layernorm: True
+    attention_dropout: 0.0
+    hidden_dropout: 0.0
+    params_dtype: "float32"
+    compute_dtype: "bfloat16"
+    layernorm_compute_dtype: "float32"
+    softmax_compute_dtype: "float32"
+    initializer_range: 0.01
+    num_nextn_predict_layers: 1
+    mtp_loss_factor: 0.3
+    apply_rope_fusion: False
+    bias_swiglu_fusion: False
+    # moe config
+    router_dense_type: "float32"
+    gated_linear_unit: True
+    moe_grouped_gemm: True
+    use_fused_ops_topkrouter: True
+    n_group: 8
+    topk_group: 4
+    use_pad_tokens: False
+    moe_token_dispatcher_type: "alltoall"
+    moe_intermediate_size: 2048
+    moe_router_load_balancing_type: 'seq_aux_loss'
+    moe_aux_loss_coeff: 0.0001
+    moe_token_drop_policy: False
+    moe_router_enable_expert_bias: True
+    moe_router_bias_update_rate: 0.0001
+
+# callbacks
+callbacks:
+  - type: MFLossMonitor
+  - type: TopkBiasBalanceCallback
+  - type: CheckpointMonitor  # Saves model weights during training
+    prefix: "deepseekv3"  # Prefix for saved file names
+    save_checkpoint_steps: 5000  # Interval steps for saving model weights
+    keep_checkpoint_max: 1  # Maximum number of saved model weight files
+    integrated_save: False  # Whether to aggregate weights for saving
+    async_save: False  # Whether to save model weights asynchronously
+    checkpoint_format: "safetensors"  # Format for saving checkpoints
+
+# wrapper cell config
+runner_wrapper:
+  type: MFTrainOneStepCell
+  scale_sense: 1.0
+  use_clip_grad: True
+
+profile: False
+profile_start_step: 10
+profile_stop_step: 11
+init_start_profile: True
+profile_communication: False
+profile_memory: False
