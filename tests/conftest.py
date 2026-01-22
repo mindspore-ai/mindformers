@@ -18,7 +18,7 @@ import os
 
 from pytest import fixture
 
-from mindformers import logger
+from mindformers.tools.logger import logger
 
 @fixture(scope="session", autouse=True)
 def check_ascend_home_path():
