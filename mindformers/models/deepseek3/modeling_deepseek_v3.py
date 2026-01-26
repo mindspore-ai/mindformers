@@ -14,12 +14,14 @@
 # ============================================================================
 """Deepseek-V3 Model."""
 import os
+import mindspore as ms
 
 from mindformers.tools.register import MindFormerRegister, MindFormerModuleType
 
 from .configuration_deepseek_v3 import DeepseekV3Config
 from .modeling_deepseek_v3_train import TrainingDeepseekV3ForCausalLM
 from .modeling_deepseek_v3_infer import InferenceDeepseekV3ForCausalLM
+from .modeling_deepseek_v3_pynative import PyNativeDeepseekV3ForCausalLM
 
 
 @MindFormerRegister.register(MindFormerModuleType.MODELS, legacy=False)
@@ -39,4 +41,6 @@ class DeepseekV3ForCausalLM:
         # when predict mode not supported, we can use online_predict mode to do inference task.
         if os.environ.get("RUN_MODE") == "predict":
             return InferenceDeepseekV3ForCausalLM(config=config)
+        if ms.get_context("mode") == ms.context.PYNATIVE_MODE:
+            return PyNativeDeepseekV3ForCausalLM(config=config)
         return TrainingDeepseekV3ForCausalLM(config=config)

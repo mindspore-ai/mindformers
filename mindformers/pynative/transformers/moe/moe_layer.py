@@ -103,4 +103,4 @@ class MoELayer(nn.Cell):
         else:
             final_out = out_experts
 
-        return final_out
+        return final_out, None

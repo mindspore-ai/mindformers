@@ -415,6 +415,9 @@ class TransformerConfig(ModelParallelConfig, MFModelConfig):
     num_decoder_layers should be set while use the 'yoco' model structure. 
     """
 
+    moe_apply_probs_on_input: bool = False
+    """Apply probs on input of experts instead of applying after activation and glu."""
+
     num_decoder_layers: int = None
     """
     The number of decoder layers. The num_encoder_layers or the 
