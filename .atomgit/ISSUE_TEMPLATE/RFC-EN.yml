@@ -1,0 +1,90 @@
+name: RFC Proposal (English)
+description: Create a new Request for Comments (RFC) proposal (English version)
+title: "[RFC] "
+labels: ["kind/rfc"]
+body:
+  - type: input
+    id: authors
+    attributes:
+      label: Authors
+      description: Please list authors' GitHub/Gitee handles (e.g., @nickname)
+      placeholder: "@nickname"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: status
+    attributes:
+      label: Status
+      options:
+        - Proposed
+        - Draft
+        - Reviewing
+        - Accepted
+        - Rejected
+    validations:
+      required: true
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: A concise overview or "elevator pitch" of the proposal.
+      placeholder: |
+        * This proposal aims to solve [problem] by [method] to achieve [goal].
+    validations:
+      required: true
+
+  - type: textarea
+    id: motivation
+    attributes:
+      label: Motivation
+      description: Why are we doing this? What pain points does it solve?
+      placeholder: |
+        * Problem Statement: What are the current limitations?
+        * Value & Impact: What specific benefits will this bring to MindFormers users?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposed_implementation
+    attributes:
+      label: Proposed Implementation
+      description: Detailed technical design, architecture, and API definitions.
+      placeholder: |
+        ### Design Logic
+        * Describe the core architecture and flow.
+
+        ### API Design
+        * Provide code snippets (e.g., new Cell, Ops, or configs).
+        * Explain how users will interact with this feature.
+    validations:
+      required: true
+
+  - type: textarea
+    id: metrics
+    attributes:
+      label: Metrics & Verification
+      description: How will success be measured?
+      placeholder: |
+        * Performance: Throughput, memory usage, TFLOPS.
+        * Accuracy: Alignment with PyTorch/Megatron baselines.
+        * Test Plan: Unit tests and integration scenarios.
+
+  - type: textarea
+    id: drawbacks
+    attributes:
+      label: Drawbacks & Constraints
+      description: Potential risks, breaking changes, or dependencies.
+      placeholder: |
+        * Breaking Changes: Will existing models/configs be affected?
+        * Complexity & Dependencies: Any significant overhead or new libraries?
+
+  - type: textarea
+    id: documentation
+    attributes:
+      label: Documentation & Usability
+      description: Plan for documentation updates and user experience.
+      placeholder: |
+        * Config Changes: New yaml parameters and defaults.
+        * Docs Update: README or tutorial revisions.
