@@ -86,6 +86,7 @@ from mindformers.parallel_core.training_graph.loss_func import (
 )
 from mindformers.checkpoint.checkpoint import AsyncSaveManager, CommonInfo, save_checkpoint
 from mindformers.parallel_core.transformer_config import TransformerConfig
+from mindformers.models.utils import num_floating_point_operations, convert_transformer_config_to_args_for_tflops
 
 # pylint: disable=import-outside-toplevel
 __all__ = ['MFLossMonitor', 'CheckpointMonitor', 'SummaryMonitor', 'ProfileMonitor', 'EvalCallBack']
@@ -478,10 +479,11 @@ class MFLossMonitor(Callback):
         if not scaling_sens:
             scaling_sens = "unavailable"
 
-        if self.mf_support is None:
-            self.mf_support = self._can_calculate_model_flops(cb_params)
-        if (not self.mf_calculated or check_arf_status(cb_params)) and self.mf_support:
-            self._calculate_model_flops()
+        # Choose calculation method based on legacy model status
+        if is_legacy_model():
+            self._calculate_flops_legacy(cb_params)
+        else:
+            self._calculate_flops_mcore(cb_params)
 
         origin_epochs = self.origin_epochs
 
@@ -561,9 +563,31 @@ class MFLossMonitor(Callback):
         rank_list_str = "-".join(rank_str_list)
         return rank_list, rank_list_str
 
+    def _calculate_flops_legacy(self, cb_params):
+        """Calculate FLOPs for legacy models using runtime collection API."""
+        if self.mf_support is None:
+            self.mf_support = self._can_calculate_model_flops(cb_params)
+        if (not self.mf_calculated or check_arf_status(cb_params)) and self.mf_support:
+            self._calculate_model_flops()
+
+    def _calculate_flops_mcore(self, cb_params):
+        """Calculate FLOPs for mcore models using configuration-based method."""
+        if not self.mf_calculated or check_arf_status(cb_params):
+            network = cb_params.train_network if cb_params.mode == 'train' else cb_params.eval_network
+            real_network = get_real_models(network)
+            config = real_network.get_gpt_transformer_config()
+
+            batch_size = self.global_batch_size
+
+            args = convert_transformer_config_to_args_for_tflops(config)
+            self.full_model_flops = num_floating_point_operations(args, batch_size)
+            self.mf_calculated = True
+
+            logger.info("Full model flops calculated: %d", self.full_model_flops)
+
     def _can_calculate_model_flops(self, cb_params):
         """
-        Check whether the model flops can be collected
+        Check whether the model flops can be collected for legacy models.
         """
         if cb_params.mode == 'train':
             network = cb_params.train_network
@@ -573,15 +597,15 @@ class MFLossMonitor(Callback):
             logger.warning('Model Flops computation only support train and eval mode!')
             return False
         if ms.get_context('mode') != ms.GRAPH_MODE:
-            logger.warning('Model Flops computation only support graph mode!')
+            logger.warning('Model Flops computation only support graph mode in legacy mode!')
             return False
         if not hasattr(network, 'current_phase'):
-            logger.warning('This model dose not support collecting model flops now!')
+            logger.warning('This model dose not support collecting model flops now in legacy mode!')
             return False
 
-        if not is_legacy_model() and self.is_moe_model:
-            logger.warning("Model Flops computation is not support when using GroupMatMul MoELayer, "
-                           "due to dynamic shape")
+        if self.is_moe_model:
+            logger.warning("Model Flops computation is not support when using GroupMatMul MoELayer "
+                           "in legacy mode, due to dynamic shape")
             return False
 
         self.current_phase = network.current_phase
@@ -676,7 +700,10 @@ class MFLossMonitor(Callback):
 
         global_step = cur_step_num + (cur_epoch_num - 1) * steps_per_epoch
         if self.mf_calculated:
-            throughput_per_npu = self.full_model_flops / per_step_seconds / 1e9
+            if is_legacy_model():
+                throughput_per_npu = self.full_model_flops / per_step_seconds / 1e9
+            else:
+                throughput_per_npu = self.full_model_flops / per_step_seconds / 1e9 / self.device_num
             throughput_info = f', train_throughput_per_npu: {throughput_per_npu:.3f}T'
             if self.tensor_writer is not None:
                 self.tensor_writer.add_scalar('model-flops-throughput-per-npu',
