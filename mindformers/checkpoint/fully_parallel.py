@@ -236,16 +236,20 @@ class BalancedSaveStrategy():
         if self.rank_id == 0:
             param_file_mapping = []
             cur_rank_id = 0
-            rank_param_ids_mappings = self._get_rank_param_ids_mappings(shared_distribution)
 
-            for rank_id, params in rank_param_ids_mappings.items():
+            for rank_id, params in shared_distribution.items():
                 if params:
                     save_file_name = get_checkpoint_name(
                         None, self.user_prefix, cur_rank_id, self.total_files_num, self.file_type
                     )
-                    for param_id in params:
-                        param_file_mapping.append(
-                            (save_file_name + ".safetensors", rank_id, _reverse_sharded_tensor_shard_id(param_id)))
+                    for shard_id in params:
+                        rank_group = params[shard_id][1]
+                        param_file_mapping.append((
+                            save_file_name + ".safetensors",
+                            rank_id,
+                            rank_group,
+                            _reverse_sharded_tensor_shard_id(shard_id)
+                        ))
                     cur_rank_id += 1
 
             sharded_tensor_metas = get_all_sharded_tensor(self.network, self.filter_func)
@@ -255,12 +259,13 @@ class BalancedSaveStrategy():
                 origin_shard_metadata, origin_param_file_mapping = load_metadata(
                     get_metadata_filename(self.checkpoint_path, iteration))
                 sharded_tensor_metas.update({"origin": origin_shard_metadata})
-                for param_id, storage in origin_param_file_mapping.items():
+                for shard_id, storage in origin_param_file_mapping.items():
                     for storage_item in storage:
                         param_file_mapping.append((
                             storage_item["file_name"],
                             storage_item["storage_rank"],
-                            _reverse_sharded_tensor_shard_id(param_id)
+                            storage_item["rank_group"],
+                            _reverse_sharded_tensor_shard_id(shard_id)
                         ))
 
             metadata_file_path = get_metadata_filename(self.checkpoint_path, iteration)
@@ -440,5 +445,10 @@ def apply_balance_shard_strategy(network: Cell, filter_func: Callable[[str], boo
             rank_id_to_sharded_tensors[selected_rank_id][shard_id] = (sharded_tensor, rank_group)
         else:
             rank_id_to_sharded_tensors[selected_rank_id] = {shard_id: (sharded_tensor, rank_group)}
+
+    rank_id_to_sharded_tensors = {
+        k: rank_id_to_sharded_tensors.get(k, None)
+        for k in sorted(rank_id_to_sharded_tensors)
+    }
 
     return rank_id_to_sharded_tensors

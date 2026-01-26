@@ -22,7 +22,7 @@ import shutil
 from enum import Enum
 from glob import glob
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List
 
 import mindspore as ms
 from mindspore import context
@@ -454,3 +454,60 @@ def compile_model(model, dataset, mode, sink_mode, epoch=1, sink_size=1, do_eval
     build_time_end = time.time()
     build_duration = build_time_end - build_time_start
     logger.info(f"Time spent compiling the model: {build_duration:.2f} seconds")
+
+
+def is_hf_checkpoint(checkpoint_path: str) -> bool:
+    """Determine whether the weight path is in HuggingFace format."""
+    if not checkpoint_path:
+        raise ValueError("checkpoint_path cannot be empty")
+
+    if not os.path.exists(checkpoint_path):
+        raise ValueError(f"checkpoint_path does not exist: {checkpoint_path}")
+
+    if not os.path.isdir(checkpoint_path):
+        raise ValueError(f"checkpoint_path is not a directory: {checkpoint_path}")
+
+    # Check whether exits `model.safetensors` or `model.safetensors.index.json`.
+    has_model_safetensors = os.path.exists(os.path.join(checkpoint_path, "model.safetensors"))
+    has_index = bool(glob(os.path.join(checkpoint_path, "*model.safetensors.index.json")))
+
+    return has_model_safetensors or has_index
+
+
+def get_needed_hf_files(checkpoint_dir: str) -> List[str]:
+    """
+    Obtain the list of safetensors files that need to be loaded under the HuggingFace weights directory.
+
+    Processing flow:
+    1. Check if there is a "model.safetensors.index.json" file.
+       - Existence: Parse the file list from `index.json`.
+       - Not present: Search for all "safetensors" files in the directory.
+    2. Return a list of complete file paths.
+
+    Args:
+        checkpoint_dir: HuggingFace weights directory.
+
+    Returns:
+        List[str]: List of full paths to safetensors files.
+    """
+    index_file = glob(os.path.join(checkpoint_dir, "*model.safetensors.index.json"))[0]
+
+    if os.path.exists(index_file):
+        # Parse the file list from `index.json`.
+        with open(index_file, 'r', encoding='utf-8') as f:
+            index_data = json.load(f)
+
+        # The format of `weight_map`: {"param_name": "model-00001-of-00002.safetensors"}
+        weight_map = index_data.get("weight_map", {})
+        file_names_set = set(weight_map.values())
+
+        return [
+            os.path.join(checkpoint_dir, file_name)
+            for file_name
+            in file_names_set
+        ]
+
+    # Directly search for the "safetensors" file
+    pattern = os.path.join(checkpoint_dir, "*.safetensors")
+
+    return glob(pattern)

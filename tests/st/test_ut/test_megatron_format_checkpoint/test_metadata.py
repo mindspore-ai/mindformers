@@ -67,6 +67,8 @@ def save_metadata_without_npu(global_strategy_info, model_keys, user_prefix, met
             filter_func=(lambda x: x in list(model_keys)) if not save_optimizer else None
         )
 
+        sharded_tensor_metas[cur_npu_rank] = cur_rank_sharded_tensors
+
         # Get mappings of parameter file of current rank.
         for _, sharded_tensor in cur_rank_sharded_tensors.items():
             if save_optimizer and sharded_tensor.key not in list(model_keys):
@@ -77,6 +79,7 @@ def save_metadata_without_npu(global_strategy_info, model_keys, user_prefix, met
                 (
                     ckpt_name + '.safetensors',
                     cur_npu_rank,
+                    [cur_npu_rank],  # rank_group - new required field
                     (sharded_tensor.key, sharded_tensor.global_offset)
                 )
             )
@@ -143,6 +146,7 @@ def test_save_and_load_metadata_case():
     adam_mapping_0 = has_optimizer_param_file_mappings["('adam_m.decoder.layers.0.input_layernorm.weight', (0,))"][0]
     assert adam_mapping_0["storage_rank"] == 0
     assert adam_mapping_0["file_name"] == "my_test_net-opt-0000000-0000002.safetensors"
+    assert "rank_group" in adam_mapping_0
 
     # 4. Test load 'metadata.json' without optimizer info.
     no_optimizer_sharded_tensors, no_optimizer_param_file_mappings = load_metadata(

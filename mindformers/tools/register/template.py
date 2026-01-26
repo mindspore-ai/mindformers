@@ -253,6 +253,7 @@ class GeneralConfig(Config):
     use_legacy_format = True
     pretrained_model_dir = ""
     balanced_load = False
+    reshard_worker_num = 1
 
     # eval while training
     do_eval = False

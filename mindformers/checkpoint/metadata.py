@@ -17,8 +17,10 @@ import os
 import json
 import tempfile
 from glob import glob
-from safetensors import safe_open
+from typing import Dict, Tuple
+from collections import defaultdict
 
+from mindspore import load_checkpoint as ms_load_checkpoint
 from mindspore.communication.management import get_group_size
 from mindspore.common.dtype import all_types
 from mindspore.parallel import Layout
@@ -27,10 +29,13 @@ from mindformers.tools.logger import logger
 from mindformers.tools.utils import set_safe_mode_for_file_or_dir
 from mindformers.checkpoint.sharded_tensor import build_sharded_tensor
 from mindformers.checkpoint.utils import (
+    is_hf_checkpoint,
+    get_needed_hf_files,
     get_checkpoint_name,
     get_sharded_tensor_shard_id,
     FileType
 )
+
 
 tensor_to_ms_type = {str(dtype).lower(): dtype for dtype in all_types}
 
@@ -149,11 +154,16 @@ def save_metadata(sharded_tensor_metas, param_file_mappings, meta_data_path):
     for param_file_mapping in param_file_mappings:
         file_name = param_file_mapping[0]
         storage_rank = param_file_mapping[1]
-        param_id = get_sharded_tensor_shard_id(param_file_mapping[2][0], param_file_mapping[2][1])
-        if param_id not in storage_data:
-            storage_data[param_id] = [{"file_name": file_name, "storage_rank": storage_rank}]
+        rank_group = param_file_mapping[2]
+        shard_id = get_sharded_tensor_shard_id(param_file_mapping[3][0], param_file_mapping[3][1])
+        if shard_id not in storage_data:
+            storage_data[shard_id] = [
+                {"file_name": file_name, "storage_rank": storage_rank, "rank_group": rank_group}
+            ]
         else:
-            storage_data[param_id].append({"file_name": file_name, "storage_rank": storage_rank})
+            storage_data[shard_id].append(
+                {"file_name": file_name, "storage_rank": storage_rank, "rank_group": rank_group}
+            )
 
     metadata = {"state_dict_metadata": state_dict_metadata, "storage_data": storage_data}
 
@@ -277,11 +287,16 @@ def generate_default_metadata_from_checkpoint(checkpoint_dir: str) -> tuple[dict
         raise NotADirectoryError(
             f"Checkpoint directory '{checkpoint_dir}' does not exist or is not a directory.")
 
-    logger.info("..........Load Metadata from Checkpoint Files..........")
+    logger.info("..........Generate Metadata from Checkpoint Files..........")
 
     # Find all safetensor files in the checkpoint directory
-    safetensor_pattern = os.path.join(checkpoint_dir, "*.safetensors")
-    safetensor_files = glob(safetensor_pattern)
+    if is_hf_checkpoint(checkpoint_dir):
+        safetensor_files = get_needed_hf_files(checkpoint_dir)
+        logger.info(f"Detected HuggingFace checkpoint, found {len(safetensor_files)} safetensor files")
+    else:
+        safetensor_pattern = os.path.join(checkpoint_dir, "*.safetensors")
+        safetensor_files = glob(safetensor_pattern)
+        logger.info(f"Found {len(safetensor_files)} safetensor files in directory")
 
     # Verify we found safetensor files
     if not safetensor_files:
@@ -297,45 +312,34 @@ def generate_default_metadata_from_checkpoint(checkpoint_dir: str) -> tuple[dict
     # Process each safetensor file
     for safetensor_file in safetensor_files:
         file_basename = os.path.basename(safetensor_file)
-        logger.info(f"Extracting metadata from Safetensors file: {file_basename}")
+        logger.info(f"Extracting metadata from: {file_basename}")
 
-        # Open the safetensor file and process each tensor
-        with safe_open(safetensor_file, framework="np", device="cpu") as f:
-            for param_name in f.keys():
-                try:
-                    # Load the tensor to extract its properties
-                    tensor = f.get_tensor(param_name)  # Load as numpy tensor
-                except Exception as e:
-                    raise RuntimeError(
-                        f"Failed to load tensor '{param_name}' from file '{file_basename}'"
-                    ) from e
+        loaded_params = ms_load_checkpoint(
+            safetensor_file,
+            format='safetensors'
+        )
 
-                # Extract tensor properties
-                tensor_shape = tensor.shape
-                ms_dtype = tensor_to_ms_type.get(str(tensor.dtype))
-                global_offset = (0,)
-                axis_fragmentations = (1,) * len(tensor_shape)
+        for param_name, param in loaded_params.items():
+            param_shape = tuple(param.shape)
+            sharded_tensor = build_sharded_tensor(
+                param_name=param_name,
+                param_dtype=param.dtype,
+                local_shape=param_shape,
+                global_shape=param_shape,
+                global_offset=(0,),  # In multi-dimensional scenarios, each dimension is 0.
+                axis_fragmentations=[1] * len(param_shape),
+                layout=None
+            )
 
-                # Create sharded tensor metadata object
-                sharded_tensor = build_sharded_tensor(
-                    param_name=param_name,
-                    param_dtype=ms_dtype,
-                    local_shape=tensor_shape,
-                    global_shape=tensor_shape,
-                    global_offset=global_offset,
-                    axis_fragmentations=axis_fragmentations,
-                    layout=None
-                )
+            # Check for duplicate parameters
+            if param_name in sharded_tensor_metas:
+                raise RuntimeError(f"Duplicate parameter_name found: {param_name}.")
 
-                # Check for duplicate parameters
-                if param_name in sharded_tensor_metas:
-                    raise RuntimeError(f"Duplicate parameter_name found: {param_name}.")
-
-                # Store metadata with fixed storage rank 0
-                sharded_tensor_metas[param_name] = [sharded_tensor]
-                param_file_mappings[str((param_name, (0,)))] = [
-                    {"file_name": file_basename, "storage_rank": 0}
-                ]
+            # Store metadata with fixed storage rank 0
+            sharded_tensor_metas[param_name] = [sharded_tensor]
+            param_file_mappings[str((param_name, (0,)))] = [
+                {"file_name": file_basename, "storage_rank": 0, "rank_group": [0]}
+            ]
 
     return sharded_tensor_metas, param_file_mappings
 
@@ -344,6 +348,12 @@ def get_total_params_file_mapping_info(sharded_tensor_metas, user_prefix, model_
     """Get all shard metadata file mappings list."""
     if sharded_tensor_metas is None:
         return None
+
+    shard_id_to_ranks = defaultdict(list)
+    for cur_npu_rank, cur_rank_sharded_tensors in sharded_tensor_metas.items():
+        for sharded_tensor in cur_rank_sharded_tensors.values():
+            shard_id = get_sharded_tensor_shard_id(sharded_tensor.key, sharded_tensor.global_offset)
+            shard_id_to_ranks[shard_id].append(cur_npu_rank)
 
     npu_nums = get_group_size()
     param_file_mappings = []
@@ -356,7 +366,47 @@ def get_total_params_file_mapping_info(sharded_tensor_metas, user_prefix, model_
                 ckpt_name = get_checkpoint_name(None, user_prefix, cur_npu_rank, npu_nums, FileType.MODEL)
 
             param_file_mappings.append(
-                (ckpt_name + '.safetensors', cur_npu_rank, (sharded_tensor.key, sharded_tensor.global_offset))
+                (ckpt_name + '.safetensors',
+                 cur_npu_rank,
+                 shard_id_to_ranks[get_sharded_tensor_shard_id(sharded_tensor.key, sharded_tensor.global_offset)],
+                 (sharded_tensor.key, sharded_tensor.global_offset))
             )
 
     return param_file_mappings
+
+
+def get_metadata_of_checkpoint(checkpoint_dir: str) -> Tuple[Dict, Dict]:
+    """
+    Retrieves metadata from checkpoint directory, either from an existing metadata file
+     or by parsing checkpoint files.
+
+    First checks for a pre-existing 'metadata.json' file in the checkpoint directory. If found,
+    it loads metadata from this file using load_metadata(). If not found, it generates metadata
+    by parsing the checkpoint files directly using load_metadata_from_checkpoint().
+
+    Args:
+        checkpoint_dir: Path to the directory containing the checkpoint files.
+        network: The target core network (Cell) which has method `convert_name` to convert Hugging Face weight.
+
+    Returns:
+        A tuple containing two dictionaries:
+        - sharded_tensor_metas: Metadata about sharded tensors
+        - param_file_mappings: Mapping from shard IDs to storage information lists.
+            Each storage info dict has "file_name", "storage_rank", "rank_group" keys.
+    """
+    logger.info("..........Load Metadata of Checkpoint..........")
+
+    # Construct path to metadata file
+    metadata_path = os.path.join(checkpoint_dir, "metadata.json")
+
+    # Load from existing metadata file if available
+    if os.path.exists(metadata_path):
+        sharded_tensor_metas, param_file_mappings = load_metadata(metadata_path)
+    # Otherwise generate metadata from checkpoint files
+    else:
+        sharded_tensor_metas, param_file_mappings = generate_default_metadata_from_checkpoint(checkpoint_dir)
+
+    # if the content or format of metadata_path and checkpoint_dir are invalid, the return value of
+    # sharded_tensor_metas and param_file_mappings may be empty or None,
+    # and it may cause an error in subsequent loading process.
+    return sharded_tensor_metas, param_file_mappings

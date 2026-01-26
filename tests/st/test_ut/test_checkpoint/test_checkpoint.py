@@ -16,7 +16,6 @@
 # pylint: disable=W0621
 import os
 import json
-from unittest.mock import patch
 import pytest
 import numpy as np
 
@@ -27,17 +26,12 @@ from mindformers.checkpoint.checkpoint import (
     AsyncSaveManager,
     save_checkpoint,
     save_metadata_json,
-    load_safetensor,
-    categorize_params,
-    get_metadata_of_checkpoint,
-    params_key_mapping,
     load_checkpoint,
-    concat_params,
     check_the_param_for_load_ckpt,
     load_parameters,
-    get_checkpoint_path
+    get_checkpoint_path,
 )
-from mindformers.checkpoint.sharded_tensor import ShardedTensor
+from mindformers.checkpoint.metadata import get_metadata_of_checkpoint
 
 
 class SimpleNet(nn.Cell):
@@ -305,125 +299,6 @@ def test_get_metadata_of_checkpoint(tmp_path):
 @pytest.mark.level0
 @pytest.mark.platform_x86_cpu
 @pytest.mark.env_onecard
-def test_params_key_mapping(simple_network):
-    """
-    Feature: Test params_key_mapping function.
-    Description: Test the functionality of params_key_mapping with a simple sharded_tensor_metas dict.
-    Expectation: The function should successfully map parameters and return dictionaries and core network.
-    """
-    # Create a simple sharded_tensor_metas dict with all required parameters
-    sharded_tensor_metas = {
-        "test_param": [
-            ShardedTensor(
-                key="test_param",
-                org_key="test_param",
-                dtype=mstype.float32,
-                local_shape=(10, 10),  # Add missing local_shape parameter
-                global_shape=(10, 10),
-                global_offset=(0, 0),
-                axis_fragmentations=(),
-                layout=None
-            )
-        ]
-    }
-
-    # Test params_key_mapping
-    mapped_metas, key_mapping = params_key_mapping(sharded_tensor_metas, simple_network)
-    assert isinstance(mapped_metas, dict)
-    assert isinstance(key_mapping, dict)
-
-
-@pytest.mark.level0
-@pytest.mark.platform_x86_cpu
-@pytest.mark.env_onecard
-def test_concat_params(tmp_path, simple_network):
-    """
-    Feature: Test concat_params function.
-    Description: Test the functionality of concat_params with mocked load_safetensor.
-    Expectation: The function should successfully concatenate parameters and add them to the state_dict.
-    """
-    # Create a simple state_dict
-    state_dict = {}
-    key_mapping = {"test_param": "test_param"}
-
-    # Create test data with sharded tensor list
-    sharded_tensor_list = [
-        {
-            'sub_name': 'test_param',
-            'file_name': 'test.safetensors',
-            'param_dtype': mstype.float32,
-        }
-    ]
-
-    need_concat_params = {
-        "test_param": (sharded_tensor_list, [])
-    }
-
-    # Mock the load_safetensor function to avoid actual file loading
-    # pylint: disable=W0613
-    def mock_load_safetensor(checkpoint_path, param_name, index_tuple=None, dtype=None, **kwargs):
-        """Mock load_safetensor function."""
-        return {param_name: Parameter(Tensor(np.ones((10, 10)), dtype=dtype), name=param_name)}
-
-    with patch('mindformers.checkpoint.checkpoint.load_safetensor', side_effect=mock_load_safetensor):
-        concat_params(tmp_path, simple_network, key_mapping, need_concat_params, state_dict)
-        # Since we're mocking load_safetensor, the state_dict should contain the mocked parameter
-        assert "test_param" in state_dict
-        assert isinstance(state_dict["test_param"], Parameter)
-
-
-@pytest.mark.level0
-@pytest.mark.platform_x86_cpu
-@pytest.mark.env_onecard
-def test_categorize_params():
-    """
-    Feature: Test categorize_params function.
-    Description: Test the functionality of categorize_params with actual ShardedTensor objects.
-    Expectation: The function should successfully categorize parameters and return the expected dictionaries and list.
-    """
-    # Create test data with actual ShardedTensor objects
-    src_sharded_tensor = ShardedTensor(
-        key="test_param",
-        org_key="test_param",
-        dtype=mstype.float32,
-        local_shape=(10, 10),
-        global_shape=(10, 10),
-        global_offset=(0, 0),
-        axis_fragmentations=(),
-        layout=None
-    )
-
-    dst_sharded_tensor = ShardedTensor(
-        key="test_param",
-        org_key="test_param",
-        dtype=mstype.float32,
-        local_shape=(10, 10),
-        global_shape=(10, 10),
-        global_offset=(0, 0),
-        axis_fragmentations=(),
-        layout=None
-    )
-
-    dst_sharded_tensor_metas = {"test_param": dst_sharded_tensor}
-    src_sharded_tensor_metas = {"test_param": [src_sharded_tensor]}
-    param_file_mappings = {
-        "('test_param', (0, 0))": [{"file_name": "test.safetensors", "storage_rank": 0}]
-    }
-
-    # Test categorize_params with valid inputs
-    not_mapping_params, need_concat_params, no_shard_params, online_shard_params = categorize_params(
-        dst_sharded_tensor_metas, src_sharded_tensor_metas, param_file_mappings
-    )
-
-    assert isinstance(not_mapping_params, list)
-    assert isinstance(need_concat_params, dict)
-    assert isinstance(no_shard_params, dict)
-    assert isinstance(online_shard_params, dict)
-
-
-@pytest.mark.level0
-@pytest.mark.platform_x86_cpu
-@pytest.mark.env_onecard
 def test_save_and_load_checkpoint(tmp_path, simple_network, optimizer):
     """
     Feature: Test save_checkpoint and load_checkpoint functions.
@@ -456,32 +331,6 @@ def test_save_and_load_checkpoint(tmp_path, simple_network, optimizer):
     except Exception:
         # For other exceptions, just log and continue - we've already tested the function call
         pass
-
-
-@pytest.mark.level0
-@pytest.mark.platform_x86_cpu
-@pytest.mark.env_onecard
-def test_load_safetensor(tmp_path):
-    """
-    Feature: Test load_safetensor function.
-    Description: Test the error handling of load_safetensor with non-existent file and invalid content.
-    Expectation: The function should raise appropriate exceptions for invalid inputs.
-    """
-    # Test with non-existent file
-    non_existent_file = os.path.join(tmp_path, "non_existent.safetensors")
-    with pytest.raises(FileNotFoundError):
-        load_safetensor(non_existent_file)
-
-    # Test with invalid parameter name
-    # Create a simple safetensors file for testing
-    # Note: This requires actual safetensors file creation, which is complex
-    # We'll test the error handling instead
-    dummy_file = os.path.join(tmp_path, "dummy.safetensors")
-    with open(dummy_file, "w", encoding='utf-8') as f:
-        f.write("dummy content")
-
-    with pytest.raises(Exception):
-        load_safetensor(dummy_file, param_name="invalid_param")
 
 
 @pytest.mark.level0

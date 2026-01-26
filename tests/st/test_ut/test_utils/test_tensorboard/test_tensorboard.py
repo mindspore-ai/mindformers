@@ -49,7 +49,7 @@ _CHECK_TEXT_MAPPING = {
     'optimizer', 'parallel_config', 'parallel', 'recompute_config', 'remove_redundancy', 'runner_config',
     'runner_wrapper', 'monitor_config', 'tensorboard', 'train_dataset_task', 'train_dataset', 'trainer',
     'swap_config', 'use_legacy', 'pretrained_model_dir', 'print_separate_loss', 'use_legacy_format',
-    'balanced_load'
+    'balanced_load', 'reshard_worker_num'
 }
 
 def generator_train():
