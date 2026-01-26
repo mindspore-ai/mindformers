@@ -167,7 +167,7 @@ class TestMTP:
             multi_card_mtp_loss = np.load(output_file_path)
             self.check_acc(multi_card_mtp_loss, golden_data_key)
 
-    #@pytest.mark.level0
+    @pytest.mark.level0
     @pytest.mark.platform_arm_ascend910b_training
     @pytest.mark.env_onecard
     @pytest.mark.parametrize(

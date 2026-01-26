@@ -29,7 +29,6 @@ from dataclasses import dataclass
 from typing import Union, List, Optional
 
 from mindspore import nn, Tensor
-from mindspore import dtype as mstype
 from mindspore import mint
 from mindspore import ops
 
@@ -172,7 +171,6 @@ class MultiTokenPredictionLayer(nn.Cell):
                   decoder_input: Tensor,
                   hidden_states: Tensor,
                   attention_mask: Tensor,
-                  extra_loss=0.,
                   rotary_pos_emb: Tensor = None,
                   actual_seq_len: Tensor = None):
         """
@@ -185,13 +183,11 @@ class MultiTokenPredictionLayer(nn.Cell):
             hidden_states (Tensor): hidden states tensor of shape [s, b, h] where s is the sequence length, b is the
                 batch size, and h is the hidden size.
             attention_mask (Tensor): Boolean tensor of shape [1, 1, s, s] for masking self-attention.
-            extra_loss (float, optional): Additional loss term. Defaults to 0.0.
             rotary_pos_emb (Tensor, optional): Rotary positional embeddings.
             actual_seq_len (Tensor, optional): Actual sequence length tensor.
 
         Returns:
-            Tuple[Tensor, Tensor]: The output hidden states tensor of shape
-            [s, b, h] and the updated extra loss.
+            Tuple[Tensor, Tensor]: The output hidden states tensor of shape [s, b, h].
         """
         decoder_input = self.enorm(decoder_input)
         hidden_states = self.hnorm(hidden_states)
@@ -200,10 +196,9 @@ class MultiTokenPredictionLayer(nn.Cell):
         # and the (i + K)-th token's embedding, and combine them with linear projection.
         hidden_states = self.cat((decoder_input, hidden_states), -1)
         hidden_states, _ = self.eh_proj(hidden_states)
-        hidden_states, _, extra_loss = self.transformer_layer(
+        hidden_states, _ = self.transformer_layer(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
-            extra_loss=extra_loss,
             rotary_pos_emb=rotary_pos_emb,
             actual_seq_len=actual_seq_len
         )
@@ -211,7 +206,7 @@ class MultiTokenPredictionLayer(nn.Cell):
         # Layer norm before shared head layer.
         hidden_states = self.final_layernorm(hidden_states)
 
-        return hidden_states, extra_loss
+        return hidden_states
 
 
 @dataclass
@@ -286,7 +281,6 @@ class MultiTokenPredictionBlock(nn.Cell):
         if not self.layers:
             raise ValueError("MultiTokenPredictionBlock must have at least one layer.")
 
-        self.init_extra_loss = Tensor([0], mstype.float32)
         self.compute_language_model_loss = CrossEntropyLoss(config.calculate_per_token_loss)
 
         self.cast = ops.cast
@@ -336,7 +330,6 @@ class MultiTokenPredictionBlock(nn.Cell):
             embedding: nn.Cell = None,
             output_layer: nn.Cell = None,
             output_weight: Tensor = None,
-            extra_loss=None,
     ):
         """
         Perform the forward pass through all of the MTP modules.
@@ -352,23 +345,20 @@ class MultiTokenPredictionBlock(nn.Cell):
             rotary_pos_emb (Tensor, optional): Rotary positional embeddings.
             extra_block_kwargs (dict, optional): Additional keyword arguments for blocks.
             loss_mask (Tensor, optional): Loss mask tensor with shape [b, s].
-            embedding (nn.Cell, optional): Embedding layer for token embedding.
-            output_layer (nn.Cell, optional): Output layer for logits generation.
-            output_weight (Tensor, optional): Output weight tensor.
-            extra_loss (Tensor, optional): Additional loss term.
+            embedding (nn.Cell, optional): Embedding layer for token embedding. Default: ``None``.
+            output_layer (nn.Cell, optional): Output layer for logits generation. Default: ``None``.
+            output_weight (Tensor, optional): Output weight tensor. Default: ``None``.
 
         Returns:
-            Tuple[Tensor, Tensor]: The MTP loss tensor and updated extra loss.
-            - If calculate_per_token_loss is True: Returns tuple of (numerator, denominator) and extra_loss.
-            - Otherwise: Returns scalar loss tensor and extra_loss.
+            Union[Tuple[Tensor, Tensor], Tensor]: The MTP loss tensor.
+            - If calculate_per_token_loss is True: Returns tuple of (numerator, denominator)
+            - Otherwise, returns scalar loss tensor.
         """
         if labels is None:
             raise ValueError("labels should not be None for calculating multi token prediction loss.")
         if loss_mask is None:
             # if loss_mask is not provided, use all ones as loss_mask
             loss_mask = self.ones_like(labels)
-        if extra_loss is None:
-            extra_loss = self.init_extra_loss
 
         mtp_loss = 0
         numerator, denominator = 0, 0
@@ -381,11 +371,10 @@ class MultiTokenPredictionBlock(nn.Cell):
                 position_ids=position_ids
             )
             # norm, linear projection and transformer
-            hidden_states, extra_loss = layer(
+            hidden_states = layer(
                 decoder_input=decoder_input,
                 hidden_states=hidden_states,
                 attention_mask=attention_mask,
-                extra_loss=extra_loss,
                 rotary_pos_emb=rotary_pos_emb,
                 **(extra_block_kwargs or {}),
             )
@@ -416,5 +405,5 @@ class MultiTokenPredictionBlock(nn.Cell):
                 mtp_loss = mtp_loss + mtp_layer_loss
 
         if self.calculate_per_token_loss:
-            return (numerator, denominator), extra_loss
-        return mtp_loss, extra_loss
+            return (numerator, denominator)
+        return mtp_loss
