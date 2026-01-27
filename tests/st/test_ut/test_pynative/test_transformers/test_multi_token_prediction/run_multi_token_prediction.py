@@ -35,7 +35,6 @@ from mindformers.pynative.transformers.mlp import MLP, MLPSubmodules
 from mindformers.pynative.layers.flash_attention import FlashAttention
 from mindformers.pynative.layers.linear import Linear
 from mindformers.parallel_core.transformer_config import TransformerConfig
-from mindformers.parallel_core.training_graph.device_matrix import layout
 from mindformers.parallel_core.inference.parallel_state import initialize_model_parallel
 from mindformers.parallel_core.utils.spec_utils import ModuleSpec
 from mindformers.core.context.build_context import build_context
@@ -86,8 +85,6 @@ class MTPRunner:
                 if self.config.pipeline_model_parallel_size is not None else 1
             initialize_model_parallel(tensor_model_parallel_size=self.tp, data_parallel_size=self.dp,
                                       pipeline_model_parallel_size=self.pp)
-
-        layout.init_layout(self.config)
 
     def build_model(self):
         """Build and initialize Multi-Token Prediction (MTP) model."""
@@ -187,8 +184,7 @@ class MTPRunner:
         if self.rank_id is None or int(self.rank_id) == 0:
             # Convert to float32 for saving, common practice for bf16/fp16
             output_np = {
-                'mtp_loss': output[0].asnumpy().astype(np.float32),
-                'extra_loss': output[1].asnumpy().astype(np.float32)
+                'mtp_loss': output[0].asnumpy().astype(np.float32)
             }
             output_path = self.args.output_path
             np.savez(output_path, **output_np)
