@@ -109,7 +109,7 @@ msrun_launcher.sh包括run_mindformer.py命令和推理卡数两个参数。
 
 单卡推理：
 
-当使用9B权重推理时，推荐使用默认[配置](https://gitee.com/mindspore/mindformers/blob/master/configs/glm4/predict_glm4.yaml)进行单卡推理，执行以下命令即可启动推理任务：
+当使用9B权重推理时，推荐使用默认[配置](https://atomgit.com/mindspore/mindformers/blob/master/configs/glm4/predict_glm4.yaml)进行单卡推理，执行以下命令即可启动推理任务：
 
 ```shell
 python run_mindformer.py \

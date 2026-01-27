@@ -194,7 +194,7 @@ class MFCheck(BaseCheck):
         error_flag = kwargs.get('error_flag', None)
         logger.error(f'{error_flag} test failed!', exc_info=True)
         logger.info('If you need any help, please open an issue in the MindFormers repository: '
-                    'https://gitee.com/mindspore/mindformers/issues')
+                    'https://atomgit.com/mindspore/mindformers/issues')
 
     def _success(self, **kwargs):
         test = kwargs.get('test', None)
@@ -401,7 +401,7 @@ def run_check():
     if not version_file.is_file():
         raise RuntimeError('Cannot find VERSION_MAP.json or the found one is not a file')
 
-    with open(version_file) as f:
+    with open(version_file, encoding='utf-8') as f:
         version_mapping = json.load(f)
 
     os.environ['MS_ALLOC_CONF'] = "enable_vmm:False"

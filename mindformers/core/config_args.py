@@ -334,7 +334,7 @@ class ContextConfig(BaseArgsConfig):
               to `Ascend community <https://www.hiascend.com/>`_ .
             - parallel_speed_up_json_path(Union[str, None]): The path to the parallel speed up json file, configuration
               can refer to `parallel_speed_up.json
-              <https://gitee.com/mindspore/mindspore/blob/r2.1/config/parallel_speed_up.json>`_ .
+              <https://atomgit.com/mindspore/mindspore/blob/r2.1/config/parallel_speed_up.json>`_ .
               If its value is None or '', it does not take effect. Default None.
 
               - recompute_comm_overlap (bool): Enable overlap between recompute ops and communication ops if True.

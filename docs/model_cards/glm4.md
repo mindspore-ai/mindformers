@@ -138,7 +138,7 @@ MindSpore TransFormers 提供已经转换完成的预训练权重、词表文件
        mlp_concat: False
    ```
 
-2. 执行 mindformers 根目录下的 `convert_weight.py` [转换脚本](https://gitee.com/mindspore/mindformers/blob/master/convert_weight.py)，将 HuggingFace 的权重转换为完整的 MindSpore ckpt 权重。
+2. 执行 mindformers 根目录下的 `convert_weight.py` [转换脚本](https://atomgit.com/mindspore/mindformers/blob/master/convert_weight.py)，将 HuggingFace 的权重转换为完整的 MindSpore ckpt 权重。
 
    ```shell
    python convert_weight.py --model glm4 --input_path HF_CKPT_PATH --output_path MS_NOT_CONCAT_CKPT_PATH --dtype DTYPE --config YAML_PATH

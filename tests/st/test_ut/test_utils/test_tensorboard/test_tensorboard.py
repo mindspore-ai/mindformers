@@ -117,4 +117,4 @@ class TestTensorBoard:
             (f"Text information written is incorrect. The following keys are not found in _CHECK_TEXT_MAPPING: "
              f"{text_map - _CHECK_TEXT_MAPPING}. Please check and modify _CHECK_TEXT_MAPPING, and also review and "
              f"update the documentation: "
-             f"https://gitee.com/mindspore/docs/blob/master/docs/mindformers/docs/source_zh_cn/feature/monitor.md")
+             f"https://atomgit.com/mindspore/docs/blob/master/docs/mindformers/docs/source_zh_cn/feature/monitor.md")
