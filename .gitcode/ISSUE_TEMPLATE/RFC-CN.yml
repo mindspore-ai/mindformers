@@ -7,7 +7,7 @@ body:
     id: authors
     attributes:
       label: 作者 (Authors)
-      description: 请填写作者的 GitHub/Gitee 账号 (例如 @nickname)
+      description: 请填写作者的 AtomGit/GitHub 账号 (例如 @nickname)
       placeholder: "@nickname"
     validations:
       required: true

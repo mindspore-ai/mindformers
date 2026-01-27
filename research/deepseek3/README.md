@@ -103,7 +103,7 @@ MindSpore Transformers支持对DeepSeek-V3的推理，目前推理需要4台Atla
 参考[环境环境](#环境安装)搭建基础环境。完成之后，配置推理相关的环境变量：
 
 ```bash
-git clone https://gitee.com/mindspore/mindformers.git -b r1.5.0
+git clone https://atomgit.com/mindspore/mindformers.git -b r1.5.0
 export MINDFORMERS_HOME=/path/to/mindformers
 export PYTHONPATH=$MINDFORMERS_HOME:$PYTHONPATH
 export REGISTER_PATH=/path/to/deepseek3
@@ -241,4 +241,4 @@ bash scripts/msrun_launcher.sh "research/deepseek3/run_predict_deepseek.py \
 <｜begin▁of▁sentence｜>请介绍一下北京的景点\n\n北京，作为中国的首都，拥有丰富的历史文化遗产和众多的旅游景点。以下是一些著名的北京景点介绍：\n\n1. 故宫博物院：位于北京市中心，是中国明清两代的皇家宫殿，也是世界上现存规模最大、保存最为完整的木质结构古建筑群。故宫内收藏有大量珍贵的文物和艺术品，是了解中国古代皇家文化的重要窗口。\n\n2. 天安门广场：位于北京市中心，是世界上最大的城市广场之一。广场北侧是天安门城楼，南侧是人民英雄纪念碑，东侧是国家博物馆，西侧是人民大会堂。天安门广场是中国的象征，也是许多重要历史事件的发生地。\n\n3. 颐和园：位于北京市西北郊，是中国清朝时期的皇家园林，也是中国四大名园之一。颐和园以昆明湖和万寿山为基础，融合了江南园林的精致与北方园林的宏伟，是中国古典园林艺术的杰作。\n\n4. 长城：长城是中国古代的军事防御工程，横跨中国北部和中部地区。北京段的长城包括八达岭、慕田峪、金山岭等，是游客体验长城壮丽风光和了解中国古代军事文化的好去处。\n\n5. 天坛：位于北京市南部，是中国明清两代皇帝祭天祈谷的地方。天坛是中国古代祭天文化的代表，其建筑布局严谨，体现了中国古代的宇宙观和哲学思想。\n\n6. 圆明园：位于北京市西北郊，是清朝时期的皇家园林，曾被誉为“万园之园”。圆明园在1860年的第二次鸦片战争中被英法联军焚毁，现为遗址公园，是了解中国近代历史的重要场所。\n\n7. 北海公园：位于北京市中心，是中国现存最古老、保存最完整的皇家园林之一。北海公园以琼华岛为中心，湖光山色与古建筑相映成趣，是市民休闲娱乐的好去处。\n\n8. 北京奥林匹克公园：位于北京市朝阳区，是2008年北京奥运会的主要场馆区。公园内有鸟巢（国家体育场）、水立方（国家游泳中心）等标志性建筑，是体验现代体育文化和建筑艺术的好地方。\n\n9. 南锣鼓巷：位于北京市东城区，是北京最古老的街区之一，也是北京胡同文化的代表。南锣鼓巷以其独特的胡同风貌和丰富的文化底蕴，吸引了众多游客前来探访。\n\n10. 北京动物园：位于北京市西城区，是中国最早的动物园之一。北京动物园内饲养有众多珍稀动物，是了解中国动物多样性和进行科普教育的好地方。\n\n以上只是北京众多景点中的一部分，北京还有许多其他值得一游的地方，如798艺术区、雍和宫、景山公园等。每个景点都有其独特的历史背景和文化价值，值得游客深入探索。<｜end▁of▁sentence｜>
 ```
 
-如有关于DeepSeek-V3推理的相关问题，可以在MindSpore Transformers的Gitee仓库中[提交ISSUE](https://gitee.com/mindspore/mindformers/issues/new)以获取支持。
+如有关于DeepSeek-V3推理的相关问题，可以在MindSpore Transformers的AtomGit仓库中[提交ISSUE](https://atomgit.com/mindspore/mindformers/issues/new)以获取支持。

@@ -57,21 +57,21 @@ mindformers在源码构建安装过程中，会产生临时目录和程序文件
 | 开发引入 |   -    |          mindformers/core/callback/callback.py           |                                        https://www.hiascend.com/document/detail/zh/mindstudio/80RC1/                                         |      MindStudio官网文档链接      |
 | 开发引入 |   -    |          mindformers/models/processing_utils.py          |                                                          https://modelers.cn/models                                                          |         魔乐社区模型库链接          |
 | 开发引入 |   -    |      mindformers/models/tokenization_utils_base.py       |                                                          https://modelers.cn/models                                                          |         魔乐社区模型库链接          |
-| 开发引入 |   -    |                 mindformers/run_check.py                 |                                                https://gitee.com/mindspore/mindformers/issues                                                |    mindformers的issue链接     |
+| 开发引入 |   -    |                 mindformers/run_check.py                 |                                                https://atomgit.com/mindspore/mindformers/issues                                                |    mindformers的issue链接     |
 | 开发引入 |   -    |                 mindformers/run_check.py                 |                                         https://www.hiascend.com/document/detail/zh/canncommercial/                                          |         CANN官方使用文档         |
 | 开发引入 |   -    |                 mindformers/run_check.py                 |                                                      https://www.mindspore.cn/install/                                                       |      mindspore官方安装文档       |
 | 开发引入 |   -    |         mindformers/mindformers/tools/hub/hub.py         |                                                             https://modelers.cn/                                                             |          魔乐社区官网链接          |
 | 开发引入 |   -    |           mindformers/trainer/training_args.py           |   https://www.mindspore.cn/mindformers/docs/zh-CN/master/feature/ckpt.html#%E6%9D%83%E9%87%8D%E5%88%87%E5%88%86%E4%B8%8E%E5%90%88%E5%B9%B6   |   mindformers权重切分与合并特性文档   |
-| 开发引入 |   -    |                    run_mindformer.py                     |                                          https://gitee.com/mindspore/mindformers#%E4%BB%8B%E7%BB%8D                                          |       mindformers介绍        |
-| 开发引入 |   -    |                   mindformers/setup.py                   |                                                 https://gitee.com/mindspore/mindformers/tags                                                 |      mindformers包下载链接      |
-| 开发引入 |   -    |                   mindformers/setup.py                   |                                                https://gitee.com/mindspore/mindformers/issues                                                |    mindformers的issue链接     |
+| 开发引入 |   -    |                    run_mindformer.py                     |                                          https://atomgit.com/mindspore/mindformers#%E4%BB%8B%E7%BB%8D                                          |       mindformers介绍        |
+| 开发引入 |   -    |                   mindformers/setup.py                   |                                                 https://atomgit.com/mindspore/mindformers/tags                                                 |      mindformers包下载链接      |
+| 开发引入 |   -    |                   mindformers/setup.py                   |                                                https://atomgit.com/mindspore/mindformers/issues                                                |    mindformers的issue链接     |
 | 开发引入 |   -    |                   mindformers/setup.py                   |                                                           https://www.mindspore.cn                                                           |       mindspore官网链接        |
 | 开发引入 |   -    |                   mindformers/setup.py                   |                                                             contact@mindspore.cn                                                             |       mindspore的联系邮箱       |
-| 开发引入 |   -    |                   mindformers/setup.py                   |                                                   https://gitee.com/mindspore/mindformers                                                    |  setup脚本方式安装mindformers地址  |
+| 开发引入 |   -    |                   mindformers/setup.py                   |                                                   https://atomgit.com/mindspore/mindformers                                                    |  setup脚本方式安装mindformers地址  |
 
 ### 公开接口声明
 
-mindformers对外暴露接口可参考[api](https://gitee.com/mindspore/mindformers/tree/master/docs/api)， 具体接口规格可参考对应API文档查询。
+mindformers对外暴露接口可参考[api](https://atomgit.com/mindspore/mindformers/tree/master/docs/api)， 具体接口规格可参考对应API文档查询。
 
 ### 通信矩阵
 

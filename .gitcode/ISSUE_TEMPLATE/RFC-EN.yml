@@ -7,7 +7,7 @@ body:
     id: authors
     attributes:
       label: Authors
-      description: Please list authors' GitHub/Gitee handles (e.g., @nickname)
+      description: Please list authors' AtomGit/GitHub handles (e.g., @nickname)
       placeholder: "@nickname"
     validations:
       required: true

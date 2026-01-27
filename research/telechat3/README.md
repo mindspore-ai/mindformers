@@ -181,7 +181,7 @@ MindFormers提供`TeleChat3-36b`的微调示例，过程中使用中电信人工
   2. 设置启动脚本中的`--train_dataset_dir /{path}/dataset.mindrecord`加载微调数据集
   3. 设置启动脚本中的`--run_mode finetune`
 
-  配置文件中各参数含义详见[Config配置说明文档](https://gitee.com/mindspore/mindformers/blob/master/configs/README.md)。auto_parallel说明详见[自动并行](../../docs/feature_cards/Auto_Parallel.md)。
+  配置文件中各参数含义详见[Config配置说明文档](https://atomgit.com/mindspore/mindformers/blob/master/configs/README.md)。auto_parallel说明详见[自动并行](../../docs/feature_cards/Auto_Parallel.md)。
 
 - step 2. 根据服务器节点数等信息，修改相应的配置。
 
