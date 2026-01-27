@@ -6,15 +6,17 @@
 
 ## 1. Introduction
 
-The goal of the MindSpore Transformers suite is to build a full-process development suite for Large model pre-training, fine-tuning, evaluation, inference, and deployment. It provides mainstream Transformer-based Large Language Models (LLMs) and Multimodal Models (MMs). It is expected to help users easily realize the full process of large model development.
+The MindSpore Transformers suite aims to build a comprehensive development toolkit covering the entire lifecycle of large-scale models, including pre-training, fine-tuning, evaluation, inference, and deployment. It provides industry-leading large Transformer-based language models, multimodal understanding models, and omni-modal models, enabling users to easily achieve end-to-end development of large-scale models.
 
-Based on MindSpore's built-in parallel technology and component-based design, the MindSpore Transformers suite has the following features:
+Based on MindSpore’s built-in multi-dimensional hybrid parallelism technology and modular design, the MindSpore Transformers suite offers the following features:
 
-- One-click initiation of single or multi card pre-training, fine-tuning, evaluation, inference, and deployment processes for large models;
-- Provides rich multi-dimensional hybrid parallel capabilities for flexible and easy-to-use personalized configuration;
-- System-level deep optimization on large model training and inference, native support for ultra-large-scale cluster efficient training and inference, rapid fault recovery;
-- Support for configurable development of task components. Any module can be enabled by unified configuration, including model network, optimizer, learning rate policy, etc.;
-- Provide real-time visualization of training accuracy/performance monitoring indicators.
+- Configurable one-click launch for pre-training, fine-tuning, evaluation, inference, and deployment of large-scale models.
+- Integration with mainstream ecosystems such as Hugging Face, Megatron-LM, vLLM, and OpenCompass.
+- Rich multi-dimensional hybrid parallelism and debugging/tuning capabilities, supporting training for trillion-parameter models.
+- System-level deep optimization for training and inference, enhancing performance for hundred-billion dense and trillion sparse large-scale models.
+- High availability in training, ensuring stable operation of large models on clusters with tens of thousands of NPUs.
+- Fine-grained, multi-level training monitoring to facilitate anomaly detection and analysis.
+- Simplified model integration through Mcore architecture upgrades and modular design, offering broader standardization and stronger ecosystem support.
 
 For details about MindSpore Transformers tutorials and API documents, see **[MindSpore Transformers Documentation](https://www.mindspore.cn/mindformers/docs/en/master/index.html)**. The following are quick jump links to some of the key content:
 
@@ -33,14 +35,15 @@ The following table lists models supported by MindSpore Transformers.
 
 | Model                                                                                                                                         | Specifications                |    Model Type     | Model Architecture |        Latest Version         |
 |:----------------------------------------------------------------------------------------------------------------------------------------------|:------------------------------|:-----------------:|:------------------:|:-----------------------------:|
-| [Qwen3](https://gitee.com/mindspore/mindformers/blob/master/configs/qwen3) ![Recent Popular](./docs/assets/hot.svg)                           | 0.6B/1.7B/4B/8B/14B/32B       |     Dense LLM     |       Mcore        |    In-development version     |
-| [Qwen3-MoE](https://gitee.com/mindspore/mindformers/blob/master/configs/qwen3_moe) ![Recent Popular](./docs/assets/hot.svg)                   | 30B-A3B/235B-A22B             |    Sparse LLM     |       Mcore        |    In-development version     |
-| [DeepSeek-V3](https://gitee.com/mindspore/mindformers/blob/r1.6.0/research/deepseek3) ![Recent Popular](./docs/assets/hot.svg)                | 671B                          |    Sparse LLM     |       Legacy       | 1.6.0, In-development version |
-| [GLM4](https://gitee.com/mindspore/mindformers/blob/r1.6.0/docs/model_cards/glm4.md) ![Recent Popular](./docs/assets/hot.svg)                 | 9B                            |     Dense LLM     |       Legacy       | 1.6.0, In-development version |
-| [Llama3.1](https://gitee.com/mindspore/mindformers/blob/r1.6.0/research/llama3_1) ![Recent Popular](./docs/assets/hot.svg)                    | 8B/70B                        |     Dense LLM     |       Legacy       | 1.6.0, In-development version |
-| [Mixtral](https://gitee.com/mindspore/mindformers/blob/r1.6.0/research/mixtral) ![Recent Popular](./docs/assets/hot.svg)                      | 8x7B                          |    Sparse LLM     |       Legacy       | 1.6.0, In-development version |
-| [Qwen2.5](https://gitee.com/mindspore/mindformers/blob/r1.6.0/research/qwen2_5) ![Recent Popular](./docs/assets/hot.svg)                      | 0.5B/1.5B/7B/14B/32B/72B      |     Dense LLM     |       Legacy       | 1.6.0, In-development version |
-| [TeleChat2](https://gitee.com/mindspore/mindformers/blob/r1.6.0/research/telechat2) ![Recent Popular](./docs/assets/hot.svg)                  | 7B/35B/115B                   |     Dense LLM     |       Legacy       | 1.6.0, In-development version |
+| [Qwen3](https://gitee.com/mindspore/mindformers/blob/master/configs/qwen3) ![Recent Popular](./docs/assets/hot.svg)                           | 0.6B/1.7B/4B/8B/14B/32B       |     Dense LLM     |       Mcore        | 1.8.0, In-development version |
+| [Qwen3-MoE](https://gitee.com/mindspore/mindformers/blob/master/configs/qwen3_moe) ![Recent Popular](./docs/assets/hot.svg)                   | 30B-A3B/235B-A22B             |    Sparse LLM     |       Mcore        | 1.8.0, In-development version |
+| [DeepSeek-V3](https://gitee.com/mindspore/mindformers/blob/master/research/deepseek3) ![Recent Popular](./docs/assets/hot.svg)                | 671B                          |    Sparse LLM     |    Mcore/Legacy    | 1.8.0, In-development version |
+| [GLM4.5](https://gitee.com/mindspore/mindformers/blob/master/configs/glm4_moe) ![Recent Popular](./docs/assets/hot.svg)                       | 106B-A12B/355B-A32B           |    Sparse LLM     |       Mcore        | 1.8.0, In-development version |
+| [GLM4](https://gitee.com/mindspore/mindformers/blob/master/configs/glm4) ![Recent Popular](./docs/assets/hot.svg)                             | 9B                            |     Dense LLM     |    Mcore/Legacy    | 1.8.0, In-development version |
+| [Qwen2.5](https://gitee.com/mindspore/mindformers/blob/master/research/qwen2_5) ![Recent Popular](./docs/assets/hot.svg)                      | 0.5B/1.5B/7B/14B/32B/72B      |     Dense LLM     |       Legacy       | 1.8.0, In-development version |
+| [TeleChat2](https://gitee.com/mindspore/mindformers/blob/master/research/telechat2) ![Recent Popular](./docs/assets/hot.svg)                  | 7B/35B/115B                   |     Dense LLM     |    Mcore/Legacy    | 1.8.0, In-development version |
+| [Llama3.1](https://gitee.com/mindspore/mindformers/blob/r1.7.0/research/llama3_1) ![End of Life](./docs/assets/eol.svg)                       | 8B/70B                        |     Dense LLM     |       Legacy       |             1.7.0             |
+| [Mixtral](https://gitee.com/mindspore/mindformers/blob/r1.7.0/research/mixtral) ![End of Life](./docs/assets/eol.svg)                         | 8x7B                          |    Sparse LLM     |       Legacy       |             1.7.0             |
 | [CodeLlama](https://gitee.com/mindspore/mindformers/blob/r1.5.0/docs/model_cards/codellama.md) ![End of Life](./docs/assets/eol.svg)          | 34B                           |     Dense LLM     |       Legacy       |             1.5.0             |
 | [CogVLM2-Image](https://gitee.com/mindspore/mindformers/blob/r1.5.0/docs/model_cards/cogvlm2_image.md) ![End of Life](./docs/assets/eol.svg)  | 19B                           |        MM         |       Legacy       |             1.5.0             |
 | [CogVLM2-Video](https://gitee.com/mindspore/mindformers/blob/r1.5.0/docs/model_cards/cogvlm2_video.md) ![End of Life](./docs/assets/eol.svg)  | 13B                           |        MM         |       Legacy       |             1.5.0             |
@@ -127,6 +130,8 @@ Historical Version Supporting Relationships:
 
 | MindSpore Transformers |                   MindSpore                   |                                                      CANN                                                      |                                                 Driver/Firmware                                                 |
 |:----------------------:|:---------------------------------------------:|:--------------------------------------------------------------------------------------------------------------:|:---------------------------------------------------------------------------------------------------------------:|
+|         1.8.0          |   [2.7.2](https://www.mindspore.cn/install)   |   [8.5.0](https://www.hiascend.com/document/detail/zh/canncommercial/850/softwareinst/instg/instg_0000.html)   |   [25.5.0](https://www.hiascend.com/document/detail/zh/canncommercial/850/softwareinst/instg/instg_0000.html)   |
+|         1.7.0          |   [2.7.1](https://www.mindspore.cn/install)   | [8.3.RC1](https://www.hiascend.com/document/detail/zh/canncommercial/83RC1/softwareinst/instg/instg_0000.html) | [25.3.RC1](https://www.hiascend.com/document/detail/zh/canncommercial/83RC1/softwareinst/instg/instg_0000.html) |
 |         1.6.0          |   [2.7.0](https://www.mindspore.cn/install)   | [8.2.RC1](https://www.hiascend.com/document/detail/zh/canncommercial/82RC1/softwareinst/instg/instg_0000.html) |  [25.2.0](https://www.hiascend.com/document/detail/zh/canncommercial/82RC1/softwareinst/instg/instg_0000.html)  |
 |         1.5.0          | [2.6.0-rc1](https://www.mindspore.cn/install) | [8.1.RC1](https://www.hiascend.com/document/detail/zh/canncommercial/81RC1/softwareinst/instg/instg_0000.html) | [25.0.RC1](https://www.hiascend.com/document/detail/zh/canncommercial/81RC1/softwareinst/instg/instg_0000.html) |
 |         1.3.2          |  [2.4.10](https://www.mindspore.cn/versions)  |   [8.0.0](https://www.hiascend.com/document/detail/zh/canncommercial/800/softwareinst/instg/instg_0000.html)   |   [24.1.0](https://www.hiascend.com/document/detail/zh/canncommercial/800/softwareinst/instg/instg_0000.html)   |
@@ -165,9 +170,10 @@ MindSpore Transformers released version preservation policy:
 
 | **MindSpore Transformers Version** | **Corresponding Label** | **Current Status** | **Release Time** |        **Subsequent Status**         | **EOL Date** |
 |:----------------------------------:|:-----------------------:|:------------------:|:----------------:|:------------------------------------:|:------------:|
-|               1.7.0                |         v1.7.0          |      Preserve      |    2025/10/27    | No preserve expected from 2025/04/27 |  2026/07/27  |
-|               1.6.0                |         v1.6.0          |      Preserve      |    2025/07/29    | No preserve expected from 2025/01/29 |  2026/04/29  |
-|               1.5.0                |         v1.5.0          |    No Preserve     |    2025/04/29    | End of Life expected from 2026/01/29 |  2026/01/29  |
+|               1.8.0                |         v1.8.0          |      Preserve      |    2026/01/26    | No preserve expected from 2026/07/26 |  2026/10/26  |
+|               1.7.0                |         v1.7.0          |      Preserve      |    2025/10/27    | No preserve expected from 2026/04/27 |  2026/07/27  |
+|               1.6.0                |         v1.6.0          |    No Preserve     |    2025/07/29    | End of Life expected from 2026/04/29 |  2026/04/29  |
+|               1.5.0                |         v1.5.0          |    End of Life     |    2025/04/29    |                  -                   |  2026/01/29  |
 |               1.3.2                |         v1.3.2          |    End of Life     |    2024/12/20    |                  -                   |  2025/09/20  |
 |               1.2.0                |         v1.2.0          |    End of Life     |    2024/07/12    |                  -                   |  2025/04/12  |
 |               1.1.0                |         v1.1.0          |    End of Life     |    2024/04/15    |                  -                   |  2025/01/15  |
