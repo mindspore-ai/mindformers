@@ -1,4 +1,4 @@
-# TeleChat3
+# TeleChat3-MoE
 
 ## 模型描述
 
@@ -6,9 +6,9 @@
 
 ## 支持规格
 
-|    模型名称    |     规格     | 支持任务 | 模型架构  |                       支持设备                        |        模型级别         |
-|:----------:|:----------:|:----:|:-----:|:-------------------------------------------------:|:-------------------:|
-| TeleChat3 |    36B     |  预训练  | Mcore | Atlas 800T A2/Atlas 800I A2/Atlas 900 A3 SuperPoD | [Released](#模型级别介绍) |
+|    模型名称    |    规格     | 支持任务 | 模型架构  |                       支持设备                        |        模型级别         |
+|:----------:|:---------:|:----:|:-----:|:-------------------------------------------------:|:-------------------:|
+|TeleChat3    | 105B-A4.7B |  预训练  | Mcore | Atlas 800T A2/Atlas 800I A2/Atlas 900 A3 SuperPoD | [Released](#模型级别介绍) |
 
 说明：
 
@@ -35,7 +35,7 @@ TeleChat3 当前支持的版本配套如下。
 
 |         模型名称         | 下载链接                                             | 说明 |
 |:--------------------:|:-------------------------------------------------|:---|
-| TeleChat/TeleChat3-36B | [ModelScope](https://modelscope.cn/models/TeleAI/TeleChat3-36B-Thinking/files)
+|  TeleChat/TeleChat3-105B-A4.7B  | [ModelScope](https://modelscope.cn/models/TeleAI/TeleChat3-105B-A4.7B-Thinking/files)
 
 #### 数据集下载
 
@@ -71,7 +71,7 @@ MindSpore Transformers 预训练阶段当前已支持[Megatron格式的数据集
 
 MindSpore Transformers提供了数据预处理脚本`toolkit/data_preprocess/megatron/preprocess_indexed_dataset.py`用于将jsonl格式的原始文本预料转换成.bin或.idx文件。
 
-> 这里需要提前下载[TeleChat3-36B](https://modelscope.cn/models/TeleAI/TeleChat3-36B-Thinking/files)模型的tokenizer文件。
+> 这里需要提前下载[TeleChat3-105B-A4.7B](https://modelscope.cn/models/TeleAI/TeleChat3-105B-A4.7B-Thinking/files)模型的tokenizer文件。
 
 例如：
 
@@ -80,7 +80,7 @@ python toolkit/data_preprocess/megatron/preprocess_indexed_dataset.py \
   --input /path/to/data.jsonl \
   --output-prefix /path/to/wiki103-megatron \
   --tokenizer-type HuggingFaceTokenizer \
-  --tokenizer-dir /path/to/TeleChat3-36B # 其他规格的模型可以调整为对应的tokenizer路径
+  --tokenizer-dir /path/to/TeleChat3-105B-A4.7B # 其他规格的模型可以调整为对应的tokenizer路径
 ```
 
 > 运行完成后会生成`/path/to/wiki103-megatron_text_document.bin`和`/path/to/wiki103-megatron_text_document.idx`文件。
@@ -113,7 +113,7 @@ train_dataset: &train_dataset
 
 #### 3. 启动预训练任务
 
-通过指定模型路径和配置文件[configs/telechat3/pretrain_telechat3_36b.yaml](https://atomgit.com/mindspore/mindformers/blob/master/configs/telechat3/pretrain_telechat3_36b.yaml)以`msrun`的方式启动[run_mindformer.py](https://atomgit.com/mindspore/mindformers/blob/master/run_mindformer.py)脚本，进行16卡分布式训练。您可参考如下方式，拉起两台Atlas 800T A2（64G）训练。
+通过指定模型路径和配置文件[configs/telechat3_moe/pretrain_telechat3_105b_a4b_4k.yaml](https://atomgit.com/mindspore/mindformers/blob/master/configs/telechat3_moe/pretrain_telechat3_105b_a4b_4k.yaml)以`msrun`的方式启动[run_mindformer.py](https://atomgit.com/mindspore/mindformers/blob/master/run_mindformer.py)脚本，进行16卡分布式训练。您可参考如下方式，拉起两台Atlas 800T A2（64G）训练。
 
 在每台服务器上执行如下命令。设置`master_ip`为主节点IP地址，即`Rank 0`服务器的IP；`node_rank`为每个节点的序号；`port`为当前进程的端口号（可在50000~65536中选择）。
 
@@ -122,7 +122,7 @@ master_ip=192.168.1.1
 node_rank=0
 port=50001
 bash scripts/msrun_launcher.sh "run_mindformer.py \
---config configs/telechat3/pretrain_telechat3_36b.yaml \
+--config configs/telechat3/pretrain_telechat3_105b_a4b_4k.yaml \
 --auto_trans_ckpt False \
 --use_parallel True \
 --run_mode train" \
@@ -145,21 +145,22 @@ tail -f ./output/msrun_log/worker_0.log
 
 ### 模型文件说明
 
-TeleChat3-36B的模型文件包括以下内容：
+TeleChat3-105B的模型文件包括以下内容：
 
 ```text
 📦mindformers
 ├── 📂mindformers
 │   └── 📂models
-│       └── 📂TeleChat3
-│           ├── 📄__init__.py                       # TeleChat3模块初始化文件
-│           ├── 📄configuration_telechat3.py        # TeleChat3模型配置类定义
-│           ├── 📄modeling_telechat3.py             # TeleChat3模型主体实现
-│           ├── 📄modeling_telechat3_train.py       # TeleChat3训练模型实现
-│           └── 📄utils.py                          # TeleChat3工具函数和基础类
+│       └── 📂telechat3_moe
+│           ├── 📄__init__.py                           # TeleChat3模块初始化文件
+│           ├── 📄configuration_telechat3_moe.py        # TeleChat3模型配置类定义
+│           ├── 📄modeling_telechat3_moe.py             # TeleChat3模型主体实现
+│           ├── 📄modeling_telechat3_moe_train.py       # TeleChat3训练模型实现
+│           └── 📄utils.py                              # TeleChat3工具函数和基础类
 ├── 📂configs
 │   └── 📂telechat3
-│       └── 📄pretrain_telechat3_36b.yaml           # TeleChat3-36B 预训练配置
+│       ├── 📄pretrain_telechat3_105b_a4b_4k.yaml   # TeleChat3-105B-A4.7B 4k 预训练配置
+│       └── 📄parallel_speed_up.json                # 数据集并行通信配置
 └── 📄run_mindformer.py                             # 主要执行脚本
 ```
 

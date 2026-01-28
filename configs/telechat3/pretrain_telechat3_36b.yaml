@@ -1,0 +1,193 @@
+seed: 0
+output_dir: './output' # path to save checkpoint and strategy
+load_checkpoint: ''
+load_ckpt_format: 'safetensors'  # format of checkpoint files to load
+src_strategy_path_or_dir: ''
+auto_trans_ckpt: False  # If True, auto transform `load_checkpoint` to load in distributed model
+only_save_strategy: False
+resume_training:  False #True
+use_parallel: True
+run_mode: 'train'
+train_precision_sync: True
+use_legacy: False
+
+# trainer config
+trainer:
+  type: CausalLanguageModelingTrainer
+  model_name: 'telechat3'
+
+# runner config
+runner_config:
+  epochs: 10
+  batch_size: 1
+  sink_mode: True
+  sink_size: 1
+  gradient_accumulation_steps: 1
+
+# optimizer
+optimizer:
+  type: AdamW
+  betas: [0.9, 0.95]
+  eps: 1.e-8
+  weight_decay: 0.1
+
+# lr schedule
+lr_schedule:
+  type: ConstantWarmUpLR
+  learning_rate: 2.e-4
+  lr_end: 2.e-5
+  warmup_steps: 2000
+  total_steps: 1908000
+
+# dataset
+train_dataset: &train_dataset
+  data_loader:
+    type: BlendedMegatronDatasetDataLoader
+    datasets_type: "GPTDataset"
+    sizes:
+      - 8000   # 训练集数据样本数
+      - 0    # 测试集数据样本数，当前不支持配置
+      - 0    # 评测集数据样本数，当前不支持配置
+    config:  # GPTDataset配置项
+      seed: 1234                         # 数据采样随机种子
+      split: "1, 0, 0"                   # 训练、测试、评测集使用比例，当前不支持配置
+      seq_length: 8192                   # 数据集返回数据的序列长度
+      eod_mask_loss: False               # 是否在eod处计算loss
+      reset_position_ids: False          # 是否在eod处重置position_ids
+      create_attention_mask: False        # 是否返回attention_mask
+      reset_attention_mask: False        # 是否在eod处重置attention_mask，返回阶梯状attention_mask
+      create_compressed_eod_mask: False  # 是否返回压缩后的attention_mask
+      eod_pad_length: 128                # 设置压缩后attention_mask的长度
+      eod: 1                             # 数据集中eod的token id
+      pad: -1                            # 数据集中pad的token id
+      data_path:  # Megatron数据集采样比例以及路径
+        - '1'
+        - "/dataset_path"
+
+  input_columns: ["input_ids", "labels", "loss_mask", "position_ids"]
+  construct_args_key: ["input_ids", "labels"]
+
+  num_parallel_workers: 8
+  python_multiprocessing: False
+  drop_remainder: True
+  numa_enable: False
+  prefetch_size: 1
+  seed: 1234
+train_dataset_task:
+  type: CausalLanguageModelDataset
+  dataset_config: *train_dataset
+
+# mindspore context init config
+context:
+  mode: 0 # 0--Graph Mode; 1--Pynative Mode
+  device_target: "Ascend"
+  max_device_memory: "58GB"
+  memory_optimize_level: "O0"
+  jit_config:
+    jit_level: "O0"
+
+# parallel config for device num = 8
+parallel_config:
+  data_parallel: &dp 1
+  model_parallel: 8
+  pipeline_stage: 2
+  micro_batch_num: &micro_batch_num 4
+  use_seq_parallel: True
+  gradient_aggregation_group: 4
+# when model parallel is greater than 1, we can set micro_batch_interleave_num=2, that may accelerate the train process.
+micro_batch_interleave_num: 1
+
+# parallel context config
+parallel:
+  parallel_mode: 1 # 0-data parallel, 1-semi-auto parallel, 2-auto parallel, 3-hybrid parallel
+  gradients_mean: False
+  enable_alltoall: False
+  full_batch: False
+  dataset_strategy: [[*dp, 1], [*dp, 1], [*dp, 1], [*dp, 1]]
+  enable_parallel_optimizer: True
+  pipeline_config:
+    pipeline_interleave: True
+    pipeline_scheduler: 'seqpipe'
+  strategy_ckpt_config:
+    save_file: "./ckpt_strategy.ckpt"
+    only_trainable_params: False
+  parallel_optimizer_config:
+    gradient_accumulation_shard: False
+    parallel_optimizer_threshold: 64
+
+# recompute config
+recompute_config:
+  recompute: [[14, 14], [14, 14]]
+  select_comm_recompute: False
+  select_recompute: False
+
+  parallel_optimizer_comm_recompute: False
+  mp_comm_recompute: False
+  recompute_slice_activation: False
+
+# model config
+model:
+  model_config:
+    vocab_size: 131072
+    hidden_size: 6144
+    intermediate_size: 24576
+    num_hidden_layers: 64
+    num_attention_heads: 48
+    num_key_value_heads: 8
+    hidden_act: 'swiglu'
+    max_position_embeddings: 8192
+    seq_length: 8192
+    rms_norm_eps: 1.e-5
+    tie_word_embeddings: False
+    rope_theta: 10000
+    attention_bias: False
+    use_flash_attention: True
+    add_bias_linear: False
+    eos_token_id: 2
+    pad_token_id: 3
+    bos_token_id: 1
+    pp_interleave_num: 2
+    attention_dropout: 0.0
+    hidden_dropout: 0.0
+    input_sliced_sig: True
+    untie_embeddings_and_output_weights: True
+    position_embedding_type: "rope"
+    use_contiguous_weight_layout_attention: False
+    offset: 0
+    params_dtype: "float32"
+    compute_dtype: "bfloat16"
+    layernorm_compute_dtype: "float32"
+    softmax_compute_dtype: "float32"
+    rotary_dtype: "float32"
+    fp32_residual_connection: True
+    model_type: "telechat3"
+    architectures: ["TeleChat3ForCausalLM"]
+
+# callbacks
+callbacks:
+  - type: MFLossMonitor
+  - type: CheckpointMonitor
+    prefix: "telechat3"
+    save_checkpoint_steps: 300
+    keep_checkpoint_max: 10
+    integrated_save: False
+    remove_redundancy: True
+    async_save: False
+    checkpoint_format: "safetensors"  # format of checkpoint files to save
+
+
+# wrapper cell config
+runner_wrapper:
+  type: MFTrainOneStepCell
+  scale_sense: 1.0
+  use_clip_grad: True
+
+profile: False
+profile_start_step: 1000
+profile_stop_step: 1000
+init_start_profile: False
+profile_communication: False
+profile_memory: True
+layer_scale: False
+layer_decay: 0.65
+lr_scale_factor: 256

@@ -27,7 +27,7 @@ monitor_config:
 # trainer config
 trainer:
   type: CausalLanguageModelingTrainer
-  model_name: 'telechat3'
+  model_name: 'telechat3_moe'
 
 # runner config
 runner_config:
@@ -62,7 +62,7 @@ train_dataset: &train_dataset
     type: BlendedMegatronDatasetDataLoader
     datasets_type: "GPTDataset"
     sizes:
-      - 16   # 训练集数据样本数
+      - 8000   # 训练集数据样本数
       - 0    # 测试集数据样本数，当前不支持配置
       - 0    # 评测集数据样本数，当前不支持配置
     config:  # GPTDataset配置项
@@ -153,9 +153,9 @@ recompute_config:
 use_legacy: False
 model:
   model_config:
-    model_type: "telechat3"
+    model_type: "telechat3_moe"
     input_sliced_sig: True
-    architectures: ["TeleChat3ForCausalLM"]
+    architectures: ["TeleChat3MoeForCausalLM"]
     batch_size: *bs  # add for increase predict
     offset: 0
     pp_interleave_num: 1
@@ -235,7 +235,6 @@ model:
     moe_router_bias_update_rate: &moe_router_bias_update_rate 0.001
 
     fp32_residual_connection: True
-    #param_init_std_rules: [{"target": "decoder.layers.0.*", "init_method_std": 0.0048}]
 
 # callbacks
 callbacks:
@@ -248,7 +247,7 @@ callbacks:
     expert_num: *expert_num
     micro_batch_num: *micro_batch_num
   - type: CheckpointMonitor
-    prefix: "telechat3"
+    prefix: "telechat3_moe"
     save_checkpoint_steps: 1000
     keep_checkpoint_max: 10
     integrated_save: False
