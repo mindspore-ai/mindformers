@@ -27,7 +27,7 @@ model:
 # mindspore context init config
 context:
   mode: 0 #0--Graph Mode; 1--Pynative Mode
-  max_device_memory: "29GB"
+  max_device_memory: "28GB"
   device_id: 0
   device_target: "Ascend"
   affinity_cpu_list: None
