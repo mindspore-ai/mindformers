@@ -1,4 +1,4 @@
 mindspore:
-  'https://repo.mindspore.cn/mindspore/mindspore/version/202601/20260116/r2.7.2_20260116112642_970b12dc1a89d57d703e7a1bae412212aad95887_newest/'
+  'https://repo.mindspore.cn/mindspore/mindspore/version/202601/20260127/master_20260127103157_f2b017131bee3075ffb191186024f46b9c35fbf2_newest/'
 ms_custom_ops:
-  'https://repo.mindspore.cn/mindspore/ms_custom_ops/version/202512/20251215/vllm-ms-0.4.1_20251215142754_2e299050ce11004b2d9449d93f26592100bad415_newest/'
+  'https://repo.mindspore.cn/mindspore/ms_custom_ops/version/202601/20260127/main_20260127041506_687ef6b5f9141a87b24572950a576e03e294953c_newest/'

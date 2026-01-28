@@ -31,11 +31,12 @@ class Dropout(nn.Cell):
     """
 
     def __init__(self, drop_prob: float = 0.5):
-        super(Dropout, self).__init__()
+        super().__init__()
         self.p = drop_prob
         self.use_dropout = drop_prob != 0
         self.generator_step = Tensor(1, mstype.int64)
-        self.seed, self.offset = Generator()._step(self.generator_step)  # pylint: disable=protected-access
+        self.generator = Generator()
+        self.seed, self.offset = self.generator._step(self.generator_step)  # pylint: disable=protected-access
         self.dropout = ms.ops.auto_generate.DropoutExt().add_prim_attr("side_effect_hidden", True)
 
     def construct(self, x):
@@ -46,7 +47,6 @@ class Dropout(nn.Cell):
         """
         if not self.training or not self.use_dropout:
             return x
-
         out, _ = self.dropout(input=x, p=self.p, seed=self.seed, offset=self.offset)
         return out
 

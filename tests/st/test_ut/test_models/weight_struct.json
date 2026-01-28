@@ -10,8 +10,6 @@
           128,
           128
         ],
-        "embedding.embedding_dropout.seed": [],
-        "embedding.embedding_dropout.offset": [],
         "decoder.layers.0.input_layernorm.weight": [
           128
         ],
@@ -34,8 +32,6 @@
           128,
           256
         ],
-        "decoder.layers.0.hidden_states_dropout.seed": [],
-        "decoder.layers.0.hidden_states_dropout.offset": [],
         "decoder.layers.1.input_layernorm.weight": [
           128
         ],
@@ -58,8 +54,6 @@
           128,
           256
         ],
-        "decoder.layers.1.hidden_states_dropout.seed": [],
-        "decoder.layers.1.hidden_states_dropout.offset": [],
         "decoder.final_layernorm.weight": [
           128
         ],
@@ -95,19 +89,15 @@
           128,
           256
         ],
-        "mtp.layers.0.transformer_layer.hidden_states_dropout.seed": [],
-        "mtp.layers.0.transformer_layer.hidden_states_dropout.offset": [],
         "mtp.layers.0.final_layernorm.weight": [
           128
         ],
-        "mtp.embedding.embedding_dropout.seed": [],
-        "mtp.embedding.embedding_dropout.offset": [],
         "output_layer.weight": [
           1000,
           128
         ]
       },
-      "weight_count": 36
+      "weight_count": 26
     },
     "configuration_1": {
       "weights": {
@@ -119,8 +109,6 @@
           128,
           128
         ],
-        "embedding.embedding_dropout.seed": [],
-        "embedding.embedding_dropout.offset": [],
         "decoder.layers.0.input_layernorm.weight": [
           128
         ],
@@ -155,8 +143,6 @@
           128,
           256
         ],
-        "decoder.layers.0.hidden_states_dropout.seed": [],
-        "decoder.layers.0.hidden_states_dropout.offset": [],
         "decoder.layers.1.input_layernorm.weight": [
           128
         ],
@@ -212,8 +198,6 @@
           128,
           512
         ],
-        "decoder.layers.1.hidden_states_dropout.seed": [],
-        "decoder.layers.1.hidden_states_dropout.offset": [],
         "decoder.final_layernorm.weight": [
           128
         ],
@@ -282,19 +266,15 @@
           128,
           512
         ],
-        "mtp.layers.0.transformer_layer.hidden_states_dropout.seed": [],
-        "mtp.layers.0.transformer_layer.hidden_states_dropout.offset": [],
         "mtp.layers.0.final_layernorm.weight": [
           128
         ],
-        "mtp.embedding.embedding_dropout.seed": [],
-        "mtp.embedding.embedding_dropout.offset": [],
         "output_layer.weight": [
           1000,
           128
         ]
       },
-      "weight_count": 57
+      "weight_count": 47
     },
     "configuration_2": {
       "weights": {
@@ -306,8 +286,6 @@
           128,
           128
         ],
-        "embedding.embedding_dropout.seed": [],
-        "embedding.embedding_dropout.offset": [],
         "decoder.layers.0.input_layernorm.weight": [
           128
         ],
@@ -338,8 +316,6 @@
           128,
           256
         ],
-        "decoder.layers.0.hidden_states_dropout.seed": [],
-        "decoder.layers.0.hidden_states_dropout.offset": [],
         "decoder.layers.1.input_layernorm.weight": [
           128
         ],
@@ -370,8 +346,6 @@
           128,
           256
         ],
-        "decoder.layers.1.hidden_states_dropout.seed": [],
-        "decoder.layers.1.hidden_states_dropout.offset": [],
         "decoder.final_layernorm.weight": [
           128
         ],
@@ -415,19 +389,15 @@
           128,
           256
         ],
-        "mtp.layers.0.transformer_layer.hidden_states_dropout.seed": [],
-        "mtp.layers.0.transformer_layer.hidden_states_dropout.offset": [],
         "mtp.layers.0.final_layernorm.weight": [
           128
         ],
-        "mtp.embedding.embedding_dropout.seed": [],
-        "mtp.embedding.embedding_dropout.offset": [],
         "output_layer.weight": [
           1000,
           128
         ]
       },
-      "weight_count": 42
+      "weight_count": 32
     }
   },
   "infer_version": {
@@ -682,6 +652,6 @@
     }
   },
   "metadata": {
-    "generated_at": "2025-10-25 16:28:42"
+    "generated_at": "2025-01-28 17:22:25"
   }
 }
