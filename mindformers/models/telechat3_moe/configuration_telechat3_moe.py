@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2025 bzantium and the HuggingFace Inc. team. All rights reserved.
+# Copyright 2026 bzantium and the HuggingFace Inc. team. All rights reserved.
 #
 #
 # Modification points:
@@ -23,7 +23,7 @@
 # limitations under the License.
 """TeleChat3 Hugging Face Model Configs."""
 
-__all__ = ['TeleChat3Config']
+__all__ = ['TeleChat3MoeConfig']
 
 from mindformers.tools.register import MindFormerRegister, MindFormerModuleType
 from mindformers.models.configuration_utils import PretrainedConfig
@@ -35,8 +35,8 @@ from mindformers.models.model_config_utils import (
 )
 
 
-@MindFormerRegister.register(MindFormerModuleType.CONFIG, legacy=False, search_names=["telechat3"])
-class TeleChat3Config(PretrainedConfig):
+@MindFormerRegister.register(MindFormerModuleType.CONFIG, legacy=False, search_names=['telechat3_moe', 'telechat3_mtp'])
+class TeleChat3MoeConfig(PretrainedConfig):
     """
     This is the configuration class to store the configuration of a [`TeleChat3Model`].
     It is used to instantiate an TeleChat3 model according to the specified arguments, defining the model architecture.
@@ -49,14 +49,42 @@ class TeleChat3Config(PretrainedConfig):
         vocab_size (`int`, *optional*, defaults to 131072):
             Vocabulary size of the Deep model. Defines the number of different tokens that can be represented by the
             `inputs_ids` passed when calling [`TeleChat3Model`]
-        hidden_size (`int`, *optional*, defaults to 4096):
+        hidden_size (`int`, *optional*, defaults to 2560):
             Dimension of the hidden representations.
-        intermediate_size (`int`, *optional*, defaults to 22016):
+        intermediate_size (`int`, *optional*, defaults to 7680):
             Dimension of the MLP representations.
-        num_hidden_layers (`int`, *optional*, defaults to 32):
+        moe_intermediate_size (`int`, *optional*, defaults to 1536):
+            Dimension of the MoE representations.
+        num_hidden_layers (`int`, *optional*, defaults to 4):
             Number of hidden layers in the Transformer decoder.
+        num_nextn_predict_layers (`int`, *optional*, defaults to 1):
+            Number of nextn predict layers in the TeleChat3 Model.
         num_attention_heads (`int`, *optional*, defaults to 32):
             Number of attention heads for each attention layer in the Transformer decoder.
+        n_shared_experts (`int`, *optional*, defaults to 1):
+            Number of shared experts, None means dense model.
+        n_routed_experts (`int`, *optional*, defaults to 192):
+            Number of routed experts, None means dense model.
+        routed_scaling_factor (`float`, *optional*, defaults to 2.8):
+            Scaling factor or routed experts.
+        topk_method (`str`, *optional*, defaults to `noaux_tc`):
+            Topk method used in routed gate.
+        n_group (`int`, *optional*, defaults to 8):
+            Number of groups for routed experts.
+        topk_group (`int`, *optional*, defaults to 4):
+            Number of selected groups for each token.
+            for each token, ensuring the selected experts is only within `topk_group` groups.
+        num_experts_per_tok (`int`, *optional*, defaults to 8):
+            Number of selected experts, None means dense model.
+        moe_layer_freq (`int`, *optional*, defaults to 1):
+            The frequency of the MoE layer: one expert layer for every `moe_layer_freq - 1` dense layers.
+        first_k_dense_replace (`int`, *optional*, defaults to 3):
+            Number of dense layers in shallow layers(embed->dense->dense->...->dense->moe->moe...->lm_head).
+                                                            \\--k dense layers--/
+        norm_topk_prob (`bool`, *optional*, defaults to True):
+            Whether to normalize the weights of the routed experts.
+        scoring_func (`str`, *optional*, defaults to 'sigmoid'):
+            Method of computing expert weights.
         num_key_value_heads (`int`, *optional*):
             This is the number of key_value heads that should be used to implement Grouped Query Attention. If
             `num_key_value_heads=num_attention_heads`, the model will use Multi Head Attention (MHA), if
@@ -65,18 +93,23 @@ class TeleChat3Config(PretrainedConfig):
             by mean-pooling all the original heads within that group. For more details checkout [this
             paper](https://arxiv.org/pdf/2305.13245.pdf). If it is not specified, will default to
             `num_attention_heads`.
-        head_dim: Projection weights dimension in multi-head attention.
         hidden_act (`str` or `function`, *optional*, defaults to `"silu"`):
             The non-linear activation function (function or string) in the decoder.
-        max_position_embeddings (`int`, *optional*, defaults to 32768):
+        max_position_embeddings (`int`, *optional*, defaults to 4096):
             The maximum sequence length that this model might ever be used with.
         initializer_range (`float`, *optional*, defaults to 0.02):
             The standard deviation of the truncated_normal_initializer for initializing all weight matrices.
         rms_norm_eps (`float`, *optional*, defaults to 1e-06):
             The epsilon used by the rms normalization layers.
         use_cache (`bool`, *optional*, defaults to `True`):
-            Whether the model should return the last key/values attentions (not used by all models). Only
+            Whether or not the model should return the last key/values attentions (not used by all models). Only
             relevant if `config.is_decoder=True`.
+        pad_token_id (`int`, *optional*):
+            Padding token id.
+        bos_token_id (`int`, *optional*, defaults to 0):
+            Beginning of stream token id.
+        eos_token_id (`int`, *optional*, defaults to 1):
+            End of stream token id.
         tie_word_embeddings (`bool`, *optional*, defaults to `False`):
             Whether to tie weight embeddings
         rope_theta (`float`, *optional*, defaults to 10000.0):
@@ -88,81 +121,106 @@ class TeleChat3Config(PretrainedConfig):
             `max_position_embeddings` to the expected new maximum.
         attention_bias (`bool`, defaults to `False`, *optional*, defaults to `False`):
             Whether to use a bias in the query, key, value and output projection layers during self-attention.
-        use_sliding_window (`bool`, *optional*, defaults to `False`):
-            Whether to use sliding window attention.
-        sliding_window (`int`, *optional*, defaults to 4096):
-            Sliding window attention (SWA) window size. If not specified, will default to `4096`.
-        max_window_layers (`int`, *optional*, defaults to 28):
-            The number of layers using full attention. The first `max_window_layers`
-            layers will use full attention, while any
-            additional layer afterward will use SWA (Sliding Window Attention).
-        layer_types (`list`, *optional*):
-            Attention pattern for each layer.
         attention_dropout (`float`, *optional*, defaults to 0.0):
             The dropout ratio for the attention probabilities.
-        num_nextn_predict_layers (`int`, *optional*, defaults to 0):
-            Number of nextn predict layers in the TeleChat3 Model.
     """
-    model_type = "telechat3"
+
+    model_type = "telechat3_moe"
     keys_to_ignore_at_inference = ["past_key_values"]
 
-    @register_mf_model_parameter(
-        mf_model_kwargs=MFModelConfig(
-            pad_token_id=151643,
-            block_size=32,
-            num_blocks=1024,
-            normalization="RMSNorm",
-            add_bias_linear=False,
-            gated_linear_unit=True,
-            use_contiguous_weight_layout_attention=False
-        ))
+    # Use the decorators provided in MF to intercept unsupported and register MF custom parameters
+    @register_mf_model_parameter(mf_model_kwargs=MFModelConfig(
+        seq_length=4096,
+        compute_dtype='bf16',
+        layernorm_compute_dtype="fp32",
+        rotary_dtype="fp32",
+        hidden_dropout=0.0,
+        use_flash_attention=True,
+        moe_router_score_function="sigmoid",
+        moe_router_enable_expert_bias=True,
+        moe_router_fusion=True,
+        normalization="RMSNorm",
+        add_bias_linear=False,
+        gated_linear_unit=True,
+    ))
     @ignore_and_delete_parameter(extra_ignore_param=[
-        ('max_window_layers', NotSupportedInfo.useless),
-        ('sliding_window', NotSupportedInfo.useless),
-        ('use_sliding_window', NotSupportedInfo.useless),
-        ('layer_types', NotSupportedInfo.useless)
+        ('ep_size', NotSupportedInfo.useless),
+        ('scoring_func', NotSupportedInfo.useless),
     ])
     def __init__(
             self,
             vocab_size=131072,
-            hidden_size=4096,
-            intermediate_size=22016,
-            num_hidden_layers=32,
+            hidden_size=2560,
+            intermediate_size=7680,
+            moe_intermediate_size=1536,
+            num_hidden_layers=4,
+            num_nextn_predict_layers=1,
             num_attention_heads=32,
             num_key_value_heads=32,
-            head_dim=128,
+            n_shared_experts=1,
+            n_routed_experts=192,
+            ep_size=4,
+            routed_scaling_factor=2.8,
+            kv_lora_rank=512,
+            q_lora_rank=1536,
+            qk_rope_head_dim=64,
+            v_head_dim=128,
+            qk_nope_head_dim=128,
+            topk_method='noaux_tc',
+            n_group=8,
+            topk_group=4,
+            num_experts_per_tok=8,
+            moe_layer_freq=1,
+            first_k_dense_replace=3,
+            norm_topk_prob=True,
+            scoring_func='sigmoid',
             hidden_act="silu",
-            max_position_embeddings=32768,
+            max_position_embeddings=4096,
             initializer_range=0.02,
             rms_norm_eps=1e-6,
             use_cache=True,
+            pad_token_id=None,
+            bos_token_id=0,
+            eos_token_id=1,
             tie_word_embeddings=False,
             rope_theta=10000.0,
             rope_scaling=None,
             attention_bias=False,
-            use_sliding_window=False,
-            sliding_window=4096,
-            max_window_layers=28,
-            layer_types=None,
             attention_dropout=0.0,
-            num_nextn_predict_layers=0,
-            **kwargs):
+            **kwargs,
+    ):
+        """TeleChat3 Config"""
         self.vocab_size = vocab_size
         self.max_position_embeddings = max_position_embeddings
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
+        self.moe_intermediate_size = moe_intermediate_size
         self.num_hidden_layers = num_hidden_layers
-        self.num_attention_heads = num_attention_heads
-        self.use_sliding_window = use_sliding_window
-        self.sliding_window = sliding_window
-        self.max_window_layers = max_window_layers
         self.num_nextn_predict_layers = num_nextn_predict_layers
+        self.num_attention_heads = num_attention_heads
+        self.n_shared_experts = n_shared_experts
+        self.n_routed_experts = n_routed_experts
+        self.ep_size = ep_size # useless in MindFormers
+        self.routed_scaling_factor = routed_scaling_factor
+        self.kv_lora_rank = kv_lora_rank
+        self.q_lora_rank = q_lora_rank
+        self.qk_rope_head_dim = qk_rope_head_dim
+        self.v_head_dim = v_head_dim
+        self.qk_nope_head_dim = qk_nope_head_dim
+        self.topk_method = topk_method
+        self.n_group = n_group
+        self.topk_group = topk_group
+        self.num_experts_per_tok = num_experts_per_tok
+        self.moe_layer_freq = moe_layer_freq
+        self.first_k_dense_replace = first_k_dense_replace
+        self.norm_topk_prob = norm_topk_prob
+        self.scoring_func = scoring_func
         # for backward compatibility
         if num_key_value_heads is None:
             num_key_value_heads = num_attention_heads
+
         self.num_key_value_heads = num_key_value_heads
         self.hidden_act = hidden_act
-        self.head_dim = head_dim
         self.initializer_range = initializer_range
         self.rms_norm_eps = rms_norm_eps
         self.use_cache = use_cache
@@ -170,20 +228,11 @@ class TeleChat3Config(PretrainedConfig):
         self.rope_scaling = rope_scaling
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
-        # Validate the correctness of rotary position embeddings parameters
-        # BC: if there is a 'type' field, move it to 'rope_type'.
-        if self.rope_scaling is not None and "type" in self.rope_scaling:
-            self.rope_scaling["rope_type"] = self.rope_scaling["type"]
 
-        self.layer_types = layer_types
-        if self.layer_types is not None:
-            self.layer_types = [
-                "sliding_attention"
-                if self.sliding_window is not None and i >= self.max_window_layers
-                else "full_attention"
-                for i in range(self.num_hidden_layers)
-            ]
         super().__init__(
+            pad_token_id=pad_token_id,
+            bos_token_id=bos_token_id,
+            eos_token_id=eos_token_id,
             tie_word_embeddings=tie_word_embeddings,
             **kwargs,
         )

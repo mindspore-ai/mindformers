@@ -1,4 +1,4 @@
-# Copyright 2025 TeleAI Technologies Co., Ltd
+# Copyright 2026 TeleAI Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,21 +15,21 @@
 """TeleChat3 Model for training."""
 from mindspore import Tensor
 
-from mindformers.models.telechat3.utils import TeleChat3PreTrainedModel
+from mindformers.models.telechat3_moe.utils import TeleChat3MoePreTrainedModel
 from mindformers.parallel_core.training_graph.base_models.gpt.gpt_model import GPTModel
 from mindformers.parallel_core.training_graph.base_models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec, \
     get_gpt_mtp_block_spec, get_gpt_layer_local_spec
 from mindformers.parallel_core.utils.model_mixin import TrainModelMixin
 
-from .configuration_telechat3 import TeleChat3Config
+from .configuration_telechat3_moe import TeleChat3MoeConfig
 
 
-class TrainingTeleChat3ForCausalLM(TrainModelMixin, TeleChat3PreTrainedModel):
+class TrainingTeleChat3MoeForCausalLM(TrainModelMixin, TeleChat3MoePreTrainedModel):
     """TeleChat3 model for training"""
 
-    def __init__(self, config: TeleChat3Config):
+    def __init__(self, config: TeleChat3MoeConfig):
         super().__init__(config, auto_prefix=False)
-        transformer_config = self.convert_to_transformer_config(config, is_mla_model=False)
+        transformer_config = self.convert_to_transformer_config(config, is_mla_model=True)
         if transformer_config.num_moe_experts:
             transformer_layer_spec = get_gpt_decoder_block_spec(transformer_config)
         else:
