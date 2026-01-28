@@ -3,7 +3,7 @@ mindformers.core.PromptAccMetric
 
 .. py:class:: mindformers.core.PromptAccMetric()
 
-    计算每个实体的提示准确率（prompt acc）。提示准确率是基于构建提示的文本分类准确度。准确的索引是具有最小困惑度的提示索引。
+    计算每个实体的提示准确率（Prompt Accuracy）。提示准确率是基于构建提示的文本分类准确度。准确的索引是具有最小困惑度的提示索引。
 
     1. 为该评估指标构建提示的方式如下：
 

@@ -110,9 +110,9 @@ output_path: 生成数据集的路径
 
 #### 模型权重下载与转换
 
-MindFormers提供已经转换完成的预训练权重、词表文件用于预训练、微调和推理，开发者可以下载获取官方权重后，通过下面提供的**权重转换脚本**，将官方权重转换为MindSpore权重；或直接使用MindFormers提供的**已转换权重**
+开发者可以下载获取官方权重后，通过下面提供的**权重转换脚本**，将官方权重转换为MindSpore权重。
 
-1.torch模型权重及词模型下载链接：
+torch模型权重及词模型下载链接：
 
 - [TeleChat3-36b](https://modelscope.cn/models/TeleAI/TeleChat3-36B-Thinking/files)
 
@@ -129,11 +129,6 @@ python mindformers/research/telechat3/convert_weight_torch_to_ms.py \
 torch_path: torch版本权重保存目录路径
 mindspore_path: 权重保存文件名，可以指定自定义保存路径
 ```
-
-2.获取MindFormers提供的已转换权重，可直接从下面的链接获取。
-
-- [TeleChat3-1.8b](https://telechat-docker.obs.cn-north-4.myhuaweicloud.com/model_weight/Telechat_1.8b/Telechat_1.8b.zip)
-- [TeleChat3-36b](https://telechat-docker.obs.cn-north-4.myhuaweicloud.com/model_weight/Telechat_36b/Telechat_36b.zip)
 
 ### [分布式权重切分与合并](https://www.mindspore.cn/mindformers/docs/zh-CN/master/index.html#%E5%88%86%E5%B8%83%E5%BC%8F%E6%9D%83%E9%87%8D%E5%88%87%E5%88%86%E4%B8%8E%E5%90%88%E5%B9%B6)
 
@@ -181,7 +176,7 @@ MindFormers提供`TeleChat3-36b`的微调示例，过程中使用中电信人工
   2. 设置启动脚本中的`--train_dataset_dir /{path}/dataset.mindrecord`加载微调数据集
   3. 设置启动脚本中的`--run_mode finetune`
 
-  配置文件中各参数含义详见[Config配置说明文档](https://atomgit.com/mindspore/mindformers/blob/master/configs/README.md)。auto_parallel说明详见[自动并行](../../docs/feature_cards/Auto_Parallel.md)。
+  配置文件中各参数含义详见[Config配置说明文档](https://www.mindspore.cn/mindformers/docs/zh-CN/master/feature/configuration.html)。
 
 - step 2. 根据服务器节点数等信息，修改相应的配置。
 

@@ -3,7 +3,7 @@ mindformers.core.SummaryMonitor
 
 .. py:class:: mindformers.core.SummaryMonitor(summary_dir=None, collect_freq=10, collect_specified_data=None, keep_default_action=True, custom_lineage_data=None, collect_tensor_freq=None, max_file_size=None, export_options=None)
 
-    SummaryMonitor可以帮助收集收集一些常用信息，比如loss、学习率、计算图等。
+    SummaryMonitor可以帮助收集一些常用信息，比如loss、学习率、计算图等。
 
     .. note::
         可参考 `note <https://www.mindspore.cn/docs/zh-CN/master/api_python/mindspore/mindspore.SummaryCollector.html>`_ 。
