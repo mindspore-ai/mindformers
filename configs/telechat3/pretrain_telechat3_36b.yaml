@@ -91,7 +91,7 @@ parallel_config:
   data_parallel: &dp 1
   model_parallel: 8
   pipeline_stage: 2
-  micro_batch_num: &micro_batch_num 4
+  micro_batch_num: 4
   use_seq_parallel: True
   gradient_aggregation_group: 4
 # when model parallel is greater than 1, we can set micro_batch_interleave_num=2, that may accelerate the train process.

@@ -113,7 +113,7 @@ train_dataset: &train_dataset
 
 #### 3. 启动预训练任务
 
-通过指定模型路径和配置文件[configs/telechat3_moe/pretrain_telechat3_105b_a4b_4k.yaml](https://atomgit.com/mindspore/mindformers/blob/master/configs/telechat3_moe/pretrain_telechat3_105b_a4b_4k.yaml)以`msrun`的方式启动[run_mindformer.py](https://atomgit.com/mindspore/mindformers/blob/master/run_mindformer.py)脚本，进行16卡分布式训练。您可参考如下方式，拉起两台Atlas 800T A2（64G）训练。
+通过指定模型路径和配置文件[configs/telechat3_moe/pretrain_telechat3_105b_a4b_4k.yaml](https://atomgit.com/mindspore/mindformers/blob/master/configs/telechat3_moe/pretrain_telechat3_105b_a4b_4k.yaml)以`msrun`的方式启动[run_mindformer.py](https://atomgit.com/mindspore/mindformers/blob/master/run_mindformer.py)脚本，进行256卡分布式训练。您可参考如下方式，拉起32台Atlas 800T A2（64G）训练。
 
 在每台服务器上执行如下命令。设置`master_ip`为主节点IP地址，即`Rank 0`服务器的IP；`node_rank`为每个节点的序号；`port`为当前进程的端口号（可在50000~65536中选择）。
 
@@ -126,7 +126,7 @@ bash scripts/msrun_launcher.sh "run_mindformer.py \
 --auto_trans_ckpt False \
 --use_parallel True \
 --run_mode train" \
-48 8 $master_ip $port $node_rank output/msrun_log False 7200
+256 8 $master_ip $port $node_rank output/msrun_log False 7200
 ```
 
 > 此处样例代码假设主节点为`192.168.1.1`、当前Rank序号为`0`。实际执行时请将`master_ip`设置为实际的主节点IP地址；将`node_rank`设置为当前节点的Rank序号；将`port`设置为当前进程的端口号。
