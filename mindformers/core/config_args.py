@@ -490,6 +490,7 @@ class MFContextConfig(BaseArgsConfig):
         'only_save_strategy',
         'use_legacy_format',
         'balanced_load',
+        'reshard_worker_num',
         'run_mode',
         'use_legacy',
         'exclude_cann_cpu',

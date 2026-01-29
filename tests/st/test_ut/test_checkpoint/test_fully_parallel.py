@@ -418,8 +418,20 @@ def test_balanced_save_strategy_save_with_existing_metadata(
 
     with patch("mindformers.checkpoint.fully_parallel.os.path.exists", return_value=True):
         with patch("mindformers.checkpoint.fully_parallel.load_metadata") as mock_load:
-            mock_load.return_value = ({"shard1": MagicMock()},
-                                      {"param1": [{"file_name": "test.safetensors", "storage_rank": 0}]})
+            mock_load.return_value = (
+                {
+                    "shard1": MagicMock()
+                },
+                {
+                    "param1": [
+                        {
+                            "file_name": "test.safetensors",
+                            "storage_rank": 0,
+                            "rank_group": [0]
+                        }
+                    ]
+                }
+            )
             strategy.save(0)
 
     # Check that save_checkpoint was called

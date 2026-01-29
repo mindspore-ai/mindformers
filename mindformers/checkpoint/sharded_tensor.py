@@ -82,16 +82,20 @@ class ShardedTensor:
 
 
 def build_sharded_tensor(
-        param_name: str, param_dtype: ms.dtype, local_shape: Tuple[int, ...], global_shape: Tuple[int, ...],
-        axis_fragmentations: Tuple[int, ...], global_offset: Tuple[int, ...], replica_id: ReplicaId = 0,
-        allow_shape_mismatch: bool = False, allow_to_save: bool = True, layout: Optional[ms.Layout] = None
+        param_name: str, param_dtype: ms.dtype = None, local_shape: Optional[Tuple[int]] = None,
+        global_shape: Optional[Tuple[int]] = None, axis_fragmentations: Optional[Tuple[int]] = None,
+        global_offset: Tuple[int] = (0,), replica_id: ReplicaId = 0, allow_shape_mismatch: bool = False,
+        allow_to_save: bool = True, layout: Optional[ms.Layout] = None
 ) -> ShardedTensor:
     """Creates and returns a ShardedTensor instance with the specified parameters."""
     return ShardedTensor(
-        key=param_name, org_key=param_name, dtype=param_dtype, local_shape=tuple(local_shape),
-        global_shape=tuple(global_shape), global_offset=tuple(global_offset),
-        axis_fragmentations=tuple(axis_fragmentations), replica_id=replica_id,
-        allow_shape_mismatch=allow_shape_mismatch, allow_to_save=allow_to_save, layout=layout
+        key=param_name, org_key=param_name, dtype=param_dtype,
+        local_shape=tuple(local_shape) if local_shape else local_shape,
+        global_shape=tuple(global_shape) if global_shape else global_shape,
+        global_offset=tuple(global_offset) if global_offset else global_offset,
+        axis_fragmentations=tuple(axis_fragmentations) if axis_fragmentations else axis_fragmentations,
+        replica_id=replica_id, allow_shape_mismatch=allow_shape_mismatch, allow_to_save=allow_to_save,
+        layout=layout
     )
 
 
@@ -449,6 +453,9 @@ def get_all_sharded_tensor(
         )
 
         sharded_tensor_metas[cur_npu_rank] = cur_rank_sharded_tensors
+
+    sharded_tensor_metas = {k: sharded_tensor_metas.get(k, None) for k in sorted(sharded_tensor_metas)}
+
     return sharded_tensor_metas
 
 
