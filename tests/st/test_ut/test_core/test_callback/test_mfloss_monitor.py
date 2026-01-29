@@ -1027,5 +1027,184 @@ class TestMFLossMonitorMstxEnabled:
         mock_mstx.range_start.assert_called_once()
         assert monitor.mstx_range_id == 12345
 
+
+class TestMFLossMonitorMcoreFlops:
+    """Test MFLossMonitor mcore FLOPs calculation"""
+
+    @pytest.mark.level0
+    @pytest.mark.platform_x86_cpu
+    @patch('mindformers.core.callback.callback.get_real_group_size', return_value=8)
+    @patch('mindformers.core.callback.callback.get_tensorboard_writer', return_value=None)
+    @patch('mindformers.core.callback.callback.get_tensorboard_args', return_value={})
+    @patch('mindformers.core.callback.callback.get_auto_parallel_context')
+    @patch('mindformers.core.callback.callback.set_auto_parallel_context')
+    @patch('mindformers.core.callback.callback.is_legacy_model', return_value=False)
+    @patch('mindformers.core.callback.callback.get_real_models')
+    @patch('mindformers.core.callback.callback.check_arf_status', return_value=False)
+    @patch('time.time')
+    def test_mcore_flops_calculation(
+            self, mock_time, mock_arf, mock_get_real_models, mock_mcore,
+            mock_set_context, mock_get_context, *mocks):
+        """Test mcore FLOPs calculation and verify the result is reasonable"""
+
+        mock_time.return_value = 1000.0
+
+        def get_context_side_effect(x):
+            return {
+                'parallel_mode': 'stand_alone',
+                'full_batch': False
+            }.get(x, None)
+
+        mock_get_context.side_effect = get_context_side_effect
+
+        class MockConfig:
+            """Mock configuration object for testing."""
+            def __init__(self):
+                self.num_layers = 12
+                self.seq_length = 2048
+                self.hidden_size = 768
+                self.num_attention_heads = 12
+                self.kv_channels = 64
+                self.ffn_hidden_size = 3072
+                self.vocab_size = 128000
+                self.num_query_groups = None
+                self.num_moe_experts = None
+                self.moe_layer_freq = 1
+                self.moe_router_topk = 2
+                self.mtp_num_layers = 0
+                self.moe_ffn_hidden_size = 3072
+                self.moe_shared_expert_intermediate_size = None
+                self.multi_latent_attention = True
+                self.hidden_act = 'gelu'
+                self.q_lora_rank = 512
+                self.qk_head_dim = 128
+                self.qk_pos_emb_head_dim = 64
+                self.kv_lora_rank = 512
+                self.v_head_dim = 128
+
+        mock_config = MockConfig()
+
+        # Mock network with get_gpt_transformer_config method
+        mock_network = Mock()
+        mock_network.get_gpt_transformer_config.return_value = mock_config
+        mock_get_real_models.return_value = mock_network
+
+        monitor = MFLossMonitor(
+            origin_epochs=10,
+            dataset_size=100,
+            global_batch_size=32
+        )
+        monitor.step_time = 999.0
+        monitor.mf_calculated = False
+
+        run_context = Mock()
+        cb_params = Mock()
+        cb_params.cur_step_num = 1
+        cb_params.batch_num = 100
+        cb_params.cur_epoch_num = 1
+        cb_params.dataset_sink_mode = False
+        cb_params.net_outputs = (0.5, False, 1024.0, 0.001, 2.5)
+        cb_params.get.return_value = None
+        cb_params.mode = 'train'
+        cb_params.train_network = mock_network
+        run_context.original_args.return_value = cb_params
+
+        monitor.on_train_step_end(run_context)
+
+        # Verify FLOPs were calculated
+        assert monitor.mf_calculated
+        assert monitor.full_model_flops > 0
+
+        expected_flops = 101975945379840
+        assert monitor.full_model_flops == expected_flops, \
+            f"FLOPs value {monitor.full_model_flops} does not match expected {expected_flops}"
+
+        # Verify get_gpt_transformer_config was called
+        mock_network.get_gpt_transformer_config.assert_called_once()
+
+    @pytest.mark.level0
+    @pytest.mark.platform_x86_cpu
+    @patch('mindformers.core.callback.callback.get_real_group_size', return_value=1)
+    @patch('mindformers.core.callback.callback.get_tensorboard_writer', return_value=None)
+    @patch('mindformers.core.callback.callback.get_tensorboard_args', return_value={})
+    @patch('mindformers.core.callback.callback.get_auto_parallel_context')
+    @patch('mindformers.core.callback.callback.set_auto_parallel_context')
+    @patch('mindformers.core.callback.callback.is_legacy_model', return_value=False)
+    @patch('mindformers.core.callback.callback.get_real_models')
+    @patch('mindformers.core.callback.callback.check_arf_status', return_value=False)
+    @patch('time.time')
+    def test_mcore_flops_calculation_hybrid_model(
+            self, mock_time, mock_arf, mock_get_real_models, mock_mcore,
+            mock_set_context, mock_get_context, *mocks):
+        """Test mcore FLOPs calculation for hybrid model"""
+
+        mock_time.return_value = 1000.0
+
+        def get_context_side_effect(x):
+            return {
+                'parallel_mode': 'stand_alone',
+                'full_batch': False
+            }.get(x, None)
+
+        mock_get_context.side_effect = get_context_side_effect
+
+        class MockConfig:
+            """Mock configuration object for testing."""
+            def __init__(self):
+                self.num_layers = 12
+                self.seq_length = 2048
+                self.hidden_size = 768
+                self.num_attention_heads = 12
+                self.kv_channels = 64
+                self.ffn_hidden_size = 3072
+                self.vocab_size = 128000
+                self.num_query_groups = 12
+                self.multi_latent_attention = False
+                self.hidden_act = 'gelu'
+                self.moe_layer_freq = 1
+                self.moe_router_topk = 2
+                self.moe_ffn_hidden_size = None
+                self.moe_shared_expert_intermediate_size = None
+                self.is_hybrid_model = True
+                self.hybrid_attention_ratio = 0.5
+                self.hybrid_mlp_ratio = 0.3
+
+        mock_config = MockConfig()
+
+        mock_network = Mock()
+        mock_network.get_gpt_transformer_config.return_value = mock_config
+        mock_get_real_models.return_value = mock_network
+
+        monitor = MFLossMonitor(
+            origin_epochs=10,
+            dataset_size=100,
+            global_batch_size=32
+        )
+        monitor.step_time = 999.0
+        monitor.mf_calculated = False
+
+        run_context = Mock()
+        cb_params = Mock()
+        cb_params.cur_step_num = 1
+        cb_params.batch_num = 100
+        cb_params.cur_epoch_num = 1
+        cb_params.dataset_sink_mode = False
+        cb_params.net_outputs = (0.5, False, 1024.0, 0.001, 2.5)
+        cb_params.get.return_value = None
+        cb_params.mode = 'train'
+        cb_params.train_network = mock_network
+        run_context.original_args.return_value = cb_params
+
+        monitor.on_train_step_end(run_context)
+
+        assert monitor.mf_calculated
+        assert monitor.full_model_flops > 0
+
+        expected_flops = 59929289293824
+        assert monitor.full_model_flops == expected_flops, \
+            f"FLOPs value {monitor.full_model_flops} does not match expected {expected_flops}"
+
+        mock_network.get_gpt_transformer_config.assert_called_once()
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])
