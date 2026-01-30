@@ -20,6 +20,10 @@ pytest tests/st/test_auto_register
 import os
 import pytest
 
+import mindspore as ms
+
+from tests.utils.model_tester import create_tokenizer
+
 from mindformers.tools import MindFormerConfig
 from mindformers.core import build_lr, build_optim, build_metric, build_callback
 from mindformers.models import build_model, build_processor
@@ -27,8 +31,7 @@ from mindformers.trainer import build_trainer
 from mindformers.pipeline import build_pipeline
 from mindformers.wrapper import build_wrapper
 
-from tests.utils.model_tester import create_tokenizer
-
+ms.set_context(mode=0)
 
 path = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 

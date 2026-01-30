@@ -1,4 +1,4 @@
-# Copyright 2025 Huawei Technologies Co., Ltd
+# Copyright 2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,6 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """TrainerState for tracking training progress."""
+
 from dataclasses import dataclass
 from typing import Optional, Dict, Any
 
@@ -37,6 +38,8 @@ class TrainerState:
             Number of steps in one epoch. Used to determine epoch boundaries.
         global_batch_size (int):
             Global batch size across all devices.
+        total_flops (float):
+            Total FLOPs for the model.
         best_metric (float):
             Best metric value achieved so far.
         best_model_checkpoint (str):
@@ -54,6 +57,7 @@ class TrainerState:
     save_steps: int = 0
     epoch_step: int = 0
     global_batch_size: int = 0
+    total_flops: float = 0.0
     best_metric: Optional[float] = None
     best_model_checkpoint: Optional[str] = None
     is_train_begin: bool = False
@@ -79,6 +83,7 @@ class TrainerState:
             "save_steps": self.save_steps,
             "epoch_step": self.epoch_step,
             "global_batch_size": self.global_batch_size,
+            "total_flops": self.total_flops,
             "best_metric": self.best_metric,
             "best_model_checkpoint": self.best_model_checkpoint,
         }

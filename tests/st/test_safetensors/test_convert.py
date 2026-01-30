@@ -27,6 +27,8 @@ import pytest
 import numpy as np
 from safetensors.numpy import save_file, load_file
 
+import mindspore as ms
+
 from mindformers import LlamaForCausalLM
 from mindformers.tools import MindFormerConfig
 from mindformers.utils import (
@@ -35,6 +37,8 @@ from mindformers.utils import (
     is_hf_safetensors_dir,
 )
 from mindformers.utils.convert_utils import qkv_concat_hf2mg
+
+ms.set_context(mode=0)
 
 
 @pytest.mark.level0
@@ -165,7 +169,7 @@ class TestConvert:
             f"but got {converted_dict_3.get('model.layers.0.attention.wv.weight')}."
 
         # check whether the map in the json file is correct
-        with open(converted_map_file, 'r') as f:
+        with open(converted_map_file, 'r', encoding='utf-8') as f:
             converted_map = json.load(f)
         assert "model.layers.0.attention.wq.weight" in converted_map.keys(), \
             "param_name_map.json does not have key 'model.layers.0.attention.wq.weight'."
@@ -214,7 +218,7 @@ class TestConvert:
             f"not the same as expected weights {expect_qkv_weights}."
 
         # check whether the map in the json file is correct
-        with open(converted_map_file, 'r') as f:
+        with open(converted_map_file, 'r', encoding='utf-8') as f:
             converted_map = json.load(f)
         assert "model.layers.0.attention.w_qkv.weight" in converted_map.keys(), \
             "param_name_map.json does not have key 'model.layers.0.attention.w_qkv.weight'."

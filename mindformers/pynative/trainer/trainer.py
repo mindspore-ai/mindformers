@@ -1,4 +1,4 @@
-# Copyright 2025 Huawei Technologies Co., Ltd
+# Copyright 2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,28 +13,57 @@
 # limitations under the License.
 # ============================================================================
 """Trainer for training models with MindFormers."""
+
 import os
 import enum
-from typing import Union, Optional, Callable, List, Dict, Any
+from typing import Optional, Callable, List, Dict, Any, Union
+import json
+import numpy as np
 
+from mindspore import mint, manual_seed, value_and_grad, set_deterministic
 from mindspore.dataset import Dataset
+from mindspore.common import set_seed
+from mindspore.mint.distributed import (
+    init_process_group,
+    destroy_process_group,
+    get_world_size,
+)
+from mindspore.nn.utils import no_init_parameters
+from mindspore.ops import clip_by_global_norm
 
-# Import from mindformers
-from mindformers.dataset import build_dataset
-from mindformers.models import PreTrainedModel, build_network
-from mindformers.checkpoint.checkpoint import load_checkpoint
-from mindformers.trainer.training_args import TrainingArguments
+try:
+    from hyper_parallel import parallelize_value_and_grad
+except ImportError:
+    parallelize_value_and_grad = None
+
 from mindformers.tools.logger import logger
-from mindformers.tools import MindFormerConfig
-from mindformers.core import build_lr, build_optim, build_callback, build_metric
-from mindformers.pet import get_pet_model
-from mindformers.core.callback_pynative import CallbackHandler
-from mindformers.trainer.optimizer_grouped_parameters import get_optimizer_grouped_parameters
-from mindformers.trainer_pynative.train_state import TrainerState
+from mindformers.pynative.config import TrainConfig
+from mindformers.models import PreTrainedModel
+from mindformers.checkpoint.checkpoint import load_checkpoint
+from mindformers.pynative.callback import (
+    CallbackHandler,
+    TrainerCallback,
+    LossCallback,
+    CheckpointCallback,
+)
+
+from mindformers.checkpoint.checkpoint import CommonInfo, get_checkpoint_path
+
+from .train_state import TrainerState
+from .utils import (
+    _build_model,
+    _build_dataset,
+    _build_optimizer,
+    _build_lr_scheduler,
+    _build_callback,
+    _build_lora_model,
+    compute_parameters,
+)
 
 
 class TrainMode(enum.Enum):
     """Training mode enumeration."""
+
     FINETUNE = "finetune"
     PRETRAIN = "pretrain"
 
@@ -42,161 +71,166 @@ class TrainMode(enum.Enum):
 class Trainer:
     """
     Trainer for training models in MindFormers.
-
-    The Trainer class provides a unified interface for training models with support for:
-    - Model training and evaluation
-    - Checkpoint management
-    - Callback system
-    - Custom loss functions
-    - Distributed training
-
-    Args:
-        model: Model instance or None. If None, will be built from config.
-        config: Either a path to yaml config file or a TrainingArguments instance
-        compute_loss_func: Optional custom loss function
-        train_dataset: Training dataset instance or None
-        eval_dataset: Evaluation dataset instance or None
-        processing_class: Optional processor for data preprocessing
-        optimizer: Optimizer instance or None
-        lr_scheduler: Learning rate scheduler instance or None
-        compute_metrics: Optional function to compute evaluation metrics
-        callbacks: List of callback instances
     """
 
     def __init__(
         self,
+        config: Union[str, dict] = None,
         model: PreTrainedModel = None,
-        config: Union[str, TrainingArguments] = None,
-        compute_loss_func: Optional[Callable] = None,
+        run_mode: Optional[str] = "train",
         train_dataset: Optional[Dataset] = None,
         eval_dataset: Optional[Dataset] = None,
-        processing_class: Optional[Any] = None,
         optimizer: Optional[Any] = None,
         lr_scheduler: Optional[Any] = None,
-        compute_metrics: Optional[Callable] = None,
-        callbacks: Optional[List] = None
+        callbacks: Optional[List] = None,
+        compute_loss_func: Optional[Callable] = None,
     ):
         """
         Initialize the Trainer.
 
         Args:
-            model: Model instance
-            config: YAML configuration file path (str) or TrainingArguments instance
-            compute_loss_func: Custom loss function
-            train_dataset: Training dataset
-            eval_dataset: Evaluation dataset
-            processing_class: Data processor
-            optimizer: Optimizer instance
-            lr_scheduler: Learning rate scheduler
-            compute_metrics: Metrics computation function
-            callbacks: List of callbacks
+            config (Union[str, dict], optional): The configuration of the trainer.
+                It can be a path to a yaml file or a dictionary. Defaults to None.
+            model (PreTrainedModel, optional): The model to train. Defaults to None.
+            run_mode (str, optional): The running mode. Can be "train", "finetune", "eval" or "predict".
+                Defaults to "train".
+            train_dataset (Dataset, optional): The training dataset. Defaults to None.
+            eval_dataset (Dataset, optional): The evaluation dataset. Defaults to None.
+            optimizer (Any, optional): The optimizer. Defaults to None.
+            lr_scheduler (Any, optional): The learning rate scheduler. Defaults to None.
+            callbacks (List, optional): The list of callbacks. Defaults to None.
+            compute_loss_func (Callable, optional): The function to compute loss. Defaults to None.
         """
-        # Initialize config
-        self.config = self._init_config(config)
-
         # Verify instance validity when config is yaml file
-        if isinstance(config, str):
-            if any([model, train_dataset, eval_dataset, optimizer, lr_scheduler, callbacks]):
-                logger.warning(
-                    "When config is a yaml file, model/dataset/optimizer/lr_scheduler/callbacks "
-                    "instances should not be provided. They will be built from config."
-                )
+        if isinstance(config, str) and any(
+            [model, train_dataset, eval_dataset, optimizer, lr_scheduler, callbacks]
+        ):
+            logger.warning(
+                "When config is a yaml file, (model, dataset, optimizer, lr_scheduler, callbacks) "
+                "instances should not be provided. They will be built from config."
+            )
+
+        # Initialize config
+        self.config = self._init_config(config, run_mode)
+
+        self.world_size = get_world_size()
+        logger.info(f"Current world size: {self.world_size}.")
+        self.use_parallel = self.world_size > 1
+        if self.use_parallel:
+            raise ValueError("Parallel training is not supported yet.")
+
+        self._setup_seed_and_determinism()
+
+        self.global_batch_size = self.config.training.global_batch_size
+        self.gradient_accumulation_steps = None
+        self._compute_data_parallel_size()
 
         # Create model
-        self.model = self._create_model(
-            model,
-            getattr(self.config, 'model', None)
+        self.model = self._create_model(model, self.config.model)
+
+        # Create train dataset
+        self.train_dataset = self._create_dataset(
+            train_dataset, getattr(self.config, "train_dataset", None)
+        )
+        if self.train_dataset is not None:
+            self.train_epoch_step = self._get_dataset_size(self.train_dataset)
+        else:
+            self.train_epoch_step = self.config.training.steps
+        self.train_num_epochs = max(
+            self.config.training.steps // self.train_epoch_step, 1
         )
 
-        # Create datasets
-        self.train_dataset = self._create_dataset(
-            train_dataset,
-            getattr(self.config, 'train_dataset', None)
-        )
+        # Create evaluate dataset
         self.eval_dataset = self._create_dataset(
-            eval_dataset,
-            getattr(self.config, 'eval_dataset', None)
+            eval_dataset, getattr(self.config, "eval_dataset", None)
         )
 
         # Create optimizer and scheduler
         self.optimizer, self.lr_scheduler = self._create_optimizer_and_scheduler(
             optimizer,
             lr_scheduler,
-            getattr(self.config, 'optimizer', None),
-            getattr(self.config, 'lr_schedule', None)
+            getattr(self.config, "optimizer", None),
+            getattr(self.config, "lr_scheduler", None),
         )
 
         # Create callback handler
-        self.callback_handler = self._create_callback_handler(
-            callbacks,
-            self.config
-        )
-
-        # Create metrics
-        self.compute_metrics = self._create_metrics(
-            compute_metrics,
-            getattr(self.config, 'metric', None)
-        )
+        self.callback_handler = self._create_callback_handler(callbacks, self.config)
 
         # Store other parameters
         self.compute_loss_func = compute_loss_func
-        self.processing_class = processing_class
 
         # Initialize training state
+        self.communication_init = False
         self.state = None
 
-    def _init_config(self, config: Union[str, TrainingArguments]) -> MindFormerConfig:
+    @staticmethod
+    def _init_config(config: Union[str, dict], run_mode: str = "train") -> TrainConfig:
         """
-        Initialize trainer config from yaml file or TrainingArguments instance.
-
-        This method converts config inputs to MindFormerConfig:
-        - yaml file path (str) -> MindFormerConfig
-        - TrainingArguments -> MindFormerConfig
+        Initialize trainer config from yaml file or dict instance.
 
         Args:
-            config: Either a yaml file path (str) or TrainingArguments instance
+            config (Union[str, dict]): The configuration of the trainer.
+            run_mode (str, optional): The running mode. Defaults to "train".
 
         Returns:
-            MindFormerConfig instance
+            TrainConfig: The initialized trainer configuration.
 
         Raises:
-            ValueError: If config is None
-            FileNotFoundError: If yaml file does not exist
+            ValueError: If config is None or invalid type.
+            FileNotFoundError: If config file not found.
         """
         if config is None:
-            raise ValueError("config cannot be None. Please provide a yaml file path or TrainingArguments instance.")
+            raise ValueError(
+                "config cannot be None. Please provide a yaml file path or dict."
+            )
 
-        # If config is a string (yaml file path), load it as MindFormerConfig
         if isinstance(config, str):
             if not os.path.exists(config):
                 raise FileNotFoundError(f"Config file not found: {config}")
 
             logger.info(f"Loading config from yaml file: {config}")
-            return MindFormerConfig(config)
 
-        # If config is TrainingArguments, convert to MindFormerConfig
-        if isinstance(config, TrainingArguments):
-            logger.info("Converting TrainingArguments to MindFormerConfig")
-            # Convert TrainingArguments to dict first
-            config_dict = {}
-            for key in dir(config):
-                if not key.startswith('_') and not callable(getattr(config, key)):
-                    config_dict[key] = getattr(config, key)
-            return MindFormerConfig(**config_dict)
+            if run_mode == "train":
+                config = TrainConfig.load_from_yaml(config)
+            else:
+                raise ValueError(f"Invalid run mode: {run_mode}")
 
-        # Should not reach here due to type hints
-        raise TypeError(f"config must be str or TrainingArguments, got {type(config)}")
+        elif isinstance(config, dict):
+            config = TrainConfig.from_dict(config)
+
+        else:
+            raise ValueError(
+                f"Invalid config type: {type(config)}, expected str or dict."
+            )
+
+        logger.info(f"Current config: {json.dumps(config.to_dict(), indent=2)}")
+        return config
+
+    def _setup_seed_and_determinism(self):
+        """Set random seed and deterministic mode."""
+        # Set deterministic mode
+        if self.config.training.deterministic:
+            set_deterministic(True)
+
+        # Set random seed
+        seed = self.config.training.seed
+        set_seed(seed)
+        manual_seed(seed)
+        np.random.seed(seed)
 
     def _create_model(self, model, model_config: Optional[Dict]) -> Any:
         """
         Create or validate model instance.
 
         Args:
-            model: User-provided model instance or None
-            model_config: Model configuration from yaml
+            model (PreTrainedModel): The model instance.
+            model_config (Optional[Dict]): The model configuration.
 
         Returns:
-            Model instance
+            Any: The created or validated model instance.
+
+        Raises:
+            ValueError: If neither model instance nor model config is provided.
         """
         # If user provided model instance, use it directly
         if model is not None:
@@ -205,49 +239,68 @@ class Trainer:
 
         # Build model from config
         if model_config is None:
-            raise ValueError("Either model instance or model_config must be provided.")
+            raise ValueError("Either model instance or config.model must be provided.")
 
         logger.info("Building model from config...")
-        model = build_network(model_config)
+        with no_init_parameters():
+            model = _build_model(model_config)
 
-        # Apply PET if provided (after base model is built)
-        pet_config = getattr(self.config, 'pet_config', None)
-        if pet_config is not None:
-            logger.info("Applying PET configuration to model...")
-            model = get_pet_model(model, pet_config)
+        # Apply LoRA if provided (after base model is built)
+        lora_config = getattr(self.config, "lora_config", None)
+        if model is not None and lora_config is not None:
+            logger.info("Applying LoRA configuration to model...")
+            _build_lora_model(model, lora_config)
 
+        # Compute parameters of the model
+        compute_parameters(model)
         return model
 
-    # pylint: disable=unused-argument
-    def _wrapper_model(self, model, config: Dict) -> Any:
+    def _compute_data_parallel_size(self):
         """
-        Wrap model for distributed training (HSDP).
-
-        Args:
-            model: Model to wrap
-            config: Wrapper configuration (reserved for future use)
-
-        Returns:
-            Wrapped model
+        Compute the data parallel size based on the parallelism settings.
         """
-        # Reserved interface: currently no wrapper logic required
-        logger.info("Wrapper is a no-op. Returning model as-is.")
-        return model
+        parallelism = self.config.parallelism
+        tensor_parallel = parallelism.tensor_parallel
+        pipeline_parallel = parallelism.pipeline_parallel
+        context_parallel = parallelism.context_parallel
 
-    def _create_dataset(
-        self,
-        dataset,
-        dataset_config: Optional[Dict]
-    ) -> Optional[Any]:
+        data_parallel = self.world_size // (
+            tensor_parallel * pipeline_parallel * context_parallel
+        )
+        self.config.parallelism.data_parallel = data_parallel
+        logger.info(
+            f"Got parallelism settings: {data_parallel=}, {tensor_parallel=}, "
+            f"{pipeline_parallel=}, {context_parallel=}"
+        )
+
+        # calculate gradient accumulation steps
+        if (
+            data_parallel * self.config.training.local_batch_size
+            > self.global_batch_size
+        ):
+            raise ValueError(
+                "The product of data_parallel and local_batch_size exceeds global_batch_size, "
+                "please increase global_batch_size or decrease local_batch_size."
+            )
+
+        self.num_accumulation_steps = self.global_batch_size // (
+            data_parallel * self.config.training.local_batch_size
+        )
+        logger.info(
+            f"Calculate global_batch_size={self.global_batch_size}, "
+            f"num_accumulation_steps={self.num_accumulation_steps}."
+        )
+
+    def _create_dataset(self, dataset, dataset_config: Optional[Dict]) -> Optional[Any]:
         """
         Create or validate dataset instance.
 
         Args:
-            dataset: User-provided dataset instance or None
-            dataset_config: Dataset configuration from yaml
+            dataset (Dataset): The dataset instance.
+            dataset_config (Optional[Dict]): The dataset configuration.
 
         Returns:
-            Dataset instance or None
+            Optional[Any]: The created or validated dataset instance.
         """
         # If user provided dataset instance, use it directly
         if dataset is not None:
@@ -260,26 +313,45 @@ class Trainer:
 
         # Build dataset from config
         logger.info("Building dataset from config...")
-        return build_dataset(dataset_config)
+        dataset = _build_dataset(
+            dataset_config,
+            self.global_batch_size,
+            self.config.parallelism.data_parallel,
+            self.num_accumulation_steps,
+        )
+
+        return dataset
+
+    @staticmethod
+    def _get_dataset_size(dataset) -> int:
+        """
+        Get the size of a dataset.
+        """
+        if hasattr(dataset, "get_dataset_size"):
+            return dataset.get_dataset_size()
+        if hasattr(dataset, "__len__"):
+            return len(dataset)
+        # Cannot determine dataset size; raise error per spec
+        raise ValueError("Unable to determine dataset size from the provided dataset.")
 
     def _create_optimizer_and_scheduler(
         self,
         optimizer,
         lr_scheduler,
-        optimizer_config: Optional[Dict],
-        lr_config: Optional[Dict]
+        optim_config: Optional[Dict],
+        lr_config: Optional[Dict],
     ) -> tuple:
         """
         Create optimizer and learning rate scheduler.
 
         Args:
-            optimizer: User-provided optimizer instance or None
-            lr_scheduler: User-provided LR scheduler instance or None
-            optimizer_config: Optimizer configuration from yaml
-            lr_config: LR scheduler configuration from yaml
+            optimizer (Any): The optimizer instance.
+            lr_scheduler (Any): The learning rate scheduler instance.
+            optim_config (Optional[Dict]): The optimizer configuration.
+            lr_config (Optional[Dict]): The learning rate scheduler configuration.
 
         Returns:
-            Tuple of (optimizer, lr_scheduler)
+            tuple: A tuple containing the optimizer and learning rate scheduler.
         """
         # If user provided instances, use them directly
         if optimizer is not None and lr_scheduler is not None:
@@ -287,62 +359,62 @@ class Trainer:
             return optimizer, lr_scheduler
 
         # Build from config
-        if optimizer_config is None or lr_config is None:
+        if optim_config is None or lr_config is None:
             logger.warning("No optimizer or lr_scheduler config provided.")
             return None, None
 
         logger.info("Building optimizer and lr_scheduler from config...")
 
-        # Build learning rate scheduler first
-        lr = build_lr(lr_config)
+        # Build learning rate scheduler
+        lr_scheduler = _build_lr_scheduler(lr_config, self.config.training.steps)
 
-        # Get grouped parameters using official utility
-        weight_decay = getattr(optimizer_config, 'weight_decay', 0.0) if optimizer_config else 0.0
-        grouped_params = get_optimizer_grouped_parameters(
-            model=self.model,
-            weight_decay=weight_decay,
-            dynamic_lr_schedule=lr,
-            layer_scale=False,
-            layer_decay=1.0,
-            optimizer_type=getattr(optimizer_config, 'type', 'AdamW') if optimizer_config else 'AdamW',
-            model_params=None
+        # Build optimizer
+        optimizer = _build_optimizer(optim_config, self.model, lr_scheduler)
+        return optimizer, lr_scheduler
+
+    def _create_build_in_callbacks(self) -> List[TrainerCallback]:
+        """
+        Create default callbacks.
+        """
+        # build checkpoint callback
+        checkpoint = self.config.checkpoint
+        checkpoint_callback = CheckpointCallback(
+            save_path=checkpoint.save_path,
+            save_max=checkpoint.save_max,
+            save_interleaved_steps=checkpoint.save_interleaved_steps,
+            no_save_optim=checkpoint.no_save_optim,
+            async_save=checkpoint.async_save,
+            prefix=checkpoint.prefix,
+            remove_redundancy=checkpoint.remove_redundancy,
         )
 
-        # Build optimizer using default_args to inject params and lr
-        default_args = {
-            'params': grouped_params,
-            'learning_rate': lr
-        }
-        optimizer = build_optim(optimizer_config, default_args=default_args)
-
-        return optimizer, lr
+        return [
+            LossCallback(),
+            checkpoint_callback,
+        ]
 
     def _create_callback_handler(
-        self,
-        callbacks: Optional[List],
-        config: Any
+        self, callbacks: Optional[List], config: Any
     ) -> CallbackHandler:
         """
         Create callback handler.
 
         Args:
-            callbacks: User-provided callback list or None
-            config: Configuration object
+            callbacks (Optional[List]): The list of callbacks.
+            config (Any): The configuration.
 
         Returns:
-            CallbackHandler instance
+            CallbackHandler: The created callback handler.
         """
         # Prepare initial callback list
-        callback_list: List = []
+        callback_list = self._create_build_in_callbacks()
         if callbacks:
             callback_list.extend(callbacks)
 
         # Build callbacks from config and extend
-        callback_config = getattr(config, 'callbacks', None)
-        if callback_config is not None:
-            cbs = build_callback(callback_config)
-            if cbs:
-                callback_list.extend(cbs)
+        callback_config = getattr(config, "callbacks", [])
+        for callback in callback_config:
+            callback_list.append(_build_callback(callback))
 
         # Create handler with complete list
         cb_handler = CallbackHandler(
@@ -351,176 +423,160 @@ class Trainer:
             train_dataset=self.train_dataset,
             eval_dataset=self.eval_dataset,
             optimizer=self.optimizer,
-            lr_scheduler=self.lr_scheduler
+            lr_scheduler=self.lr_scheduler,
         )
 
         return cb_handler
 
-    def _create_metrics(
-        self,
-        compute_metrics: Optional[Callable],
-        metric_config: Optional[Dict]
-    ) -> Optional[Callable]:
-        """
-        Create or validate metrics function.
-
-        Args:
-            compute_metrics: User-provided metrics function or None
-            metric_config: Metrics configuration from yaml
-
-        Returns:
-            Metrics function or None
-        """
-        # If user provided metrics function, use it directly
-        if compute_metrics is not None:
-            logger.info("Using user-provided compute_metrics function.")
-            return compute_metrics
-
-        # Build from config
-        if metric_config is None:
-            return None
-
-        logger.info("Building metrics from config...")
-        return build_metric(metric_config)
+    def _init_train_state(self):
+        """Initialize training state."""
+        return TrainerState(
+            epoch_step=self.train_epoch_step,
+            max_steps=self.config.training.steps,
+            save_steps=self.config.checkpoint.save_interleaved_steps,
+            global_batch_size=self.global_batch_size,
+            is_train_begin=True,
+            is_train_end=False,
+        )
 
     def train(
         self,
         checkpoint_path: Optional[str] = None,
         mode: str = "pretrain",
-        do_eval: bool = False
     ):
         """
         Execute the training loop.
 
         Args:
-            checkpoint_path: Path to checkpoint file to load
-            mode: Training mode, either "pretrain" or "finetune"
-            do_eval: Whether to run evaluation
+            checkpoint_path (Optional[str], optional): Path to load checkpoint from. Defaults to None.
+            mode (str, optional): Training mode, can be "pretrain" or "finetune". Defaults to "pretrain".
 
-        Returns:
-            Training output/results
+        Raises:
+            ValueError: If mode is not "pretrain" or "finetune".
         """
         # Validate mode
         if mode not in ["pretrain", "finetune"]:
             raise ValueError(f"mode must be 'pretrain' or 'finetune', got: {mode}")
 
-        # Check checkpoint_path
-        if mode == "finetune" and checkpoint_path is None:
-            load_checkpoint_path = getattr(self.config, 'load_checkpoint', None)
-            if load_checkpoint_path is None:
-                raise ValueError(
-                    "In finetune mode, checkpoint_path cannot be None. "
-                    "Please provide checkpoint_path or set config.load_checkpoint"
-                )
-            checkpoint_path = load_checkpoint_path
-        elif checkpoint_path is None and hasattr(self.config, 'load_checkpoint'):
-            checkpoint_path = self.config.load_checkpoint
-
-        # Initialize parallel config and wrappers
-        self._init_parallel_config()
-
-        # Load checkpoint
-        if checkpoint_path is not None:
-            self._load_checkpoint(checkpoint_path, mode)
+        # MindSpore communication setting
+        if self.use_parallel:
+            init_process_group()
+            self.communication_init = True
+            logger.info("Distributed communication is initialized.")
 
         # Initialize training state
-        self.state = TrainerState(
-            max_steps=getattr(self.config, 'max_steps', 1000),
-            eval_steps=getattr(self.config, 'eval_steps', 100),
-            save_steps=getattr(self.config, 'save_steps', 100),
-            global_batch_size=getattr(self.config, 'global_batch_size', 0),
-        )
+        self.state = self._init_train_state()
 
-        # Calculate epoch step
-        if self.train_dataset is not None:
-            self.state.epoch_step = self._get_dataset_size(self.train_dataset)
+        # Initialize parallel config and wrappers
+        if self.use_parallel:
+            self._init_parallel_config(self.model, self.config.parallelism)
+
+        # Load checkpoint
+        checkpoint_path = checkpoint_path or self.config.checkpoint.load_path
+        if checkpoint_path:
+            self._load_checkpoint(checkpoint_path, self.model, self.optimizer)
 
         # Call train begin callback
-        if self.callback_handler is not None:
-            self.callback_handler.on_train_begin(self.config, self.state)
+        self.callback_handler.on_train_begin(self.config, self.state)
 
         # Execute training loop
-        self._inner_train_loop(do_eval)
+        self._inner_train_loop()
 
         # Call train end callback
-        if self.callback_handler is not None:
-            self.callback_handler.on_train_end(self.config, self.state)
+        self.callback_handler.on_train_end(self.config, self.state)
 
-    def _init_parallel_config(self):
+        if self.communication_init:
+            destroy_process_group()
+
+    def _init_parallel_config(self, model, parallelism):
         """Initialize parallel configuration."""
-        # Initialize parallel configuration
-        # 1) HSDP wrapper
-        # 2) Pipeline parallel config
-        # 3) Data parallel config
-        logger.info("Initializing parallel config...")
+        _, _ = model, parallelism
+        raise ValueError("Parallel training is not supported yet.")
 
-    def _load_checkpoint(self, checkpoint_path: str, mode: str):
+    def _load_checkpoint(
+        self,
+        checkpoint_path: str,
+        model,
+        optimizer=None,
+        global_step: Optional[int] = None,
+    ):
         """
         Load checkpoint from file.
 
         Args:
-            checkpoint_path: Path to checkpoint file
-            mode: Training mode ("pretrain" or "finetune")
-        """
-        if not os.path.exists(checkpoint_path):
-            raise FileNotFoundError(f"Checkpoint file not found: {checkpoint_path}")
+            checkpoint_path (str): The path to the checkpoint file.
+            model (PreTrainedModel): The model instance.
+            optimizer (Any, optional): The optimizer instance. Defaults to None.
+            global_step (Optional[int], optional): The global step. Defaults to None.
 
+        Raises:
+            ValueError: If model is None.
+        """
+        if model is None:
+            raise ValueError("model is None, cannot load checkpoint.")
+
+        checkpoint_path = get_checkpoint_path(checkpoint_path)
         logger.info(f"Loading checkpoint from: {checkpoint_path}")
 
-        # Prepare global_step possibly adjusted by global_batch_size differences later
-        global_step = getattr(self.state, 'global_step', None) if hasattr(self, 'state') else None
+        common_file = os.path.join(checkpoint_path, "common.json")
+        common_info = CommonInfo.load_common(common_file)
 
-        # balanced_load flag from config if available
-        balanced_load = getattr(self.config, 'balanced_load', False)
+        checkpoint = self.config.checkpoint
 
-        # Use updated API signature per spec
+        if not checkpoint.no_load_optim:
+            if optimizer is None:
+                raise ValueError("If no_load_optim is False, optimizer is required.")
+
+            global_step = common_info.global_step
+            if common_info.global_batch_size != self.global_batch_size:
+                global_step = int(
+                    common_info.global_step
+                    * (common_info.global_batch_size / self.global_batch_size)
+                )
+                logger.info(
+                    f"Scaled global step: {common_info.global_step} -> {global_step} "
+                    f"(batch size changed from {common_info.global_batch_size} to {self.global_batch_size})"
+                )
+            self.train_dataset.set_init_step(global_step)
+            logger.info(f"Resume dataset from: {global_step}")
+
+            self.state.global_step = global_step
+
         load_checkpoint(
             checkpoint=checkpoint_path,
-            network=self.model,
-            optimizer=self.optimizer if mode == "pretrain" else None,
+            network=model,
+            optimizer=optimizer,
             global_step=global_step,
-            balanced_load=balanced_load,
+            balanced_load=checkpoint.load_balanced,
         )
 
-        # Implement: 需要将commoninfo的参数设置给lr模块、数据集模块等，请根据BaseTrainer的逻辑完善该部分逻辑的修改
-
-    def _get_dataset_size(self, dataset) -> int:
-        """
-        Get the size of a dataset.
-
-        Args:
-            dataset: Dataset instance
-
-        Returns:
-            Number of batches in the dataset
-        """
-        if hasattr(dataset, '__len__'):
-            return len(dataset)
-        if hasattr(dataset, 'get_dataset_size'):
-            return dataset.get_dataset_size()
-        # Cannot determine dataset size; raise error per spec
-        raise ValueError("Unable to determine dataset size from the provided dataset.")
-
-    def _inner_train_loop(self, do_eval: bool = False):
+    def _inner_train_loop(self):
         """
         Internal training loop.
-
-        Args:
-            do_eval: Whether to run evaluation
         """
-        if self.train_dataset is None:
-            raise ValueError("train_dataset is None, cannot train.")
-
         # Create dataset iterator
         dataset_iter = self._create_dataset_iterator(self.train_dataset)
 
+        if self.use_parallel:
+            grad_fn = parallelize_value_and_grad(
+                self.compute_loss, self.optimizer.parameters
+            )
+
+        else:
+            grad_fn = value_and_grad(
+                self.compute_loss, None, self.optimizer.parameters, has_aux=False
+            )
+
+        if hasattr(self.model, "set_train"):
+            self.model.set_train(True)
+
         # Training loop
+        logger.info("Start training loop...")
         step = self.state.global_step
         while step < self.state.max_steps:
-            # Check epoch begin
+            # Epoch begin callback
             if step % self.state.epoch_step == 0 and step > 0:
-                if self.callback_handler is not None:
-                    self.callback_handler.on_epoch_begin(self.config, self.state)
+                self.callback_handler.on_epoch_begin(self.config, self.state)
                 self.state.update_epoch()
 
             # Get batch data
@@ -532,62 +588,66 @@ class Trainer:
                 inputs = self.get_batch(dataset_iter)
 
             # Step begin callback
-            if self.callback_handler is not None:
-                self.callback_handler.on_step_begin(self.config, self.state)
+            self.callback_handler.on_step_begin(self.config, self.state)
 
             # Training step
             try:
-                loss = self.training_step(self.model, inputs)
+                loss, grad_norm = self.training_step(self.model, inputs, grad_fn)
             except Exception as e:
-                logger.error(f"Error in training step {step}: {e}")
-                raise
+                raise RuntimeError(f"Error in training step {step}.") from e
 
             # Update state
             self.state.global_step += 1
             step = self.state.global_step
 
             # Step end callback (pass loss)
-            if self.callback_handler is not None:
-                self.callback_handler.on_step_end(
-                    self.config,
-                    self.state,
-                    loss=loss
-                )
+            self.callback_handler.on_step_end(
+                self.config, self.state, loss=loss, grad_norm=grad_norm
+            )
 
-            # Check epoch end
+            # Epoch end callback (pass loss)
             if step % self.state.epoch_step == 0:
-                if self.callback_handler is not None:
-                    self.callback_handler.on_epoch_end(self.config, self.state)
-
-            # Evaluation
-            if do_eval and self.state.eval_steps > 0 and step % self.state.eval_steps == 0:
-                self.evaluate()
+                self.callback_handler.on_epoch_end(self.config, self.state)
 
     def _create_dataset_iterator(self, dataset):
         """
         Create an iterator for the dataset using MindSpore Dataset API.
 
         Args:
-            dataset: mindspore.dataset.Dataset instance
+            dataset (Dataset): The dataset instance.
 
         Returns:
-            Dictionary iterator from MindSpore dataset
+            DatasetIterator: The dataset iterator.
+
+        Raises:
+            ValueError: If dataset is None.
+            TypeError: If dataset does not support create_dict_iterator.
         """
-        if hasattr(dataset, 'create_dict_iterator'):
-            return dataset.create_dict_iterator()
-        raise TypeError(f"Dataset type {type(dataset)} does not support create_dict_iterator()")
+        if dataset is None:
+            raise ValueError("dataset is None, cannot create dataset iterator.")
+
+        if not hasattr(dataset, "create_dict_iterator"):
+            raise TypeError(
+                f"Dataset type {type(dataset)} does not support create_dict_iterator()"
+            )
+        return dataset.create_dict_iterator(
+            output_numpy=False, num_epochs=self.train_num_epochs
+        )
 
     def get_batch(self, dataset_iter) -> Dict[str, Any]:
         """
         Get a batch of data from the dataset.
 
-        Modes:
-        - Distributed dataset mode
-        - Remove redundant load mode
-        - Naive loading mode
+        Args:
+            dataset_iter (DatasetIterator): Dataset iterator.
+
+        Returns:
+            Dict[str, Any]: Dictionary containing batch data.
         """
-        use_distribute_dataset = getattr(self.config, 'use_distribute_dataset', False)
-        use_remove_redundant_dataset = getattr(self.config, 'use_remove_redundant_dataset', False)
+        use_distribute_dataset = getattr(self.config, "use_distribute_dataset", False)
+        use_remove_redundant_dataset = getattr(
+            self.config, "use_remove_redundant_dataset", False
+        )
 
         if use_distribute_dataset:
             data = self._get_batch_distributed(dataset_iter)
@@ -614,29 +674,25 @@ class Trainer:
         """Fetch next batch in naive loading mode (simplified)."""
         return next(dataset_iter)
 
-    def compute_loss(
-        self,
-        model,
-        inputs: Dict[str, Any]
-    ):
+    def compute_loss(self, model, inputs: Dict[str, Any]):
         """
         Compute loss for the model.
 
         Args:
-            model: The model
-            inputs: Input data dictionary
+            model (PreTrainedModel): Model instance.
+            inputs (Dict[str, Any]): Input data dictionary.
 
         Returns:
-            Loss value
+            Tensor: Computed loss value.
         """
         # Forward pass
         outputs = model(**inputs)
 
-        # Get labels from inputs
-        labels = inputs.get('labels', None)
-
         # Compute loss
         if self.compute_loss_func is not None:
+            # Get labels from inputs
+            labels = inputs.get("labels", None)
+
             # Use user-defined loss function
             loss = self.compute_loss_func(outputs, labels)
         else:
@@ -648,32 +704,41 @@ class Trainer:
                 # Assume first element is loss
                 loss = outputs[0]
 
+        # return value must be Tensor or DTensor
         return loss
 
-    def training_step(
-        self,
-        model,
-        inputs: Dict[str, Any]
-    ):
+    def training_step(self, model, inputs: Dict[str, Any], grad_fn: Callable):
         """
         Perform a single training step.
 
         Args:
-            model: The model
-            inputs: Input data dictionary
+            model (PreTrainedModel): Model instance.
+            inputs (Dict[str, Any]): Input data dictionary.
+            grad_fn (Callable): Gradient computation function.
 
         Returns:
-            Loss value
+            tuple: Tuple containing loss value and gradient norm (loss, grad_norm).
         """
         # Forward and compute loss
-        loss = self.compute_loss(model, inputs)
+        loss, grads = grad_fn(model, inputs)
 
-        # Backward pass
-        # In real implementation with MindSpore:
+        # Gradient norm calculation
+        overflow = False
+        grad_norm = 0.0
+        for grad in grads:
+            if grad.isinf().any() or grad.isnan().any():
+                overflow = True
+                break
+            grad_norm += mint.sum(mint.square(grad))
+
+        if overflow:
+            return loss, None
+        grad_norm = mint.sqrt(grad_norm)
+
+        # Clip gradients
+        grads = clip_by_global_norm(grads)
 
         # Optimizer step
+        self.optimizer(grads)
 
-        return loss
-
-    def evaluate(self):
-        """Placeholder for evaluation; to be implemented."""
+        return loss, grad_norm
