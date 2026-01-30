@@ -49,7 +49,8 @@ from mindformers.checkpoint.utils import (
     check_checkpoints_dir_max_num,
     get_metadata_filename,
     verify_ckpt_valid,
-    FileType
+    FileType,
+    get_core_network
 )
 from mindformers.checkpoint.fully_parallel import BalancedSaveStrategy, apply_balance_shard_strategy
 from mindformers.checkpoint.metadata import (
@@ -531,6 +532,107 @@ def load_checkpoint(
     )
 
     logger.info("..........Loading Checkpoint Finished..........")
+    logger.info(f"..........Loading Time Cost: {time() - start_load_time:.5f} s..........")
+
+
+def load_hf_checkpoint(
+        pretrained_model_dir: str,
+        network: Cell,
+        balanced_load: bool = False,
+        reshard_worker_num: int = 1,
+) -> None:
+    """
+    Load HuggingFace format weights.
+
+    Uses a two-step processing approach:
+        1. Reshard: Uses ReshardLoader to handle distributed slicing;
+        2. Convert: Uses Template to handle QKV concatenation, Stack, and other conversions.
+
+    Design notes:
+        - ReshardLoader uses template.get_mf_name() to complete HF→MF parameter name mapping
+        - WeightTemplate.get_mf_state_dict() completes the final weight conversion (e.g., QKV concatenation)
+    """
+    logger.info("..........Start Load Checkpoint..........")
+    start_load_time = time()
+
+    # 1. Get template
+    core_network = get_core_network(network)
+    template = core_network.template
+    if template is None:
+        raise ValueError(
+            "The template of current model is None. Please check:"
+            "\n  1. Whether the conversion template of model has been registered using `register_hf_weight_template`."
+            "\n    You need to navigate to the entry point of the model's training code file "
+            "(such as `TrainingQwen3ForCausalLM` in `modeling_qwen3_train.py`), "
+            "and add the `@register_hf_weight_template` above its `__init__` function "
+            "to register the conversion template."
+            "\n  2. Whether the current model has added weight conversion rules in the model's utils file, such as:"
+            "\n    weight_converters = ["
+            "\n        RenameConvertOp("
+            "\n            hf_names='model.embed_tokens.weight',"
+            "\n            mf_names='embedding.word_embeddings.weight'"
+            "\n        ),"
+            "\n        ..."
+            "\n    ]"
+        )
+
+    # 2. Get target metadata
+    def filter_func(param_name: str) -> bool:
+        return param_name in list(network.parameters_dict().keys())
+
+    param_redundancy = None
+    logger.info("..........Get Metadata of Network..........")
+    if balanced_load:
+        rank_id_to_sharded_tensors = apply_balance_shard_strategy(network, filter_func)
+        dst_sharded_tensor_metas = get_cur_sharded_tensor_after_balanced(rank_id_to_sharded_tensors)
+        param_redundancy = get_param_redundancy_after_balanced(rank_id_to_sharded_tensors)
+    else:
+        dst_sharded_tensor_metas = get_cur_sharded_tensor(network, filter_func) \
+            if get_real_group_size() > 1 else get_sharded_tensor_from_cell(network)
+
+    # 3. Get source metadata (built from HF weights)
+    src_sharded_tensor_metas, param_file_mappings = get_metadata_of_checkpoint(pretrained_model_dir)
+
+    # 4. Reshard:
+    # Pass template for parameter name mapping, and ReshardLoader internally will:
+    #   (1) Pre-build bidirectional mapping:
+    #      - src_to_dst_mapping: {src_name: dst_name}, e.g., {q_proj: qkv, k_proj: qkv, v_proj: qkv}
+    #      - dst_to_src_mapping: {dst_name: [src_names]}, e.g., {qkv: [q_proj, k_proj, v_proj]}
+    #   (2) Iterate through dst_metas, for each target parameter, get all related source parameters via dst_to_src_mapping
+    #   (3) For each source parameter (e.g., q, k, v), calculate offset and perform slicing separately
+    reshard_loader = ReshardLoader(
+        checkpoint_dir=pretrained_model_dir,
+        dst_sharded_tensor_metas=dst_sharded_tensor_metas,  # {mf_param_name: ShardedTensor}
+        src_sharded_tensor_metas=src_sharded_tensor_metas,  # {hf_param_name: [ShardedTensor]}
+        param_file_mappings=param_file_mappings,  # {(hf_param_name, global_offset): [...]}
+        reshard_worker_num=reshard_worker_num,
+        template=template  # HF weights need template for parameter name mapping
+    )
+
+    # Get Reshard output: `{hf_param_name: tensor}`.
+    # Returned keys are HF original parameter names (e.g., q_proj.weight, k_proj.weight, v_proj.weight)
+    # Each source parameter has been sliced (only loading the part needed by current card)
+    reshard_output = reshard_loader.load()
+
+    # 5. Convert:
+    # Use template.get_mf_state_dict() to convert `{hf_param_name: weight}` to `{mf_param_name: Parameter}.`
+    # Internally iterates through parameters, calling add_hf_weight() for conversion:
+    #   - Single-source weights (e.g., embed_tokens): directly rename
+    #   - Multi-source weights (e.g., QKV): temporarily store q, k, v, then concatenate after all are ready
+    # Since Reshard stage has completed slicing, no need to slice again during conversion
+    state_dict = template.get_mf_state_dict(reshard_output)
+
+    # 6. Load into network
+    logger.info("..........Loading State Dict into Network..........")
+    # Load state dictionary into network and optimizer
+    load_parameters(
+        network,
+        state_dict,
+        balanced_load=balanced_load,
+        param_redundancy=param_redundancy
+    )
+
+    logger.info("..........Loading Hugging Face Checkpoint Finished..........")
     logger.info(f"..........Loading Time Cost: {time() - start_load_time:.5f} s..........")
 
 

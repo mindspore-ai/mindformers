@@ -490,24 +490,35 @@ def get_needed_hf_files(checkpoint_dir: str) -> List[str]:
     Returns:
         List[str]: List of full paths to safetensors files.
     """
-    index_file = glob(os.path.join(checkpoint_dir, "*model.safetensors.index.json"))[0]
+    # Check if index file exists
+    index_files = glob(os.path.join(checkpoint_dir, "*model.safetensors.index.json"))
 
-    if os.path.exists(index_file):
-        # Parse the file list from `index.json`.
-        with open(index_file, 'r', encoding='utf-8') as f:
-            index_data = json.load(f)
+    if index_files:
+        index_file = index_files[0]
+        if os.path.exists(index_file):
+            # Parse the file list from `index.json`.
+            with open(index_file, 'r', encoding='utf-8') as f:
+                index_data = json.load(f)
 
-        # The format of `weight_map`: {"param_name": "model-00001-of-00002.safetensors"}
-        weight_map = index_data.get("weight_map", {})
-        file_names_set = set(weight_map.values())
+            # The format of `weight_map`: {"param_name": "model-00001-of-00002.safetensors"}
+            weight_map = index_data.get("weight_map", {})
+            file_names_set = set(weight_map.values())
 
-        return [
-            os.path.join(checkpoint_dir, file_name)
-            for file_name
-            in file_names_set
-        ]
+            return [
+                os.path.join(checkpoint_dir, file_name)
+                for file_name
+                in file_names_set
+            ]
 
-    # Directly search for the "safetensors" file
+    # No index file found, directly search for all "safetensors" files
     pattern = os.path.join(checkpoint_dir, "*.safetensors")
-
     return glob(pattern)
+
+# pylint: disable=W0212
+def get_core_network(network):
+    """Get the core network that register `WeightTemplate`."""
+    if hasattr(network, '_backbone'):
+        return get_core_network(network._backbone)
+    if hasattr(network, 'network'):
+        return get_core_network(network.network)
+    return network

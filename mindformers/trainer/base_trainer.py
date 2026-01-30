@@ -67,8 +67,8 @@ from mindformers.core.callback.callback import (
 )
 from mindformers.modules.seq_pipe import SequenceSplit
 from mindformers.utils.load_checkpoint_utils import get_load_path_after_hf_convert
-from mindformers.checkpoint.checkpoint import load_checkpoint, CommonInfo
-from mindformers.checkpoint.utils import compile_model
+from mindformers.checkpoint.checkpoint import load_checkpoint, CommonInfo, load_hf_checkpoint
+from mindformers.checkpoint.utils import compile_model, is_hf_checkpoint
 from mindformers.dataset.dataloader.hf_dataloader import _resume_hf_iterable_dataset
 from ..core.config_args import ConfigArguments
 from .training_args import TrainingArguments
@@ -1465,6 +1465,11 @@ class BaseTrainer:
                               epoch=config.runner_config.epochs, sink_size=config.runner_config.sink_size)
 
             if config.resume_training:
+                if is_hf_checkpoint(config.load_checkpoint):
+                    raise ValueError(
+                        "Resume training is not supported for HuggingFace checkpoints."
+                    )
+
                 logger.info(".............Start resume training from checkpoint..................")
                 global_step = common_info.global_step
                 if common_info.global_batch_size != self.global_batch_size:
@@ -1480,15 +1485,23 @@ class BaseTrainer:
                     optimizer=optimizer,
                     global_step=global_step,
                     balanced_load=config.balanced_load,
-                    reshard_worker_num=config.reshard_worker_num or 1
+                    reshard_worker_num=config.reshard_worker_num
                 )
             else:
-                load_checkpoint(
-                    checkpoint=config.load_checkpoint,
-                    network=network,
-                    balanced_load=config.balanced_load,
-                    reshard_worker_num=config.reshard_worker_num or 1
-                )
+                if is_hf_checkpoint(config.load_checkpoint):
+                    load_hf_checkpoint(
+                        pretrained_model_dir=config.load_checkpoint,
+                        network=network,
+                        balanced_load=config.balanced_load,
+                        reshard_worker_num=config.reshard_worker_num
+                    )
+                else:
+                    load_checkpoint(
+                        checkpoint=config.load_checkpoint,
+                        network=network,
+                        balanced_load=config.balanced_load,
+                        reshard_worker_num=config.reshard_worker_num
+                    )
         elif (config.load_checkpoint or config.only_save_strategy) and not check_is_reboot_node():
             if config.resume_training:
                 logger.info(".............Start resume training from checkpoint..................")
