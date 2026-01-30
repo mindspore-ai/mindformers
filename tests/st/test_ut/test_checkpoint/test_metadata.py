@@ -12,16 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Test save/load common info."""
+"""Test save/load `metadata.json` info."""
 
 import os
+import json
 import shutil
 import pytest
 
 import mindspore as ms
 
 from mindformers.checkpoint.sharded_tensor import get_sharded_tensor_from_strategy_metadata
-from mindformers.checkpoint.metadata import save_metadata, load_metadata
+from mindformers.checkpoint.metadata import save_metadata, load_metadata, get_metadata_of_checkpoint
+from mindformers.checkpoint.checkpoint import save_metadata_json
 from mindformers.checkpoint.utils import (
     get_checkpoint_iter_dir,
     get_metadata_filename,
@@ -153,7 +155,7 @@ def test_save_and_load_metadata_case():
         get_metadata_filename(CHECKPOINT_ROOT_DIR, ITERATION_WITHOUT_OPTIMIZER)
     )
 
-    for k in no_optimizer_sharded_tensors.keys():
+    for k in no_optimizer_sharded_tensors:
         assert "adam" not in k
 
     for sharded_tensor_no_op in no_optimizer_sharded_tensors['decoder.layers.0.input_layernorm.weight']:
@@ -170,3 +172,85 @@ def test_save_and_load_metadata_case():
     assert os.path.exists(CHECKPOINT_ROOT_DIR) == NOT_EXISTS
     assert os.path.exists(has_optimizer_metadata_file_path) == NOT_EXISTS
     assert os.path.exists(no_optimizer_metadata_file_path) == NOT_EXISTS
+
+
+@pytest.mark.level0
+@pytest.mark.platform_x86_cpu
+@pytest.mark.env_onecard
+def test_save_metadata_json_with_none(tmp_path):
+    """
+    Feature: Test save_metadata_json with None sharded_tensor_metas.
+    Description: Test when sharded_tensor_metas is None.
+    Expectation: Should not create metadata file.
+    """
+    metadata_file = os.path.join(tmp_path, "metadata.json")
+    save_metadata_json(None, [], "test", metadata_file)
+    assert not os.path.exists(metadata_file)
+
+
+@pytest.mark.level0
+@pytest.mark.platform_x86_cpu
+@pytest.mark.env_onecard
+def test_get_metadata_of_checkpoint():
+    """
+    Feature: Test get_metadata_of_checkpoint.
+    Description: Test reading metadata from checkpoint directory.
+    Expectation: Should return sharded_tensor_metas and param_file_mappings with rank_group field.
+    """
+    # Create mock checkpoint directory
+    test_checkpoint_dir = "./test_checkpoint_metadata"
+    os.makedirs(test_checkpoint_dir, exist_ok=True)
+
+    try:
+        # Create mock metadata file
+        metadata_path = os.path.join(test_checkpoint_dir, "metadata.json")
+        mock_metadata = {
+            "state_dict_metadata": {
+                "decoder.final_layernorm.weight": {
+                    "properties": {
+                        "dtype": "Float32",
+                        "replica_id": [0, 1, 2, 3],
+                        "allow_shape_mismatch": False,
+                        "allow_to_save": True
+                    },
+                    "global_shape": [896],
+                    "axis_fragmentations": [1],
+                    "layout": {
+                        "device_matrix": [1, 1, 4],
+                        "tensor_map": [-1],
+                        "interleaved_parallel": False,
+                        "alias_name": ["a", "b", "c"],
+                        "rank_list": [0, 1, 2, 3]
+                    },
+                    "chunk": [{
+                        "global_offset": [0],
+                        "local_shape": [896]
+                    }]
+                }
+            },
+            "storage_data": {
+                "('decoder.final_layernorm.weight', (0,))": [{
+                    "file_name": "model-0000003-0000004.safetensors",
+                    "storage_rank": 3,
+                    "rank_group": [3, 4, 5]
+                }]
+            }
+        }
+
+        with open(metadata_path, "w", encoding='utf-8') as f:
+            json.dump(mock_metadata, f)
+        sharded_tensor_metas, param_file_mappings = get_metadata_of_checkpoint(test_checkpoint_dir)
+        assert isinstance(sharded_tensor_metas, dict)
+        assert isinstance(param_file_mappings, dict)
+
+        # Verify rank_group field exists in storage_data
+        storage_data_key = "('decoder.final_layernorm.weight', (0,))"
+        assert storage_data_key in param_file_mappings
+        storage_info = param_file_mappings[storage_data_key][0]
+        assert "rank_group" in storage_info
+        assert storage_info["rank_group"] == [3, 4, 5]
+        assert storage_info["file_name"] == "model-0000003-0000004.safetensors"
+        assert storage_info["storage_rank"] == 3
+    finally:
+        if os.path.exists(test_checkpoint_dir):
+            shutil.rmtree(test_checkpoint_dir)  # Clean up
