@@ -23,6 +23,7 @@ from mindformers.core.context import build_context
 from mindformers.trainer import Trainer
 from mindformers.tools.logger import logger
 from mindformers.utils.file_utils import set_output_path
+from mindformers.pynative.trainer import Trainer as PynativeTrainer
 
 SUPPORT_MULTI_MODAL_FILETYPES = {
     "video": (".mp4", ".avi", ".mkv"),
@@ -59,6 +60,11 @@ def create_multi_modal_predict_data(predict_data_list, modal_type_list):
 
 def main(config):
     """main."""
+    if config.mode == 1:
+        trainer = PynativeTrainer(config.config)
+        trainer.train()
+        return
+
     # set output path
     set_output_path(config.output_dir)
 
@@ -73,6 +79,7 @@ def main(config):
     elif config.run_mode in ['predict', 'predict_with_train_model']:
         trainer.predict(predict_checkpoint=config.load_checkpoint, input_data=config.input_data,
                         batch_size=config.predict_batch_size, adapter_id=config.adapter_id)
+    return
 
 
 if __name__ == "__main__":
@@ -229,6 +236,10 @@ if __name__ == "__main__":
         os.environ["REGISTER_PATH"] = args_.register_path
         if args_.register_path not in sys.path:
             sys.path.append(args_.register_path)
+
+    if args_.mode == 1:
+        main(args_)
+        sys.exit(0)
 
     if args_.run_mode is not None:
         config_ = MindFormerConfig(args_.config, run_mode=args_.run_mode)

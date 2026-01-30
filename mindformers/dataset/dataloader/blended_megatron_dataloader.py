@@ -143,7 +143,7 @@ class MegatronDatasetBuilder:
                                            shard_id=shard_id)
             return gen_dataset
 
-        if get_real_group_size() > 1:
+        if get_real_group_size() > 1 and ms.get_context('mode') != ms.context.PYNATIVE_MODE:
             global_rank_id = get_real_rank()
             stage_num = ms.get_auto_parallel_context("pipeline_stages")
             total_device_num = get_real_group_size() // stage_num
