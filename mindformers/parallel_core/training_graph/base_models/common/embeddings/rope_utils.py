@@ -22,7 +22,7 @@ __all__ = [
 from mindspore import nn, Tensor, ops
 from mindspore.context import ParallelMode
 from mindspore.parallel._utils import _get_parallel_mode, _is_sharding_propagation
-from mindspore.ops.auto_generate import AddExt, Reshape, Mul, Cos, Sin, Split, Neg, Concat, StackExt, StridedSlice, Cast
+from mindspore.ops.auto_generate import AddExt, Reshape, Mul, Muls, Cos, Sin, Split, Neg, Concat, StackExt, StridedSlice, Cast
 from mindformers.parallel_core.training_graph.device_matrix import layout
 from mindformers.parallel_core.transformer_config import TransformerConfig, MLATransformerConfig
 from mindformers.parallel_core.training_graph.base_models.common.embeddings.rotary_pos_embedding import (
@@ -79,7 +79,7 @@ class ApplyRotaryPosEmb(nn.Cell):
         self.append_eod = config.use_eod_reset
         self.add = AddExt()
         self.mul = Mul()
-        self.mul_mscale = Mul()
+        self.mul_mscale = Muls()
         self.cos = Cos()
         self.sin = Sin()
         self.neg = Neg()
@@ -177,7 +177,7 @@ class ApplyRotaryPosEmb(nn.Cell):
         self.strideslice.add_prim_attr("self_define_shard", True)
         self.cat.add_prim_attr("self_define_shard", True)
 
-        self.mul_mscale.shard(in_strategy=(layout("None", "None", "None", "None"), layout("None",)))
+        self.mul_mscale.shard(in_strategy=(layout("None", "None", "None", "None"), ))
         self.cos.shard(in_strategy=(layout("None", "None", "None", "None"),),
                        out_strategy=(layout("None", "None", "None", "None"),)
                        )
