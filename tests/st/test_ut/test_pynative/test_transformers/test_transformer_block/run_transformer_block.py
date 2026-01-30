@@ -21,7 +21,7 @@ import numpy as np
 import mindspore as ms
 from mindspore import context
 
-from data_gen_utils import get_init_params, DEFAULT_SEQ_LENGTH, DEFAULT_BATCH_SIZE, DEFAULT_HIDDEN_SIZE, \
+from data_gen_utils import get_init_params, get_fixed_weights, DEFAULT_SEQ_LENGTH, DEFAULT_BATCH_SIZE, DEFAULT_HIDDEN_SIZE, \
     DEFAULT_FFN_HIDDEN_SIZE, DEFAULT_NUM_HEADS, DEFAULT_POST_LAYER_NORM
 
 from mindformers.pynative.layers.identity_op import IdentityOp
@@ -93,7 +93,8 @@ class TransformerLayerRunner:
             layernorm_compute_dtype='fp32',
             normalization="LayerNorm",
             num_layers=self.num_layers,
-            params_dtype='fp32'
+            params_dtype='fp32',
+            attention_dropout=0.0,
         )
 
         # Submodules
@@ -132,13 +133,26 @@ class TransformerLayerRunner:
         self.hidden_states = init_input_params.get("hidden_states")
         self.attention_mask = init_input_params.get("attention_mask")
 
+        # Fixed weights (weight_dict with parameter names as keys)
+        self.weight_dict = get_fixed_weights(
+            hidden_size=self.hidden_size,
+            ffn_hidden_size=self.ffn_hidden_size,
+            num_layers=self.num_layers,
+            post_layer_norm=self.post_layer_norm,
+            param_init_dtype=self.param_init_dtype
+        )
+
     def build_model(self):
-        """Build and initialize TransformerLayer model"""
+        """Build and initialize TransformerBlock model"""
         net = TransformerBlock(
             config=self.config,
             spec=self.submodules_spec,
             post_layer_norm=self.post_layer_norm
         )
+
+        # Load fixed weights into the model
+        if self.weight_dict:
+            net.load_state_dict(self.weight_dict, strict=False)
 
         return net
 
@@ -178,8 +192,8 @@ def main():
     parser.add_argument("--hidden_size", type=int, default=DEFAULT_HIDDEN_SIZE)
     parser.add_argument("--ffn_hidden_size", type=int, default=DEFAULT_FFN_HIDDEN_SIZE)
     parser.add_argument("--num_attention_heads", type=int, default=DEFAULT_NUM_HEADS)
-    parser.add_argument("--post_layer_norm", type=bool, default=DEFAULT_POST_LAYER_NORM)
-    parser.add_argument("--num_layers", type=int, default=1)
+    parser.add_argument("--post_layer_norm", type=lambda x: x.lower() == "true", default=DEFAULT_POST_LAYER_NORM)
+    parser.add_argument("--num_layers", type=int, default=2)
 
     # Submodule types (must match keys in MODULE_MAP)
     parser.add_argument("--input_layernorm", type=str, default="Norm", choices=MODULE_MAP.keys())
