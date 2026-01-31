@@ -266,17 +266,17 @@ class GPTModel(nn.Cell):
         # current aclgraph not support moveto in graph
         # add moveto config for model to control
         if self.move_lens_to_cpu:
-            if self.is_pynative:  # ops.move_to not support pynative mode
-                batch_valid_length_cpu = batch_valid_length.move_to("CPU")
-                q_seq_lens_cpu = q_seq_lens.move_to("CPU")
-                context_lens_tensor_cpu = context_lens_tensor.move_to("CPU")
+            if self.is_pynative:  # ops.move_to does not support pynative mode
+                batch_valid_length_cpu = batch_valid_length.to("CPU")
+                q_seq_lens_cpu = q_seq_lens.to("CPU")
+                context_lens_tensor_cpu = context_lens_tensor.to("CPU")
             else:
                 batch_valid_length_cpu = ops.move_to(batch_valid_length, "CPU")
                 q_seq_lens_cpu = ops.move_to(q_seq_lens, "CPU")
                 context_lens_tensor_cpu = ops.move_to(context_lens_tensor, "CPU")
 
-            # embedding contains the allreduce ops. Adding the depend ops ensures that the move_to ops is
-            # launched before the allreduce, reducing the sync waiting time when the move_to ops launched.
+            # embedding contains the allreduce ops. Adding the depend ops ensures that the to ops is
+            # launched before the allreduce, reducing the sync waiting time when the to ops are launched.
             input_ids = self.depend(input_ids, q_seq_lens_cpu)
             input_ids = self.depend(input_ids, batch_valid_length_cpu)
             input_ids = self.depend(input_ids, context_lens_tensor_cpu)
