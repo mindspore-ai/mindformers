@@ -19,6 +19,7 @@ from mindformers.tools.register import MindFormerRegister, MindFormerModuleType
 
 from .configuration_telechat3 import TeleChat3Config
 from .modeling_telechat3_train import TrainingTeleChat3ForCausalLM
+from .modeling_telechat3_infer import InferenceTelechat3ForCausalLM
 
 
 @MindFormerRegister.register(MindFormerModuleType.MODELS, legacy=False)
@@ -36,5 +37,5 @@ class TeleChat3ForCausalLM:
         # get run mode to init different model.
         # we can use train mode to do train task.
         if os.environ.get("RUN_MODE") == "predict":
-            raise ValueError("TeleChat3 model is currently only support training.")
+            return InferenceTelechat3ForCausalLM(config=config)
         return TrainingTeleChat3ForCausalLM(config=config)

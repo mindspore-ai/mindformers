@@ -9,6 +9,7 @@
 |    模型名称    |     规格     | 支持任务 | 模型架构  |                       支持设备                        |        模型级别         |
 |:----------:|:----------:|:----:|:-----:|:-------------------------------------------------:|:-------------------:|
 | TeleChat3 |    36B     |  预训练  | Mcore | Atlas 800T A2/Atlas 800I A2/Atlas 900 A3 SuperPoD | [Released](#模型级别介绍) |
+| TeleChat3 |    36B     |  推理  | Mcore | Atlas 800T A2/Atlas 800I A2/Atlas 900 A3 SuperPoD | [Released](#模型级别介绍) |
 
 说明：
 
@@ -141,6 +142,90 @@ tail -f ./output/msrun_log/worker_0.log
 
 如有关于TeleChat3预训练的相关问题，可以在MindSpore Transformers的AtomGit仓库中[提交ISSUE](https://atomgit.com/mindspore/mindformers/issues/new)以获取支持。
 
+### 推理样例
+
+推理是指在预训练模型的基础上，利用已学习到的语言知识对新的输入数据进行预测或生成。在MindSpore官网提供了详细的[指导](https://www.mindspore.cn/mindformers/docs/zh-CN/master/guide/inference.html)。
+
+#### 1. 修改任务配置
+
+MindSpore Transformers 提供了推理任务的[配置文件](https://atomgit.com/mindspore/mindformers/blob/master/configs/telechat3/predict_telechat3_36b.yaml)，用户可以根据实际情况修改此配置文件中的权重路径和其他参数。
+
+当前推理可以直接复用Hugging Face的配置文件和tokenizer，并且在线加载Hugging Face的safetensors格式的权重，使用时配置修改如下：
+
+```yaml
+pretrained_model_dir: '/path/hf_dir'
+parallel_config:
+  data_parallel: 1
+  model_parallel: 1
+```
+
+参数说明：
+
+- pretrained_model_dir：Hugging Face模型目录路径，放置模型配置、Tokenizer等文件。`/path/hf_dir`中的内容如下：
+
+```text
+📂Telechat3-36B
+├── 📄config.json
+├── 📄generation_config.json
+├── 📄model-xxx.safetensors
+├── 📄model-xxx.safetensors
+├── 📄model.safetensors.index.json
+├── 📄special_tokens_map.json
+├── 📄tokenizer.model
+└── 📄tokenizer_config.json
+```
+
+- data_parallel：数据并行，当前推理并不支持此并行策略，默认为1；
+- model_parallel：模型并行，默认值为 1。需根据实际模型规模及硬件资源情况，调整该参数为相应的device_num（即实际使用的卡数）。
+
+不同规格和序列长度的并行配置可参考[并行配置建议](#并行配置建议)。
+
+#### 2. 启动推理任务
+
+使用 `run_mindformer` 统一脚本执行推理任务。
+
+单卡推理可以直接执行[run_mindformer.py](https://atomgit.com/mindspore/mindformers/blob/master/run_mindformer.py)脚本，多卡推理需要借助[scripts/msrun_launcher.sh](https://atomgit.com/mindspore/mindformers/blob/master/scripts/msrun_launcher.sh)来启动。
+
+run_mindformer.py的参数说明如下：
+
+| 参数                             | 参数说明                                                       |
+|:-------------------------------|:-----------------------------------------------------------|
+| config                         | yaml配置文件的路径                                                |
+| run_mode                       | 运行的模式，推理设置为predict                                         |
+| use_parallel                   | 是否使用多卡推理                                                   |
+| predict_data                   | 推理的输入数据，多batch推理时需要传入输入数据的txt文件路径，包含多行输入                   |
+| predict_batch_size             | 多batch推理的batch_size大小                                      |
+| pretrained_model_dir           | Hugging Face模型目录路径，放置模型配置、Tokenizer等文件                     |
+| parallel_config.data_parallel  | 数据并行，当前推理们模式下设置为1                                          |
+| parallel_config.model_parallel | 模型并行，默认值为 1。需根据实际模型规模及硬件资源情况，调整该参数为相应的device_num（即实际使用的卡数） |
+
+msrun_launcher.sh包括run_mindformer.py命令和推理卡数两个参数。
+
+TeleChat3-36B模型至少需要两卡推理，多卡推理需参考下面修改配置：
+
+1. 模型并行model_parallel的配置和使用的卡数需保持一致，下文用例为2卡推理，需将model_parallel设置成2；
+2. 当前版本的多卡推理不支持数据并行，需将data_parallel设置为1。
+
+当使用完整权重推理时，需要开启在线切分方式加载权重，参考以下命令：
+
+```shell
+bash scripts/msrun_launcher.sh "run_mindformer.py \
+ --config configs/telechat3/predict_telechat3_36b.yaml \
+ --run_mode predict \
+ --use_parallel True \
+ --pretrained_model_dir '/path/hf_dir' \
+ --parallel_config.data_parallel 1 \
+ --parallel_config.model_parallel 2 \
+ --trust_remote_code True \
+ --predict_data '帮助我制定一份去上海的旅游攻略'" 2
+```
+
+出现如下结果，证明推理成功。推理结果也会保存到当前目录下的 text_generation_result.txt 文件中。详细日志可通过`./output/msrun_log`目录查看。
+
+```text
+'text_generation_text': [帮助我制定一份去上海的旅游攻略，包括景点推荐、美食推荐和交通指南......]
+```
+
 ## 附录
 
 ### 模型文件说明
@@ -156,10 +241,12 @@ TeleChat3-36B的模型文件包括以下内容：
 │           ├── 📄configuration_telechat3.py        # TeleChat3模型配置类定义
 │           ├── 📄modeling_telechat3.py             # TeleChat3模型主体实现
 │           ├── 📄modeling_telechat3_train.py       # TeleChat3训练模型实现
+│           ├── 📄modeling_telechat3_infer.py       # TeleChat3推理模型实现
 │           └── 📄utils.py                          # TeleChat3工具函数和基础类
 ├── 📂configs
 │   └── 📂telechat3
-│       └── 📄pretrain_telechat3_36b.yaml           # TeleChat3-36B 预训练配置
+│       ├── 📄pretrain_telechat3_36b.yaml           # TeleChat3-36B 预训练配置
+        └── 📄predict_telechat3_36b.yaml            # TeleChat3-36B 推理配置
 └── 📄run_mindformer.py                             # 主要执行脚本
 ```
 
@@ -212,6 +299,37 @@ TeleChat3-36B的模型文件包括以下内容：
   max_device_memory: "58GB"</code></pre>
     </td>
     <td> Validated </td>
+  </tr>
+</table>
+
+- 推理：
+
+<table>
+  <tr>
+    <th>模型</th>
+    <th>规格</th>
+    <th>设备</th>
+    <th>卡数</th>
+    <th>并行配置</th>
+    <th>内存配置</th>
+    <th>模型级别</th>
+  </tr>
+  <tr>
+    <td>TeleChat3</td>
+    <td>36B</td>
+    <td>1 × Atlas 800T A2 (2P)</td>
+    <td>2</td>
+    <td>
+      <pre><code class="language-yaml">parallel_config:
+  data_parallel: 1
+  model_parallel: 2</code></pre>
+    </td>
+    <td>
+      <pre><code class="language-yaml">context:
+  ...
+  max_device_memory: "59GB"</code></pre>
+    </td>
+    <td> Released </td>
   </tr>
 </table>
 

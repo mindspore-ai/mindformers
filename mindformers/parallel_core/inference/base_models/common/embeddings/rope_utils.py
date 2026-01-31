@@ -76,8 +76,9 @@ def _get_yarn(**kwargs):
         original_max_position_embeddings=kwargs["original_max_position_embeddings"],
         beta_slow=config.beta_slow,
         beta_fast=config.beta_fast,
-        mscale=config.mscale,
-        mscale_all_dim=config.mscale_all_dim
+        mscale=getattr(config, "mscale", None),
+        mscale_all_dim=getattr(config, "mscale_all_dim", None),
+        coeff=getattr(config, "coeff", 0.1)
     )
 
 
@@ -100,6 +101,7 @@ ROPE_FUNCTION = {
     'llama': _get_llama3,
     'yarn': _get_yarn,
     'partial_rope': _get_partialrope,
+    'telechat3-yarn': _get_yarn,
 }
 
 
@@ -116,7 +118,7 @@ def get_rope(
         **kwargs,
 ) -> RotaryEmbedding:
     """Obtain an instantiation object of RoPE class based on `position_embedding_type`"""
-    if position_embedding_type not in ROPE_FUNCTION.keys():
+    if position_embedding_type not in ROPE_FUNCTION:
         raise ValueError(f"RoPE type {position_embedding_type} is not supported, "
                          f"if you wish to successfully execute this task, "
                          f"you can implement this function or remove the rope_scaling "
