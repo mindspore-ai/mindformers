@@ -16,9 +16,13 @@
 __all__ = ["GroupedMLP"]
 
 import mindspore as ms
+import numpy as np
 from mindspore import mint, nn, ops
 from mindspore.common.parameter import Parameter
 from mindspore.ops.auto_generate import GroupedMatmul
+
+from hyper_parallel import DTensor
+
 from mindformers.tools.logger import logger
 from mindformers.pynative.layers.activation import get_activation
 from mindformers.parallel_core.transformer_config import TransformerConfig
@@ -87,20 +91,15 @@ class GroupedMLP(nn.Cell):
         self.cumsum = mint.cumsum
         self.bmm = mint.bmm
 
-    def permute(self, tokens, top_scores, selected_experts_indices):
+    def permute(self, tokens, top_scores, selected_experts_indices, num_tokens_per_expert):
         """
         Reorders token indices to match the order of experts for MoE routing.
         """
         _, _, dim = tokens.shape
         tokens = self.reshape(tokens, (-1, dim))
-        # group tokens together by expert indices from 0 to num_experts and pass that to experts forward
-        num_tokens_per_expert = self.histc(
-            selected_experts_indices,
-            bins=self.num_local_experts,
-            min=0,
-            max=self.num_local_experts,
-        )
+
         num_tokens_per_expert = self.cast(num_tokens_per_expert, selected_experts_indices.dtype)
+        num_tokens_per_expert = self.cumsum(num_tokens_per_expert, dim=0, dtype=ms.int64)
 
         # Reorder the token indices to match the order of the experts
         # token_indices_experts_sorted shape (bs*slen*top_k,)
@@ -110,10 +109,10 @@ class GroupedMLP(nn.Cell):
 
         # shape (bs*slen*top_k, dim)
         routed_input = tokens[token_indices_experts_sorted // self.top_k]
-
+        routed_input = self.reshape(routed_input, (-1, self.hidden_size))
         return num_tokens_per_expert, token_indices_experts_sorted, top_scores_experts_sorted, routed_input
 
-    def unpermute(self, routed_output, token_indices_experts_sorted, shape):
+    def unpermute(self, routed_output, token_indices_experts_sorted, probs, shape):
         """
         Restores the original token order from expert-sorted outputs for MoE routing.
         """
@@ -124,33 +123,44 @@ class GroupedMLP(nn.Cell):
             dtype=routed_output.dtype,
         )
         routed_output_unsorted[token_indices_experts_sorted] = routed_output
+        probs = self.cast(probs, routed_output.dtype)
+        routed_output_unsorted = self.mul(routed_output_unsorted, self.unsqueeze(probs, -1))
         routed_output_unsorted = self.reshape(routed_output_unsorted, (-1, self.top_k, dim))
         out_experts = routed_output_unsorted.sum(dim=1)
         return out_experts
 
-    def construct(self, tokens, probs, topk_indices):
+    def construct(self, tokens, probs, topk_indices, num_tokens_per_expert):
         """Construct function of GroupedMLP."""
-        tokens_per_expert, token_indices_experts_sorted, permuted_probs, permuted_local_hidden_states = self.permute(
-            tokens, probs, topk_indices)
+        # Func permute and unpermute is required when using a single card or ep is not enabled.
+        # When ep parallelism is enabled, ExpertParallel inference will take over the dispatch operation.
+        need_dispatch = not isinstance(self.weight1, DTensor) or "ep" not in self.weight1.device_mesh.mesh_dim_names
 
-        permuted_local_hidden_states = self.reshape(permuted_local_hidden_states, (-1, self.hidden_size))
+        if need_dispatch:
+            tokens_per_expert, token_indices_experts_sorted, permuted_probs, permuted_local_hidden_states = self.permute(
+                tokens, probs, topk_indices, num_tokens_per_expert)
+        else:
+            tokens_per_expert, permuted_probs, permuted_local_hidden_states = num_tokens_per_expert, probs, tokens
+            token_indices_experts_sorted = None
+
         if self.config.moe_apply_probs_on_input:
             permuted_local_hidden_states = self.mul(self.unsqueeze(permuted_probs, -1), permuted_local_hidden_states)
             permuted_probs = self.ones_like(permuted_probs)
 
-        experts_output = self.experts_forward(permuted_local_hidden_states, tokens_per_expert, permuted_probs)
+        experts_output = self.experts_forward(permuted_local_hidden_states, tokens_per_expert)
 
-        output = self.unpermute(experts_output, token_indices_experts_sorted, tokens.shape)
-        return output
+        if need_dispatch:
+            experts_output = self.unpermute(experts_output, token_indices_experts_sorted, permuted_probs, tokens.shape)
 
-    def experts_forward(self, permuted_local_hidden_states, tokens_per_expert, permuted_probs):
+        return experts_output
+
+    def experts_forward(self, permuted_local_hidden_states, tokens_per_expert):
         """Forward step of GroupedMLP."""
         original_dtype = permuted_local_hidden_states.dtype
         w1 = self.cast(self.weight1, original_dtype)
         w2 = self.cast(self.weight2, original_dtype)
         w1 = self.reshape(w1, (-1, self.hidden_size, self.moe_ffn_hidden_size))
         w2 = self.reshape(w2, (-1, self.config.moe_ffn_hidden_size, self.hidden_size))
-        tokens_per_expert = self.cumsum(tokens_per_expert, dim=0, dtype=ms.int64)
+
         fc1_output = GroupedMatmul(split_item=3, group_type=0)(
             [permuted_local_hidden_states], [w1], None, None, None, None, None, tokens_per_expert)[0]
 
@@ -164,8 +174,6 @@ class GroupedMLP(nn.Cell):
         else:
             intermediate_parallel = self.activation_func(fc1_output)
 
-        permuted_probs = self.cast(permuted_probs, intermediate_parallel.dtype)
-        intermediate_parallel = self.mul(intermediate_parallel, self.unsqueeze(permuted_probs, -1))
         fc2_output = GroupedMatmul(split_item=3, group_type=0)(
             [intermediate_parallel], [w2], None, None, None, None, None, tokens_per_expert)[0]
         return fc2_output
