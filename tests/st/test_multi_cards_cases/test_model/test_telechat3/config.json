@@ -1,13 +1,13 @@
 {
   "architectures": [
-    "TeleChat3ForCausalLM"
+    "TeleChat3MoeForCausalLM"
   ],
   "attention_bias": false,
   "attention_dropout": 0.0,
   "auto_map": {
-    "AutoConfig": "configuration_telechat3.TeleChat3Config",
-    "AutoModel": "modeling_telechat.TeleChat3Model",
-    "AutoModelForCausalLM": "modeling_telechat.TeleChat3ForCausalLM"
+    "AutoConfig": "configuration_telechat3_moe.TeleChat3MoeConfig",
+    "AutoModel": "modeling_telechat3_moe.TeleChat3MoeForCausalLM",
+    "AutoModelForCausalLM": "modeling_telechat3_moe.TeleChat3MoeForCausalLM"
   },
   "bos_token_id": 0,
   "eos_token_id": 1,
@@ -19,7 +19,7 @@
   "intermediate_size": 18432,
   "kv_lora_rank": 512,
   "max_position_embeddings": 163840,
-  "model_type": "telechat3",
+  "model_type": "telechat3_moe",
   "moe_intermediate_size": 2048,
   "moe_layer_freq": 1,
   "n_group": 8,
