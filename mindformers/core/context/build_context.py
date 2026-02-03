@@ -661,10 +661,6 @@ def build_parallel_context(config: Union[dict, MindFormerConfig]):
 
 def is_legacy_model():
     """Determine whether it is use_legacy mode."""
-    # if in pynative mode, return False
-    if mindspore.get_context('mode') == ms_context.PYNATIVE_MODE:
-        return False
-
     mf_ctx_instance = MFContextOperator.get_mf_ctx_instance()
     if mf_ctx_instance is not None:
         is_use_legacy = mf_ctx_instance.get_context("use_legacy")

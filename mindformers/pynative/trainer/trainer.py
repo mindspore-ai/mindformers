@@ -46,6 +46,7 @@ from mindformers.pynative.callback import (
     LossCallback,
     CheckpointCallback,
 )
+from mindformers.core.context.build_context import build_context
 
 from mindformers.checkpoint.checkpoint import CommonInfo, get_checkpoint_path
 
@@ -112,6 +113,7 @@ class Trainer:
 
         # Initialize config
         self.config = self._init_config(config, run_mode)
+        build_context({'use_legacy': False, 'context': {'mode': 1}})
 
         self.world_size = get_world_size()
         logger.info(f"Current world size: {self.world_size}.")
