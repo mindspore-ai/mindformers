@@ -29,24 +29,24 @@ from .data_gen_utils import GOLDEN_DATA, GPU_DATA, \
 
 SINGLE_CARD_TEST_PARAM = "model_args, data_keys, expect_error"
 SINGLE_CARD_TEST_CASES = [
-    # Case 1: Standard Norm, SelfAttention, Norm, MLP, post_layer_norm, num_layers=1
-    (
-        {
-            "input_layernorm": "Norm", "self_attention": "SelfAttention",
-            "pre_cross_attn_layernorm": "IdentityOp", "cross_attention": "IdentityOp",
-            "pre_mlp_layernorm": "Norm", "mlp": "MLP", "post_layer_norm": "True", "num_layers": 1,
-        },
-        {"output": "output_default"},  # Expect output
-        False
-    ),
-    # Case 2: Standard Norm, SelfAttention, Norm, MLP, post_layer_norm, num_layers=2
+    # Case 1: Standard Norm, SelfAttention, Norm, MLP, post_layer_norm=True, num_layers=2
     (
         {
             "input_layernorm": "Norm", "self_attention": "SelfAttention",
             "pre_cross_attn_layernorm": "IdentityOp", "cross_attention": "IdentityOp",
             "pre_mlp_layernorm": "Norm", "mlp": "MLP", "post_layer_norm": "True", "num_layers": 2,
         },
-        {"output": "output_default"},  # Expect output
+        {"output": "output_post_layer_norm_true"},
+        False
+    ),
+    # Case 2: Standard Norm, SelfAttention, Norm, MLP, post_layer_norm=False, num_layers=2
+    (
+        {
+            "input_layernorm": "Norm", "self_attention": "SelfAttention",
+            "pre_cross_attn_layernorm": "IdentityOp", "cross_attention": "IdentityOp",
+            "pre_mlp_layernorm": "Norm", "mlp": "MLP", "post_layer_norm": "False", "num_layers": 2,
+        },
+        {"output": "output_post_layer_norm_false"},
         False
     ),
 ]
@@ -89,7 +89,7 @@ def build_msrun_command_list(
                  f"--cross_attention={model_args['cross_attention']}",
                  f"--pre_mlp_layernorm={model_args['pre_mlp_layernorm']}",
                  f"--mlp={model_args['mlp']}",
-                 f"--post_layer_norm={model_args['post_layer_norm']}"
+                 f"--post_layer_norm={model_args['post_layer_norm']}",
                  f"--num_layers={model_args['num_layers']}"
                  ]
     # Log the approximate command for debugging
@@ -215,6 +215,7 @@ class TestTransformerBlock:
             logger.info(f"Loaded output from {output_file_path}. Keys: {list(output_ms_dict.keys())}")
 
             self.check_output_keys(output_ms_dict, data_keys)
+            self.check_acc(output_ms_dict, data_keys)
 
             logger.info("Test passed successfully.")
 
