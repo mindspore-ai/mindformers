@@ -14,6 +14,7 @@
 # ============================================================================
 """Test module for testing MLP used for mindformers."""
 import argparse
+from data_gen_utils import get_init_params, get_golden_datas, get_gpu_datas, get_grads
 
 import mindspore as ms
 from mindspore import nn, ParameterTuple
@@ -21,15 +22,14 @@ from mindformers.parallel_core.transformer_config import TransformerConfig
 from mindformers.parallel_core.training_graph.transformer.mlp import MLP, MLPSubmodules
 from mindformers.parallel_core.training_graph.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from mindformers.parallel_core.training_graph.device_matrix import layout
-from data_gen_utils import get_init_params, get_golden_datas, get_gpu_datas, get_grads
 from tests.utils.double_benchmark import DoubleBenchmarkComparator, DoubleBenchmarkStandard
 from tests.utils.tensor_utils import to_numpy_list
 
-ms.context.set_context(deterministic="ON")
+ms.set_deterministic(True)
 ms.set_context(mode=ms.GRAPH_MODE)
 
 
-def get_config():
+def get_config(args):
     """get TransformerConfig for test"""
     return TransformerConfig(num_layers=1,
                              num_attention_heads=2,
@@ -86,15 +86,15 @@ if __name__ == "__main__":
     parser.set_defaults(add_bias_linear=False)
     parser.set_defaults(gated_linear_unit=False)
     parser.set_defaults(enable_backward=False)
-    args, rest_args = parser.parse_known_args()
+    args_, rest_args = parser.parse_known_args()
 
-    transformer_config = get_config()
-    input_, state_dict = get_init_params(args, transformer_config)
-    net = TestModel(transformer_config, args.input_size)
+    transformer_config = get_config(args_)
+    input_, state_dict = get_init_params(args_, transformer_config)
+    net = TestModel(transformer_config, args_.input_size)
     ms.load_param_into_net(net, state_dict)
 
-    if not args.enable_backward:
-        if args.add_bias_linear:
+    if not args_.enable_backward:
+        if args_.add_bias_linear:
             output, bias = net(input_)
             assert bias is not None
         else:
@@ -103,7 +103,7 @@ if __name__ == "__main__":
         weights = ParameterTuple(net.trainable_params())
         train_network = nn.ForwardValueAndGrad(net, weights=weights, get_all=True, get_by_list=True)
         outputs, grads = train_network(input_)
-        if args.add_bias_linear:
+        if args_.add_bias_linear:
             output, bias = outputs
             assert bias is not None
         else:
@@ -116,9 +116,9 @@ if __name__ == "__main__":
             DoubleBenchmarkComparator.check_pass_or_not(grad_npu, grad_gpu, grad_golden, standard)
     output_npu = output.asnumpy()
     standard = DoubleBenchmarkStandard(dtype="bfloat16")
-    output_gpu = get_gpu_datas(args)
-    output_golden = get_golden_datas(args)
+    output_gpu = get_gpu_datas(args_)
+    output_golden = get_golden_datas(args_)
     DoubleBenchmarkComparator.check_pass_or_not(output_npu, output_gpu, output_golden, standard)
 
-    print(f"Test Case Finished: input_size:{args.input_size}, add_bias-linear:{args.add_bias_linear}, "
-          f"gated_linear_unit:{args.gated_linear_unit}, enable_backward:{args.enable_backward}.")
+    print(f"Test Case Finished: input_size:{args_.input_size}, add_bias-linear:{args_.add_bias_linear}, "
+          f"gated_linear_unit:{args_.gated_linear_unit}, enable_backward:{args_.enable_backward}.")

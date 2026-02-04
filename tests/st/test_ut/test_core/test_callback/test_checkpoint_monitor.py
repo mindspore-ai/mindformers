@@ -633,7 +633,7 @@ class TestCheckpointMonitorSkipTrainableParams:
     @pytest.mark.level1
     @pytest.mark.platform_x86_cpu
     @patch('mindformers.core.callback.callback.get_real_rank', return_value=0)
-    @patch('mindformers.core.callback.callback.context.get_context', return_value=0)  # GRAPH_MODE
+    @patch('mindformers.core.callback.callback.get_context', return_value=0)  # GRAPH_MODE
     @patch('mindformers.core.callback.callback.ms.get_auto_parallel_context',
            return_value='semi_auto_parallel')
     def test_skip_trainable_params_graph_mode_parallel(
@@ -659,7 +659,7 @@ class TestCheckpointMonitorSkipTrainableParams:
     @pytest.mark.level1
     @pytest.mark.platform_x86_cpu
     @patch('mindformers.core.callback.callback.get_real_rank', return_value=0)
-    @patch('mindformers.core.callback.callback.context.get_context', return_value=0)  # GRAPH_MODE
+    @patch('mindformers.core.callback.callback.get_context', return_value=0)  # GRAPH_MODE
     @patch('mindformers.core.callback.callback.ms.get_auto_parallel_context',
            return_value='semi_auto_parallel')
     def test_skip_trainable_params_has_init(self, mock_parallel_ctx, mock_get_ctx, mock_real_rank):
@@ -684,7 +684,7 @@ class TestCheckpointMonitorSkipTrainableParams:
     @pytest.mark.level1
     @pytest.mark.platform_x86_cpu
     @patch('mindformers.core.callback.callback.get_real_rank', return_value=0)
-    @patch('mindformers.core.callback.callback.context.get_context', return_value=0)  # GRAPH_MODE
+    @patch('mindformers.core.callback.callback.get_context', return_value=0)  # GRAPH_MODE
     @patch('mindformers.core.callback.callback.ms.get_auto_parallel_context',
            return_value='semi_auto_parallel')
     def test_skip_trainable_params_pipeline_shared(
@@ -710,8 +710,7 @@ class TestCheckpointMonitorSkipTrainableParams:
     @pytest.mark.level1
     @pytest.mark.platform_x86_cpu
     @patch('mindformers.core.callback.callback.get_real_rank', return_value=0)
-    @patch('mindformers.core.callback.callback.context.get_context',
-           return_value=1)  # PYNATIVE_MODE
+    @patch('mindformers.core.callback.callback.get_context', return_value=1)  # PYNATIVE_MODE
     @patch('mindformers.core.callback.callback.ms.get_auto_parallel_context',
            return_value='semi_auto_parallel')
     def test_skip_trainable_params_pynative_mode(
@@ -737,7 +736,7 @@ class TestCheckpointMonitorSkipTrainableParams:
     @pytest.mark.level1
     @pytest.mark.platform_x86_cpu
     @patch('mindformers.core.callback.callback.get_real_rank', return_value=0)
-    @patch('mindformers.core.callback.callback.context.get_context', return_value=0)  # GRAPH_MODE
+    @patch('mindformers.core.callback.callback.get_context', return_value=0)  # GRAPH_MODE
     @patch('mindformers.core.callback.callback.ms.get_auto_parallel_context',
            return_value='stand_alone')
     def test_skip_trainable_params_standalone(
@@ -952,8 +951,7 @@ class TestCheckpointMonitorSaveCheckpointNetwork:
     @patch('mindformers.core.callback.callback.get_real_rank', return_value=0)
     @patch('mindformers.core.callback.callback.time.time', return_value=1000.0)
     @patch('mindformers.core.callback.callback.os.makedirs')
-    @patch('mindformers.core.callback.callback.context.get_context',
-           return_value=1)  # PYNATIVE_MODE
+    @patch('mindformers.core.callback.callback.get_context', return_value=1)  # PYNATIVE_MODE
     @patch('mindformers.core.callback.callback.ms.get_auto_parallel_context',
            return_value='stand_alone')
     def test_save_checkpoint_network_trainable_params(self, mock_parallel_ctx, mock_get_ctx,
@@ -1075,7 +1073,7 @@ class TestCheckpointMonitorSaveCheckpointNetwork:
     @patch('mindformers.core.callback.callback.get_real_rank', return_value=0)
     @patch('mindformers.core.callback.callback.time.time', return_value=1000.0)
     @patch('mindformers.core.callback.callback.os.makedirs')
-    @patch('mindformers.core.callback.callback.context.get_context', return_value=0)  # GRAPH_MODE
+    @patch('mindformers.core.callback.callback.get_context', return_value=0)  # GRAPH_MODE
     @patch('mindformers.core.callback.callback.ms.get_auto_parallel_context',
            return_value='semi_auto_parallel')
     @patch('mindformers.core.callback.callback._get_merged_param_data')

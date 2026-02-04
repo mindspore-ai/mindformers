@@ -826,7 +826,7 @@ class TestBuildModel:
     model = MagicMock()
     dataset = MagicMock()
 
-    @patch('mindspore.context.get_auto_parallel_context')
+    @patch('mindspore.get_auto_parallel_context')
     def test_build_model_sink_mode_value_error(self, mock_get_auto_parallel_context):
         """test build model sink mode value error"""
         mock_get_auto_parallel_context.return_value = 'auto_parallel'
@@ -843,7 +843,7 @@ class TestBuildModel:
                 do_eval=False, do_predict=False
             )
 
-    @patch('mindspore.context.get_auto_parallel_context')
+    @patch('mindspore.get_auto_parallel_context')
     def test_build_model_infer_predict_layout_when_do_eval_is_true(self, mock_get_auto_parallel_context):
         """test build model infer predict layout when do eval is true"""
         mock_get_auto_parallel_context.return_value = 'auto_parallel'
@@ -859,7 +859,7 @@ class TestBuildModel:
         )
         self.model.infer_predict_layout.assert_called_once_with(*self.dataset)
 
-    @patch('mindspore.context.get_auto_parallel_context')
+    @patch('mindspore.get_auto_parallel_context')
     def test_build_model_infer_predict_layout_when_do_predict_is_true(self, mock_get_auto_parallel_context):
         """test build model infer predict layout when do predict is true"""
         mock_get_auto_parallel_context.return_value = 'auto_parallel'
@@ -875,7 +875,7 @@ class TestBuildModel:
         )
         self.model.infer_predict_layout.assert_called_once_with(*self.dataset)
 
-    @patch('mindspore.context.get_auto_parallel_context')
+    @patch('mindspore.get_auto_parallel_context')
     def test_build_model_model_build(self, mock_get_auto_parallel_context):
         """test build model build"""
         mock_get_auto_parallel_context.return_value = 'auto_parallel'

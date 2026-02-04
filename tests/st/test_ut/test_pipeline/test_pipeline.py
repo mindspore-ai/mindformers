@@ -352,7 +352,7 @@ def test_get_ms_experimental_pipeline_builds_components(monkeypatch):
     assert isinstance(pipeline_obj, DummyPipeline)
     assert pipeline_obj.kwargs["tokenizer"] == "TOKENIZER"
     assert pipeline_obj.kwargs["image_processor"] == "IMAGE_PROCESSOR"
-    assert created["context"] == {"mode": 0, "device_id": 1, "device_target": "Ascend"}
+    assert created["context"] == {"mode": 0}
 
 
 @pytest.mark.level1

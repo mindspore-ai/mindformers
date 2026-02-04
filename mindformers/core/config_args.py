@@ -81,10 +81,6 @@ class ContextConfig(BaseArgsConfig):
     |                         +------------------------------+----------------------------+
     |                         |  save_graphs_path            |  CPU/GPU/Ascend            |
     |                         +------------------------------+----------------------------+
-    |                         |  enable_dump                 |  Ascend                    |
-    |                         +------------------------------+----------------------------+
-    |                         |  save_dump_path              |  Ascend                    |
-    |                         +------------------------------+----------------------------+
     |                         |  deterministic               |  Ascend                    |
     |                         +------------------------------+----------------------------+
     |                         |  print_file_path             |  Ascend                    |
@@ -179,10 +175,6 @@ class ContextConfig(BaseArgsConfig):
             When deterministic mode is on, model ops will be deterministic in Ascend. This means that if op run
             multiple times with the same inputs on the same hardware, it will have the exact same outputs each time.
             This is useful for debugging models.
-        enable_dump (bool):
-            This parameters is deprecated, and will be deleted in the next version.
-        save_dump_path (str):
-            This parameters is deprecated, and will be deleted in the next version.
         print_file_path (str):
             The path of saving print data. If this parameter is set, print data is saved to
             a file by default, and print_file_path is not set, the screen will be displayed.
@@ -432,9 +424,7 @@ class ContextConfig(BaseArgsConfig):
         'device_id',
         'save_graphs',
         'save_graphs_path',
-        'enable_dump',
         'auto_tune_mode',
-        'save_dump_path',
         'enable_reduce_precision',
         'variable_memory_max_size',
         'enable_profiling',
@@ -780,7 +770,7 @@ class ConfigArguments(BaseArgsConfig):
             auto_tune: bool = False,
             filepath_prefix: str = './autotune',
             autotune_per_step: int = 10,
-            seed: int = None,
+            seed: Optional[int] = None,
             train_dataset: Optional[Union[dict, BaseArgsConfig]] = None,
             eval_dataset: Optional[Union[dict, BaseArgsConfig]] = None,
             runner_config: Optional[Union[dict, BaseArgsConfig]] = None,

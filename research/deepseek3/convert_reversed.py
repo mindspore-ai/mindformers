@@ -29,7 +29,7 @@ import mindspore as ms
 from mindspore.ops.operations import Cast
 from mindformers.tools.utils import set_safe_mode_for_file_or_dir
 
-ms.set_context(device_target='CPU')
+ms.set_device(device_target='CPU')
 cpu_cast = Cast().set_device('CPU')
 
 dtype_map = {
@@ -435,7 +435,7 @@ def ms_ckpt_convertor(input_path, output_path, config):
     """Convert ckpt format checkpoint"""
     # for .ckpt format checkpoints, only single file is valid
     if os.path.isdir(input_path):
-        raise ValueError(f"File in `.ckpt` format is valid to convert checkpoints, but get a directory!")
+        raise ValueError("File in `.ckpt` format is valid to convert checkpoints, but get a directory!")
     ms_weights = ms.load_checkpoint(input_path, format='ckpt')
 
     num_layers = config["num_layers"]
@@ -465,7 +465,7 @@ def ms_ckpt_convertor(input_path, output_path, config):
         save_file(pt_layer_weights, saving_file_name)
 
     converted_st_map["metadata"]["total_size"] = total_size
-    converted_model_index_file = os.path.join(output_path, f"model.safetensors.index.json")
+    converted_model_index_file = os.path.join(output_path, "model.safetensors.index.json")
     with open(converted_model_index_file, "w") as f:
         json_string = json.dumps(converted_st_map, default=lambda x: x.__dict__, sort_keys=False, indent=2)
         f.write(json_string)
@@ -512,7 +512,7 @@ def ms_safetensors_convertor(input_path, output_path, config):
         print(f"saving weights in layer-{layer_id} to file {saving_file_name}")
 
     converted_st_map["metadata"]["total_size"] = total_size
-    converted_model_index_file = os.path.join(output_path, f"model.safetensors.index.json")
+    converted_model_index_file = os.path.join(output_path, "model.safetensors.index.json")
     with open(converted_model_index_file, "w") as f:
         json_string = json.dumps(converted_st_map, default=lambda x: x.__dict__, sort_keys=False, indent=2)
         f.write(json_string)

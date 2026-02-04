@@ -705,7 +705,8 @@ class TestTrainerInitMethods(unittest.TestCase):
     @pytest.mark.level1
     @pytest.mark.platform_x86_cpu
     @pytest.mark.env_onecard
-    def test_build_profile_cb_enabled(self):
+    @patch('mindformers.core.callback.callback.get_context', return_value="CPU")
+    def test_build_profile_cb_enabled(self, mock_get_context):  # pylint: disable=unused-argument
         """test _build_profile_cb when profile is enabled."""
         config = deepcopy(self.config)
         config.profile = True

@@ -170,11 +170,11 @@ def main():
 
     args = parser.parse_args()
 
-    ms.context.set_context(deterministic="ON")
+    ms.set_deterministic(True)
     jit_level = "O0"
     infer_boost = "on"
-    ms.set_context(device_target="Ascend",
-                   mode=ms.GRAPH_MODE,
+    ms.set_device(device_target="Ascend")
+    ms.set_context(mode=ms.GRAPH_MODE,
                    jit_config={"jit_level": jit_level, "infer_boost": infer_boost})
     seed_value = 2025
     ms.set_seed(seed_value)

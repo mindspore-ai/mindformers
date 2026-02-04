@@ -179,7 +179,7 @@ def main():
     parser.set_defaults(enable_backward=False)
     args = parser.parse_args()
 
-    ms.context.set_context(deterministic="ON")
+    ms.set_deterministic(True)
     ms.set_context(mode=ms.PYNATIVE_MODE)
 
     # Prepare input and run

@@ -21,11 +21,10 @@ import os
 import pytest
 import numpy as np
 
-import mindspore as ms
 from mindspore import set_seed
 from mindspore.dataset import GeneratorDataset
 
-from mindformers import Trainer, CosineWithWarmUpLR
+from mindformers import Trainer, CosineWithWarmUpLR, build_context
 from mindformers.trainer.optimizer_grouped_parameters import get_optimizer_grouped_parameters
 from mindformers.core import MFLossMonitor
 from mindformers.core.optim.adamw import AdamW
@@ -36,7 +35,7 @@ from mindformers.models.llama import LlamaForCausalLM, LlamaConfig
 cur_dir = os.path.dirname(os.path.abspath(__file__))
 _GLOBAL_TENSORBOARD_WRITER = None
 
-ms.set_context(mode=0)
+build_context({"mode": 0})
 
 _CHECK_TEXT_MAPPING = {
     'seed', 'output_dir', 'run_mode', 'use_parallel', 'resume_training', 'ignore_data_skip', 'data_skip_steps',

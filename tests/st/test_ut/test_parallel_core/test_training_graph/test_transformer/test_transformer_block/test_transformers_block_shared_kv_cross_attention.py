@@ -59,7 +59,7 @@ class TestTransFormersBlock:
         )
 
         build_context({"use_legacy": False})
-        ms.context.set_context(deterministic="ON")
+        ms.set_deterministic(True)
         ms.set_context(mode=ms.GRAPH_MODE)
 
         submodules = SharedKVCrossAttentionSubmodules(

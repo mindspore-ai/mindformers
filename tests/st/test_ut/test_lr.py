@@ -21,7 +21,8 @@ from mindformers.core.lr import (
     CosineWithRestartsAndWarmUpLR, ConstantWarmUpLR, ConstantWithCoolDownLR,
     CosineAnnealingLR, CosineAnnealingWarmRestarts, WarmUpStableDecayLR)
 
-ms.set_context(mode=1, device_target='CPU')
+ms.set_context(mode=1)
+ms.set_device(device_target='CPU')
 
 
 @pytest.mark.level0

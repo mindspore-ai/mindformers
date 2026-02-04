@@ -38,7 +38,11 @@ from mindspore.nn.wrap.cell_wrapper import GradAccumulationCell
 from mindspore.nn.utils import no_init_parameters
 from mindformers.mindformer_book import MindFormerBook
 from mindformers.core import build_lr, build_optim, build_callback, build_metric
-from mindformers.core.context.build_context import is_legacy_model
+from mindformers.core.context.build_context import (
+    get_context as mf_get_context,
+    is_legacy_model,
+    set_context as mf_set_context,
+)
 from mindformers.core.parallel_config import build_parallel_config
 from mindformers.dataset import build_dataset, check_dataset_config, check_dataset_iterable, BaseDataset
 from mindformers.models import build_network, build_processor, build_tokenizer, \
@@ -520,9 +524,9 @@ class BaseTrainer:
                 network = PipelineCellWithTwoOutput(network, micro_size=micro_batch_num)
             else:
                 network = PipelineCell(network, micro_size=micro_batch_num)
-        if parallel_mode in ["semi_auto_parallel", "auto_parallel"] and ms.get_context('mode') == 0:
+        if parallel_mode in ["semi_auto_parallel", "auto_parallel"] and mf_get_context('mode') == 0:
             network = _VirtualDatasetCell(network)
-            ds_broadcast_level = ms.context.get_context("dataset_broadcast_opt_level")
+            ds_broadcast_level = mf_get_context("dataset_broadcast_opt_level")
             if ds_broadcast_level > 0:
                 # pylint: disable=W0212
                 network._virtual_dataset.add_prim_attr("repeat_dim_direct", "right")
@@ -553,9 +557,9 @@ class BaseTrainer:
                 if seq_split_num > 1:
                     raise ValueError("When using seq pipe, cannot apply calculate_per_token_loss.")
             network = PipelineCellWithMultiOutputs(network, micro_size=micro_batch_num)
-        if parallel_mode in ["semi_auto_parallel", "auto_parallel"] and ms.get_context('mode') == 0:
+        if parallel_mode in ["semi_auto_parallel", "auto_parallel"] and mf_get_context('mode') == 0:
             network = _VirtualDatasetCell(network)
-            ds_broadcast_level = ms.context.get_context("dataset_broadcast_opt_level")
+            ds_broadcast_level = mf_get_context("dataset_broadcast_opt_level")
             if ds_broadcast_level > 0:
                 # pylint: disable=W0212
                 network._virtual_dataset.add_prim_attr("repeat_dim_direct", "right")
@@ -571,9 +575,9 @@ class BaseTrainer:
     def wrap_eval_network_with_tool_cells(network):
         """For evaluate in training process, warp the network with some tool cells."""
         parallel_mode = ms.context.get_auto_parallel_context("parallel_mode")
-        if parallel_mode in ["semi_auto_parallel", "auto_parallel"] and ms.get_context('mode') == 0:
+        if parallel_mode in ["semi_auto_parallel", "auto_parallel"] and mf_get_context('mode') == 0:
             network = _VirtualDatasetCell(network)
-            ds_broadcast_level = ms.context.get_context("dataset_broadcast_opt_level")
+            ds_broadcast_level = mf_get_context("dataset_broadcast_opt_level")
             if ds_broadcast_level > 0:
                 # pylint: disable=W0212
                 network._virtual_dataset.add_prim_attr("repeat_dim_direct", "right")
@@ -855,7 +859,7 @@ class BaseTrainer:
 
     def _process_megatron_dataset(self, dataset, config):
         """Dataset processing for Megatron Dataset."""
-        if ms.context.get_context("dataset_broadcast_opt_level") < 3:
+        if mf_get_context("dataset_broadcast_opt_level") < 3:
             raise ValueError("If using `BlendedMegatronDatasetDataLoader`, please set "
                              "`dataset_broadcast_opt_level: 3` in the `parallel_speed_up.json` file.")
 
@@ -872,7 +876,7 @@ class BaseTrainer:
     @staticmethod
     def _check_sink_mode_with_ds_broadcast(config):
         """Check sink_mode with dataset_broadcast_opt_level."""
-        ds_broadcast_level = ms.context.get_context("dataset_broadcast_opt_level")
+        ds_broadcast_level = mf_get_context("dataset_broadcast_opt_level")
         if ds_broadcast_level > 0 and not config.runner_config.sink_mode:
             raise ValueError(
                 f"Current `dataset_broadcast_opt_level` is {ds_broadcast_level}, "
@@ -949,14 +953,14 @@ class BaseTrainer:
     @staticmethod
     def _set_dataset_broadcast_opt_level(config):
         """Set the dataset broadcast optimization level."""
-        ds_broadcast_level = ms.context.get_context("dataset_broadcast_opt_level")
+        ds_broadcast_level = mf_get_context("dataset_broadcast_opt_level")
         if ds_broadcast_level == 0:
             logger.info("Set ds_broadcast_level=3 by default while enabling broadcast dataset.")
             ds_broadcast_level = 3
 
         # Override with the value from config if provided, otherwise keep the existing one
         ds_broadcast_level = config.context.get('dataset_broadcast_opt_level', ds_broadcast_level)
-        ms.set_context(dataset_broadcast_opt_level=ds_broadcast_level)
+        mf_set_context(dataset_broadcast_opt_level=ds_broadcast_level)
 
     def _train_dataset_postprocess(self, dataset, config):
         """

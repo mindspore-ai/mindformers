@@ -403,10 +403,10 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    ms.set_context(device_target="Ascend",
-                   mode=ms.GRAPH_MODE,
-                   jit_config={"jit_level": "O0", "infer_boost": "on"},
-                   deterministic="ON")
+    ms.set_device(device_target="Ascend")
+    ms.set_deterministic(True)
+    ms.set_context(mode=ms.GRAPH_MODE,
+                   jit_config={"jit_level": "O0", "infer_boost": "on"}) 
 
     runner = SimpleMCoreRunner(args)
     runner.run()

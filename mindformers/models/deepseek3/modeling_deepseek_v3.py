@@ -16,6 +16,7 @@
 import os
 import mindspore as ms
 
+from mindformers.core.context.build_context import get_context
 from mindformers.tools.register import MindFormerRegister, MindFormerModuleType
 
 from .configuration_deepseek_v3 import DeepseekV3Config
@@ -35,12 +36,12 @@ class DeepseekV3ForCausalLM:
         Tensor, the loss or logits of the network.
     """
 
-    def __new__(cls, config: DeepseekV3Config, *args, **kwargs):
+    def __new__(cls, config: DeepseekV3Config, *args, **kwargs):  # pylint: disable=unused-argument
         # get run mode to init different model.
         # predict mode used to deploy.
         # when predict mode not supported, we can use online_predict mode to do inference task.
         if os.environ.get("RUN_MODE") == "predict":
             return InferenceDeepseekV3ForCausalLM(config=config)
-        if ms.get_context("mode") == ms.context.PYNATIVE_MODE:
+        if get_context("mode") == ms.context.PYNATIVE_MODE:
             return PyNativeDeepseekV3ForCausalLM(config=config)
         return TrainingDeepseekV3ForCausalLM(config=config)

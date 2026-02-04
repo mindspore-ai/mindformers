@@ -38,7 +38,6 @@ def test_qwen3_30b_a3b_predict_mcore(device_num: int = 1):
     config.use_parallel = device_num > 1
     config.parallel_config.model_parallel = device_num
     build_context(config)
-    set_context(graph_kernel_flags="--disable_pass=matmul_split_fusion")
     # Auto tokenizer
     tokenizer = AutoTokenizer.from_pretrained(config.pretrained_model_dir)
     # Auto config
@@ -83,7 +82,7 @@ def test_qwen3_30b_a3b_predict_mcore(device_num: int = 1):
                                    do_sample=False,
                                    return_dict_in_generate=False)
 
-        for i in range(0, len(outputs)):
+        for i in range(0, len(outputs)):  # pylint: disable=consider-using-enumerate
             output_text = tokenizer.decode(outputs[i])
             logger.info("test_qwen3_30b_a3b_predict, output_text:{}".format(str(output_text)))
             compare_distance(output_text, answer)

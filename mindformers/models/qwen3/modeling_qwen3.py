@@ -20,8 +20,8 @@ __all__ = [
 import os
 
 import mindspore as ms
-import mindspore.context as ms_context
 
+from mindformers.core.context.build_context import get_context
 from mindformers.tools.register import MindFormerRegister, MindFormerModuleType
 from .utils import Qwen3PreTrainedModel
 from .modeling_qwen3_infer import InferenceQwen3ForCausalLM
@@ -57,6 +57,6 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel):
         if os.environ.get("RUN_MODE") == "predict":
             return InferenceQwen3ForCausalLM(config=config)
 
-        if ms.get_context("mode") == ms_context.PYNATIVE_MODE:
+        if get_context("mode") == ms.context.PYNATIVE_MODE:
             return PyNativeQwen3ForCausalLM(config=config)
         return TrainingQwen3ForCausalLM(config=config)

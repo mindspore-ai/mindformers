@@ -99,7 +99,7 @@ class TestMFLossMonitor(unittest.TestCase):
     @pytest.mark.env_onecard
     def test_fix_loss_for_parallel_no_adjustment(self):
         """Test _fix_loss_for_parallel without adjustment"""
-        with patch('mindspore.context.get_auto_parallel_context') as mock_get_context:
+        with patch('mindspore.get_auto_parallel_context') as mock_get_context:
             mock_get_context.return_value = 1  # pipeline_stages = 1
 
             original_loss = 1.0
@@ -115,7 +115,7 @@ class TestMFLossMonitor(unittest.TestCase):
         self.monitor.mirco_size = 2
         self.monitor.calculate_per_token_loss = False
 
-        with patch('mindspore.context.get_auto_parallel_context') as mock_get_context:
+        with patch('mindspore.get_auto_parallel_context') as mock_get_context:
             mock_get_context.return_value = 2  # pipeline_stages = 2
 
             original_loss = 2.0
@@ -134,7 +134,7 @@ class TestMFLossMonitor(unittest.TestCase):
         mock_cb_params.train_network = Mock()
         mock_cb_params.train_network.current_phase = 'train_phase'
 
-        with patch('mindspore.get_context') as mock_get_context:
+        with patch('mindformers.core.callback.callback.get_context') as mock_get_context:
             mock_get_context.return_value = ms.GRAPH_MODE
 
             result = self.monitor._can_calculate_model_flops(mock_cb_params)
@@ -162,8 +162,9 @@ class TestMFLossMonitorIntegration(unittest.TestCase):
     @pytest.mark.platform_x86_cpu
     @pytest.mark.env_onecard
     @patch('mindformers.core.callback.callback.get_real_group_size')
+    @patch('mindformers.core.callback.callback.get_context')
     @patch('time.time')
-    def test_on_train_step_end_basic_flow(self, mock_time, mock_get_group_size):
+    def test_on_train_step_end_basic_flow(self, mock_time, mock_get_context, mock_get_group_size):
         """Test on_train_step_end basic flow"""
         mock_time.return_value = 1000.0
         mock_get_group_size.return_value = 1
@@ -191,7 +192,7 @@ class TestMFLossMonitorIntegration(unittest.TestCase):
 
         # Mock auto parallel context
         with patch('mindspore.get_auto_parallel_context') as mock_auto_parallel, \
-                patch('mindspore.context.get_auto_parallel_context') as mock_context_auto_parallel:
+                patch('mindspore.get_auto_parallel_context') as mock_context_auto_parallel:
             mock_auto_parallel.return_value = 'data_parallel'
             mock_context_auto_parallel.return_value = 1  # pipeline_stages
 
@@ -295,7 +296,7 @@ class TestMFLossMonitorExtended:
         )
 
         # Mock both context.get_auto_parallel_context and get_auto_parallel_context
-        with patch('mindspore.context.get_auto_parallel_context', return_value=2), \
+        with patch('mindspore.get_auto_parallel_context', return_value=2), \
                 patch('mindspore.get_auto_parallel_context', return_value='not_zero_bubble_v'):
             loss = 8.0
             fixed_loss = monitor._fix_loss_for_parallel(loss, print_warning=False)
@@ -319,7 +320,7 @@ class TestMFLossMonitorExtended:
         )
 
         # Mock pipeline_stages=1 (no pipeline)
-        with patch('mindspore.context.get_auto_parallel_context', return_value=1), \
+        with patch('mindspore.get_auto_parallel_context', return_value=1), \
                 patch('mindspore.get_auto_parallel_context', return_value='not_zero_bubble_v'):
             loss = 8.0
             fixed_loss = monitor._fix_loss_for_parallel(loss, print_warning=False)
@@ -342,7 +343,7 @@ class TestMFLossMonitorExtended:
             calculate_per_token_loss=False
         )
 
-        with patch('mindspore.context.get_auto_parallel_context', return_value=1), \
+        with patch('mindspore.get_auto_parallel_context', return_value=1), \
                 patch('mindspore.get_auto_parallel_context', return_value='data_parallel'):
             loss = 8.0
             fixed_loss = monitor._fix_loss_for_parallel(loss)
@@ -647,7 +648,7 @@ class TestMFLossMonitorCanCalculateFlops:
     @patch('mindformers.core.callback.callback.get_real_group_size', return_value=1)
     @patch('mindformers.core.callback.callback.get_tensorboard_writer', return_value=None)
     @patch('mindformers.core.callback.callback.get_tensorboard_args', return_value={})
-    @patch('mindformers.core.callback.callback.ms.get_context', return_value=0)  # GRAPH_MODE
+    @patch('mindformers.core.callback.callback.get_context', return_value=0)  # GRAPH_MODE
     @patch('mindformers.core.callback.callback.is_legacy_model', return_value=True)
     def test_can_calculate_flops_train_mode(self, mock_legacy, mock_get_context, *mocks):
         """Test _can_calculate_model_flops in train mode"""
@@ -670,7 +671,7 @@ class TestMFLossMonitorCanCalculateFlops:
     @patch('mindformers.core.callback.callback.get_real_group_size', return_value=1)
     @patch('mindformers.core.callback.callback.get_tensorboard_writer', return_value=None)
     @patch('mindformers.core.callback.callback.get_tensorboard_args', return_value={})
-    @patch('mindformers.core.callback.callback.ms.get_context', return_value=1)  # PYNATIVE_MODE
+    @patch('mindformers.core.callback.callback.get_context', return_value=1)  # PYNATIVE_MODE
     @patch('mindformers.core.callback.callback.logger')
     def test_can_calculate_flops_pynative_mode(self, mock_logger, mock_get_context, *mocks):
         """Test _can_calculate_model_flops in pynative mode (should fail)"""
@@ -710,7 +711,7 @@ class TestMFLossMonitorCanCalculateFlops:
     @patch('mindformers.core.callback.callback.get_real_group_size', return_value=1)
     @patch('mindformers.core.callback.callback.get_tensorboard_writer', return_value=None)
     @patch('mindformers.core.callback.callback.get_tensorboard_args', return_value={})
-    @patch('mindformers.core.callback.callback.ms.get_context', return_value=0)
+    @patch('mindformers.core.callback.callback.get_context', return_value=0)
     @patch('mindformers.core.callback.callback.logger')
     def test_can_calculate_flops_no_current_phase(self, mock_logger, mock_get_context, *mocks):
         """Test _can_calculate_model_flops when network has no current_phase"""
@@ -731,7 +732,7 @@ class TestMFLossMonitorCanCalculateFlops:
     @patch('mindformers.core.callback.callback.get_real_group_size', return_value=1)
     @patch('mindformers.core.callback.callback.get_tensorboard_writer', return_value=None)
     @patch('mindformers.core.callback.callback.get_tensorboard_args', return_value={})
-    @patch('mindformers.core.callback.callback.ms.get_context', return_value=0)
+    @patch('mindformers.core.callback.callback.get_context', return_value=0)
     @patch('mindformers.core.callback.callback.is_legacy_model', return_value=False)
     @patch('mindformers.core.callback.callback.logger')
     def test_can_calculate_flops_moe_model_non_legacy(
@@ -760,7 +761,7 @@ class TestMFLossMonitorPrintOutputInfoLearningRate:
     @patch('mindformers.core.callback.callback.get_real_group_size', return_value=1)
     @patch('mindformers.core.callback.callback.get_tensorboard_writer', return_value=None)
     @patch('mindformers.core.callback.callback.get_tensorboard_args', return_value={})
-    @patch('mindformers.core.callback.callback.ms.context.get_context', return_value='CPU')
+    @patch('mindformers.core.callback.callback.context.get_context', return_value='CPU')
     @patch('mindformers.core.callback.callback.logger')
     def test_print_output_info_lr_schedule_cpu(self, mock_logger, mock_get_context, *mocks):
         """Test print_output_info with LearningRateSchedule on CPU"""
@@ -788,7 +789,7 @@ class TestMFLossMonitorPrintOutputInfoLearningRate:
     @patch('mindformers.core.callback.callback.get_real_group_size', return_value=1)
     @patch('mindformers.core.callback.callback.get_tensorboard_writer', return_value=None)
     @patch('mindformers.core.callback.callback.get_tensorboard_args', return_value={})
-    @patch('mindformers.core.callback.callback.ms.context.get_context', return_value='Ascend')
+    @patch('mindformers.core.callback.callback.context.get_context', return_value='Ascend')
     def test_print_output_info_lr_schedule_ascend(self, mock_get_context, *mocks):
         """Test print_output_info with LearningRateSchedule on Ascend"""
 

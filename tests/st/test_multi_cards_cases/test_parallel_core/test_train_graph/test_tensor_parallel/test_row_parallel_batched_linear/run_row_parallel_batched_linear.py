@@ -14,18 +14,18 @@
 # ============================================================================
 """Test module for testing RowParallelBatchedLinear used for mindformers."""
 import argparse
+from data_gen_utils import get_data, get_output
 
 import mindspore as ms
 from mindformers.parallel_core.transformer_config import TransformerConfig
 from mindformers.parallel_core.training_graph.tensor_parallel.batched_layers import RowParallelBatchedLinear
-from data_gen_utils import get_data, get_output
 from tests.utils.double_benchmark import DoubleBenchmarkComparator, DoubleBenchmarkStandard
 
-ms.context.set_context(deterministic="ON")
+ms.set_deterministic(True)
 ms.set_context(mode=ms.GRAPH_MODE)
 
 
-def get_config():
+def get_config(args):
     """get TransformerConfig for test"""
     return TransformerConfig(data_parallel_size=args.dp,
                              tensor_model_parallel_size=args.tp,
@@ -69,8 +69,8 @@ if __name__ == "__main__":
         type=int,
         help='num_moe_experts')
 
-    args, rest_args = parser.parse_known_args()
-    config = get_config()
+    args_, rest_args = parser.parse_known_args()
+    config = get_config(args_)
     state_dict, input_ = get_data(config)
     net = RowParallelBatchedLinear(input_size=config.hidden_size, output_size=config.ffn_hidden_size,
                                    config=config, init_method=config.init_method)

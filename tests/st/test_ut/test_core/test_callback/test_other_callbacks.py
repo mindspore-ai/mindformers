@@ -184,7 +184,7 @@ class TestTopkBiasBalanceCallback:
 
     @pytest.mark.level1
     @pytest.mark.platform_x86_cpu
-    @patch('mindspore.context.get_auto_parallel_context')
+    @patch('mindspore.get_auto_parallel_context')
     @patch('mindformers.core.callback.callback.get_tensorboard_writer')
     @patch('mindformers.core.callback.callback.get_tensorboard_args')
     def test_update_topk_bias(self, mock_args, mock_writer, mock_get_parallel):

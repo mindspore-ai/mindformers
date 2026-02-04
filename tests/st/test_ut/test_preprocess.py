@@ -19,13 +19,13 @@ import time
 import pytest
 
 import numpy as np
-from mindspore import set_context, Tensor
+from mindspore import set_device, Tensor
 
 from mindformers.tools.utils import is_pynative
 from mindformers.generation.text_generator import GenerationMixin
 from mindformers.tools.debug_info import DetailedLatency, Profiling
 
-set_context(device_target='CPU')
+set_device(device_target='CPU')
 
 
 class TestConfig:

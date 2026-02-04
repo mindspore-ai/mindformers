@@ -43,7 +43,8 @@ class ConstantTensorCell:
         del kwargs
         return ms.Tensor(np.array([self.value], dtype=np.float32))
 
-ms.set_context(mode=1, device_target='CPU')
+ms.set_context(mode=1)
+ms.set_device(device_target='CPU')
 # Ensure pipeline_stages is configured for tests to avoid division-by-zero
 # inside PerplexityMetric initialization.
 try:

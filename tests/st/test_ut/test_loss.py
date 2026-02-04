@@ -20,7 +20,8 @@ from mindspore import Tensor
 
 from mindformers import CrossEntropyLoss
 
-ms.set_context(mode=1, device_target='CPU')
+ms.set_context(mode=1)
+ms.set_device(device_target='CPU')
 
 
 def test_cross_entropy_loss():
