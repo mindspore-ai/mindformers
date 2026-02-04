@@ -13,7 +13,7 @@ use_legacy: False
 # trainer config
 trainer:
   type: CausalLanguageModelingTrainer
-  model_name: 'telechat3'
+  model_name: 'telechat3_moe'
 
 # runner config
 runner_config:
