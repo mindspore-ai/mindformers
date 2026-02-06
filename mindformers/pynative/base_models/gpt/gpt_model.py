@@ -97,6 +97,7 @@ class GPTModel(nn.Cell):
         self.post_process = post_process
         self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
         self.use_attn_mask_compression = config.use_attn_mask_compression or config.use_eod_attn_mask_compression
+        self.return_logits = False
 
         if hasattr(self.config, 'position_embedding_type'):
             # By default, use the position_embedding_type configuration in TransformerConfig.
@@ -282,7 +283,7 @@ class GPTModel(nn.Cell):
             logits = self.reshape(logits, (-1, logits.shape[-1]))
         logits = self.cast(logits, dtype.float32)
 
-        if not self.training:
+        if not self.training or self.return_logits:
             return logits.contiguous()
 
         # labels origin shape is [b s], Transpose is not required.
@@ -395,8 +396,9 @@ class GPTModel(nn.Cell):
         """
         if loss_mask is None:
             loss_mask = self.cast(self.not_equal(input_ids, self.pad_token_id), dtype.float32)
-        label_mask = self.cast(self.not_equal(labels, self.ignore_token_id), dtype.float32)
-        loss_mask = self.mul(loss_mask, label_mask)
+        if labels is not None:
+            label_mask = self.cast(self.not_equal(labels, self.ignore_token_id), dtype.float32)
+            loss_mask = self.mul(loss_mask, label_mask)
         if self.use_attn_mask_compression:
             attention_mask = self.casual_mask()
         elif attention_mask is None:
