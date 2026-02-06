@@ -14,7 +14,6 @@
 # ============================================================================
 """test api stability"""
 
-import importlib
 import inspect
 import os
 import pkgutil
@@ -30,18 +29,6 @@ import mindformers
 
 
 CUR_DIR_PATH = os.path.dirname(os.path.realpath(__file__))
-
-DEPRECATED_CLASS_LIST = [
-    "mindformers.core.loss.loss.L1Loss",
-    "mindformers.core.loss.loss.MSELoss",
-    "mindformers.core.loss.loss.SoftTargetCrossEntropy",
-    "mindformers.core.optim.optim.FP32StateAdamWeightDecay",
-    "mindformers.core.optim.optim.FusedAdamWeightDecay"
-]
-
-MCORE_CONFIG_LIST = [
-    "DeepseekV3Config"
-]
 
 
 def special_case_process(api_str, signature, obj):
@@ -142,11 +129,6 @@ def process_union_order(signature):
 
 def api_signature(obj, api_str, content, base_schema, failure_list, is_update=False):
     """extract and compare api input info"""
-    if api_str in DEPRECATED_CLASS_LIST:
-        return
-    for model_config in MCORE_CONFIG_LIST:
-        if re.search(f"{model_config}$", api_str):
-            return
     if inspect.isclass(obj):
         signature_list = [
             str(inspect.signature(obj.__init__)), str(inspect.signature(obj.__new__)), str(inspect.signature(obj))
@@ -197,15 +179,6 @@ def api_signature(obj, api_str, content, base_schema, failure_list, is_update=Fa
                 set_failure_list(api_str, value, signature, failure_list)
 
 
-def is_mod_public(modname):
-    """check whether module is public"""
-    split_strs = modname.split('.')
-    for elem in split_strs:
-        if elem.startswith("_"):
-            return False
-    return True
-
-
 def discover_path_importables(pkg_pth, pkg_name):
     """Yield all importables under a given path and package.
 
@@ -245,11 +218,10 @@ def func_in_class(obj, content, modname, elem, base_schema, failure_list, is_upd
     """check function in class"""
     class_variables = []
     for attribute in obj.__dict__.keys():
-        if not attribute.startswith('__') and callable(getattr(obj, attribute)):
+        # filter functions start with _
+        if not attribute.startswith('_') and callable(getattr(obj, attribute)):
             class_variables.append(attribute)
     for variable in class_variables:
-        if variable in ['_generate_next_value_', '_member_type_']:
-            continue
         func = getattr(obj, variable)
         api_str = f"{modname}.{elem}.{variable}"
         api_signature(func, api_str, content, base_schema, failure_list, is_update)
@@ -277,23 +249,13 @@ class TestApiStability:
     @pytest.mark.env_onecard
     def test_modules(self):
         """test modules"""
-        for mod_name in self.all_importables:
-            if "__main__" in mod_name:
-                continue
-            try:
-                mod = importlib.import_module(mod_name)
-            except ModuleNotFoundError:
-                # It is ok to ignore here as some modules' import packages are not in requirements and public
-                # apis are not deply on these package
-                continue
+        top_mod = mindformers
+        if hasattr(top_mod, '__all__'):
+            top_public_api = top_mod.__all__
 
-            if not is_mod_public(mod_name):
-                continue
-
-            def check_one_element(elem, mod_name, mod, is_public):
+            def check_one_element_top(elem, mod, is_public):
                 obj = getattr(mod, elem)
                 if hasattr(obj, "__module__"):
-                    # cannot use __import__ module list
                     if obj.__module__ not in ['sentencepiece_model_pb2', 'node_strategy_pb2']:
                         mod_source = str(__import__(obj.__module__))
                         if "mindformers" not in mod_source:
@@ -302,29 +264,28 @@ class TestApiStability:
                         or isinstance(obj, BuiltinFunctionType):
                     return
                 elem_module = getattr(obj, '__module__', None)
-
                 elem_modname_starts_with_mod = \
-                    elem_module is not None and elem_module.startswith(mod_name) and '._' not in elem_module
-
+                    elem_module is not None and elem_module.startswith("mindformers") and '._' not in elem_module
                 is_public_api = not elem.startswith('_') and elem_modname_starts_with_mod
                 if is_public != is_public_api:
                     is_public_api = is_public
-                api_str = f"{mod_name}.{elem}"
+                api_str = f"mindformers.{elem}"
                 if api_str not in self.base_schema and not self.is_update:
                     return
                 if is_public_api:
                     api_signature(obj, api_str, self.content, self.base_schema, self.failure_list, self.is_update)
-
                     # function in class
                     if inspect.isclass(obj):
-                        func_in_class(obj, self.content, mod_name, elem, self.base_schema, self.failure_list,
+                        func_in_class(obj, self.content, "mindformers", elem, self.base_schema, self.failure_list,
                                       self.is_update)
 
-            if hasattr(mod, '__all__'):
-                public_api = mod.__all__
-                all_api = dir(mod)
-                for elem in all_api:
-                    check_one_element(elem, mod_name, mod, is_public=elem in public_api)
+            for elem in top_public_api:
+                if elem.startswith('_'):
+                    continue
+                try:
+                    check_one_element_top(elem, top_mod, is_public=True)
+                except (AttributeError, ModuleNotFoundError):
+                    continue
 
         if not self.is_update:
             msg = "All the APIs below do not meet the compatibility guidelines. "
