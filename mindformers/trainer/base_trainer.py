@@ -53,7 +53,8 @@ from mindformers.tools.logger import logger
 from mindformers.utils.tensorboard import _set_tensorboard_writer, _unset_tensorboard_writer, \
     write_args_to_tensorboard, update_tensorboard_args
 from mindformers.utils.resume_ckpt_utils import get_resume_checkpoint, load_resume_checkpoint
-from mindformers.tools.utils import count_params, get_real_rank, get_real_group_size, FILE_PERMISSION
+from mindformers.tools.utils import count_params, get_real_rank, get_real_group_size, FILE_PERMISSION, \
+    get_output_root_path
 from mindformers.tools.check_rules import check_rules
 from mindformers.core.callback.callback import (
     EvalCallBack,
@@ -67,8 +68,8 @@ from mindformers.core.callback.callback import (
 )
 from mindformers.modules.seq_pipe import SequenceSplit
 from mindformers.utils.load_checkpoint_utils import get_load_path_after_hf_convert
-from mindformers.checkpoint.checkpoint import load_checkpoint, CommonInfo, load_hf_checkpoint
-from mindformers.checkpoint.utils import compile_model, is_hf_checkpoint
+from mindformers.checkpoint.checkpoint import load_checkpoint, CommonInfo, load_hf_checkpoint, get_checkpoint_path
+from mindformers.checkpoint.utils import compile_model, is_hf_checkpoint, get_healthy_checkpoint_path
 from mindformers.dataset.dataloader.hf_dataloader import _resume_hf_iterable_dataset
 from ..core.config_args import ConfigArguments
 from .training_args import TrainingArguments
@@ -1124,7 +1125,14 @@ class BaseTrainer:
         logger.info("Create train dataset finish, dataset size:%d", dataset.get_dataset_size())
 
         append_info = None
+        use_checkpoint_health_monitor = (
+            getattr(config, "use_checkpoint_health_monitor", False)) if config.use_legacy_format else False
         if not config.use_legacy_format:
+            if (self.config.monitor_config and self.config.monitor_config.health_checkpoint and
+                    self.config.monitor_config.health_checkpoint.embedding_local_norm_threshold):
+                use_checkpoint_health_monitor = True
+                if config.resume_training:
+                    config.load_checkpoint = get_healthy_checkpoint_path()
             if config.resume_training and config.load_checkpoint and not check_is_reboot_node():
                 logger.info(".............Start load resume context from common.json..................")
                 common_file = os.path.join(config.load_checkpoint, 'common.json')
@@ -1319,7 +1327,6 @@ class BaseTrainer:
         hidden_size = config.model.model_config.hidden_size
         vocab_size = config.model.model_config.vocab_size
         embedding_size = None
-        use_checkpoint_health_monitor = getattr(config, "use_checkpoint_health_monitor", False)
         if use_checkpoint_health_monitor:
             if hidden_size is None:
                 raise ValueError("You should set the hidden_size while use the checkpoint health monitor function.")
@@ -1362,6 +1369,9 @@ class BaseTrainer:
             elif "type" in callback and callback["type"] == "CheckpointMonitor":
                 logger.info("Recommend using weights in the safetensors format.")
                 embedding_local_norm_threshold = callback.get("embedding_local_norm_threshold", 1.0)
+                if not self.config.use_legacy_format and use_checkpoint_health_monitor:
+                    embedding_local_norm_threshold = (
+                        self.config.monitor_config.health_checkpoint.embedding_local_norm_threshold)
                 # load params into net
                 default_args = {"append_info": append_info,
                                 "global_batch_size": self.global_batch_size,
@@ -1407,6 +1417,36 @@ class BaseTrainer:
 
             def ckpt_load_func():
                 logger.info('Begin to load ckpt')
+                logger.info("..........Load Checkpoint for TFT.........")
+                if use_checkpoint_health_monitor:
+                    checkpoint_dir = get_healthy_checkpoint_path()
+                    if not checkpoint_dir:
+                        raise ValueError("No healthy checkpoint found.")
+                    logger.info("Load healthy checkpoint: %s", checkpoint_dir)
+                else:
+                    checkpoint_dir = get_checkpoint_path(os.path.join(get_output_root_path(), "checkpoint"))
+                    logger.info("Load default checkpoint: %s", checkpoint_dir)
+                common_info = CommonInfo.load_common(os.path.join(checkpoint_dir, 'common.json'))
+                global_step = common_info.global_step
+                if common_info.global_batch_size != self.global_batch_size:
+                    global_step = int(common_info.global_step *
+                                      (common_info.global_batch_size / self.global_batch_size))
+                load_checkpoint(
+                    checkpoint_dir,
+                    network,
+                    optimizer,
+                    global_step,
+                    config.balanced_load)
+                logger.info("..........Load Checkpoint for TFT Done..........")
+                param_dict = {
+                    'epoch_num': ms.tensor(common_info.epoch_num),
+                    'step_num': ms.tensor(common_info.step_num),
+                }
+                logger.info('End to load ckpt')
+                return param_dict, None
+
+            def ckpt_load_func_legacy():
+                logger.info('Begin to load ckpt')
                 ckpt_file = get_resume_checkpoint(f'{self.config.output_dir}/checkpoint', True,
                                                   self.config.load_ckpt_format)
                 remove_redundancy = False if config.remove_redundancy is None else config.remove_redundancy
@@ -1418,7 +1458,7 @@ class BaseTrainer:
                 "ckpt_save_fn": ckpt_save_func,
                 "initial_epoch": config.runner_config.initial_epoch,
                 "initial_step": config.runner_config.initial_step,
-                "ckpt_load_fn": ckpt_load_func
+                "ckpt_load_fn": ckpt_load_func if not self.config.use_legacy_format else ckpt_load_func_legacy
             }
             default_callbacks.append(build_callback({"type": "TrainFaultTolerance"}, default_args=default_args))
 

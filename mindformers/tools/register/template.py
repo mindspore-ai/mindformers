@@ -564,6 +564,7 @@ class MonitorConfig(Config):
     global_norm_spike_threshold = 3.0
     global_norm_spike_count_threshold = 10
     stable_rank_config = StableRankConfig()
+    health_checkpoint = None
 
     _name = "monitor_config"
 
