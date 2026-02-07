@@ -21,6 +21,7 @@ from mindformers.parallel_core.training_graph.base_models.gpt.gpt_model import G
 from mindformers.parallel_core.training_graph.base_models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from mindformers.parallel_core.utils.model_mixin import TrainModelMixin
 from mindformers.models.qwen3.utils import Qwen3PreTrainedModel
+from mindformers.checkpoint.converter.template import register_hf_weight_template
 from .configuration_qwen3 import Qwen3Config
 
 
@@ -36,6 +37,7 @@ class TrainingQwen3ForCausalLM(TrainModelMixin, Qwen3PreTrainedModel):
 
     """
 
+    @register_hf_weight_template
     def __init__(self, config: Qwen3Config):
         super().__init__(config, auto_prefix=False)
         config: TransformerConfig = self.convert_to_transformer_config(self.config)

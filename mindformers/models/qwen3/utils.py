@@ -16,7 +16,11 @@
 from mindformers.models.qwen3.configuration_qwen3 import Qwen3Config
 from mindformers.models.modeling_utils import PreTrainedModel
 from mindformers.parallel_core.utils.model_mixin import ModelMixin
-
+from mindformers.checkpoint.converter.convert_op import (
+    RenameConvertOp,
+    ConcatConvertOp,
+    QKVConvertOp,
+)
 
 class Qwen3PreTrainedModel(PreTrainedModel, ModelMixin):
     """
@@ -42,4 +46,64 @@ class Qwen3PreTrainedModel(PreTrainedModel, ModelMixin):
         ('model.norm.', 'decoder.final_layernorm.'),
         ('lm_head.', 'output_layer.'),
         ('model.layers.', 'decoder.layers.')
+    ]
+
+    weight_converters = [
+        # ========== Embedding and Output ==========
+        RenameConvertOp(
+            hf_names="model.embed_tokens.weight",
+            mf_names="embedding.word_embeddings.weight"
+        ),
+        RenameConvertOp(
+            hf_names="lm_head.weight",
+            mf_names="output_layer.weight"
+        ),
+        RenameConvertOp(
+            hf_names="model.norm.weight",
+            mf_names="decoder.final_layernorm.weight"
+        ),
+
+        # ========== Attention ==========
+        QKVConvertOp(
+            hf_names=[
+                "model.layers.{}.self_attn.q_proj.weight",
+                "model.layers.{}.self_attn.k_proj.weight",
+                "model.layers.{}.self_attn.v_proj.weight"
+            ],
+            mf_names=["decoder.layers.{}.self_attention.linear_qkv.weight"]
+        ),
+        RenameConvertOp(
+            hf_names="model.layers.{}.self_attn.o_proj.weight",
+            mf_names="decoder.layers.{}.self_attention.linear_proj.weight"
+        ),
+        RenameConvertOp(
+            hf_names="model.layers.{}.input_layernorm.weight",
+            mf_names="decoder.layers.{}.input_layernorm.weight"
+        ),
+        RenameConvertOp(
+            hf_names="model.layers.{}.self_attn.k_norm.weight",
+            mf_names="decoder.layers.{}.self_attention.k_layernorm.weight"
+        ),
+        RenameConvertOp(
+            hf_names="model.layers.{}.self_attn.q_norm.weight",
+            mf_names="decoder.layers.{}.self_attention.q_layernorm.weight"
+        ),
+
+        # ========== FFN ==========
+        ConcatConvertOp(
+            hf_names=[
+                "model.layers.{}.mlp.gate_proj.weight",
+                "model.layers.{}.mlp.up_proj.weight"
+            ],
+            mf_names=["decoder.layers.{}.mlp.linear_fc1.weight"],
+            dim=0
+        ),
+        RenameConvertOp(
+            hf_names="model.layers.{}.mlp.down_proj.weight",
+            mf_names="decoder.layers.{}.mlp.linear_fc2.weight"
+        ),
+        RenameConvertOp(
+            hf_names="model.layers.{}.post_attention_layernorm.weight",
+            mf_names="decoder.layers.{}.pre_mlp_layernorm.weight"
+        ),
     ]
