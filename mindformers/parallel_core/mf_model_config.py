@@ -408,5 +408,8 @@ class MFModelConfig:
     disable_lazy_inline: bool = False
     """Whether to disable Lazy Inline compilation acceleration."""
 
+    coeff: float = 0.1
+    """Calculate the relative scaling coefficient of mscale in Yarn Rope."""
+
     def __post_init__(self):
         self.parallel_config = default_transformer_config

@@ -114,13 +114,24 @@ class TeleChat3Config(PretrainedConfig):
             normalization="RMSNorm",
             add_bias_linear=False,
             gated_linear_unit=True,
-            use_contiguous_weight_layout_attention=False
+            use_contiguous_weight_layout_attention=False,
+            coeff=0.007,
         ))
     @ignore_and_delete_parameter(extra_ignore_param=[
         ('max_window_layers', NotSupportedInfo.useless),
         ('sliding_window', NotSupportedInfo.useless),
         ('use_sliding_window', NotSupportedInfo.useless),
-        ('layer_types', NotSupportedInfo.useless)
+        ('layer_types', NotSupportedInfo.useless),
+        ('logn', NotSupportedInfo.useless),
+        ('training_seqlen', NotSupportedInfo.useless),
+        ('embed_layernorm', NotSupportedInfo.useless),
+        ('unk_token_id', NotSupportedInfo.useless),
+        ('flash_attn', NotSupportedInfo.useless),
+        ('base_seqlen', NotSupportedInfo.useless),
+        ('mlp_bias', NotSupportedInfo.useless),
+        ('pretraining_tp', NotSupportedInfo.useless),
+        ('share_attention', NotSupportedInfo.useless),
+        ('share_ffn', NotSupportedInfo.useless),
     ])
     def __init__(
             self,

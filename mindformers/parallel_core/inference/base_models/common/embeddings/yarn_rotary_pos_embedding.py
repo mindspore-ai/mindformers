@@ -65,7 +65,8 @@ class YaRNScalingRotaryEmbedding(RotaryEmbedding):
             mscale: float = 1.0,
             mscale_all_dim: float = 0.0,
             extrapolation_factor: float = 1.0,
-            attn_factor: float = 1.0
+            attn_factor: float = 1.0,
+            coeff: float = 0.1,
     ) -> None:
         self.scaling_factor = scaling_factor
         self.original_max_position_embeddings = original_max_position_embeddings
@@ -74,10 +75,13 @@ class YaRNScalingRotaryEmbedding(RotaryEmbedding):
         self.extrapolation_factor = extrapolation_factor
         self.attn_factor = attn_factor
         # Get n-d magnitude scaling corrected for interpolation.
-        self.mscale = float(
-            _yarn_get_mscale(self.scaling_factor, float(mscale)) /
-            _yarn_get_mscale(self.scaling_factor, float(mscale_all_dim)) *
-            attn_factor)
+        if mscale and mscale_all_dim:
+            self.mscale = float(
+                _yarn_get_mscale(self.scaling_factor, float(mscale)) /
+                _yarn_get_mscale(self.scaling_factor, float(mscale_all_dim)) *
+                attn_factor)
+        else:
+            self.mscale = _yarn_get_mscale(scale=self.scaling_factor, coeff=coeff)
         super().__init__(kv_channels, rotary_percent, rotary_interleaved, seq_len_interpolation_factor,
                          rotary_base, rotary_cos_format, rotary_dtype, original_max_position_embeddings)
 
@@ -121,11 +125,11 @@ class YaRNScalingRotaryEmbedding(RotaryEmbedding):
         return cos, sin
 
 
-def _yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
+def _yarn_get_mscale(scale: float = 1, mscale: float = 1, coeff: float = 0.1) -> float:
     """Computes dynamic magnitude scaling coefficient based on scaling factor"""
     if scale <= 1:
         return 1.0
-    return 0.1 * mscale * math.log(scale) + 1.0
+    return coeff * mscale * math.log(scale) + 1.0
 
 
 def _yarn_find_correction_dim(num_rotations: int,

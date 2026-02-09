@@ -418,6 +418,7 @@ COMMON_CONFIG_MAPPING = {
     "dispatch_global_max_bs": "dispatch_global_max_bs",
     "quantization_config": "quantization_config",
     "use_fused_mla": "use_fused_mla",
+    "coeff": "coeff",
 
     # Pet
     "pet_config": "pet_config"
