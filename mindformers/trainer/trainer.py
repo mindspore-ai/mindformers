@@ -1357,6 +1357,71 @@ class Trainer:
         self._warn_if_resume_training_is_string()
         self._error_if_checkpoint_prefix_contains_rank_info()
         self._check_balanced_load_if_not_use_parallel()
+        self._convert_health_checkpoint_config()
+        self._convert_quick_resume_training_config()
+
+    def _convert_quick_resume_training_config(self):
+        """Convert quick resume training config."""
+        if self.config.monitor_config:
+            # get old config
+            check_for_global_norm = self.config.monitor_config.get("check_for_global_norm", None)
+            legacy_global_norm_spike_threshold = self.config.monitor_config.get("global_norm_spike_threshold", None)
+            new_global_norm_spike_threshold = None
+            # get new config
+            if self.config.monitor_config.health_checkpoint:
+                new_global_norm_spike_threshold = (
+                    self.config.monitor_config.health_checkpoint.global_norm_spike_threshold)
+
+            if legacy_global_norm_spike_threshold or check_for_global_norm:
+                logger.warning("The config `check_for_global_norm` and `global_norm_spike_threshold` is deprecated, "
+                               "please use `global_norm_spike_threshold` "
+                               "in `monitor_config.health_checkpoint` instead.")
+
+            if check_for_global_norm and not legacy_global_norm_spike_threshold:
+                legacy_global_norm_spike_threshold = 3.0
+                logger.warning("The config `check_for_global_norm` is set, "
+                               "but the `global_norm_spike_threshold` "
+                               "is unset, set default to 3.0.")
+
+            if check_for_global_norm and legacy_global_norm_spike_threshold and not new_global_norm_spike_threshold:
+                if not self.config.monitor_config.health_checkpoint:
+                    self.config.monitor_config.health_checkpoint = MindFormerConfig()
+                self.config.monitor_config.health_checkpoint.global_norm_spike_threshold = (
+                    legacy_global_norm_spike_threshold)
+
+    def _convert_health_checkpoint_config(self):
+        """Convert health checkpoint config."""
+        # get old config
+        use_checkpoint_health_monitor = self.config.get("use_checkpoint_health_monitor", None)
+        legacy_embedding_threshold = None
+        new_embedding_threshold = None
+        if self.config.callbacks:
+            for callback in self.config.callbacks:
+                if ("type" in callback and callback["type"] == "CheckpointMonitor"
+                        and "embedding_local_norm_threshold" in callback):
+                    legacy_embedding_threshold = callback.get("embedding_local_norm_threshold")
+        # get new config
+        if self.config.monitor_config and self.config.monitor_config.get("health_checkpoint", None):
+            new_embedding_threshold = (self.config.monitor_config.health_checkpoint
+                                       .get("embedding_local_norm_threshold", None))
+
+        if legacy_embedding_threshold or use_checkpoint_health_monitor:
+            logger.warning(
+                "The `embedding_local_norm_threshold` in `CheckpointMonitor` is deprecated. "
+                "Please use `embedding_local_norm_threshold` in `monitor_config.health_checkpoint` instead.")
+
+        if use_checkpoint_health_monitor and not legacy_embedding_threshold:
+            legacy_embedding_threshold = 1.0
+            logger.warning("The config `use_checkpoint_health_monitor` is set, "
+                           "but the `embedding_local_norm_threshold` "
+                           "is unset, set default to 1.0.")
+
+        if not new_embedding_threshold and legacy_embedding_threshold and use_checkpoint_health_monitor:
+            if not self.config.monitor_config:
+                self.config.monitor_config = MindFormerConfig()
+            if not self.config.monitor_config.health_checkpoint:
+                self.config.monitor_config.health_checkpoint = MindFormerConfig()
+            self.config.monitor_config.health_checkpoint.embedding_local_norm_threshold = legacy_embedding_threshold
 
     def _adjust_resume_training_if_ckpt_path_invalid(self):
         """Disable resume_training if checkpoint path is empty or invalid."""

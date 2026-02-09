@@ -26,6 +26,8 @@ from typing import Optional, List
 
 import mindspore as ms
 from mindspore import context
+
+from mindformers.tools import get_output_root_path
 from mindformers.tools.logger import logger
 
 
@@ -52,6 +54,18 @@ MS_TYPE_TO_SIZE = {
 class FileType(Enum):
     MODEL = "model"
     OPTIMIZER = "opt"
+
+
+class CkptHealthStatus(Enum):
+    """
+        Checkpoint health status.
+
+        Attributes:
+            NORMAL: Represents the ckpt is healthy.
+            ABNORMAL: Represents the ckpt is unhealthy.
+    """
+    NORMAL = 0
+    ABNORMAL = 1
 
 
 def check_checkpoints_dir_max_num(max_keep_num: int, checkpoints_root_path: str = None):
@@ -522,3 +536,67 @@ def get_core_network(network):
     if hasattr(network, 'network'):
         return get_core_network(network.network)
     return network
+
+
+def parse_iteration_from_dir_name(dir_name):
+    """
+    Parse iteration number from directory name.
+
+    Args:
+        dir_name (str): Directory name.
+
+    Returns:
+        int, iteration number.
+    """
+    pattern_item = PER_ITERATION_CKPT_DIR_PREFIX + r"(\d+)"
+    match = re.search(pattern_item, dir_name)
+    if match:
+        try:
+            return int(match.group(1))
+        except ValueError:
+            return None
+    return None
+
+
+def get_healthy_checkpoint_path():
+    """
+    Get the path of the most recent healthy checkpoint.
+
+    Returns:
+        str, the path of the most recent healthy checkpoint.
+    """
+    checkpoint_dir = os.path.join(get_output_root_path(), "checkpoint")
+
+    if not os.path.exists(checkpoint_dir):
+        raise ValueError(f"Checkpoint directory does not exist: {checkpoint_dir}")
+
+    if not os.path.isdir(checkpoint_dir):
+        raise ValueError(f"Checkpoint path is not a directory: {checkpoint_dir}")
+
+    checkpoint_dir_list = list(glob(os.path.join(checkpoint_dir, "iteration_*")))
+    if not checkpoint_dir_list:
+        raise RuntimeError(f"No checkpoint directory found in: {checkpoint_dir}")
+
+    def sort_key(x):
+        return parse_iteration_from_dir_name(os.path.basename(x))
+
+    checkpoint_dir_list.sort(key=sort_key, reverse=True)
+
+    for item in checkpoint_dir_list:
+        item_path = os.path.join(checkpoint_dir, item)
+        common_file_path = os.path.join(item_path, "common.json")
+        if not os.path.exists(common_file_path):
+            logger.warning(f"Skipping {item}, common.json not found.")
+            continue
+        try:
+            with open(common_file_path, "r", encoding='utf-8') as f:
+                common_json = json.load(f)
+            is_health = common_json.get("ckpt_status") == CkptHealthStatus.NORMAL.value
+            if is_health:
+                logger.info(f"Found healthy checkpoint: {item_path}")
+                return item_path
+            logger.warning(f"Skipping {item}, is_health is {is_health}.")
+        except (json.JSONDecodeError, IOError) as e:
+            logger.warning(f"Failed to load common.json for {item}: {e}.")
+            continue
+    raise RuntimeError(f"No healthy checkpoint found in: {checkpoint_dir}")

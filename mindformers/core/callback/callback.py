@@ -85,6 +85,7 @@ from mindformers.parallel_core.training_graph.loss_func import (
     check_device_local_loss
 )
 from mindformers.checkpoint.checkpoint import AsyncSaveManager, CommonInfo, save_checkpoint
+from mindformers.checkpoint.utils import CkptHealthStatus
 from mindformers.parallel_core.transformer_config import TransformerConfig
 from mindformers.models.utils import num_floating_point_operations, convert_transformer_config_to_args_for_tflops
 
@@ -1190,6 +1191,10 @@ class TrainingStateMonitor(Callback):
         self.check_for_global_norm = config.get('check_for_global_norm')
         self.global_norm_record_path = os.path.join(get_output_root_path(), "abnormal_global_norm.json")
         self.global_norm_spike_threshold = config.get('global_norm_spike_threshold')
+        self.health_checkpoint = config.get('health_checkpoint', None)
+        if self.health_checkpoint:
+            self.global_norm_spike_threshold = self.health_checkpoint.global_norm_spike_threshold
+            self.check_for_global_norm =  bool(self.global_norm_spike_threshold)
         self.global_norm_spike_count_threshold = config.get('global_norm_spike_count_threshold', 10)
         if not _is_positive_natural_number(self.global_norm_spike_count_threshold):
             raise TypeError("'monitor_config.global_norm_spike_count_threshold' should be positive integer, "
@@ -2125,6 +2130,10 @@ class CheckpointMonitor(ModelCheckpoint):
         if isinstance(cb_params.net_outputs, (tuple, list)) and len(cb_params.net_outputs) >= 3:
             self.common_info.loss_scale = float(cb_params.net_outputs[2])
         self.common_info.global_batch_size = self.global_batch_size
+
+        if self.use_checkpoint_health_monitor:
+            self.common_info.ckpt_status = CkptHealthStatus.NORMAL.value \
+                if self.get_checkpoint_health_info(cb_params) == 0 else CkptHealthStatus.ABNORMAL.value
 
         # Get all sharded tensor info of this network to save 'metadata.json'
         sharded_tensor_metas = get_all_sharded_tensor(

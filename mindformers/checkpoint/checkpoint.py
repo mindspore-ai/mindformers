@@ -87,6 +87,9 @@ class CommonInfo:
     global_batch_size: int = None
     """The total batch size during multi-NPU training."""
 
+    ckpt_status: int = None
+    """CkptHealthStatus class, Indicates whether the checkpoint is healthy."""
+
     def save_common(self, common_filename: str):
         """
         Save common info to 'common.json'.
