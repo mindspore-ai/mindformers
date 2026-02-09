@@ -282,6 +282,7 @@ COMMON_CONFIG_MAPPING = {
     "window_attn_skip_freq": "window_attn_skip_freq",
     "model_architecture": "model_architecture",
     "num_encoder_layers": "num_encoder_layers",
+    "moe_apply_probs_on_input": "moe_apply_probs_on_input",
     "num_decoder_layers": "num_decoder_layers",
 
     # Flash Attention

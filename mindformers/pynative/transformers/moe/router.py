@@ -62,7 +62,7 @@ class TopKRouter(nn.Cell):
         )
         self.weight = Parameter(init_method_normal(0.02)((num_experts, dim)), name='weight')
         self.num_experts = num_experts
-        self.num_expert_groups = num_expert_groups
+        self.num_expert_groups = num_expert_groups or 0
         self.num_limited_groups = num_limited_groups
         self.top_k = top_k
         self.score_func = score_func
@@ -187,7 +187,7 @@ class TopKRouter(nn.Cell):
 
         scores_for_choice = scores if expert_bias is None else scores + expert_bias
         # Apply node-limited routing if configured
-        if self.num_expert_groups is not None:
+        if self.num_expert_groups > 0:
             scores_for_choice = self._get_node_limited_routing_scores(scores_for_choice)
         _, selected_experts_indices = self.topk(
             scores_for_choice, k=self.top_k, dim=-1, sorted=False

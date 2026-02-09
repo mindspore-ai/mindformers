@@ -30,25 +30,35 @@ from mindformers.pynative.transformers.transformer_block import TransformerBlock
 from mindformers.pynative.transformers.transformer_layer import TransformerLayer, TransformerLayerSubmodules
 from mindformers.parallel_core.transformer_config import TransformerConfig
 from mindformers.parallel_core.utils.spec_utils import ModuleSpec
-
+from mindformers.pynative.base_models.gpt.moe_module_specs import get_moe_module_spec
+from mindformers.pynative.transformers.multi_latent_attention import MLASelfAttention, \
+    MLASelfAttentionSubmodules
 
 def get_mlp_module_spec(
         num_experts: Optional[int] = None,
+        moe_grouped_gemm: Optional[bool] = True,
 ) -> ModuleSpec:
     """Helper function to get module spec for MLP/MoE"""
     mlp = MLP
-    return ModuleSpec(
-        module=mlp,
-        submodules=MLPSubmodules(
-            linear_fc1=Linear,
-            linear_fc2=Linear,
-        ),
-    )
+    if not num_experts:
+        return ModuleSpec(
+            module=mlp,
+            submodules=MLPSubmodules(
+                linear_fc1=Linear,
+                linear_fc2=Linear,
+            ),
+        )
 
+    return get_moe_module_spec(
+        num_experts=num_experts,
+        moe_grouped_gemm=moe_grouped_gemm,
+    )
 
 def get_gpt_layer_local_spec(
         num_experts: Optional[int] = None,
+        moe_grouped_gemm: Optional[bool] = False,
         qk_layernorm: Optional[bool] = False,
+        multi_latent_attention: Optional[bool] = False,
         fused_norm: Optional[bool] = True,
         normalization: Optional[str] = "RMSNorm",
 ) -> ModuleSpec:
@@ -68,7 +78,31 @@ def get_gpt_layer_local_spec(
 
     mlp = get_mlp_module_spec(
         num_experts=num_experts,
+        moe_grouped_gemm=moe_grouped_gemm,
     )
+
+    if multi_latent_attention:
+        self_attention = ModuleSpec(
+            module=MLASelfAttention,
+            submodules=MLASelfAttentionSubmodules(
+                linear_qkv=Linear,
+                linear_qb=Linear,
+                linear_kvb=Linear,
+                core_attention=FlashAttention,
+                linear_proj=Linear,
+                q_layernorm=get_norm_cls(normalization, fused_norm) if qk_layernorm else IdentityOp,
+                k_layernorm=get_norm_cls(normalization, fused_norm) if qk_layernorm else IdentityOp,
+            ),
+        )
+        return ModuleSpec(
+            module=TransformerLayer,
+            submodules=TransformerLayerSubmodules(
+                input_layernorm=get_norm_cls(normalization, fused_norm),
+                self_attention=self_attention,
+                pre_mlp_layernorm=get_norm_cls(normalization, fused_norm),
+                mlp=mlp,
+            ),
+        )
 
     return ModuleSpec(
         module=TransformerLayer,
@@ -98,12 +132,19 @@ def get_gpt_decoder_block_spec(
     # Layer specs.
     dense_layer_spec = get_gpt_layer_local_spec(
         num_experts=None,
+        moe_grouped_gemm=False,
         qk_layernorm=config.qk_layernorm,
+        multi_latent_attention=config.multi_latent_attention,
         fused_norm=config.fused_norm,
     )
 
-    moe_layer_spec = None
-
+    moe_layer_spec = get_gpt_layer_local_spec(
+        num_experts=config.num_moe_experts,
+        moe_grouped_gemm=config.moe_grouped_gemm,
+        qk_layernorm=config.qk_layernorm,
+        multi_latent_attention=config.multi_latent_attention,
+        fused_norm=config.fused_norm,
+    )
     # Parse config.moe_layer_freq to determine the pattern of expert/dense layers.
     # 0 stands for dense layers, 1 stands for expert layers.
     # For integer N: Creates a pattern with one expert layer every N layers.
@@ -136,6 +177,6 @@ def get_gpt_decoder_block_spec(
 
     # Block spec.
     block_spec = TransformerBlockSubmodules(
-        layer_specs=layer_specs, layer_norm=get_norm_cls(config.fused_norm))
+        layer_specs=layer_specs, layer_norm=get_norm_cls(config.normalization, config.fused_norm))
 
     return block_spec

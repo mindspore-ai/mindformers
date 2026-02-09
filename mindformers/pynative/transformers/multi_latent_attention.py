@@ -126,7 +126,8 @@ class MultiLatentAttention(nn.Cell):
         self.transpose = mint.transpose
         self.cast = ops.cast
 
-    def construct(self, x: Tensor, attention_mask=None, rotary_pos_emb=None, pad_zeros=None, actual_seq_len=None):
+    def construct(self, x: Tensor, attention_mask=None, rotary_pos_emb=None,
+                  prefix_keys_values=None, pad_zeros=None, actual_seq_len=None):
         """
         Forward pass of the Multi-head Latent Attention mechanism.
         
