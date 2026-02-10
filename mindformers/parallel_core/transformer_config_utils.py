@@ -14,11 +14,10 @@
 # ============================================================================
 """Utility functions for TransformerConfig."""
 
-from dataclasses import asdict
-from copy import deepcopy
-from typing import Union
 import types
-
+from copy import deepcopy
+from dataclasses import asdict, is_dataclass, fields
+from typing import Union, List, Dict, Any, Optional
 from mindformers.models.configuration_utils import PretrainedConfig
 from mindformers.parallel_core.transformer_config import TransformerConfig, MLATransformerConfig
 from mindformers.tools.logger import logger
@@ -528,3 +527,159 @@ def convert_to_transformer_config(
     transform_config = TransformerConfig(**update_dict)
     logger.info(f"The converted TransformerConfig is: \n{asdict(transform_config)}")
     return transform_config
+
+
+_TRANSFORMER_CONFIG_METADATA: Dict[str, Dict[str, Any]] = {}
+
+
+def _init_transformer_config_metadata():
+    global _TRANSFORMER_CONFIG_METADATA
+    if _TRANSFORMER_CONFIG_METADATA:
+        return
+
+    if not is_dataclass(TransformerConfig):
+        raise TypeError("TransformerConfig must be a dataclass")
+
+    _TRANSFORMER_CONFIG_METADATA = {
+        f.name: dict(f.metadata)
+        for f in fields(TransformerConfig)
+    }
+
+
+class ConfigConversionTracer:
+    """
+    Trace each field during config conversion
+    """
+
+    def __init__(self) -> None:
+        self.records: List[Dict[str, Any]] = []
+        _init_transformer_config_metadata()
+
+    def record(
+            self,
+            source_key: str,
+            source_value: Any,
+            target_key: str,
+            target_value: Any,
+            trans_func_name: Optional[str] = None,
+    ) -> None:
+        metadata = _TRANSFORMER_CONFIG_METADATA.get(target_key, {})
+        self.records.append({
+            "source_key": source_key,
+            "source_value": source_value,
+            "target_key": target_key,
+            "target_value": target_value,
+            "trans_func": trans_func_name or "None",
+            "description": metadata.get("description", ""),
+            "usage": str(metadata.get("usage", "")),
+            "source_origin": str(metadata.get("source", "")),
+        })
+
+    def print_summary(self) -> None:
+        """
+        print config conversion details
+        """
+        if not self.records:
+            logger.info("Config Conversion summary: no records.")
+            return
+
+        logger.info("Config Conversion summary:")
+
+        headers = [
+            "Source",
+            "Target",
+            "Trans Func",
+            "Param Usage",
+            "Param Origin"
+        ]
+
+        max_len = 50
+        rows = []
+        for rec in self.records:
+            source = f"{rec['source_key']} = {rec['source_value']}"
+            target = f"{rec['target_key']} = {rec['target_value']}"
+            func = rec["trans_func"] if rec["trans_func"] != "None" else "—"
+            usage = rec.get("usage", "") or "—"
+            origin = rec.get("source_origin", "") or "—"
+
+            source = (source[:max_len] + "...") if len(source) > max_len else source
+            target = (target[:max_len] + "...") if len(target) > max_len else target
+
+            rows.append([source, target, func, usage, origin])
+
+        col_widths = [
+            max(len(headers[i]), max(len(str(row[i])) for row in rows))
+            for i in range(len(headers))
+        ]
+
+        def make_line(char="-"):
+            return "+" + "+".join(char * (w + 2) for w in col_widths) + "+"
+
+        def format_row(row):
+            cells = [
+                f" {str(cell).ljust(width)} "
+                for cell, width in zip(row, col_widths)
+            ]
+            return "|" + "|".join(cells) + "|"
+
+        print(format_row(headers))
+        print(make_line("="))
+        for row in rows:
+            print(format_row(row))
+        print(make_line("-"))
+
+
+class ConfigLogHandler:
+    """
+    Record errors or warnings during config conversion
+    """
+
+    def __init__(self) -> None:
+        self.errors: Dict[str, List[str]] = {}
+        self.warnings: Dict[str, List[str]] = {}
+
+    def add_error(self, category: str, message: str) -> None:
+        self.errors.setdefault(category, []).append(message)
+
+    def add_warning(self, category: str, message: str) -> None:
+        self.warnings.setdefault(category, []).append(message)
+
+    def has_errors(self) -> bool:
+        return bool(self.errors)
+
+    def has_warnings(self) -> bool:
+        return bool(self.warnings)
+
+    def check_and_raise(self) -> None:
+        """
+        Check and handle all warnings and errors:
+        - If a warning is generated, the warning log is recorded.
+        - If an error occurs, the system records ERROR logs (including warnings and errors) and throws ValueError.
+        """
+        has_warn = self.has_warnings()
+        has_error = self.has_errors()
+
+        if not (has_warn or has_error):
+            return
+
+        if has_warn:
+            warn_msg = self._format_issues(self.warnings, "Converted config has the following warnings:")
+            logger.warning(warn_msg)
+
+        if has_error:
+            error_msg = self._format_issues(self.errors, "Converted config failed with the following problems:")
+            logger.error(error_msg)
+            raise ValueError(error_msg)
+
+    def _format_issues(self, issues: Dict[str, List[str]], header: str) -> str:
+        if not issues:
+            return ""
+        lines = [header]
+        for category, messages in issues.items():
+            lines.append(f"\n[{category}] ({len(messages)} {'problem' if len(messages) == 1 else 'problems'})")
+            lines.extend(f"  - {msg}" for msg in messages)
+        return "\n".join(lines)
+
+    def clear(self) -> None:
+        self.errors.clear()
+        self.warnings.clear()

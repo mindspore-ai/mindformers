@@ -92,6 +92,10 @@ class ModelMixin:
         )
         return self.transformer_config
 
+    def convert_to_tf_config(self, config, is_mla_model: bool = False):
+        self.transformer_config = config.convert_to_transformer_config(is_mla_model)
+        return self.transformer_config
+
     def get_gpt_transformer_config(self):
         """
         Get the transformer config for GPT model

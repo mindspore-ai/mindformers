@@ -41,7 +41,7 @@ class InferenceQwen3MoeForCausalLM(Qwen3MoePreTrainedModel, InferModelMixin):
     def __init__(self, config: Qwen3MoeConfig):
         super().__init__(config, auto_prefix=False)
         self.config = config
-        config: TransformerConfig = self.convert_to_transformer_config(self.config)
+        config: TransformerConfig = self.convert_to_tf_config(self.config)
 
         # update communication-related configuration in TransformerConfig
         config = update_comm_config(config)
@@ -54,7 +54,7 @@ class InferenceQwen3MoeForCausalLM(Qwen3MoePreTrainedModel, InferModelMixin):
                               transformer_layer_spec=get_gpt_layer_local_spec(
                                   num_experts=config.num_moe_experts,
                                   normalization=config.normalization,
-                                  use_flash_attention=self.config.use_flash_attention,
+                                  use_flash_attention=config.use_flash_attention,
                                   qk_layernorm=True,
                                   use_alltoall=config.use_alltoall,
                               ),

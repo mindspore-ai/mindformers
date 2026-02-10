@@ -19,7 +19,6 @@ from dataclasses import dataclass, asdict
 from typing import List, Tuple
 from functools import wraps
 
-from mindformers.parallel_core.mf_model_config import MFModelConfig
 from mindformers.tools.logger import logger
 
 
@@ -119,7 +118,7 @@ def ignore_and_delete_parameter(extra_ignore_param: List[Tuple[str, str]] = None
         def wrapper(self_instance, *args, **kwargs):
             # Get original signature parameters
             sig = inspect.signature(init_func)
-            all_parameters_kwargs = dict()
+            all_parameters_kwargs = {}
             for name, param in sig.parameters.items():
                 if param.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
                     continue
@@ -140,7 +139,6 @@ def ignore_and_delete_parameter(extra_ignore_param: List[Tuple[str, str]] = None
             class_name = self_instance.__class__.__name__
 
             # Check if already printed for this class
-            global PRINTED_CLASSES
             need_print = class_name not in PRINTED_CLASSES
             if need_print:
                 PRINTED_CLASSES.add(class_name)
@@ -181,7 +179,7 @@ def ignore_and_delete_parameter(extra_ignore_param: List[Tuple[str, str]] = None
     return decorator
 
 
-def register_mf_model_parameter(mf_model_kwargs=None):
+def register_mf_model_parameter(mf_model_kwargs=None, **extra_kwargs):
     """
     Decorator factory function for customizing kwargs in __init__ method.
 
@@ -192,14 +190,14 @@ def register_mf_model_parameter(mf_model_kwargs=None):
         The decorator function.
     """
     mf_model_kwargs = asdict(mf_model_kwargs) \
-        if mf_model_kwargs is not None else asdict(MFModelConfig())
+        if mf_model_kwargs is not None else dict(extra_kwargs)
 
     def decorator(init_func):
         @wraps(init_func)
         def wrapper(self, *args, **kwargs):
 
             sig = inspect.signature(init_func)
-            all_parameters_kwargs = dict()
+            all_parameters_kwargs = {}
             for name, param in sig.parameters.items():
                 if param.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
                     continue

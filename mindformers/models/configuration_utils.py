@@ -35,6 +35,7 @@ from mindformers.tools.utils import FILE_PERMISSION
 from mindformers.models.build_config import build_model_config, get_model_config
 from mindformers.models.utils import CONFIG_NAME, ms_type_to_str, DEFAULT_CHECKPOINT_SAVE_FOLDER
 from mindformers.models.auto.utils import set_default_yaml_file
+from mindformers.modules.transformer.transformer import default_transformer_config
 from mindformers.mindformer_book import MindFormerBook, print_path_or_list
 from mindformers.tools import (
     PushToHubMixin,
@@ -227,6 +228,8 @@ class PretrainedConfig(PushToHubMixin):
         self.quantization_config = kwargs.pop("quantization_config", None)
         self.quantization = kwargs.pop("quantization", None)
 
+        self.parallel_config = kwargs.pop("parallel_config", default_transformer_config)
+        self.pet_config = kwargs.pop("pet_config", None)
         for key, value in kwargs.items():
             try:
                 setattr(self, key, value)
@@ -504,7 +507,7 @@ class PretrainedConfig(PushToHubMixin):
 
         meraged_dict = {}
         if os.path.exists(save_path):
-            with open(save_path, 'r') as file_reader:
+            with open(save_path, 'r', encoding='utf-8') as file_reader:
                 check_yaml_depth_before_loading(file_reader)
                 file_reader.seek(0)
                 meraged_dict = yaml.safe_load(file_reader.read())

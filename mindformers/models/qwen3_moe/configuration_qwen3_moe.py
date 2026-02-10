@@ -21,7 +21,7 @@ from mindformers.models.model_config_utils import (
     ignore_and_delete_parameter,
     NotSupportedInfo
 )
-from mindformers.parallel_core.mf_model_config import MFModelConfig
+from mindformers.models.qwen3_moe.config_converter_qwen3_moe import Qwen3MoeConfigConverter
 from mindformers.tools.register import MindFormerRegister, MindFormerModuleType
 
 
@@ -160,16 +160,17 @@ class Qwen3MoeConfig(PretrainedConfig):
     }
 
     @register_mf_model_parameter(
-        mf_model_kwargs=MFModelConfig(
-            pad_token_id=151643,
-            block_size=32,
-            num_blocks=1024,
-            moe_router_score_function="softmax",
-            moe_router_enable_expert_bias=False,
-            normalization='RMSNorm',
-            add_bias_linear=False,
-            gated_linear_unit=True
-        ))
+        seq_length=4096,
+        pad_token_id=151643,
+        block_size=32,
+        num_blocks=1024,
+        moe_router_score_function="softmax",
+        moe_router_enable_expert_bias=False,
+        normalization='RMSNorm',
+        add_bias_linear=False,
+        gated_linear_unit=True,
+        is_dynamic=False,
+    )
     @ignore_and_delete_parameter(extra_ignore_param=[
         ('decoder_sparse_step', NotSupportedInfo.useless),
         ('max_window_layers', NotSupportedInfo.useless),
@@ -243,3 +244,13 @@ class Qwen3MoeConfig(PretrainedConfig):
             tie_word_embeddings=tie_word_embeddings,
             **kwargs,
         )
+
+    def convert_to_transformer_config(self, is_mla_model: bool = False):
+        """
+        Convert Qwen3MoeConfig to TransformerConfig.
+        Args:
+            is_mla_model (bool, optional): Whether converting to MLATransformerConfig. Defaults to False.
+        Returns:
+            TransformerConfig: The converted transformer configuration.
+        """
+        return Qwen3MoeConfigConverter.convert(self.to_dict(), is_mla_model=is_mla_model)

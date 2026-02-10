@@ -41,7 +41,7 @@ class InferenceQwen3ForCausalLM(Qwen3PreTrainedModel, InferModelMixin):
     def __init__(self, config: Qwen3Config):
         super().__init__(config, auto_prefix=False)
         self.config = config
-        config: TransformerConfig = self.convert_to_transformer_config(self.config)
+        config: TransformerConfig = self.convert_to_tf_config(self.config)
 
         self.quant_config = get_quant_config(self.config, self.weight_mapping)
         self.pad_token_id = self.config.pad_token_id
@@ -53,7 +53,7 @@ class InferenceQwen3ForCausalLM(Qwen3PreTrainedModel, InferModelMixin):
         self.model = GPTModel(config=config,
                               transformer_layer_spec=get_gpt_layer_local_spec(
                                   normalization=config.normalization,
-                                  use_flash_attention=self.config.use_flash_attention,
+                                  use_flash_attention=config.use_flash_attention,
                                   qk_layernorm=True,
                               ),
                               vocab_size=self.vocab_size,
