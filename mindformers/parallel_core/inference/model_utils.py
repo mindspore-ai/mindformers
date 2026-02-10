@@ -121,7 +121,7 @@ class InferModelMixin(ModelMixin):
         self.model.add_flags(is_prefill=is_prefill)
         self.model.decoder.add_flags(is_prefill=is_prefill)
         for layer in self.model.decoder.layers:
-            if self.config.use_flash_attention:
+            if self.transformer_config.use_flash_attention:
                 layer.self_attention.core_attention.add_flags(is_prefill=is_prefill)
 
     def add_flags_chunked(self, is_chunked):
@@ -237,7 +237,7 @@ class InferModelMixin(ModelMixin):
         mapping_rules = {
             '.linear_q_down_proj.': ('.linear_qkv_down_proj.', '.linear_q_down_proj.', 'q_down'),
             '.linear_kv_down_proj.': ('.linear_qkv_down_proj.', '.linear_kv_down_proj.', 'kv_down')
-            if getattr(self.config, 'q_lora_rank', None) is not None else
+            if getattr(self.transformer_config, 'q_lora_rank', None) is not None else
             ('.linear_kv_down_proj.', '.linear_kv_down_proj.', 'kv_down'),
             '.linear_q_up_proj.': ('.linear_q_up_proj.', '.linear_q_up_proj.', 'q_up'),
             '.linear_kv_up_proj.': ('.linear_kv_up_proj.', '.linear_kv_up_proj.', 'kv_up'),

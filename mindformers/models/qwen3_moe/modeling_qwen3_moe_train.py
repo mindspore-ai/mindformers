@@ -43,7 +43,7 @@ class TrainingQwen3MoeForCausalLM(TrainModelMixin, Qwen3MoePreTrainedModel):
 
     def __init__(self, config):
         super().__init__(config, auto_prefix=False)
-        config: TransformerConfig = self.convert_to_transformer_config(self.config)
+        config: TransformerConfig = self.convert_to_tf_config(self.config)
 
         self.model = GPTModel(
             config=config,
@@ -59,7 +59,7 @@ class TrainingQwen3MoeForCausalLM(TrainModelMixin, Qwen3MoePreTrainedModel):
             position_embedding_type=config.position_embedding_type,
             rotary_base=self.config.rope_theta,
             share_embeddings_and_output_weights=self.config.tie_word_embeddings,
-            post_process=self.config.post_process,
+            post_process=config.post_process,
         )
 
     def construct(
