@@ -12,17 +12,4 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""distributed modules"""
-from mindformers.pynative.distributed.style import (
-    PrepareModuleInput,
-    PrepareModuleOutput,
-    PrepareModuleInputOutput,
-    ParallelStyle,
-)
-
-__all__ = [
-    "PrepareModuleInput",
-    "PrepareModuleOutput",
-    "PrepareModuleInputOutput",
-    "ParallelStyle",
-]
+"""Test distributed modules"""
