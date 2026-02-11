@@ -1264,6 +1264,21 @@ class BaseTrainer:
                 err_msg = f"The {type(network)} has not implemented the interface: `get_model_parameters`."
                 logger.error(err_msg)
                 raise NotImplementedError(err_msg)
+        try:
+            network_parameters = network.get_model_parameters(only_trainable=False)
+            param_info = []
+            not_print_params = {'max_logits_val', 'expert_load'}
+            for p in network_parameters:
+                if any(f in p.name for f in not_print_params):
+                    continue
+                param_info.append(f" Parameter: {p.name:<60s} | Shape: {str(p.shape):<18s} |"
+                                  f" Requires Grad: {str(p.requires_grad):<5s} | Dtype: {p.dtype}")
+            logger.info("Parameters to be loaded into network on the current rank: \n" + "\n".join(param_info))
+        except (RuntimeError, TypeError) as e:
+            logger.info(
+                f"get_model_parameters is not implemented for "
+                f"{network.__class__.__name__} or not using mcore model: {e}"
+            )
 
         is_moe_model = False
         is_mtp_model = False

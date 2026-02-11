@@ -217,7 +217,7 @@ class TransformerBlock(nn.Cell):
             if config.sequence_parallel or cp > 1:
                 self.final_layernorm.shard(config, in_strategy=(layout("cp_tp", "dp", "None"), layout("None",)))
 
-    def get_model_parameters(self):
+    def get_model_parameters(self, only_trainable=True):
         """ get current rank parameters in cell. """
         params = []
         current_pipeline_stage = get_current_rank_stage()
@@ -225,8 +225,14 @@ class TransformerBlock(nn.Cell):
             if is_current_pipeline_stage(layer, current_pipeline_stage):
                 for param in layer.trainable_params():
                     params.append(param)
+                if not only_trainable:
+                    for param in layer.untrainable_params():
+                        params.append(param)
         if self.post_layer_norm:
             if is_current_pipeline_stage(self.final_layernorm, current_pipeline_stage):
                 for param in self.final_layernorm.trainable_params():
                     params.append(param)
+                if not only_trainable:
+                    for param in self.final_layernorm.untrainable_params():
+                        params.append(param)
         return params

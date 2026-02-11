@@ -66,13 +66,16 @@ def get_current_rank_stage():
     return rank_id // per_stage_device_num
 
 
-def  get_model_parameters(cell: nn.Cell):
+def get_model_parameters(cell: nn.Cell, only_trainable=True):
     """get all parameters in cell."""
     params = []
     for _, sub_cell in cell.cells_and_names():
         if isinstance(sub_cell, nn.Cell):
             for param in sub_cell.trainable_params():
                 params.append(param)
+            if not only_trainable:
+                for param in sub_cell.untrainable_params():
+                    params.append(param)
     return params
 
 def is_current_pipeline_stage(layer: nn.Cell, current_pipeline_stage):

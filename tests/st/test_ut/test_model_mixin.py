@@ -403,7 +403,8 @@ class TestTrainModelMixin:
 
         # Create a mock model with get_model_parameters method
         class MockModel:
-            def get_model_parameters(self):
+            # pylint: disable=W0613
+            def get_model_parameters(self, only_trainable=True):
                 return ["param1", "param2"]
 
         class TestModel(TrainModelMixin):

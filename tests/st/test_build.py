@@ -118,11 +118,11 @@ class TestModelConfig(PretrainedConfig):
 class TestModel(PreTrainedModel):
     """Test Model API For Register."""
     def __init__(self, config: PretrainedConfig = None):
-        super(TestModel, self).__init__(config)
+        super().__init__(config)
         self.model_config = config
         self.params = Parameter(Tensor([0.1]))
 
-    def get_model_parameters(self):
+    def get_model_parameters(self, only_trainable=True):
         pass
 
 
@@ -138,7 +138,7 @@ class TestAdamWeightDecay(AdamWeightDecay):
     """Test AdamWeightDecay API For Register."""
     def __init__(self, params, learning_rate=1e-3,
                  beta1=0.9, beta2=0.999, eps=1e-6, weight_decay=0.0):
-        super(TestAdamWeightDecay, self).__init__(params, learning_rate=learning_rate,
+        super().__init__(params, learning_rate=learning_rate,
                                                   beta1=beta1, beta2=beta2, eps=eps,
                                                   weight_decay=weight_decay)
         self.param = params
@@ -148,7 +148,7 @@ class TestAdamWeightDecay(AdamWeightDecay):
 class TestCosineDecayLR(CosineDecayLR):
     """Test CosineDecayLR API For Register."""
     def __init__(self, min_lr, max_lr, decay_steps):
-        super(TestCosineDecayLR, self).__init__(min_lr, max_lr, decay_steps)
+        super().__init__(min_lr, max_lr, decay_steps)
         self.lr = max_lr
 
 
@@ -156,7 +156,7 @@ class TestCosineDecayLR(CosineDecayLR):
 class TestTrainOneStepWithLossScaleCell(TrainOneStepWithLossScaleCell):
     """Test TrainOneStepWithLossScaleCell API For Register."""
     def __init__(self, network, optimizer, scale_sense):
-        super(TestTrainOneStepWithLossScaleCell, self).__init__(network, optimizer, scale_sense)
+        super().__init__(network, optimizer, scale_sense)
         self.scale_sense = scale_sense
 
 
@@ -164,7 +164,7 @@ class TestTrainOneStepWithLossScaleCell(TrainOneStepWithLossScaleCell):
 class TestAccuracy(Accuracy):
     """Test Accuracy API For Register."""
     def __init__(self, eval_type='classification'):
-        super(TestAccuracy, self).__init__(eval_type)
+        super().__init__(eval_type)
         self.eval = eval_type
 
 
@@ -172,7 +172,7 @@ class TestAccuracy(Accuracy):
 class TestL1Loss(L1Loss):
     """Test L1Loss API For Register."""
     def __init__(self, reduction='mean'):
-        super(TestL1Loss, self).__init__(reduction)
+        super().__init__(reduction)
         self.reduction = reduction
 
 
@@ -180,7 +180,7 @@ class TestL1Loss(L1Loss):
 class TestLLossMonitor(LossMonitor):
     """Test LossMonitor API For Register."""
     def __init__(self, per_print_times=1):
-        super(TestLLossMonitor, self).__init__(per_print_times)
+        super().__init__(per_print_times)
         self.print = per_print_times
 
 
@@ -188,7 +188,7 @@ class TestLLossMonitor(LossMonitor):
 class TestTimeMonitor(TimeMonitor):
     """Test TimeMonitor API For Register."""
     def __init__(self, data_size=1):
-        super(TestTimeMonitor, self).__init__(data_size)
+        super().__init__(data_size)
         self.data_size = data_size
 
 
