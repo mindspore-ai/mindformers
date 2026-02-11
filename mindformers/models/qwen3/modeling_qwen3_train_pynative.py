@@ -37,20 +37,20 @@ class PyNativeQwen3ForCausalLM(Qwen3PreTrainedModel, TrainModelMixin):
 
     def __init__(self, config: Qwen3Config):
         super().__init__(config, auto_prefix=False)
-        config: TransformerConfig = self.convert_to_transformer_config(self.config)
+        config: TransformerConfig = self.convert_to_tf_config(self.config)
 
         self.model = GPTModel(
             config=config,
             transformer_layer_spec=get_gpt_layer_local_spec(
-                config.normalization,
+                normalization=config.normalization,
                 qk_layernorm=True,
             ),
             vocab_size=config.vocab_size,
             max_sequence_length=config.max_position_embeddings,
             position_embedding_type=config.position_embedding_type,
-            rotary_base=self.config.rope_theta,
-            share_embeddings_and_output_weights=self.config.tie_word_embeddings,
-            post_process=self.config.post_process
+            rotary_base=config.rotary_base,
+            share_embeddings_and_output_weights=config.tie_word_embeddings,
+            post_process=config.post_process
         )
 
     def construct(
