@@ -1478,5 +1478,5 @@ class PreTrainedModel(nn.Cell, ModelMixin, GenerationMixin, PushToHubMixin):
         """
         return ckpt_dict
 
-    def get_model_parameters(self):
+    def get_model_parameters(self, only_trainable=True):
         raise RuntimeError("You should implement the interface: get_model_parameters.")

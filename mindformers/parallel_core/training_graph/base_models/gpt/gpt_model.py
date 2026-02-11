@@ -787,20 +787,20 @@ class GPTModel(nn.Cell):
                 sharded_state_dict.update(sub_cell.sharded_state_dict())
         return sharded_state_dict
 
-    def get_model_parameters(self):
+    def get_model_parameters(self, only_trainable=True):
         """Get current rank trainable parameters in gpt model ."""
         params = set()
         current_pipeline_stage = get_current_rank_stage()
         if ms.get_auto_parallel_context('pipeline_stages') > 1:
             if current_pipeline_stage == self.output_layer.pipeline_stage:
-                params.update(get_model_parameters(self.output_layer))
+                params.update(get_model_parameters(self.output_layer, only_trainable))
             if hasattr(self, "mtp"):
                 if current_pipeline_stage == self.mtp.pipeline_stage:
-                    params.update(get_model_parameters(self.mtp))
-            params.update(self.decoder.get_model_parameters())
-            params.update(get_model_parameters(self.embedding))
+                    params.update(get_model_parameters(self.mtp, only_trainable))
+            params.update(self.decoder.get_model_parameters(only_trainable))
+            params.update(get_model_parameters(self.embedding, only_trainable))
         else:
-            params.update(get_model_parameters(self))
+            params.update(get_model_parameters(self, only_trainable))
         return params
 
     def make_model_muon_fns(self,):

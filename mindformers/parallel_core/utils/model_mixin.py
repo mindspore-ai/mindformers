@@ -557,10 +557,10 @@ class TrainModelMixin:
                                "Please modify the GPTModel definition method.")
         return getattr(self, 'model')
 
-    def get_model_parameters(self):
+    def get_model_parameters(self, only_trainable=True):
         """Get current rank trainable parameters in model ."""
         model = self.check_and_get_model()
-        return model.get_model_parameters()
+        return model.get_model_parameters(only_trainable)
 
     def get_max_attention_logit(self):
         """Get max attention logit values from the model."""

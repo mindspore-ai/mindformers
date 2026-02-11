@@ -94,5 +94,5 @@ class TeleChat3PreTrainedModel(PreTrainedModel, ModelMixin):
                     f"and pp * pp_interleave_num = {pp * pp_interleave_num}."
                 )
 
-    def get_model_parameters(self):
+    def get_model_parameters(self, only_trainable=True):
         pass

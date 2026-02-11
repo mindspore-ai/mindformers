@@ -50,5 +50,5 @@ class Glm4MoePreTrainedModel(PreTrainedModel, ModelMixin):
         ('model.layers.', 'decoder.layers.')
     ]
 
-    def get_model_parameters(self):
+    def get_model_parameters(self, only_trainable=True):
         pass
