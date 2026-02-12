@@ -179,22 +179,13 @@ class TransformerLayer(nn.Cell, BaseTransformerLayer):
             residual = hidden_states
 
         # Self-Attention
-        attention_output_with_bias = self.self_attention(
+        attention_output = self.self_attention(
             input_layernorm_output,
             attention_mask=attention_mask,
             rotary_pos_emb=rotary_pos_emb,
             prefix_keys_values=prefix_keys_values,
             actual_seq_len=actual_seq_len
         )
-
-        if isinstance(attention_output_with_bias, tuple):
-            attention_output, self_attention_bias = attention_output_with_bias
-        else:
-            attention_output = attention_output_with_bias
-            self_attention_bias = None
-
-        if self_attention_bias is not None:
-            attention_output = self.add(attention_output, self_attention_bias)
 
         # Dropout
         dropout_output = self.hidden_states_dropout(attention_output)
@@ -210,10 +201,7 @@ class TransformerLayer(nn.Cell, BaseTransformerLayer):
         else:
             residual = norm_input
 
-        mlp_output, mlp_output_bias = self.mlp(pre_mlp_layernorm_output)
-
-        if mlp_output_bias is not None:
-            mlp_output = self.add(mlp_output, mlp_output_bias)
+        mlp_output = self.mlp(pre_mlp_layernorm_output)
 
         # Dropout
         dropout_output = self.hidden_states_dropout(mlp_output)

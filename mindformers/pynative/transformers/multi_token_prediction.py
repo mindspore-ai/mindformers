@@ -147,7 +147,6 @@ class MultiTokenPredictionLayer(nn.Cell):
             params_dtype=config.params_dtype,
             init_method=self.config.init_method,
             bias=False,
-            skip_bias_add=False
         )
 
         self.transformer_layer = build_module(
@@ -195,7 +194,7 @@ class MultiTokenPredictionLayer(nn.Cell):
         # At the (k - 1)-th MTP module, concatenates the i-th token's hidden_states
         # and the (i + K)-th token's embedding, and combine them with linear projection.
         hidden_states = self.cat((decoder_input, hidden_states), -1)
-        hidden_states, _ = self.eh_proj(hidden_states)
+        hidden_states = self.eh_proj(hidden_states)
         hidden_states, _ = self.transformer_layer(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
@@ -379,7 +378,7 @@ class MultiTokenPredictionBlock(nn.Cell):
                 **(extra_block_kwargs or {}),
             )
             # output
-            mtp_logits, _ = output_layer(hidden_states, weight=output_weight)
+            mtp_logits = output_layer(hidden_states, weight=output_weight)
             mtp_logits = self.transpose(mtp_logits, 0, 1)
             mtp_logits = self.reshape(mtp_logits, (-1, mtp_logits.shape[-1]))
 

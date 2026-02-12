@@ -32,17 +32,17 @@ SINGLE_CARD_TEST_PARAM = "model_args, data_keys, expect_error"
 SINGLE_CARD_TEST_CASES = [
     (
         {"use_flash_attn": True, "num_query_groups": 4, "q_layernorm": None, "k_layernorm": None},
-        {"output": "output_query_group_4", "bias": "bias_query_group_4"},
+        {"output": "output_query_group_4"},
         False
     ),
     (
         {"use_flash_attn": True, "num_query_groups": 8, "q_layernorm": None, "k_layernorm": None},
-        {"output": "output_query_group_8", "bias": "bias_query_group_8"},
+        {"output": "output_query_group_8"},
         False
     ),
     (
         {"use_flash_attn": True, "num_query_groups": 4, "q_layernorm": "Norm", "k_layernorm": "Norm"},
-        {"output": "output_query_group_4", "bias": "bias_query_group_4"},
+        {"output": "output_query_group_4"},
         False
     ),
 ]

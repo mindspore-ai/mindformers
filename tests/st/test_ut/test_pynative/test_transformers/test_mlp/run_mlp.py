@@ -92,20 +92,11 @@ class MLPRunner:
             return
 
         if not self.enable_backward:
-            if self.add_bias_linear:
-                output, bias = net(self.input_)
-                assert bias is not None
-            else:
-                output = net(self.input_)
+            output = net(self.input_)
         else:
             weights = ParameterTuple(net.trainable_params())
             train_network = nn.ForwardValueAndGrad(net, weights=weights, get_all=True, get_by_list=True)
-            outputs, grads = train_network(self.input_)
-            if self.add_bias_linear:
-                output, bias = outputs
-                assert bias is not None
-            else:
-                output = outputs
+            output, grads = train_network(self.input_)
             grads_npu = to_numpy_list(grads)
             standard = DoubleBenchmarkStandard(dtype="bfloat16")
             grads_gpu = get_grads('gpu')
@@ -140,11 +131,8 @@ class TestModel(nn.Cell):
 
     def construct(self, hidden_states):
         """This avoids graph compilation errors due to unsupported return types."""
-        if self.config.add_bias_linear:
-            mlp_output, mlp_bias = self.mlp(hidden_states)
-            return mlp_output, mlp_bias
         mlp_output = self.mlp(hidden_states)
-        return mlp_output[0]
+        return mlp_output
 
 
 def main():

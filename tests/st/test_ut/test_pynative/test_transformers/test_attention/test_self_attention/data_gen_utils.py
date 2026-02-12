@@ -128,6 +128,11 @@ GOLDEN_DATA = {
          -0.02036221, 0.00047493]),
 }
 
+GOLDEN_DATA = {
+  "output_query_group_4": GOLDEN_DATA["output_query_group_4"] + GOLDEN_DATA["bias_query_group_4"],
+  "output_query_group_8": GOLDEN_DATA["output_query_group_8"] + GOLDEN_DATA["bias_query_group_8"],
+}
+
 GPU_DATA = {
     "random": np.random.randn(SEQ_LEN, BATCH_SIZE, HIDDEN_SIZE).astype(np.float32),
     "output_query_group_4": np.array(
@@ -214,4 +219,10 @@ GPU_DATA = {
          0.00939941, 0.00192261, 0.01953125, 0.01025391, -0.00653076,
          0.00027275, -0.00047302, -0.01586914, -0.00939941, -0.00561523,
          -0.02038574, 0.00047493]),
+}
+
+GPU_DATA = {
+  "random": GPU_DATA["random"],
+  "output_query_group_4": GPU_DATA["output_query_group_4"] + GPU_DATA["bias_query_group_4"],
+  "output_query_group_8": GPU_DATA["output_query_group_8"] + GPU_DATA["bias_query_group_8"],
 }

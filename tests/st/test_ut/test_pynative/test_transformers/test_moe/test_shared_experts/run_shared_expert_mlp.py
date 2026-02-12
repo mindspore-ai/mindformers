@@ -81,7 +81,7 @@ class TestModel(nn.Cell):
     def construct(self, hidden_states):
         """This avoids graph compilation errors due to unsupported return types."""
         mlp_output = self.mlp(hidden_states)
-        return mlp_output[0]
+        return mlp_output
 
 
 def main():

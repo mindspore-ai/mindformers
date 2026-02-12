@@ -140,7 +140,7 @@ def get_golden() -> dict[str, np.ndarray]:
         "output_only": output_only,
         "output_with_bias": output_with_bias,
         "output_use_weight": output_use_weight,
-        "output_bias": output_bias
+        "output_use_weight_with_bias": output_use_weight + output_bias,
     }
 
 def get_gpu_datas() -> dict[str, np.ndarray]:
@@ -257,7 +257,7 @@ def get_gpu_datas() -> dict[str, np.ndarray]:
         "output_only": output_only,
         "output_with_bias": output_with_bias,
         "output_use_weight": output_use_weight,
-        "output_bias": output_bias
+        "output_use_weight_with_bias": output_use_weight + output_bias,
     }
 
 GOLDEN_DATA = get_golden()

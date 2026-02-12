@@ -129,7 +129,6 @@ class Attention(nn.Cell):
             params_dtype=self.config.params_dtype,
             init_method=self.output_layer_init_method,
             bias=self.config.add_bias_linear,
-            skip_bias_add=True,
         )
 
         self.apply_rotary_pos_emb = ApplyRotaryPosEmb(self.parallel_config)
@@ -227,10 +226,10 @@ class Attention(nn.Cell):
                 context_layer = self.cast(output, self.compute_dtype)
 
         # apply output projection
-        output, bias = self.linear_proj(context_layer)
+        output = self.linear_proj(context_layer)
         output = self.cast(output, ori_dtype)
 
-        return output, bias
+        return output
 
     def _cat_prefix(self, key, value, prefix_keys_values):
         '''
@@ -328,7 +327,7 @@ class SelfAttention(Attention):
         """
         seq_len, bs, _ = hidden_states.shape
 
-        qkv, _ = self.linear_qkv(hidden_states)
+        qkv = self.linear_qkv(hidden_states)
         qkv = self.cast(qkv, self.compute_dtype)
         new_tensor_shape = (seq_len, bs, -1, (self.n_rep + 2) * self.head_dim)
         mixed_x_layer = self.reshape_concat(qkv, new_tensor_shape)

@@ -156,7 +156,7 @@ class TransformerBlock(nn.Cell):
         for index in range(self.num_layers):
             layer = self._get_layer(index)
             prefix_kv = prefix_keys_values[index] if prefix_keys_values is not None else None
-            hidden_states, _, = layer(
+            hidden_states, _ = layer(
                 hidden_states,
                 attention_mask,
                 rotary_pos_emb=rotary_pos_emb,

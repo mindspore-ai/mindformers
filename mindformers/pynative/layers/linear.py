@@ -39,7 +39,6 @@ class Linear(nn.Cell):
         params_dtype (str): The data type of the parameters (e.g., 'float32').
         init_method (Callable): The initialization method. Default: None.
         bias (bool): Whether to include bias in the linear layer. Default: True.
-        skip_bias_add (bool): Whether to skip bias add. Default: False.
         skip_weight_param_allocation (bool): Whether to skip weight parameter allocation. Default: False.
         bias_init (Callable): The initialization method for bias. Default: None.
     """
@@ -51,7 +50,6 @@ class Linear(nn.Cell):
                  params_dtype: str,
                  init_method: Callable = None,
                  bias: bool = True,
-                 skip_bias_add: bool = False,
                  skip_weight_param_allocation: bool = False,
                  bias_init: Callable = None
                  ):
@@ -60,7 +58,6 @@ class Linear(nn.Cell):
         self.input_size = input_size
         self.output_size = output_size
         self.init_method = init_method
-        self.skip_bias_add = skip_bias_add
         self.skip_weight_param_allocation = skip_weight_param_allocation
         self.has_bias = bias
         self.params_dtype = convert_mstype(params_dtype)
@@ -84,8 +81,7 @@ class Linear(nn.Cell):
         self.matmul = mint.matmul
         self.transpose = mint.transpose
         self.cast = ops.cast
-        if not skip_bias_add:
-            self.add = mint.add
+        self.add = mint.add
 
     def construct(self, input_: Tensor, weight: Tensor = None) -> tuple[Tensor, Tensor]:
         """Forward of Linear.
@@ -115,13 +111,10 @@ class Linear(nn.Cell):
         # Directly use 3D input: (batch, seq, input_size) @ (input_size, output_size) -> (batch, seq, output_size)
         output = self.matmul(input_, weight)
 
-        if not self.skip_bias_add and self.has_bias:
+        if self.has_bias:
             bias = self.cast(self.bias, self.compute_dtype)
             output = self.add(output, bias)
-            bias = None
-        else:
-            bias = self.bias
 
         output = self.cast(output, ori_dtype)
 
-        return output, bias
+        return output

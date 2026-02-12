@@ -31,7 +31,6 @@ class LinearRunner:
     def __init__(self, args_from_parser):
         self.args = args_from_parser
         self.has_bias = self.args.bias
-        self.skip_bias_add = self.args.skip_bias_add
         self.skip_weight_param_allocation = self.args.skip_weight_param_allocation
         self.use_weight_tensor = self.args.use_weight_tensor
 
@@ -68,7 +67,6 @@ class LinearRunner:
             output_size=self.output_size,
             compute_dtype=self.compute_dtype,
             params_dtype=self.params_dtype,
-            skip_bias_add=self.skip_bias_add,
             skip_weight_param_allocation=self.skip_weight_param_allocation,
             init_method=init_method_normal(0.01, self.param_init_dtype),
             bias_init=init_method_normal(0.01, self.param_init_dtype) if self.has_bias else None,
@@ -89,8 +87,8 @@ class LinearRunner:
         if self.use_weight_tensor:
             weight_tensor_input = self.weight_tensor_input
 
-        output, bias_tensor = net(self.inputs, weight_tensor_input)
-        output_ms = {"output": output, "bias": bias_tensor}
+        output = net(self.inputs, weight_tensor_input)
+        output_ms = {"output": output}
 
         if self.rank_id is None or int(self.rank_id) == 0:
             output_np = {k: v.asnumpy().astype(np.float32) for k, v in output_ms.items() if v is not None}
@@ -103,7 +101,6 @@ def main():
     parser.add_argument("--input_size", type=int, default=32)
     parser.add_argument("--output_size", type=int, default=32)
     parser.add_argument("--bias", type=lambda x: x.lower() == "true", default=True)
-    parser.add_argument("--skip_bias_add", type=lambda x: x.lower() == "true", default=True)
     parser.add_argument("--skip_weight_param_allocation", type=lambda x: x.lower() == "true", default=False)
     parser.add_argument("--use_weight_tensor", type=lambda x: x.lower() == "true", default=False)
     parser.add_argument("--output_path", type=str, default="output_ms.npz")

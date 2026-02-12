@@ -81,7 +81,6 @@ class MLP(nn.Cell):
             params_dtype=self.config.params_dtype,
             init_method=self.config.init_method,
             bias=self.config.add_bias_linear,
-            skip_bias_add=True
         )
 
         # Handle activation function
@@ -96,7 +95,6 @@ class MLP(nn.Cell):
             params_dtype=self.config.params_dtype,
             init_method=self.config.output_layer_init_method,
             bias=self.config.add_bias_linear,
-            skip_bias_add=True
         )
 
         self.split = mint.split
@@ -104,13 +102,11 @@ class MLP(nn.Cell):
         self.add = mint.add
         self.transpose = mint.transpose
 
-    def construct(self, hidden_states: Tensor) -> tuple[Tensor, Tensor, float]:
+    def construct(self, hidden_states: Tensor) -> Tensor:
         """ Construct function of mlp block. """
         # [seq_len, bs, hidden_size] -> [seq_len, bs, ffn_hidden_size]
-        intermediate_parallel, bias_parallel = self.linear_fc1(hidden_states)
+        intermediate_parallel = self.linear_fc1(hidden_states)
 
-        if bias_parallel is not None:
-            intermediate_parallel = self.add(intermediate_parallel, bias_parallel)
         if self.gated_linear_unit:
             seq, bs, ffn_hidden_size = intermediate_parallel.shape
             intermediate_parallel = self.reshape(intermediate_parallel, (seq, bs, ffn_hidden_size // 2, 2))
@@ -127,5 +123,5 @@ class MLP(nn.Cell):
         else:
             intermediate_parallel = self.activation_func(intermediate_parallel)
         # [seq_len, bs, hidden_size] -> [seq_len, bs, ffn_hidden_size]
-        output, output_bias = self.linear_fc2(intermediate_parallel)
-        return output, output_bias
+        output = self.linear_fc2(intermediate_parallel)
+        return output

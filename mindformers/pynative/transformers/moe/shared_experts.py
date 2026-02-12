@@ -65,8 +65,8 @@ class SharedExpertMLP(MLP):
 
     def construct(self, hidden_states: Tensor) -> tuple[Tensor, Tensor]:
         """ Construct function of shared_expert_mlp block. """
-        shared_experts_output, output_bias = super().construct(hidden_states)
+        shared_experts_output = super().construct(hidden_states)
         if self.use_shared_expert_gate:
             gate = self.sigmoid(self.shared_experts_gate(self.cast(hidden_states, self.router_dense_type)))
             shared_experts_output = self.mul_shared_gate(shared_experts_output, self.cast(gate, self.compute_dtype))
-        return shared_experts_output, output_bias
+        return shared_experts_output
