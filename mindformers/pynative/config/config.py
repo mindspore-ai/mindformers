@@ -173,16 +173,19 @@ class BaseConfig:
         """
         Iterate over all configuration fields (including extra ones).
         """
-        # Yield defined dataclass fields
-        for f in fields(self):
-            yield f.name, getattr(self, f.name)
+        results = {}
+        class_fields = (f.name for f in fields(self))
 
-        # Yield extra fields if allowed
-        if self.allow_extra or isinstance(self, BaseConfig):
-            known_fields = {f.name for f in fields(self)}
-            for k, v in self.__dict__.items():
-                if k not in known_fields and not k.startswith("_"):
-                    yield k, v
+        # Record defined dataclass fields
+        for f in class_fields:
+            results[f] = getattr(self, f)
+
+        # Record extra fields
+        for k, v in self.__dict__.items():
+            # Ignore private fields (fields with '_' prefix) and class fields
+            if k not in class_fields and not k.startswith("_"):
+                results[k] = v
+        return results
 
     def __repr__(self):
         """
@@ -191,14 +194,14 @@ class BaseConfig:
         Returns:
             A string representation of the configuration object showing all fields.
         """
-        fields_str = [f"{k}={repr(v)}" for k, v in self._iter_params()]
+        fields_str = [f"{k}={repr(v)}" for k, v in self._iter_params().items()]
         return f"{self.__class__.__name__}({', '.join(fields_str)})"
 
     def to_dict(self) -> Dict[str, Any]:
         """
         Convert configuration object to a dictionary representation.
         """
-        return {k: self._to_dict_value(v) for k, v in self._iter_params()}
+        return {k: self._to_dict_value(v) for k, v in self._iter_params().items()}
 
     @staticmethod
     def _to_dict_value(value: Any) -> Any:
@@ -249,9 +252,10 @@ class BaseConfig:
         Raises:
             TypeError: If any field value does not match its declared type.
         """
+        cls_name = type(self).__name__
         for f in fields(self):
             value = getattr(self, f.name)
-            check_type(value, f.type, f.name)
+            check_type(value, f.type, f"{cls_name}.{f.name}")
 
 
 @dataclass

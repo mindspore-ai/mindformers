@@ -1,0 +1,117 @@
+checkpoint: # name refers to torchtitan
+  # Configuration originates from the Weights 2.0 feature and supports
+  # saving and loading checkpoint- and weight-related configurations.
+
+  save_path: "/path/checkpoint" # directory to save checkpoints
+  save_max: 5                   # maximum number of checkpoints to retain
+  save_interleaved_steps: 100   # number of training steps between checkpoint saves
+  no_save_optim: False          # whether to skip saving optimizer states (default: False)
+  async_save: False             # enable asynchronous checkpoint saving
+  prefix: null                  # filename prefix for saved checkpoints
+  remove_redundancy: True       # remove redundant data when saving checkpoints
+
+  load_path: ""                 # directory to load checkpoints from
+  load_balanced: False          # enable balanced loading across ranks/devices
+  no_load_optim: True           # whether to skip loading optimizer states
+                                # default: True (opposite behavior of resume_training)
+  load_worker_number: 1         # number of worker threads used for checkpoint loading
+
+training: # name refers to torchtitan
+  steps: 100                    # total number of training steps
+  local_batch_size: 2           # per-rank batch size (corresponds to runner_config: batch_size)
+  global_batch_size: 4          # total number of samples processed per step across all ranks
+  max_norm: 1.0                 # enable gradient clipping if value > 0
+  seed: 42                      # random seed for training
+  deterministic: True           # enable deterministic training behavior
+
+parallelism: # name refers to torchtitan
+  tensor_parallel: 1                    # tensor parallelism degree (TP size)
+  context_parallel: 1                   # context parallelism degree (CP size)
+  context_parallel_method: colossal     # implementation method for context parallelism
+  pipeline_parallel: 1                  # pipeline parallelism degree (number of pipeline stages)
+  pipeline_parallel_schedule: "1f1b"    # pipeline execution schedule (e.g., 1F1B)
+  pipeline_parallel_microbatch_size: 1  # number of micro-batches per pipeline step
+  pipeline_parallel_interleave_num: 1   # number of interleaved model chunks per pipeline stage
+  # number of layers assigned to each pipeline stage
+  # supports uneven or interleaved layer placement
+  pipeline_parallel_layers_per_stage: null
+  hsdp_shard_size: 1                 # HSDP sharding group size
+  hsdp_optimizer_level: level1       # optimizer state sharding level for HSDP
+  hsdp_threshold: 64                 # parameter size threshold (in MB) for enabling HSDP sharding
+  sequence_parallel: false           # enable sequence parallelism
+
+optimizer: # name refers to torchtitan
+  type: AdamW
+  betas:
+    - 0.9
+    - 0.95
+  eps: 1.e-8
+  weight_decay: 0.01
+
+lr_scheduler: # name refers to torchtitan, but corresponds to lr_schedule
+  type: ConstantWarmUpLR
+  learning_rate: 1.e-6
+  warmup_lr_init: 0
+  warmup_steps: 0
+
+train_dataset:
+  # training dataset configuration, identical to the static-graph setup
+  dataloader:                 # dataloader sub configuration
+    type: BlendedMegatronDatasetDataLoader
+    column_names: ["input_ids", "labels", "loss_mask", "position_ids"]
+    shuffle: false                 # whether to shuffle the dataset
+    python_multiprocessing: False
+  drop_remainder: True             # whether to drop the remainder of the dataset
+  num_parallel_workers: 8     # number of parallel data loading workers
+  prefetch_size: 1            # number of prefetched batches
+  numa_enable: False          # enable NUMA-aware data loading
+
+model:
+  # model-related configuration
+  model_type: qwen3
+  architectures: 'Qwen3ForCausalLM'
+
+monitor:
+  health_checkpoint:                      # checkpoint and weight health monitoring
+    embedding_local_norm_threshold: 100.0 # threshold for embedding parameter local norm
+    global_norm_skip_threshold: 100.0     # global norm threshold for skipping updates
+    global_norm_skip_time: 10             # number of consecutive skips allowed before triggering actions
+
+  train_state:                 # training state monitoring
+    local_norm: false          # monitor local gradient/parameter norm
+    local_loss: false          # monitor local training loss
+    device_norm: false         # monitor device-level norm statistics
+    device_loss: false         # monitor device-level loss statistics
+
+  tensorboard:
+    # TensorBoard configuration
+    tensorboard_dir: ''          # directory to store TensorBoard logs
+    tensorboard_log_interval: 1  # logging interval (in steps)
+    tensorboard_queue_size: 1000 # maximum size of the TensorBoard event queue
+
+callbacks:
+  - type: callbackA
+    param: 0
+  - type: callbackB
+    param: 1
+
+context:
+  # MindSpore context configuration, reused from static-graph mode
+  mode: 1                     # 1 -- Pynative Mode
+  max_device_memory: "59GB"   # maximum device memory usage
+  device_target: "Ascend"     # target device type
+
+profiler:                     # reserved for future use
+  # MindSpore profiler configuration
+  enable_profiler: False
+  start_step: 10              # profiling start step
+  stop_step: 20               # profiling stop step
+  output_path: ''             # profiler output directory
+  profiler_level: Level0      # profiling detail level
+  profile_memory: False       # enable memory profiling
+
+recompute:                    # reserved for future use
+  # activation recomputation configuration
+  full_recompute: False             # enable activation recomputation
+  select_recompute: False     # enable selective recomputation
+
