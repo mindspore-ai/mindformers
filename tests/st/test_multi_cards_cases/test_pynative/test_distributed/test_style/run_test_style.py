@@ -60,8 +60,7 @@ class TestModule(nn.Cell):
             params_dtype="float32",
             compute_dtype="float32",
             init_method=init_method_normal(),
-            bias=True,
-            skip_bias_add=True,
+            bias=True
         )
 
     def construct(self, x, y=None, mask=None):
@@ -156,8 +155,8 @@ def run_prepare_module_input(device_mesh, test_tensors):
         module_local, test_tensor, Shard(0), Shard(1), device_mesh
     )
     _verify_dtensor_result(
-        result[0],
-        expected_result[0],
+        result,
+        expected_result,
         "use_local_output test: Result mismatch",
         use_local_output=True,
     )
@@ -217,8 +216,8 @@ def run_prepare_module_output(device_mesh, test_tensors):
     # Test: Shard dimension change with use_local_output
     module_shard = TestModule()
     prepare_shard = PrepareModuleOutput(
-        output_layouts=(Shard(0), None),
-        desired_output_layouts=(Shard(1), None),
+        output_layouts=(Shard(0),),
+        desired_output_layouts=(Shard(1),),
         use_local_output=True,
     )
     # pylint: disable=protected-access
@@ -229,14 +228,14 @@ def run_prepare_module_output(device_mesh, test_tensors):
     ref_module = _create_reference_module(module_shard)
     ref_output = ref_module(test_tensor)
     sharded_dtensor = DTensor.from_local(
-        ref_output[0], device_mesh, (Shard(0),)
+        ref_output, device_mesh, (Shard(0),)
     )
     expected_dtensor = sharded_dtensor.redistribute(
         device_mesh, (Shard(1),)
     )
     expected_tensor = expected_dtensor.to_local()
     _verify_dtensor_result(
-        result[0],
+        result,
         expected_tensor,
         "Shard change test: Result mismatch",
         use_local_output=True,

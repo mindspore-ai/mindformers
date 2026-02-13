@@ -28,38 +28,33 @@ OUTPUT_SIZE = 32
 SINGLE_CARD_TEST_PARAM = "model_args, data_keys, expect_error"
 SINGLE_CARD_TEST_CASES = [
     (
-        {"bias": True, "skip_bias_add": True, "skip_weight_param_allocation": False, "use_weight_tensor": False},
-        {"output": "output_only", "bias": "output_bias"},
-        False
-    ),
-    (
-        {"bias": True, "skip_bias_add": False, "skip_weight_param_allocation": False, "use_weight_tensor": False},
+        {"bias": True, "skip_weight_param_allocation": False, "use_weight_tensor": False},
         {"output": "output_with_bias"},
         False
     ),
     (
-        {"bias": False, "skip_bias_add": True, "skip_weight_param_allocation": False, "use_weight_tensor": False},
+        {"bias": False, "skip_weight_param_allocation": False, "use_weight_tensor": False},
         {"output": "output_only"},
         False
     ),
     (
-        {"bias": False, "skip_bias_add": False, "skip_weight_param_allocation": False, "use_weight_tensor": False},
-        {"output": "output_only"},
-        False
-    ),
-    (
-        {"bias": True, "skip_bias_add": True, "skip_weight_param_allocation": True, "use_weight_tensor": False},
+        {"bias": True, "skip_weight_param_allocation": True, "use_weight_tensor": False},
         None,
         True
     ),
     (
-        {"bias": True, "skip_bias_add": True, "skip_weight_param_allocation": False, "use_weight_tensor": True},
-        {"output": "output_use_weight", "bias": "output_bias"},
+        {"bias": True, "skip_weight_param_allocation": False, "use_weight_tensor": True},
+        {"output": "output_use_weight_with_bias"},
         False
     ),
     (
-        {"bias": True, "skip_bias_add": True, "skip_weight_param_allocation": True, "use_weight_tensor": True},
-        {"output": "output_use_weight", "bias": "output_bias"},
+        {"bias": True, "skip_weight_param_allocation": True, "use_weight_tensor": True},
+        {"output": "output_use_weight_with_bias"},
+        False
+    ),
+    (
+        {"bias": False, "skip_weight_param_allocation": True, "use_weight_tensor": True},
+        {"output": "output_use_weight"},
         False
     ),
 ]
@@ -67,7 +62,7 @@ SINGLE_CARD_TEST_CASES = [
 def build_msrun_command_list(
         worker_num, local_worker_num, log_dir, run_script_path,
         input_size, output_size,
-        bias, skip_bias_add, skip_weight_param_allocation, use_weight_tensor,
+        bias, skip_weight_param_allocation, use_weight_tensor,
         output_path_param, tensor_parallel, port_id
     ):
     """ Build the msrun command with the specified parameters. """
@@ -87,7 +82,6 @@ def build_msrun_command_list(
         f"--input_size={input_size}",
         f"--output_size={output_size}",
         f"--bias={str(bias).lower()}",
-        f"--skip_bias_add={str(skip_bias_add).lower()}",
         f"--skip_weight_param_allocation={str(skip_weight_param_allocation).lower()}",
         f"--use_weight_tensor={str(use_weight_tensor).lower()}",
         f"--output_path={output_path_param}",
@@ -124,20 +118,6 @@ class TestLinear:
                 standard=standard
             )
 
-    def check_output_keys(self, output_ms_dict, expected_bias_key_present):
-        """ Check if the 'bias' key is present or absent as expected in the output. """
-        output_keys = output_ms_dict.keys()
-        if expected_bias_key_present:
-            assert "bias" in output_keys, (
-                f"The 'bias' key is expected in the output "
-                f"dictionary but was not found. Keys: {output_keys}"
-            )
-        else:
-            assert "bias" not in output_keys, (
-                f"The 'bias' key is not expected in the output "
-                f"dictionary but was found. Keys: {output_keys}"
-            )
-
     def run_test(
             self,
             worker_num,
@@ -162,7 +142,6 @@ class TestLinear:
             input_size=INPUT_SIZE,
             output_size=OUTPUT_SIZE,
             bias=model_args["bias"],
-            skip_bias_add=model_args["skip_bias_add"],
             skip_weight_param_allocation=model_args["skip_weight_param_allocation"],
             use_weight_tensor=model_args["use_weight_tensor"],
             output_path_param=output_file_path,
@@ -189,9 +168,7 @@ class TestLinear:
             )
 
             output_ms_dict = np.load(output_file_path)
-            should_bias_key_be_present = model_args["bias"] and model_args["skip_bias_add"]
 
-            self.check_output_keys(output_ms_dict, should_bias_key_be_present)
             self.check_acc(output_ms_dict, data_keys)
 
 class TestLinearSingleCard(TestLinear):

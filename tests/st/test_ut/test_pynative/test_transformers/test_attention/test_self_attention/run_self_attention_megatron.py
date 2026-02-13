@@ -124,8 +124,8 @@ class SelfAttentionMegatronRunner:
     def run(self):
         """Run the model with given inputs"""
         net = self.build_model()
-        output, bias = net(self.hidden_states, self.attention_mask)
-        output_ms = {"output": output, "bias": bias}
+        output = net(self.hidden_states, self.attention_mask)
+        output_ms = {"output": output}
 
         if self.rank_id is None or int(self.rank_id) == 0:
             output_np = {k: v.asnumpy().astype(np.float32) for k, v in output_ms.items() if v is not None}

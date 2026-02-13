@@ -201,7 +201,6 @@ class GPTModel(nn.Cell):
                                        output_size=self.vocab_size,
                                        init_method=self.init_method,
                                        bias=False,
-                                       skip_bias_add=False,
                                        skip_weight_param_allocation=skip_weight_param_allocation,
                                        compute_dtype=self.config.compute_dtype,
                                        params_dtype=self.config.params_dtype)
@@ -277,7 +276,7 @@ class GPTModel(nn.Cell):
             return hidden_states
 
         # logits origin shape is [s b h], transform it to [b*s h].
-        logits, _ = self.output_layer(hidden_states, output_weight)
+        logits = self.output_layer(hidden_states, output_weight)
         if logits.ndim > 2:
             logits = self.transpose(logits, (1, 0, 2))
             logits = self.reshape(logits, (-1, logits.shape[-1]))

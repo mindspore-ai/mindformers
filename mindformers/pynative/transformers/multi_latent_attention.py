@@ -118,7 +118,6 @@ class MultiLatentAttention(nn.Cell):
             compute_dtype=config.compute_dtype,
             init_method=self.config.output_layer_init_method,
             bias=self.config.add_bias_linear,
-            skip_bias_add=True
         )
 
         self.shape = ops.shape
@@ -170,7 +169,7 @@ class MultiLatentAttention(nn.Cell):
         else:
             attn_out = self.core_attention(query, key, value, attention_mask)
 
-        output = self.linear_proj(attn_out)[0]
+        output = self.linear_proj(attn_out)
         output = self.cast(output, ori_dtype)
         return output
 
@@ -254,7 +253,6 @@ class MLASelfAttention(MultiLatentAttention):
                 compute_dtype=config.compute_dtype,
                 init_method=self.config.init_method,
                 bias=self.config.add_bias_linear or self.config.add_qkv_bias,
-                skip_bias_add=False
             )
 
         self.linear_qkv = build_module(
@@ -265,7 +263,6 @@ class MLASelfAttention(MultiLatentAttention):
             compute_dtype=config.compute_dtype,
             init_method=self.config.init_method,
             bias=self.config.add_bias_linear or self.config.add_qkv_bias,
-            skip_bias_add=False
         )
 
         if submodules.k_layernorm is not None:
@@ -288,7 +285,6 @@ class MLASelfAttention(MultiLatentAttention):
             compute_dtype=config.compute_dtype,
             init_method=self.config.init_method,
             bias=self.config.add_bias_linear or self.config.add_qkv_bias,
-            skip_bias_add=False
         )
 
         self.linear_proj = build_module(
@@ -299,7 +295,6 @@ class MLASelfAttention(MultiLatentAttention):
             compute_dtype=config.compute_dtype,
             init_method=self.config.output_layer_init_method,
             bias=self.config.add_bias_linear,
-            skip_bias_add=True
         )
 
     def get_query_key_value_tensors(self,
@@ -324,7 +319,7 @@ class MLASelfAttention(MultiLatentAttention):
         """
         seq_len, bs, _ = self.shape(hidden_states)
 
-        qkv_combo = self.linear_qkv(hidden_states)[0]
+        qkv_combo = self.linear_qkv(hidden_states)
 
         q_a, compressed_kv, k_pe = self.split(
             qkv_combo,
@@ -338,7 +333,7 @@ class MLASelfAttention(MultiLatentAttention):
 
         if self.q_layernorm is not None:
             q_a = self.q_layernorm(q_a)
-            q = self.linear_qb(q_a)[0]
+            q = self.linear_qb(q_a)
             q = self.reshape(q, (seq_len, bs, self.num_attention_heads, -1))
 
             q_nope, q_pe = self.split(
@@ -354,7 +349,7 @@ class MLASelfAttention(MultiLatentAttention):
         k_pe = self.reshape(k_pe, (seq_len, bs, 1, self.qk_pos_emb_head_dim))
         compressed_kv_norm = self.k_layernorm(compressed_kv)
 
-        kv = self.linear_kvb(compressed_kv_norm)[0]
+        kv = self.linear_kvb(compressed_kv_norm)
         kv = self.reshape(kv, (
             seq_len,
             bs,
