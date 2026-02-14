@@ -353,6 +353,29 @@ def test_set_ms_affinity_with_affinity_config(mock_set_affinity, mock_rank, mock
 
 @pytest.mark.level1
 @pytest.mark.platform_x86_cpu
+@patch('os.access')
+@patch('os.path.exists')
+@patch('mindspore.runtime.set_cpu_affinity')
+def test_set_ms_affinity_with_json_file(mock_set_affinity, mock_exists, mock_access):
+    """
+    Feature: Test set_ms_affinity with JSON file path.
+    Description: Verify that set_cpu_affinity is called correctly when affinity_config is a .json file path.
+    Expectation: MindSpore set_cpu_affinity is called with (True, None, None, json_path).
+    """
+    mock_exists.return_value = True
+    mock_access.return_value = True
+
+    json_path = "/tmp/test_affinity_config.json"
+    
+    set_ms_affinity(json_path, None)
+
+    mock_exists.assert_called_once_with(json_path)
+    mock_access.assert_called_once_with(json_path, os.R_OK)
+    mock_set_affinity.assert_called_once_with(True, None, None, json_path)
+
+
+@pytest.mark.level1
+@pytest.mark.platform_x86_cpu
 @patch('mindformers.tools.utils.get_real_group_size')
 @patch('mindformers.tools.utils.get_real_local_rank')
 @patch('mindspore.runtime.set_cpu_affinity')

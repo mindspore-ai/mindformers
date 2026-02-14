@@ -39,7 +39,8 @@ from mindformers.tools.utils import (
 )
 from mindformers.version_control import (
     check_tft_valid,
-    set_ms_deterministic
+    set_ms_deterministic,
+    check_set_cpu_affintiy_bind_file_support,
 )
 
 
@@ -382,6 +383,22 @@ def set_ms_affinity(affinity_config, affinity_cpu_list):
     """
     if affinity_config and affinity_cpu_list:
         affinity_cpu_list = None
+
+    if isinstance(affinity_config, str) and affinity_config.endswith(".json"):
+        if not check_set_cpu_affintiy_bind_file_support:
+            raise RuntimeError(
+                "affinity_config is not supported to set a string value in this version of MindSpore. " \
+                "Please upgrade to 2.9.0 at least."
+            )
+
+        if not os.path.exists(affinity_config):
+            raise FileNotFoundError(f"Affinity config file not found: {affinity_config}")
+
+        if not os.access(affinity_config, os.R_OK):
+            raise PermissionError(f"Permission denied: Cannot read affinity config file {affinity_config}")
+
+        mindspore.runtime.set_cpu_affinity(True, None, None, affinity_config)
+        return
 
     if affinity_config:
         # Check if any device_X in affinity_config has X >= device_num

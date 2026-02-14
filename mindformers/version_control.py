@@ -326,6 +326,11 @@ def check_pin_memory_interface_support():
     return is_version_ge(ms.__version__, "2.7.1")
 
 
+def check_set_cpu_affintiy_bind_file_support():
+    """check mindspore version if support set_cpu_affinity's parameter bind_file."""
+    return is_version_ge(ms.__version__, "2.9.0")
+
+
 def set_ms_deterministic(deterministic):
     """Set deterministic computing through mindspore."""
     logger.debug("The version of MindSpore is %s, "
