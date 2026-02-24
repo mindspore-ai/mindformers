@@ -166,6 +166,8 @@ class TestGetSeparateLoss:
         mock_mtp_loss.asnumpy.return_value = np.array([0.2])
         mock_lm_loss = Mock()
         mock_lm_loss.asnumpy.return_value = np.array([0.3])
+        mock_indexer_loss = Mock()
+        mock_indexer_loss.asnumpy.return_value = np.array([0.4])
 
         mock_param_register.get.side_effect = lambda x, default=None: {
             'aux_loss': mock_aux_loss,
@@ -173,11 +175,12 @@ class TestGetSeparateLoss:
             'lm_loss': mock_lm_loss
         }.get(x, default)
 
-        lm_loss, aux_loss, mtp_loss = _get_separate_loss()
+        lm_loss, aux_loss, mtp_loss, indexer_loss = _get_separate_loss()
 
         assert lm_loss[0] == 0.3
         assert aux_loss[0] == 0.1
         assert mtp_loss[0] == 0.2
+        assert indexer_loss[0] == 0.4
 
         # Verify clear was called
         assert mock_param_register.clear.call_count == 3

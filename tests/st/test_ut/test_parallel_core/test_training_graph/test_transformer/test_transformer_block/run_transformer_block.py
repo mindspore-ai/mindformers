@@ -166,7 +166,7 @@ class TransformerLayerRunner:
         net = self.build_model()
         net.set_train(False)  # Set to eval mode
 
-        output, extra_loss = net(
+        output, extra_loss, _ = net(
             self.hidden_states,
             attention_mask=self.attention_mask,
         )

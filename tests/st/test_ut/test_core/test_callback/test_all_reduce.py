@@ -142,6 +142,8 @@ class TestHelperFunctions(unittest.TestCase):
         mock_mtp_loss.asnumpy.return_value = np.array(0.2)
         mock_lm_loss = MagicMock()
         mock_lm_loss.asnumpy.return_value = np.array(0.3)
+        mock_indexer_loss = MagicMock()
+        mock_indexer_loss.asnumpy.return_value = np.array(0.4)
 
         mock_parameter_register.get.side_effect = lambda x: {
             "aux_loss": mock_aux_loss,
@@ -154,17 +156,19 @@ class TestHelperFunctions(unittest.TestCase):
 
         # Call function
         # pylint: disable=W0212
-        lm_loss, aux_loss, mtp_loss = callback_module._get_separate_loss()
+        lm_loss, aux_loss, mtp_loss, indexer_loss = callback_module._get_separate_loss()
 
         # Verify return values
         self.assertEqual(lm_loss, np.array(0.3))
         self.assertEqual(aux_loss, np.array(0.1))
         self.assertEqual(mtp_loss, np.array(0.2))
+        self.assertEqual(indexer_loss, np.array(0.4))
 
         # Verify clear method was called
         mock_parameter_register.clear.assert_any_call("aux_loss")
         mock_parameter_register.clear.assert_any_call("mtp_loss")
         mock_parameter_register.clear.assert_any_call("lm_loss")
+        mock_parameter_register.clear.assert_any_call("indexer_loss")
 
     @pytest.mark.level1
     @pytest.mark.platform_x86_cpu

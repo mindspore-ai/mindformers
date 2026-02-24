@@ -18,7 +18,18 @@ from typing import Union
 import math
 
 from mindspore import nn, Tensor
-from mindspore.ops.auto_generate import Cast, Shape, Reshape, Transpose, Tile, Concat, SplitWithSize, ExpandDims
+from mindspore.ops.auto_generate import (
+    AddExt,
+    Cast,
+    Shape,
+    Reshape,
+    Transpose,
+    Tile,
+    Concat,
+    SplitWithSize,
+    ExpandDims,
+    BatchMatMul
+)
 from mindspore.ops import functional as F
 from mindspore.context import ParallelMode
 from mindspore.parallel._utils import _get_parallel_mode, _is_sharding_propagation
@@ -107,6 +118,8 @@ class MultiLatentAttention(nn.Cell):
         self.v_head_dim = self.config.v_head_dim
         self.input_layout = self.config.input_layout
         self.compute_dtype = self.config.compute_dtype
+        self.use_dsa = self.config.experimental_attention_variant == "dsa"
+        self.mla_qkv_concat = self.config.mla_qkv_concat
 
         # Define ulysses context parallel related parameters
         self.cp_ds = self.config.hierarchical_context_parallel_sizes
@@ -148,7 +161,15 @@ class MultiLatentAttention(nn.Cell):
         self.reshape = Reshape()
         self.bs_transpose = Transpose()
         self.tnd_transpose = Transpose()
+        self.tnd_transpose_one_head = Transpose()
         self.cast = Cast()
+        self.add_loss = AddExt()
+        if self.use_dsa:
+            self.split_w_kvb = SplitWithSize()
+            self.transpose_weight = Transpose()
+            self.cat_q = Concat(axis=3).add_prim_attr("self_define_shard", True)
+            self.cat_k = Concat(axis=3).add_prim_attr("self_define_shard", True)
+            self.bmm = BatchMatMul()
 
         if _get_parallel_mode() in (ParallelMode.AUTO_PARALLEL,) and _is_sharding_propagation():
             self.sharding_propagation()
@@ -183,9 +204,22 @@ class MultiLatentAttention(nn.Cell):
 
         self.bs_transpose.shard(((dp, cp, tp),))
         self.tnd_transpose.shard((layout("cp", "dp", "tp", "None"),))
+        self.tnd_transpose_one_head.shard((layout("cp", "dp", "None", "None"),))
+        if self.use_dsa:
+            self.split_w_kvb.shard((layout("tp", "None", "None"),))
+            self.transpose_weight.shard((layout("tp", "None", "None"),))
+            self.cat_q.shard(
+                in_strategy=((layout("cp", "dp", "tp", "None"), layout("cp", "dp", "tp", "None")),),
+                out_strategy=(layout("cp", "dp", "tp", "None"),)
+            )
+            self.cat_k.shard(
+                in_strategy=((layout("cp", "dp", "None", "None"), layout("cp", "dp", "None", "None")),),
+                out_strategy=(layout("cp", "dp", "None", "None"),)
+            )
+            self.bmm.shard((layout("cp", "dp", "tp", "None", "None"), layout("tp", "None", "None")))
 
-    def construct(self, x: Tensor, attention_mask=None, rotary_pos_emb=None, rotary_pos_cos=None,
-                  rotary_pos_sin=None, prefix_keys_values=None, pad_zeros=None, actual_seq_len=None):
+    def construct(self, x: Tensor, attention_mask=None, rotary_pos_emb=None, rotary_pos_cos=None, rotary_pos_sin=None,
+                  prefix_keys_values=None, pad_zeros=None, actual_seq_len=None, attention_loss=0.):
         """Forward process."""
         if rotary_pos_cos:
             raise NotImplementedError("rotary_pos_cos is not supported for now.")
@@ -197,11 +231,33 @@ class MultiLatentAttention(nn.Cell):
             raise NotImplementedError("pad_zeros is not supported for now.")
         ori_dtype = x.dtype
         seq_len, bs, _ = self.shape(x)
+        if self.use_dsa:
+            query, key, value, q_compress = self.get_query_key_value_tensors(x, rotary_pos_emb=rotary_pos_emb)
+            x = F.stop_gradient(x)
+            q_compress = F.stop_gradient(q_compress)
+            index_scores, topk_indices = self.core_attention.indexer(
+                x, q_compress,
+                attention_mask, rotary_pos_emb,
+                actual_seq_len, actual_seq_len
+            )
+            # do MHA->MQA transform
+            q_nope, q_rope = query
+            k_nope, k_rope = key
+            w_kvb = self.linear_kvb.weight if self.mla_qkv_concat else self.linear_kv_up_proj.weight
+            w_kvb = self.cast(w_kvb, self.compute_dtype)
+            w_kvb = self.reshape(w_kvb, (self.num_attention_heads, -1, self.kv_lora_rank))
+            q_absorb, v_absorb = self.split_w_kvb(w_kvb, [self.qk_head_dim, self.v_head_dim], dim=1)
+            v_absorb = self.transpose_weight(v_absorb, (0, 2, 1))
+            q_nope = self.bmm(self.reshape(q_nope, (seq_len, bs, -1, 1, self.qk_head_dim)), q_absorb)
+            q_nope = self.reshape(q_nope, (seq_len, bs, -1, self.kv_lora_rank))
+            query = self.cat_q([q_nope, q_rope])
+            key = self.cat_k([k_nope, k_rope])
+        else:
+            query, key, value = self.get_query_key_value_tensors(x, rotary_pos_emb=rotary_pos_emb)
 
-        query, key, value = self.get_query_key_value_tensors(x, rotary_pos_emb=rotary_pos_emb)
-
+        head_dim = query.shape[-1]
         # with ulysses context parallel, insert all to all before FA
-        if self.cp > 1:
+        if self.cp > 1 and not self.use_dsa:
             if self.cp_ds > 1:
                 # For query & key & value, transpose from [S, B, N, D] back to [B, S, N, D]
                 query = self._ulysses_qkv_a2a(query)
@@ -215,12 +271,16 @@ class MultiLatentAttention(nn.Cell):
 
         if self.input_layout == "TND":
             query = self.sbh2tnd(query)
-            key = self.sbh2tnd(key)
-            value = self.sbh2tnd(value)
+            key = self.sbh2tnd(key, self.use_dsa)
+            value = self.sbh2tnd(value, self.use_dsa)
 
         query = self.cast(query, self.compute_dtype)
         key = self.cast(key, self.compute_dtype)
         value = self.cast(value, self.compute_dtype)
+        # For DSA, rename `topk_indices` to `attention_mask` for unified function calling format.
+        if self.use_dsa:
+            mask = attention_mask
+            attention_mask = topk_indices
         if self.use_flash_attention:
             if self.use_eod_attn_mask_compression:
                 context_layer = self.core_attention(
@@ -238,12 +298,28 @@ class MultiLatentAttention(nn.Cell):
                 attn_out = self.reshape(context_layer, (seq_len, bs, -1))
         else:
             attn_out = self.core_attention(query, key, value, attention_mask)
-
+        if self.use_dsa:
+            attn_out = self.reshape(attn_out, (seq_len, bs, self.num_attention_heads, -1))
+            attn_out = self.bmm(self.reshape(attn_out, (seq_len, bs, -1, 1, self.kv_lora_rank)), v_absorb)
+            attn_out = self.reshape(attn_out, (seq_len, bs, -1, self.v_head_dim))
+            attn_out = self.reshape(attn_out, (seq_len, bs, -1))
         output = self.linear_proj(attn_out)[0]  # dp, mp -> dp, 1 / dp * mp, 1
         output = self.cast(output, ori_dtype)
-        return output
+        if self.use_dsa:
+            query = F.stop_gradient(query)
+            key = F.stop_gradient(key)
+            if self.use_eod_attn_mask_compression:
+                query = self.reshape(query, (bs, seq_len, -1, head_dim))
+                key = self.reshape(key, (bs, seq_len, -1, head_dim))
+            else:
+                query = self.reshape(query, (seq_len, bs, -1, head_dim))
+                key = self.reshape(key, (seq_len, bs, -1, head_dim))
+            indexer_loss = self.core_attention.indexer_loss(index_scores, topk_indices,
+                                                            query, key, mask, actual_seq_len)
+            attention_loss = self.add_loss(attention_loss, indexer_loss)
+        return output, attention_loss
 
-    def sbh2tnd(self, x):
+    def sbh2tnd(self, x, one_head=False):
         """
         Convert a input tensor from SBH/SBND layout to TND layout.
 
@@ -254,9 +330,11 @@ class MultiLatentAttention(nn.Cell):
             x_merge: the TND output tensor
         """
         seq_len, bs = x.shape[:2]
-        x = self.reshape(x, (seq_len, bs, self.num_attention_heads, -1))
-        x = self.tnd_transpose(x, (1, 0, 2, 3))
-        x = self.reshape(x, (bs * seq_len, self.num_attention_heads, -1))
+        num_head = 1 if one_head else self.num_attention_heads
+        transpose = self.tnd_transpose_one_head if one_head else self.tnd_transpose
+        x = self.reshape(x, (seq_len, bs, num_head, -1))
+        x = transpose(x, (1, 0, 2, 3))
+        x = self.reshape(x, (bs * seq_len, num_head, -1))
         return x
 
     def _ulysses_qkv_a2a(self, qkv):
@@ -340,7 +418,6 @@ class MLASelfAttentionConcatenated(MultiLatentAttention):
         self.split_3d = SplitWithSize()
         self.tile_kv = Tile()
         self.pe_concat = Concat(axis=3)
-        self.pe_tnd_concat = Concat(axis=3)
         self.apply_rotary_emb = ApplyRotaryPosEmb(config)
         self.apply_rotary_emb2 = ApplyRotaryPosEmb(config, for_k_pos_emb=True)
         self.reshape = Reshape()
@@ -393,7 +470,7 @@ class MLASelfAttentionConcatenated(MultiLatentAttention):
         self.linear_kvb = build_module(
             submodules.linear_kvb,
             self.kv_lora_rank,
-            self.config.num_attention_heads * (self.q_head_dim - self.qk_pos_emb_head_dim + self.v_head_dim),
+            self.config.num_attention_heads * (self.qk_head_dim + self.v_head_dim),
             config=self.config,
             init_method=self.config.init_method,
             bias=self.config.add_bias_linear or self.config.add_qkv_bias,
@@ -481,16 +558,6 @@ class MLASelfAttentionConcatenated(MultiLatentAttention):
         k_pe = self.reshape(k_pe, (seq_len, bs, 1, self.qk_pos_emb_head_dim))
         compressed_kv_norm = self.k_layernorm(compressed_kv)
 
-        kv = self.linear_kvb(compressed_kv_norm)[0]
-        kv = self.reshape(kv, (
-            seq_len,
-            bs,
-            self.num_attention_heads,
-            self.qk_head_dim + self.v_head_dim,
-        ))
-
-        k_nope, value = self.split(kv, [self.qk_head_dim, self.v_head_dim], dim=-1)
-
         if rotary_pos_emb is not None:
             q_pe = self.apply_rotary_emb(
                 q_pe,
@@ -505,10 +572,27 @@ class MLASelfAttentionConcatenated(MultiLatentAttention):
                 multi_latent_attention=self.config.multi_latent_attention
             )
 
-        query = self.pe_concat([q_nope, q_pe])
-        k_pe = self.tile_kv(k_pe, (1, 1, self.num_attention_heads, 1))
-        key = self.pe_concat([k_nope, k_pe])
+        if self.use_dsa:
+            k_nope = self.reshape(compressed_kv_norm, (seq_len, bs, 1, -1))
+            value = self.reshape(compressed_kv_norm, (seq_len, bs, 1, -1))
+            query = (q_nope, q_pe)
+            key = (k_nope, k_pe)
+        else:
+            kv = self.linear_kvb(compressed_kv_norm)[0]
+            kv = self.reshape(kv, (
+                seq_len,
+                bs,
+                self.num_attention_heads,
+                self.qk_head_dim + self.v_head_dim,
+            ))
 
+            k_nope, value = self.split(kv, [self.qk_head_dim, self.v_head_dim], dim=-1)
+            query = self.pe_concat([q_nope, q_pe])
+            k_pe = self.tile_kv(k_pe, (1, 1, self.num_attention_heads, 1))
+            key = self.pe_concat([k_nope, k_pe])
+
+        if self.use_dsa:
+            return query, key, value, q_a
         return query, key, value
 
 
@@ -540,7 +624,6 @@ class MLASelfAttention(MultiLatentAttention):
         self.split_3d = SplitWithSize()
         self.tile_kv = Tile()
         self.pe_concat = Concat(axis=3)
-        self.pe_tnd_concat = Concat(axis=3)
         self.apply_rotary_emb = ApplyRotaryPosEmb(config)
         self.apply_rotary_emb2 = ApplyRotaryPosEmb(config, for_k_pos_emb=True)
         self.reshape = Reshape()
@@ -656,19 +739,10 @@ class MLASelfAttention(MultiLatentAttention):
         q_len, bs, _ = self.shape(q)
 
         q = self.reshape(q, (q_len, bs, self.num_attention_heads, self.q_head_dim))
-        kv, _ = self.linear_kv_up_proj(kv_compressed)
-
-        kv = self.reshape(kv, (q_len, bs, self.num_attention_heads, self.config.qk_head_dim + self.config.v_head_dim))
-
-        k_pos_emb = self.expand_dims(k_pos_emb, 2)
-
         q_no_pe, q_pos_emb = self.split(
             q, [self.config.qk_head_dim, self.config.qk_pos_emb_head_dim], dim=-1
         )
-
-        k_no_pe, value = self.split(
-            kv, [self.config.qk_head_dim, self.config.v_head_dim], dim=-1
-        )
+        k_pos_emb = self.expand_dims(k_pos_emb, 2)
 
         if rotary_pos_emb is not None:
             q_pos_emb = self.apply_rotary_emb(
@@ -684,11 +758,20 @@ class MLASelfAttention(MultiLatentAttention):
                 multi_latent_attention=self.config.multi_latent_attention
             )
 
-        query = self.pe_concat([q_no_pe, q_pos_emb])
-
-        k_pos_emb = self.tile_kv(k_pos_emb, (1, 1, self.num_attention_heads, 1))
-        key = self.pe_concat([k_no_pe, k_pos_emb])
-
+        if self.use_dsa:
+            k_no_pe = self.reshape(kv_compressed, (q_len, bs, 1, -1))
+            value = self.reshape(kv_compressed, (q_len, bs, 1, -1))
+            query = (q_no_pe, q_pos_emb)
+            key = (k_no_pe, k_pos_emb)
+        else:
+            kv, _ = self.linear_kv_up_proj(kv_compressed)
+            kv = self.reshape(kv, (q_len, bs, self.num_attention_heads, -1))
+            k_no_pe, value = self.split(
+                kv, [self.config.qk_head_dim, self.config.v_head_dim], dim=-1
+            )
+            query = self.pe_concat([q_no_pe, q_pos_emb])
+            k_pos_emb = self.tile_kv(k_pos_emb, (1, 1, self.num_attention_heads, 1))
+            key = self.pe_concat([k_no_pe, k_pos_emb])
         return query, key, value
 
     def get_query_key_value_tensors(self, hidden_states,
@@ -731,5 +814,6 @@ class MLASelfAttention(MultiLatentAttention):
         query, key, value = self.qkv_up_proj_and_rope_apply(
             q_compressed, kv_compressed, k_pos_emb, rotary_pos_emb
         )
-
+        if self.use_dsa:
+            return query, key, value, q_compressed
         return query, key, value

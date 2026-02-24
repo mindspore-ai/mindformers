@@ -20,6 +20,7 @@ from mindformers.parallel_core.training_graph.base_models.gpt.gpt_model import G
 from mindformers.parallel_core.training_graph.base_models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec, \
     get_gpt_mtp_block_spec, get_gpt_layer_local_spec
 from mindformers.parallel_core.utils.model_mixin import TrainModelMixin
+from mindformers.tools.logger import logger
 
 from .configuration_deepseek_v3 import DeepseekV3Config
 
@@ -36,6 +37,7 @@ class TrainingDeepseekV3ForCausalLM(TrainModelMixin, DeepseekV3PreTrainedModel):
             transformer_layer_spec = get_gpt_layer_local_spec(
                 qk_layernorm=transformer_config.qk_layernorm,
                 multi_latent_attention=transformer_config.multi_latent_attention,
+                sparse_attention=transformer_config.experimental_attention_variant == 'dsa',
                 use_contiguous_weight_layout_attention=transformer_config.use_contiguous_weight_layout_attention,
                 mla_qkv_concat=transformer_config.mla_qkv_concat,
                 use_interleaved_weight_layout_mlp=transformer_config.use_interleaved_weight_layout_mlp
@@ -54,6 +56,17 @@ class TrainingDeepseekV3ForCausalLM(TrainModelMixin, DeepseekV3PreTrainedModel):
             rope_scaling=False,
             mtp_block_spec=mtp_block_spec
         )
+        if transformer_config.experimental_attention_variant == 'dsa' and \
+                not transformer_config.dsa_indexer_use_sparse_loss:
+            logger.warning("`dsa_indexer_use_sparse_loss` is set to False, so Dense Warm-up Stage of DeepSeek-V3.2 "
+                           "will be applied. Freeze all parameters except indexer.")
+            self.freeze()
+
+    def freeze(self):
+        for cell_name, cell in self.model.cells_and_names():
+            for param in cell.trainable_params():
+                if "indexer" not in param.name:
+                    param.requires_grad = False
 
     def construct(
             self,

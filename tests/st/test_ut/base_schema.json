@@ -81,7 +81,7 @@
         "signature": "(self, run_context)"
     },
     "mindformers.MFLossMonitor.print_output_info": {
-        "signature": "(self, cb_params, cur_epoch_num, origin_epochs, throughput, cur_step_num, steps_per_epoch, loss, per_step_seconds, overflow, scaling_sens, time_remain, percent, global_norm, main_loss, extra_loss, mtp_loss)"
+        "signature": "(self, cb_params, cur_epoch_num, origin_epochs, throughput, cur_step_num, steps_per_epoch, loss, per_step_seconds, overflow, scaling_sens, time_remain, percent, global_norm, main_loss, extra_loss, mtp_loss, indexer_loss)"
     },
     "mindformers.ProfileMonitor": {
         "signature": "(start_step=1, stop_step=10, output_path=None, start_profile=True, profile_rank_ids=None, profile_pipeline=False, profile_communication=False, profile_memory=False, config=None, profiler_level=0, with_stack=False, data_simplification=True, mstx=False, **kwargs)"
@@ -742,6 +742,9 @@
     },
     "mindformers.PretrainedConfig.to_dict": {
         "signature": "(self) -> Dict[str, Any]"
+    },
+    "mindformers.PretrainedConfig.convert_to_transformer_config": {
+        "signature": "(self, is_mla_model: bool = False)"
     },
     "mindformers.PretrainedConfig.from_pretrained": {
         "signature": "(yaml_name_or_path, **kwargs) -> 'PretrainedConfig'"

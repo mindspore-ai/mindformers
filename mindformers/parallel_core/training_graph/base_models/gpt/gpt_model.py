@@ -453,7 +453,7 @@ class GPTModel(nn.Cell):
         labels, attention_mask, loss_mask, local_labels, local_loss_mask = self._preprocess_input_labels_and_masks(
             input_ids, labels, attention_mask, loss_mask)
 
-        hidden_states, rotary_pos_emb, extra_loss = self.language_model(
+        hidden_states, rotary_pos_emb, extra_loss, attention_loss = self.language_model(
             input_ids,
             position_ids,
             attention_mask,
@@ -466,7 +466,7 @@ class GPTModel(nn.Cell):
         mtp_loss = self.init_mtp_loss
         numerator1, denominator1 = self.init_numerator1, self.init_denominator1
         if self.mtp_process:
-            mtp_loss, extra_loss = self.mtp(
+            mtp_loss, extra_loss, attention_loss = self.mtp(
                 input_ids,
                 position_ids,
                 hidden_states,
@@ -480,6 +480,7 @@ class GPTModel(nn.Cell):
                 tokentype_embeddings_weight=getattr(self.embedding.tokentype_embeddings, 'weight', None),
                 output_weight=self.output_layer.weight,
                 extra_loss=extra_loss,
+                attention_loss=attention_loss
             )
             if self.calculate_per_token_loss:
                 numerator1, denominator1 = mtp_loss
@@ -507,8 +508,8 @@ class GPTModel(nn.Cell):
 
         if self.calculate_per_token_loss:
             numerator0, denominator0 = loss
-            return numerator0, denominator0, numerator1, denominator1, extra_loss * denominator0
-        return loss, mtp_loss, extra_loss
+            return numerator0, denominator0, numerator1, denominator1, extra_loss * denominator0, attention_loss
+        return loss, mtp_loss, extra_loss, attention_loss
 
     def forward_func_logits(self, input_):
         """Morphed forward."""
@@ -555,7 +556,7 @@ class GPTModel(nn.Cell):
             attn_mask = self.concat_prefix((prefix_mask, attn_mask))
 
         # Run decoder.
-        hidden_states, extra_loss = self.decoder(
+        hidden_states, extra_loss, attention_loss = self.decoder(
             decoder_input,
             attn_mask,
             rotary_pos_emb,
@@ -563,7 +564,7 @@ class GPTModel(nn.Cell):
             actual_seq_len
         )
 
-        return hidden_states, rotary_pos_emb, extra_loss
+        return hidden_states, rotary_pos_emb, extra_loss, attention_loss
 
     def shared_embedding_or_output_weight(self):
         """Gets the embedding weight or output logit weights when share embedding and output weights set to True.

@@ -300,6 +300,7 @@ class MFTrainOneStepCell(nn.TrainOneStepWithLossScaleCell):
         transformer_config = real_network.get_gpt_transformer_config() if not self.use_legacy else None
 
         if self.print_separate_loss:
+            self.indexer_loss_parameter = parameter_register.register("indexer_loss", Tensor([0], mstype.float32))
             self.aux_loss_parameter = parameter_register.register("aux_loss", Tensor([0], mstype.float32))
             self.mtp_loss_parameter = parameter_register.register("mtp_loss", Tensor([0], mstype.float32))
             self.lm_loss_parameter = parameter_register.register("lm_loss", Tensor([0], mstype.float32))
@@ -308,6 +309,7 @@ class MFTrainOneStepCell(nn.TrainOneStepWithLossScaleCell):
                 transformer_config.moe_layer_freq,
                 transformer_config.num_layers
             )
+            self.total_num_layers = transformer_config.num_layers + transformer_config.mtp_num_layers
 
         # Get grouped LR schedulers from base_trainer
         grouped_lr_scheduler = kwargs.get('grouped_lr_scheduler')
@@ -410,11 +412,12 @@ class MFTrainOneStepCell(nn.TrainOneStepWithLossScaleCell):
     def grads_for_mcore(self, scaling_sens, *inputs):
         """calculate grad for mcore model"""
         if self.calculate_per_token_loss:
-            numerator0, denominator0, numerator1, _, aux_loss = self.network(*inputs)
+            numerator0, denominator0, numerator1, _, aux_loss, indexer_loss = self.network(*inputs)
             lm_loss = numerator0 / denominator0
             mtp_loss = numerator1 / denominator0
             aux_loss = aux_loss / denominator0
-            loss = lm_loss + aux_loss
+            indexer_loss = indexer_loss / denominator0
+            loss = lm_loss + aux_loss + indexer_loss
             loss = loss + mtp_loss
 
             scaling_sens_filled = C.ones_like(numerator0) * F.cast(scaling_sens, F.dtype(numerator0))
@@ -425,20 +428,23 @@ class MFTrainOneStepCell(nn.TrainOneStepWithLossScaleCell):
                                                            self.cast(scaling_sens_filled, mstype.float32),
                                                            self.cast(scaling_sens_filled_zero, mstype.float32),
                                                            self.cast(scaling_sens_filled, mstype.float32),
+                                                           self.cast(scaling_sens_filled, mstype.float32),
                                                            ))
             grad_scale_factor = denominator0
         else:
-            lm_loss, mtp_loss, aux_loss = self.network(*inputs)
-            loss = lm_loss + aux_loss
+            lm_loss, mtp_loss, aux_loss, indexer_loss = self.network(*inputs)
+            loss = lm_loss + aux_loss + indexer_loss
             loss = loss + mtp_loss
 
             scaling_sens_filled = C.ones_like(loss) * F.cast(scaling_sens, F.dtype(loss))
             grads = self.grad(self.network, self.weights)(*inputs, (scaling_sens_filled,
                                                                     scaling_sens_filled,
+                                                                    scaling_sens_filled,
                                                                     scaling_sens_filled))
             grad_scale_factor = self.grad_scale_factor
 
         if self.print_separate_loss:
+            F.assign_add(self.indexer_loss_parameter, indexer_loss / self.total_num_layers)
             F.assign_add(self.aux_loss_parameter, aux_loss / self.aux_loss_scale if self.aux_loss_scale > 0 else 0)
             F.assign_add(self.mtp_loss_parameter, mtp_loss)
             F.assign_add(self.lm_loss_parameter, lm_loss)
@@ -948,6 +954,7 @@ class MFPipelineWithLossScaleCell(nn.TrainOneStepWithLossScaleCell):
         # loss
         self.print_separate_loss = bool(print_separate_loss and not self.use_legacy)
         if self.print_separate_loss:
+            self.indexer_loss_parameter = parameter_register.register("indexer_loss", Tensor([0], mstype.float32))
             self.aux_loss_parameter = parameter_register.register("aux_loss", Tensor([0], mstype.float32))
             self.mtp_loss_parameter = parameter_register.register("mtp_loss", Tensor([0], mstype.float32))
             self.lm_loss_parameter = parameter_register.register("lm_loss", Tensor([0], mstype.float32))
@@ -956,6 +963,7 @@ class MFPipelineWithLossScaleCell(nn.TrainOneStepWithLossScaleCell):
                 transformer_config.moe_layer_freq,
                 transformer_config.num_layers
             )
+            self.total_num_layers = transformer_config.num_layers + transformer_config.mtp_num_layers
 
         # Get grouped LR schedulers from base_trainer
         grouped_lr_scheduler = kwargs.get('grouped_lr_scheduler')
@@ -1067,12 +1075,13 @@ class MFPipelineWithLossScaleCell(nn.TrainOneStepWithLossScaleCell):
     def grads_for_mcore(self, scaling_sens, *inputs):
         """calculate grad for mcore model"""
         if self.calculate_per_token_loss:
-            numerator0, denominator0, numerator1, _, aux_loss = self.network(*inputs)
+            numerator0, denominator0, numerator1, _, aux_loss, indexer_loss = self.network(*inputs)
             denominator0 = self.allreduce2(denominator0)
             lm_loss = numerator0 / denominator0
             mtp_loss = numerator1 / denominator0
             aux_loss = aux_loss / denominator0
-            loss = lm_loss + aux_loss
+            indexer_loss = indexer_loss / denominator0
+            loss = lm_loss + aux_loss + indexer_loss
             loss = loss + mtp_loss
 
             scaling_sens_filled = C.ones_like(numerator0) * F.cast(scaling_sens, F.dtype(numerator0))
@@ -1084,20 +1093,24 @@ class MFPipelineWithLossScaleCell(nn.TrainOneStepWithLossScaleCell):
                                                            self.cast(scaling_sens_filled_zero, mstype.float32),
                                                            self.cast(scaling_sens_filled / self.micro_size,
                                                                      mstype.float32),
+                                                           self.cast(scaling_sens_filled / self.micro_size,
+                                                                     mstype.float32),
                                                            ))
             grad_scale_factor = denominator0
         else:
-            lm_loss, mtp_loss, aux_loss = self.network(*inputs)
-            loss = lm_loss + aux_loss
+            lm_loss, mtp_loss, aux_loss, indexer_loss = self.network(*inputs)
+            loss = lm_loss + aux_loss + indexer_loss
             loss = loss + mtp_loss
             scaling_sens_filled = C.ones_like(loss) * F.cast(scaling_sens, F.dtype(loss))
             scaling_sens_filled = self.cast(scaling_sens_filled / self.micro_size, mstype.float32)
             grads = self.grad(self.network, self.weights)(*inputs, (scaling_sens_filled,
                                                                     scaling_sens_filled,
+                                                                    scaling_sens_filled,
                                                                     scaling_sens_filled))
             grad_scale_factor = self.grad_scale_factor
 
         if self.print_separate_loss:
+            F.assign_add(self.indexer_loss_parameter, indexer_loss / self.total_num_layers)
             F.assign_add(self.aux_loss_parameter, aux_loss / self.aux_loss_scale)
             F.assign_add(self.mtp_loss_parameter, mtp_loss)
             F.assign_add(self.lm_loss_parameter, lm_loss)
