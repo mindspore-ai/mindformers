@@ -46,7 +46,8 @@ from mindformers.pynative.callback import (
     LossCallback,
     CheckpointCallback,
 )
-from mindformers.core.context.build_context import build_context
+import mindformers.tools.register.register as register_module
+import mindformers.dataset.handler.base_handler as handler_module
 
 from mindformers.checkpoint.checkpoint import CommonInfo, get_checkpoint_path
 
@@ -60,6 +61,17 @@ from .utils import (
     _build_lora_model,
     compute_parameters,
 )
+
+
+def patch_legacy_model_inference():
+    """Patch legacy model inference."""
+    return False
+
+
+def patch_pynative_modules():
+    """Patch is_legacy_model for pynative trainer."""
+    register_module.is_legacy_model = patch_legacy_model_inference
+    handler_module.is_legacy_model = patch_legacy_model_inference
 
 
 class TrainMode(enum.Enum):
@@ -111,9 +123,11 @@ class Trainer:
                 "instances should not be provided. They will be built from config."
             )
 
+        # patch legacy model inference for pynative mode
+        patch_pynative_modules()
+
         # Initialize config
         self.config = self._init_config(config, run_mode)
-        build_context({'use_legacy': False, 'context': {'mode': 1}})
 
         self.world_size = get_world_size()
         logger.info(f"Current world size: {self.world_size}.")
