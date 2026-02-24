@@ -2565,12 +2565,10 @@ class MLATransformerConfig(TransformerConfig):
 
         if self.experimental_attention_variant == 'dsa':
             if self.kv_lora_rank != 512 or self.qk_pos_emb_head_dim != 64 or \
-                    self.dsa_indexer_topk != 2048 or self.dsa_indexer_head_dim != 128 or self.dsa_indexer_n_heads != 64:
+                    self.dsa_indexer_head_dim != 128 or self.dsa_indexer_n_heads != 64:
                 raise ValueError("CurrentLy, when `experimental_attention_variant` == 'dsa', "
                                  "`kv_lora_rank` only supports 512, `qk_pos_emb_head_dim` only supports 64, "
-                                 "`dsa_indexer_topk` only supports 2048, "
-                                 "`dsa_indexer_head_dim` only supports 128, "
-                                 "`dsa_indexer_n_heads` only supports 64.")
+                                 "`dsa_indexer_head_dim` only supports 128, `dsa_indexer_n_heads` only supports 64.")
 
 
 default_transformer_config = TransformerConfig(num_attention_heads=1, num_layers=1)
