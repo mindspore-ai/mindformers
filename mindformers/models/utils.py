@@ -22,6 +22,7 @@
 """Check Model Input Config."""
 import json
 import os
+from dataclasses import dataclass
 from functools import wraps
 from typing import Union, Optional
 import mindspore.common.dtype as mstype
@@ -246,15 +247,154 @@ def convert_transformer_config_to_args_for_tflops(
     return config
 
 
+class Symbols:
+    """Symbols for different layer types."""
+
+    MAMBA = "M"
+    ATTENTION = "*"
+    MLP = "-"
+    MOE = 'E'
+    MTP_SEPARATOR = "/"
+    VALID = {MAMBA, ATTENTION, MLP, MOE}
+
+
+@dataclass
+class ParsedHybridPattern:
+    """Result of parsing a unified hybrid pattern string.
+
+    A unified pattern encodes both the main decoder pattern and the MTP pattern
+    in a single string using "/" as a separator.
+
+    Format: "<main_pattern>/<mtp_pattern>/<mtp_pattern>/..."
+
+    Examples:
+        - "M*M*" -> main="M*M*", mtp=None, depths=0 (no MTP)
+        - "M*M*/MM/MM" -> main="M*M*", mtp="MM", depths=2
+        - "MMMM/*M/*M/*M" -> main="MMMM", mtp="*M", depths=3
+
+    The "/" symbol introduces MTP patterns. Each repeated pattern after the main
+    decoder represents one MTP prediction depth.
+
+    Attributes:
+        main_pattern: The main decoder layer pattern (e.g., "M*M*")
+        mtp_pattern: The MTP layer pattern per depth (e.g., "MM"), or None if no MTP
+        mtp_num_depths: Number of MTP prediction depths (0 if no MTP)
+    """
+
+    main_pattern: Optional[str]
+    mtp_pattern: Optional[str]
+    mtp_num_depths: int
+
+
+def parse_hybrid_pattern(pattern: Optional[str]) -> ParsedHybridPattern:
+    """Parse a unified hybrid pattern string into main and MTP components.
+
+    The pattern uses "/" as a separator between the main decoder pattern and
+    MTP patterns. Each MTP pattern after the separator represents one prediction
+    depth.
+
+    Format: "<main_pattern>/<mtp_pattern>/<mtp_pattern>/..."
+
+    Args:
+        pattern: Unified pattern string, e.g., "M*M*/MM/MM" or just "M*M*"
+
+    Returns:
+        ParsedHybridPattern with main_pattern, mtp_pattern, and mtp_num_depths
+
+    Raises:
+        ValueError: If MTP patterns are inconsistent (all must be identical)
+        ValueError: If pattern contains invalid layer symbols
+
+    Examples:
+        >>> parse_hybrid_pattern("M*M*")
+        ParsedHybridPattern(main_pattern="M*M*", mtp_pattern=None, mtp_num_depths=0)
+
+        >>> parse_hybrid_pattern("M*M*/MM/MM")
+        ParsedHybridPattern(main_pattern="M*M*", mtp_pattern="MM", mtp_num_depths=2)
+
+        >>> parse_hybrid_pattern("MMMM/*M/*M/*M")
+        ParsedHybridPattern(main_pattern="MMMM", mtp_pattern="*M", mtp_num_depths=3)
+    """
+    if pattern is None:
+        return ParsedHybridPattern(main_pattern=None, mtp_pattern=None, mtp_num_depths=0)
+
+    parts = pattern.split(Symbols.MTP_SEPARATOR)
+
+    if len(parts) == 1:
+        # No MTP separator found - pattern is main decoder only
+        main_pattern = parts[0]
+        _validate_pattern(main_pattern, "main")
+        return ParsedHybridPattern(main_pattern=main_pattern, mtp_pattern=None, mtp_num_depths=0)
+
+    # First part is main decoder pattern
+    main_pattern = parts[0]
+    if main_pattern:
+        _validate_pattern(main_pattern, "main")
+
+    # Remaining parts are MTP patterns (one per depth)
+    mtp_parts = parts[1:]
+
+    if not mtp_parts or all(p == "" for p in mtp_parts):
+        # No MTP patterns after separator
+        return ParsedHybridPattern(
+            main_pattern=main_pattern if main_pattern else None, mtp_pattern=None, mtp_num_depths=0
+        )
+
+    # Validate all MTP patterns are identical
+    mtp_pattern = mtp_parts[0]
+    for i, part in enumerate(mtp_parts[1:], start=2):
+        if part != mtp_pattern:
+            raise ValueError(
+                f"All MTP patterns must be identical. "
+                f"Pattern 1 is '{mtp_pattern}', but pattern {i} is '{part}'. "
+                f"Full pattern: '{pattern}'"
+            )
+
+    _validate_pattern(mtp_pattern, "MTP")
+
+    return ParsedHybridPattern(
+        main_pattern=main_pattern if main_pattern else None,
+        mtp_pattern=mtp_pattern,
+        mtp_num_depths=len(mtp_parts),
+    )
+
+
+def _validate_pattern(pattern: str, pattern_name: str) -> None:
+    """Validate that a pattern contains only valid layer symbols.
+
+    Args:
+        pattern: Layer pattern string to validate
+        pattern_name: Name of pattern for error messages (e.g., "main" or "MTP")
+
+    Raises:
+        ValueError: If pattern contains invalid symbols
+    """
+    for char in pattern:
+        if char not in Symbols.VALID:
+            raise ValueError(
+                f"In {pattern_name} pattern, '{char}' is not a valid layer symbol. "
+                f"Valid symbols are: {Symbols.VALID}"
+            )
+
+
 def num_floating_point_operations(args, batch_size):
     """Calculate the total floating point operations for the model."""
     def calculate_layer_counts():
         """Calculate the number of attention, Mamba, and MLP layers."""
         if args.hybrid_override_pattern:
+            # Parse unified pattern to separate main and MTP components
+            parsed = parse_hybrid_pattern(args.hybrid_override_pattern)
             counts = {'M': 0, '*': 0, '-': 0, 'E': 0}
-            for layer_type in args.hybrid_override_pattern:
-                if layer_type in counts:
-                    counts[layer_type] += 1
+            # Count main decoder layers
+            if parsed.main_pattern:
+                for layer_type in parsed.main_pattern:
+                    if layer_type in counts:
+                        counts[layer_type] += 1
+            # Count MTP layers (pattern repeated mtp_num_depths times)
+            if parsed.mtp_pattern and parsed.mtp_num_depths > 0:
+                for layer_type in parsed.mtp_pattern:
+                    if layer_type in counts:
+                        counts[layer_type] += parsed.mtp_num_depths
             return counts['*'], counts['M'], counts['-'], counts['E']
         num_attn_layers = round(args.num_layers * args.hybrid_attention_ratio)
         num_mlp_layers = round(args.num_layers * args.hybrid_mlp_ratio)
@@ -330,7 +470,7 @@ def num_floating_point_operations(args, batch_size):
                      mlp_expansion=4.0, swiglu=False,
                      moe_latent_size=None,
                      moe_ffn_hidden_size=2048, shared_expert_ffn_hidden_size=2048, num_experts_routed_to=1,
-                     vocab_size=256000):
+                     vocab_size=256000, mtp_num_layers=0):
         """Calculate total FLOPs for the hybrid model."""
         flops_fwd = (
                 num_attn_layers * attn_layer_flops(batch_size, seq_len, hidden_size,
@@ -343,7 +483,7 @@ def num_floating_point_operations(args, batch_size):
                 num_moe_layers * moe_layer_flops(batch_size, seq_len, hidden_size, moe_ffn_hidden_size,
                                                  shared_expert_ffn_hidden_size, num_experts_routed_to,
                                                  moe_latent_size, swiglu) +
-                (2 * batch_size * seq_len * hidden_size * vocab_size)  # logits computation
+                (2 * batch_size * seq_len * hidden_size * vocab_size * (1 + mtp_num_layers))  # logits computation
         )
         return flops_fwd * 3
 
@@ -393,6 +533,7 @@ def num_floating_point_operations(args, batch_size):
             if args.moe_ffn_hidden_size is not None
             else args.ffn_hidden_size
         )
+        moe_latent_size = args.moe_latent_size
         shared_expert_ffn_hidden_size = (
             0
             if args.moe_shared_expert_intermediate_size is None
@@ -572,7 +713,20 @@ def num_floating_point_operations(args, batch_size):
                     (args.ffn_hidden_size * ffn_expansion_factor)
                     * num_dense_layers
                     # routed experts
-                    + (moe_ffn_hidden_size * num_experts_routed_to * ffn_expansion_factor)
+                    + (
+                        (moe_ffn_hidden_size * num_experts_routed_to * ffn_expansion_factor)
+                        if moe_latent_size is None
+                        else (
+                            (
+                                moe_ffn_hidden_size
+                                * num_experts_routed_to
+                                * ffn_expansion_factor
+                                * moe_latent_size
+                                / args.hidden_size
+                            )  # Routed experts run on moe_latent_size.
+                            + 2 * moe_latent_size  # Up proj and down proj.
+                        )
+                    )
                     * num_moe_layers
                     # Shared Experts.
                     + (shared_expert_ffn_hidden_size * ffn_expansion_factor)
@@ -605,6 +759,9 @@ def num_floating_point_operations(args, batch_size):
         # Calculate the number of each type of layer.
         num_attn_layers, num_mamba_layers, num_mlp_layers, num_moe_layers = calculate_layer_counts()
 
+        mtp_num_layers = args.mtp_num_layers
+        if mtp_num_layers is None:
+            mtp_num_layers = 0
         # Compute hybrid model FLOPs.
         return hybrid_flops(
             batch_size=batch_size,
@@ -631,6 +788,7 @@ def num_floating_point_operations(args, batch_size):
                                            else args.moe_shared_expert_intermediate_size),
             num_experts_routed_to=args.moe_router_topk,
             vocab_size=args.padded_vocab_size,
+            mtp_num_layers=mtp_num_layers,
         )
     # Compute standard Transformer model FLOPs.
     return transformer_flops()
