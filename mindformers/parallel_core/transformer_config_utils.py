@@ -283,6 +283,13 @@ COMMON_CONFIG_MAPPING = {
     "num_encoder_layers": "num_encoder_layers",
     "moe_apply_probs_on_input": "moe_apply_probs_on_input",
     "num_decoder_layers": "num_decoder_layers",
+    # dsa
+    ("index_head_dim", "dsa_indexer_head_dim"): "dsa_indexer_head_dim",
+    ("index_n_heads", "dsa_indexer_n_heads"): "dsa_indexer_n_heads",
+    ("index_topk", "dsa_indexer_topk"): "dsa_indexer_topk",
+    "dsa_indexer_loss_coeff": "dsa_indexer_loss_coeff",
+    "dsa_indexer_use_sparse_loss": "dsa_indexer_use_sparse_loss",
+    "experimental_attention_variant": "experimental_attention_variant",
 
     # Flash Attention
     # not changes

@@ -1361,6 +1361,71 @@ class TransformerConfig:
     )
 
     ####################
+    # attention variant
+    ####################
+    experimental_attention_variant: str = field(
+        default=None,
+        metadata={
+            "description": "Type of attention variant to use. Currently support ['dsa']."
+                           "Defaults: `None`, which means that no attention variant will be applied.",
+            "usage": ParamUsage.TRAINING,
+            "source": ParamSource.MEGATRON,
+            "mode": ParamMode.GRAPH
+        }
+    )
+
+    dsa_indexer_n_heads: int = field(
+        default=None,
+        metadata={
+            "description": "Number of DSA indexer heads.",
+            "usage": ParamUsage.TRAINING,
+            "source": ParamSource.MEGATRON,
+            "mode": ParamMode.GRAPH
+        }
+    )
+
+    dsa_indexer_head_dim: int = field(
+        default=None,
+        metadata={
+            "description": "Dimension per DSA indexer head.",
+            "usage": ParamUsage.TRAINING,
+            "source": ParamSource.MEGATRON,
+            "mode": ParamMode.GRAPH
+        }
+    )
+
+    dsa_indexer_topk: int = field(
+        default=None,
+        metadata={
+            "description": "Number of top-k tokens to select in DSA indexer.",
+            "usage": ParamUsage.TRAINING,
+            "source": ParamSource.MEGATRON,
+            "mode": ParamMode.GRAPH
+        }
+    )
+
+    dsa_indexer_loss_coeff: float = field(
+        default=None,
+        metadata={
+            "description": "Coefficient for the DSA indexer KL divergence loss. Set to 0 to disable indexer loss.",
+            "usage": ParamUsage.TRAINING,
+            "source": ParamSource.MEGATRON,
+            "mode": ParamMode.GRAPH
+        }
+    )
+
+    dsa_indexer_use_sparse_loss: bool = field(
+        default=False,
+        metadata={
+            "description": "Whether to use sparse DSA indexer loss."
+                           "If True, the indexer loss will be computed using the top-k indices.",
+            "usage": ParamUsage.TRAINING,
+            "source": ParamSource.MEGATRON,
+            "mode": ParamMode.GRAPH
+        }
+    )
+
+    ####################
     # Initialization
     ####################
 
@@ -1987,12 +2052,21 @@ class TransformerConfig:
             raise ValueError("context_parallel is only available for flash attention for now, "
                              "please set use_flash_attention=True.")
 
+        if self.experimental_attention_variant == 'dsa':
+            if not self.multi_latent_attention:
+                raise ValueError("When experimental_attention_variant == 'dsa', multi_latent_attention should be True.")
+            if not self.use_flash_attention:
+                raise ValueError("DeepSeek Sparse Attention is only available for flash attention for now, "
+                                 "please set use_flash_attention=True.")
+
         if self.use_flash_attention:
             if self.use_eod_attn_mask_compression and not self.use_ring_attention:
                 self.input_layout = "TND"
                 if self.attention_dropout != 0:
                     logger.warning("When use TND layout of flash attention, attention_dropout is ignored. Set to 0.")
                     self.attention_dropout = 0.
+            elif self.experimental_attention_variant == 'dsa':
+                self.input_layout = "BSND"
             elif self.context_parallel_size > 1:
                 self.input_layout = "BSH"
             else:
@@ -2481,6 +2555,23 @@ class MLATransformerConfig(TransformerConfig):
             "mode": ParamMode.COMMON
         }
     )
+
+    def __post_init__(self):
+        """
+        Python dataclass method that is used to modify attributes after initialization.
+        See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more
+        details.
+        """
+        super().__post_init__()
+
+        if self.experimental_attention_variant == 'dsa':
+            if self.kv_lora_rank != 512 or self.qk_pos_emb_head_dim != 64 or \
+                    self.dsa_indexer_topk != 2048 or self.dsa_indexer_head_dim != 128 or self.dsa_indexer_n_heads != 64:
+                raise ValueError("CurrentLy, when `experimental_attention_variant` == 'dsa', "
+                                 "`kv_lora_rank` only supports 512, `qk_pos_emb_head_dim` only supports 64, "
+                                 "`dsa_indexer_topk` only supports 2048, "
+                                 "`dsa_indexer_head_dim` only supports 128, "
+                                 "`dsa_indexer_n_heads` only supports 64.")
 
 
 default_transformer_config = TransformerConfig(num_attention_heads=1, num_layers=1)

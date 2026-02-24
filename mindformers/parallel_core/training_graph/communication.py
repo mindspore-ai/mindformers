@@ -20,6 +20,7 @@ from mindspore.communication import create_group
 
 from mindformers.checkpoint.sharded_tensor import ShardedTensor
 from mindformers.tools.logger import logger
+from mindformers.tools.utils import get_rank_info
 
 
 def compute_repeat_num_and_model_parallel_size(sharded_info: ShardedTensor, world_size: int, pp: int, op: int):
@@ -56,6 +57,16 @@ def create_communication_group(rank_list):
     group_name = str(hashed)
     create_group(group_name, rank_list)
     return group_name
+
+
+def get_dp_cp_id(config):
+    """Get the CP (Context Parallel) and DP (Data Parallel) offset id on current rank"""
+    rank, group_size = get_rank_info()
+    pp_domain_size = group_size // config.pipeline_model_parallel_size
+    dp_domain_size = pp_domain_size // config.data_parallel_size
+    dp_id = rank % pp_domain_size // dp_domain_size
+    cp_id = rank % pp_domain_size % dp_domain_size // config.tensor_model_parallel_size % config.context_parallel_size
+    return dp_id, cp_id
 
 
 OP_GROUP_NAME = {}
