@@ -15,11 +15,11 @@
 """Glm4 Config API."""
 
 from mindformers.models.configuration_utils import PretrainedConfig
+from mindformers.models.glm4.config_converter_glm4 import Glm4ConfigConverter
 from mindformers.models.model_config_utils import (
     register_mf_model_parameter,
     ignore_and_delete_parameter
 )
-from mindformers.parallel_core.mf_model_config import MFModelConfig
 from mindformers.tools.register import MindFormerRegister, MindFormerModuleType
 
 
@@ -99,14 +99,16 @@ class Glm4Config(PretrainedConfig):
     }
 
     @register_mf_model_parameter(
-        mf_model_kwargs=MFModelConfig(
-            block_size=32,
-            num_blocks=1024,
-            normalization='RMSNorm',
-            add_bias_linear=False,
-            gated_linear_unit=True,
-            sandwich_norm=True,
-            rotary_cos_format='interleaved'))
+        seq_length=4096,
+        block_size=32,
+        num_blocks=1024,
+        normalization='RMSNorm',
+        add_bias_linear=False,
+        gated_linear_unit=True,
+        sandwich_norm=True,
+        rotary_cos_format='interleaved',
+        is_dynamic=False,
+    )
     @ignore_and_delete_parameter()
     def __init__(self,
                  vocab_size=151552,
@@ -156,3 +158,13 @@ class Glm4Config(PretrainedConfig):
             tie_word_embeddings=tie_word_embeddings,
             **kwargs,
         )
+
+    def convert_to_transformer_config(self, is_mla_model: bool = False):
+        """
+        Convert Glm4Config to TransformerConfig.
+        Args:
+            is_mla_model (bool, optional): Whether converting to MLATransformerConfig. Defaults to False.
+        Returns:
+            TransformerConfig: The converted transformer configuration.
+        """
+        return Glm4ConfigConverter.convert(self.to_dict(), is_mla_model=is_mla_model)

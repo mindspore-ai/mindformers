@@ -49,16 +49,16 @@ class InferenceGlm4ForCausalLM(Glm4PreTrainedModel, InferModelMixin):
         self.model = GPTModel(config=config,
                               transformer_layer_spec=get_gpt_layer_local_spec(
                                   normalization=config.normalization,
-                                  use_flash_attention=self.config.use_flash_attention,
+                                  use_flash_attention=config.use_flash_attention,
                                   sandwich_norm=True,
                               ),
                               vocab_size=self.vocab_size,
                               max_sequence_length=self.max_position_embeddings,
-                              rotary_percent=self.config.partial_rotary_factor,
+                              rotary_percent=config.partial_rotary_factor,
                               rotary_base=self.config.rope_theta,
                               share_embeddings_and_output_weights=self.config.tie_word_embeddings,
-                              pre_process=self.config.pre_process,
-                              post_process=self.config.post_process,
+                              pre_process=config.pre_process,
+                              post_process=config.post_process,
                               quant_config=self.quant_config,)
 
     @jit

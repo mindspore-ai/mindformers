@@ -83,27 +83,6 @@ class TestModelMixin:
     @pytest.mark.level0
     @pytest.mark.platform_x86_cpu
     @pytest.mark.env_onecard
-    def test_convert_to_transformer_config(self):
-        """Test convert_to_transformer_config method"""
-        mixin = ModelMixin()
-
-        # Mock the convert_to_transformer_config function
-        mock_transformer_config = MagicMock()
-        with patch('mindformers.parallel_core.utils.model_mixin.convert_to_transformer_config',
-                   return_value=mock_transformer_config):
-            # Create a simple config dict
-            config = {
-                "hidden_size": 768,
-                "num_attention_heads": 12
-            }
-
-            transformer_config = mixin.convert_to_transformer_config(config)
-            assert transformer_config is mock_transformer_config
-            assert mixin.transformer_config is mock_transformer_config
-
-    @pytest.mark.level0
-    @pytest.mark.platform_x86_cpu
-    @pytest.mark.env_onecard
     def test_get_gpt_transformer_config(self):
         """Test get_gpt_transformer_config method"""
         mixin = ModelMixin()

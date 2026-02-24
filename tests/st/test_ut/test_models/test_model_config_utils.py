@@ -19,7 +19,6 @@ Test model_config_utils for
 
 import pytest
 
-from mindformers.parallel_core.mf_model_config import MFModelConfig
 from mindformers.models.model_config_utils import (
     NotSupportedInfo,
     ignore_and_delete_parameter,
@@ -54,15 +53,16 @@ class HuggingFaceModelConfigExample1(PretrainedConfig):
         self.num_nextn_predict_layers = num_nextn_predict_layers
         self.num_attention_heads = num_attention_heads
         super().__init__(**kwargs)
-
+    def convert_to_transformer_config(self, is_mla_model: bool = False):
+        pass
 
 class HuggingFaceModelConfigExample2(PretrainedConfig):
     """HuggingFaceModelConfigExample2"""
 
-    @register_mf_model_parameter(mf_model_kwargs=MFModelConfig(
+    @register_mf_model_parameter(
         compute_dtype='fp32',
         layernorm_compute_dtype="float32"
-    ))
+    )
     def __init__(
             self,
             vocab_size=129280,
@@ -83,7 +83,8 @@ class HuggingFaceModelConfigExample2(PretrainedConfig):
         self.num_attention_heads = num_attention_heads
 
         super().__init__(**kwargs)
-
+    def convert_to_transformer_config(self, is_mla_model: bool = False):
+        pass
 
 class HuggingFaceModelConfigExample3(PretrainedConfig):
     """HuggingFaceModelConfigExample3"""
@@ -96,10 +97,8 @@ class HuggingFaceModelConfigExample3(PretrainedConfig):
         ]
     )
     @register_mf_model_parameter(
-        mf_model_kwargs=MFModelConfig(
-            compute_dtype="bfloat16",
-            batch_size=32
-        )
+        compute_dtype="bfloat16",
+        batch_size=32
     )
     def __init__(
             self,
@@ -121,7 +120,8 @@ class HuggingFaceModelConfigExample3(PretrainedConfig):
         self.num_attention_heads = num_attention_heads
 
         super().__init__(**kwargs)
-
+    def convert_to_transformer_config(self, is_mla_model: bool = False):
+        pass
 
 class TestModelConfigUtils:
     """A test class for HF ModelConfig utils."""

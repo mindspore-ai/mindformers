@@ -19,9 +19,8 @@ import pytest
 import numpy as np
 from mindspore import dtype as mstype
 
-from mindformers.parallel_core.mf_model_config import convert_str_to_mstype
 from mindformers.parallel_core.transformer_config_utils import convert_to_transformer_config
-from mindformers.parallel_core.transformer_config import TransformerConfig, MLATransformerConfig
+from mindformers.parallel_core.transformer_config import TransformerConfig, MLATransformerConfig, convert_str_to_mstype
 
 
 class DummyConfig(dict):

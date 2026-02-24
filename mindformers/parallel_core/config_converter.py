@@ -71,7 +71,7 @@ class ConfigConverter(ABC):
         # including the mapping, conversion result, conversion error, and conversion record.
         log_handler = ConfigLogHandler()
         tracer = ConfigConversionTracer()
-        mapping = cls._get_final_mapping(log_handler)
+        mapping = cls._get_final_mapping(log_handler, is_mla_model)
         result: Dict[str, Any] = {}
         reversed_mapping: Dict[str, List[str]] = {}
         cls._get_reversed_mapping(mapping, reversed_mapping)
@@ -117,7 +117,7 @@ class ConfigConverter(ABC):
             ) from e
 
     @classmethod
-    def _get_final_mapping(cls, log_handler) -> Dict[str, Union[str, Tuple[str, Callable]]]:
+    def _get_final_mapping(cls, log_handler, is_mla_model: bool = False) -> Dict[str, Union[str, Tuple[str, Callable]]]:
         """
         Merge the CONFIG_MAPPING of all classes in MRO and add the default mapping of the same name (uncovered fields).
         Rule:
@@ -156,10 +156,16 @@ class ConfigConverter(ABC):
                     final_rules.append((src_keys, target_key, trans_func))
         # step2: Default map with the same name
         megatron_fields = {f.name for f in fields(TransformerConfig)}
-        for field in megatron_fields:
-            rule = ((field,), field, None)
-            if rule not in final_rules:
-                final_rules.append(rule)
+        existing_rule_keys = {(src_keys, target_key) for src_keys, target_key, _ in final_rules}
+        all_default_fields = set(megatron_fields)
+        # append mla field if needed
+        if is_mla_model:
+            mla_fields = {f.name for f in fields(MLATransformerConfig)}
+            all_default_fields.update(mla_fields - megatron_fields)
+        for field in all_default_fields:
+            rule_key = ((field,), field)
+            if rule_key not in existing_rule_keys:
+                final_rules.append((rule_key[0], rule_key[1], None))
         # step3: Build the final mapping dict (source_key -> target_spec)
         final: Dict[str, List[Union[str, Tuple[str, Callable]]]] = {}
         for src_keys, target_key, trans_func in final_rules:

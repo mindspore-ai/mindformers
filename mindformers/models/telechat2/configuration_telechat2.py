@@ -20,7 +20,7 @@ from mindformers.models.model_config_utils import (
     ignore_and_delete_parameter,
     NotSupportedInfo
 )
-from mindformers.parallel_core.mf_model_config import MFModelConfig
+from mindformers.models.telechat2.config_converter_telechat2 import Telechat2ConfigConverter
 from mindformers.tools.register import MindFormerRegister, MindFormerModuleType
 
 
@@ -57,15 +57,16 @@ class Telechat2Config(PretrainedConfig):
     }
 
     @register_mf_model_parameter(
-        mf_model_kwargs=MFModelConfig(
-            block_size=32,
-            num_blocks=1024,
-            normalization='RMSNorm',
-            gated_linear_unit=True,
-            hidden_act='silu',
-            add_mlp_fc1_bias_linear=False,
-            add_mlp_fc2_bias_linear=True,
-        ))
+        seq_length=4096,
+        block_size=32,
+        num_blocks=1024,
+        normalization='RMSNorm',
+        gated_linear_unit=True,
+        hidden_act='silu',
+        add_mlp_fc1_bias_linear=False,
+        add_mlp_fc2_bias_linear=True,
+        is_dynamic=False,
+    )
     @ignore_and_delete_parameter(extra_ignore_param=[
         ('max_window_layers', NotSupportedInfo.useless),
         ('sliding_window', NotSupportedInfo.useless),
@@ -126,3 +127,13 @@ class Telechat2Config(PretrainedConfig):
         self.num_key_value_heads = kwargs.pop("num_key_value_heads", None)
 
         super().__init__(bos_token_id=bos_token_id, eos_token_id=eos_token_id, **kwargs)
+
+    def convert_to_transformer_config(self, is_mla_model: bool = False):
+        """
+        Convert Telechat2Config to TransformerConfig.
+        Args:
+            is_mla_model (bool, optional): Whether converting to MLATransformerConfig. Defaults to False.
+        Returns:
+            TransformerConfig: The converted transformer configuration.
+        """
+        return Telechat2ConfigConverter.convert(self.to_dict(), is_mla_model=is_mla_model)

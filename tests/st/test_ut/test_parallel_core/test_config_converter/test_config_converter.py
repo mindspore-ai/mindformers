@@ -179,9 +179,10 @@ def test_pre_process_without_parallel_config():
 @pytest.mark.env_onecard
 def test_convert_instantiation_type_error_raises_runtime_error():
     """
-    Feature: 若 result 无法实例化为 TransformerConfig（如非法键），convert 将 TypeError 包装为 RuntimeError。
-    Description: 通过子类向 result 注入 TransformerConfig 不存在的键，使 config_cls(**result) 抛出 TypeError。
-    Expectation: 抛出 RuntimeError，且 cause 为 TypeError。
+    Feature:  If the result cannot be instantiated as TransformerConfig (e.g., due to invalid keys), raise RuntimeError.
+    Description: By injecting TransformerConfig with a nonexistent key into result through subclasses,
+    the config_cls(**result) raises a TypeError.。
+    Expectation: Raise a RuntimeError with the cause being a TypeError.
     """
 
     class BadConverter(ConfigConverter):

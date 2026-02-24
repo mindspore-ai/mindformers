@@ -287,6 +287,24 @@ class PretrainedConfig(PushToHubMixin):
         self.dict_ms_dtype_to_str(output)
         return output
 
+    def convert_to_transformer_config(self, is_mla_model: bool = False):
+        """
+        Convert the model configuration to TransformerConfig.
+        Config subclasses must override this method.
+
+        Returns:
+            TransformerConfig: The transformed transformer configuration.
+
+        Raises:
+            NotImplementedError: Raised when a subclass fails to implement, indicating the need to implement
+            the ConfigConverter for the corresponding model.
+        """
+        raise NotImplementedError(
+            f"{self.__class__.__name__} has not implemented convert_to_transformer_config."
+            "Please implement this method in the Config class of the model and create ConfigConverter for this "
+            "model with corresponding config mapping"
+        )
+
     @classmethod
     def from_pretrained(cls, yaml_name_or_path, **kwargs) -> "PretrainedConfig":
         """
@@ -429,7 +447,6 @@ class PretrainedConfig(PushToHubMixin):
             MindFormerBook.set_model_config_to_name(id(config), config_args.model.arch.type)
 
         return config
-
 
     def save_pretrained(self, save_directory=None, save_name="mindspore_model", **kwargs):
         """

@@ -21,7 +21,7 @@ from mindformers.models.model_config_utils import (
     ignore_and_delete_parameter,
     NotSupportedInfo
 )
-from mindformers.parallel_core.mf_model_config import MFModelConfig
+from mindformers.models.qwen3.config_converter_qwen3 import Qwen3ConfigConverter
 from mindformers.tools.register import MindFormerRegister, MindFormerModuleType
 
 
@@ -142,14 +142,14 @@ class Qwen2Config(PretrainedConfig):
     }
 
     @register_mf_model_parameter(
-        mf_model_kwargs=MFModelConfig(
-            pad_token_id=151643,
-            block_size=32,
-            num_blocks=1024,
-            normalization='RMSNorm',
-            add_bias_linear=False,
-            gated_linear_unit=True
-        ))
+        seq_length=4096,
+        pad_token_id=151643,
+        block_size=32,
+        num_blocks=1024,
+        normalization='RMSNorm',
+        add_bias_linear=False,
+        gated_linear_unit=True
+    )
     @ignore_and_delete_parameter(extra_ignore_param=[
         ('max_window_layers', NotSupportedInfo.useless),
         ('sliding_window', NotSupportedInfo.useless),
@@ -217,3 +217,13 @@ class Qwen2Config(PretrainedConfig):
             tie_word_embeddings=tie_word_embeddings,
             **kwargs,
         )
+
+    def convert_to_transformer_config(self, is_mla_model: bool = False):
+        """
+        Convert Qwen2Config to TransformerConfig.Reuse Qwen3ConfigConverter
+        Args:
+            is_mla_model (bool, optional): Whether converting to MLATransformerConfig. Defaults to False.
+        Returns:
+            TransformerConfig: The converted transformer configuration.
+        """
+        return Qwen3ConfigConverter.convert(self.to_dict(), is_mla_model=is_mla_model)

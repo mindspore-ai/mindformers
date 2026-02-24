@@ -48,10 +48,7 @@ class InferenceDeepseekV3ForCausalLM(DeepseekV3PreTrainedModel, InferModelMixin)
             setattr(config, "num_nextn_predict_layers", 0)
 
         self.config = config
-        config: MLATransformerConfig = self.convert_to_transformer_config(
-            self.config,
-            is_mla_model=True,
-        )
+        config: MLATransformerConfig = self.convert_to_transformer_config(self.config, is_mla_model=True)
         # update communication-related configuration in TransformerConfig
         config = update_comm_config(config)
         self.use_fused_mla = config.use_fused_mla and use_ms_custom_ops() and \

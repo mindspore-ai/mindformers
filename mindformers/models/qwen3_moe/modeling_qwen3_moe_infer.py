@@ -41,7 +41,7 @@ class InferenceQwen3MoeForCausalLM(Qwen3MoePreTrainedModel, InferModelMixin):
     def __init__(self, config: Qwen3MoeConfig):
         super().__init__(config, auto_prefix=False)
         self.config = config
-        config: TransformerConfig = self.convert_to_tf_config(self.config)
+        config: TransformerConfig = self.convert_to_transformer_config(self.config)
 
         # update communication-related configuration in TransformerConfig
         config = update_comm_config(config)

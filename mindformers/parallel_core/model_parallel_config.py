@@ -6,7 +6,7 @@
 from dataclasses import dataclass
 from typing import Optional, Union
 
-from mindformers.parallel_core.mf_model_config import convert_str_to_mstype
+from mindformers.parallel_core.transformer_config import convert_str_to_mstype
 
 
 @dataclass

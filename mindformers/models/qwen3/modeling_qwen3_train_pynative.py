@@ -37,7 +37,7 @@ class PyNativeQwen3ForCausalLM(Qwen3PreTrainedModel, TrainModelMixin):
 
     def __init__(self, config: Qwen3Config):
         super().__init__(config, auto_prefix=False)
-        config: TransformerConfig = self.convert_to_tf_config(self.config)
+        config: TransformerConfig = self.convert_to_transformer_config(self.config)
 
         self.model = GPTModel(
             config=config,
