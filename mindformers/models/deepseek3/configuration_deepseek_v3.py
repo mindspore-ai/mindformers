@@ -26,9 +26,9 @@
 
 __all__ = ['DeepseekV3Config']
 
+from mindformers.models.deepseek3.config_converter_deepseek_v3 import DeepseekV3ConfigConverter
 from mindformers.tools.register import MindFormerRegister, MindFormerModuleType
 from mindformers.models.configuration_utils import PretrainedConfig
-from mindformers.parallel_core.mf_model_config import MFModelConfig
 from mindformers.models.model_config_utils import (
     register_mf_model_parameter,
     ignore_and_delete_parameter,
@@ -136,7 +136,7 @@ class DeepseekV3Config(PretrainedConfig):
     keys_to_ignore_at_inference = ["past_key_values"]
 
     # Use the decorators provided in MF to intercept unsupported and register MF custom parameters
-    @register_mf_model_parameter(mf_model_kwargs=MFModelConfig(
+    @register_mf_model_parameter(
         seq_length=4096,
         compute_dtype='bf16',
         layernorm_compute_dtype="fp32",
@@ -149,7 +149,9 @@ class DeepseekV3Config(PretrainedConfig):
         normalization="RMSNorm",
         add_bias_linear=False,
         gated_linear_unit=True,
-    ))
+        multi_latent_attention=True,
+        is_dynamic=False,
+    )
     @ignore_and_delete_parameter(extra_ignore_param=[
         ('ep_size', NotSupportedInfo.useless),
         ('scoring_func', NotSupportedInfo.useless),
@@ -207,7 +209,7 @@ class DeepseekV3Config(PretrainedConfig):
         self.num_attention_heads = num_attention_heads
         self.n_shared_experts = n_shared_experts
         self.n_routed_experts = n_routed_experts
-        self.ep_size = ep_size # useless in MindFormers
+        self.ep_size = ep_size  # useless in MindFormers
         self.routed_scaling_factor = routed_scaling_factor
         self.kv_lora_rank = kv_lora_rank
         self.q_lora_rank = q_lora_rank
@@ -243,3 +245,13 @@ class DeepseekV3Config(PretrainedConfig):
             tie_word_embeddings=tie_word_embeddings,
             **kwargs,
         )
+
+    def convert_to_transformer_config(self, is_mla_model: bool = True):
+        """
+        Convert DeepseekV3Config to TransformerConfig.
+        Args:
+            is_mla_model (bool, optional): Whether converting to MLATransformerConfig. Defaults to True.
+        Returns:
+            TransformerConfig: The converted transformer configuration.
+        """
+        return DeepseekV3ConfigConverter.convert(self.to_dict(), is_mla_model=is_mla_model)

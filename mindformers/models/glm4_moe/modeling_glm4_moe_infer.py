@@ -65,8 +65,8 @@ class InferenceGlm4MoeForCausalLM(Glm4MoePreTrainedModel, InferModelMixin):
                               rotary_percent=self.config.partial_rotary_factor,
                               rotary_base=self.config.rope_theta,
                               share_embeddings_and_output_weights=self.config.tie_word_embeddings,
-                              pre_process=self.config.pre_process,
-                              post_process=self.config.post_process,)
+                              pre_process=config.pre_process,
+                              post_process=config.post_process,)
 
     @jit
     def construct(self, input_ids, hidden_states=None, positions=None, batch_valid_length=None,

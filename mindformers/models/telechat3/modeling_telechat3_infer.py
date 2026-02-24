@@ -53,7 +53,7 @@ class InferenceTelechat3ForCausalLM(TeleChat3PreTrainedModel, InferModelMixin):
         self.model = GPTModel(config=config,
                               transformer_layer_spec=get_gpt_layer_local_spec(
                                   normalization=config.normalization,
-                                  use_flash_attention=self.config.use_flash_attention,
+                                  use_flash_attention=config.use_flash_attention,
                                   qk_layernorm=False,
                               ),
                               vocab_size=self.vocab_size,

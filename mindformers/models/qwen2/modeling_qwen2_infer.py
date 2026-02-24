@@ -51,7 +51,7 @@ class InferenceQwen2ForCausalLM(Qwen2PreTrainedModel, InferModelMixin):
         self.model = GPTModel(config=config,
                               transformer_layer_spec=get_gpt_layer_local_spec(
                                   normalization=config.normalization,
-                                  use_flash_attention=self.config.use_flash_attention,
+                                  use_flash_attention=config.use_flash_attention,
                                   qk_layernorm=False,
                               ),
                               vocab_size=self.vocab_size,
@@ -59,8 +59,8 @@ class InferenceQwen2ForCausalLM(Qwen2PreTrainedModel, InferModelMixin):
                               position_embedding_type=config.position_embedding_type,
                               rotary_base=self.config.rope_theta,
                               share_embeddings_and_output_weights=self.config.tie_word_embeddings,
-                              pre_process=self.config.pre_process,
-                              post_process=self.config.post_process,)
+                              pre_process=config.pre_process,
+                              post_process=config.post_process,)
 
     # pylint: disable=W0613
     @jit

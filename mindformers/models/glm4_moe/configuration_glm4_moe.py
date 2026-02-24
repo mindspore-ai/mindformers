@@ -16,12 +16,12 @@
 __all__ = ['Glm4MoeConfig']
 
 from mindformers.models.configuration_utils import PretrainedConfig
+from mindformers.models.glm4_moe.config_converter_glm4_moe import Glm4MoeConfigConverter
 from mindformers.models.model_config_utils import (
     register_mf_model_parameter,
     ignore_and_delete_parameter
 )
 
-from mindformers.parallel_core.mf_model_config import MFModelConfig
 from mindformers.tools.register import MindFormerRegister, MindFormerModuleType
 
 
@@ -161,16 +161,17 @@ class Glm4MoeConfig(PretrainedConfig):
     }
 
     @register_mf_model_parameter(
-        mf_model_kwargs=MFModelConfig(
-            pad_token_id=151643,
-            block_size=32,
-            num_blocks=1024,
-            moe_router_score_function="sigmoid",
-            moe_router_enable_expert_bias=True,
-            normalization='RMSNorm',
-            add_bias_linear=False,
-            gated_linear_unit=True
-        ))
+        seq_length=4096,
+        pad_token_id=151643,
+        block_size=32,
+        num_blocks=1024,
+        moe_router_score_function="sigmoid",
+        moe_router_enable_expert_bias=True,
+        normalization='RMSNorm',
+        add_bias_linear=False,
+        gated_linear_unit=True,
+        is_dynamic=False,
+    )
     @ignore_and_delete_parameter()
     def __init__(self,
                  vocab_size=151552,
@@ -240,3 +241,13 @@ class Glm4MoeConfig(PretrainedConfig):
             tie_word_embeddings=tie_word_embeddings,
             **kwargs,
         )
+
+    def convert_to_transformer_config(self, is_mla_model: bool = False):
+        """
+        Convert Glm4MoeConfig to TransformerConfig.
+        Args:
+            is_mla_model (bool, optional): Whether converting to MLATransformerConfig. Defaults to False.
+        Returns:
+            TransformerConfig: The converted transformer configuration.
+        """
+        return Glm4MoeConfigConverter.convert(self.to_dict(), is_mla_model=is_mla_model)

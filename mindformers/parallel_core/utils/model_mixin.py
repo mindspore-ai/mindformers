@@ -20,7 +20,6 @@ import numpy as np
 
 from mindformers.tools.logger import logger
 from mindformers.core.context.build_context import is_legacy_model
-from mindformers.parallel_core.transformer_config_utils import convert_to_transformer_config
 
 
 class ModelMixin:
@@ -85,14 +84,7 @@ class ModelMixin:
             " method in order to use `model.set_inputs()`."
         )
 
-    def convert_to_transformer_config(self, model_config, is_mla_model: bool = False, additional_map: dict = None,
-                                      not_convert_whitelist: set = None):
-        self.transformer_config = convert_to_transformer_config(
-            model_config, is_mla_model, additional_map, not_convert_whitelist
-        )
-        return self.transformer_config
-
-    def convert_to_tf_config(self, config, is_mla_model: bool = False):
+    def convert_to_transformer_config(self, config, is_mla_model: bool = False):
         self.transformer_config = config.convert_to_transformer_config(is_mla_model)
         return self.transformer_config
 

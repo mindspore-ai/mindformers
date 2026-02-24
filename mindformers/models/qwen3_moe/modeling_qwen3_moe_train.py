@@ -43,7 +43,7 @@ class TrainingQwen3MoeForCausalLM(TrainModelMixin, Qwen3MoePreTrainedModel):
 
     def __init__(self, config):
         super().__init__(config, auto_prefix=False)
-        config: TransformerConfig = self.convert_to_tf_config(self.config)
+        config: TransformerConfig = self.convert_to_transformer_config(self.config)
 
         self.model = GPTModel(
             config=config,
