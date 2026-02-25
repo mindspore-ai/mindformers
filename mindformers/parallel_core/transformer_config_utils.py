@@ -470,6 +470,7 @@ def convert_to_transformer_config(
         mapping_key = convert_map[key]
         if not isinstance(mapping_key, str):
             (mapping_key, trans_func) = mapping_key
+            # pylint: disable=W0718
             try:
                 value = trans_func(value)
             except Exception as e:

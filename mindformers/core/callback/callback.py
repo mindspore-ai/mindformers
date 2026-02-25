@@ -311,6 +311,7 @@ def _get_max_eigenvalue(input_tensor, num_iter):
 
 def _get_stable_rank(weight, num_iter):
     """Calculate stable rank"""
+    # pylint: disable=W0718
     try:
         eig = _get_max_eigenvalue(weight, num_iter)
     except Exception as e:

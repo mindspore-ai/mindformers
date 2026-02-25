@@ -550,7 +550,7 @@ class SelfAttentionContiguous(Attention):
         self.reshape_concat = aclnn_ops.Reshape()
         self.split_qkv.add_prim_attr("skip_redistribution", True)
         if _get_parallel_mode() in (ParallelMode.SEMI_AUTO_PARALLEL,):
-            self.shard_self_attention(self.config)
+            self.shard_self_attention()
 
     def get_query_key_value_tensors(self, hidden_states, key_value_states=None, sharded_key=None, sharded_value=None):
         """
@@ -583,7 +583,7 @@ class SelfAttentionContiguous(Attention):
 
         return query, key, value
 
-    def shard_self_attention(self, config: TransformerConfig):
+    def shard_self_attention(self):
         """Set sharding strategies."""
         self.split_qkv.shard((layout("cp", "dp", "tp"),))
         if self.q_layernorm is not None:
@@ -662,7 +662,7 @@ class SelfAttention(Attention):
 
         self.reshape_concat = aclnn_ops.Reshape()
         if _get_parallel_mode() in (ParallelMode.SEMI_AUTO_PARALLEL,):
-            self.shard_self_attention(self.config)
+            self.shard_self_attention()
 
     def get_query_key_value_tensors(self, hidden_states, key_value_states=None, sharded_key=None, sharded_value=None):
         """
@@ -691,7 +691,7 @@ class SelfAttention(Attention):
 
         return query, key, value
 
-    def shard_self_attention(self, config: TransformerConfig):
+    def shard_self_attention(self):
         """Set sharding strategies."""
         self.split_qkv.shard((layout("cp", "dp", "tp", "None"),))
         if self.q_layernorm is not None:
@@ -853,6 +853,6 @@ class SharedKVCrossAttention(Attention):
         value = sharded_value
         return query, key, value
 
-    def shard_key_value_attention(self, config: TransformerConfig):
+    def shard_key_value_attention(self):
         """Set sharding strategies."""
         self.split_qkv.shard((layout("cp", "dp", "tp", "None"),))
