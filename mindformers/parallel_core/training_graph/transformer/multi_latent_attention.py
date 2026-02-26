@@ -193,6 +193,8 @@ class MultiLatentAttention(nn.Cell):
             raise NotImplementedError("rotary_pos_sin is not supported for now.")
         if prefix_keys_values:
             raise NotImplementedError("prefix_keys_values is not supported for now.")
+        if pad_zeros:
+            raise NotImplementedError("pad_zeros is not supported for now.")
         ori_dtype = x.dtype
         seq_len, bs, _ = self.shape(x)
 

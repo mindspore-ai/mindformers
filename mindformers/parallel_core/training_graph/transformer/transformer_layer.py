@@ -199,6 +199,8 @@ class TransformerLayer(nn.Cell, BaseTransformerLayer):
                 otherwise None.
         """
         # context/context_mask are only used in cross_attention modules, unused in GPTModel.
+        if context_mask:
+            raise NotImplementedError("context_mask is not supported for now.")
 
         # Layer norm at the beginning
         input_layernorm_output = self.input_layernorm(hidden_states)

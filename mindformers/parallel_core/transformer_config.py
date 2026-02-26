@@ -1962,7 +1962,7 @@ class TransformerConfig:
                 raise ValueError(
                     f"mtp_num_layers should be `None` or non-negative integer, but get {self.mtp_num_layers}."
                 )
-            elif self.mtp_num_layers > 1:
+            if self.mtp_num_layers > 1:
                 raise ValueError(
                     f"The current version only supports the scenario where `mtp_num_layers` = `1` is configured. "
                     f"But get {self.mtp_num_layers}."
@@ -2098,20 +2098,19 @@ class TransformerConfig:
                 raise ValueError(
                     "When using group limited routing, moe_router_num_groups must be specified."
                 )
-            else:
-                assert self.num_moe_experts % self.moe_router_num_groups == 0, (
-                    f"num_moe_experts ({self.num_moe_experts}) should be divisible by "
-                    f"moe_router_num_groups ({self.moe_router_num_groups})."
-                )
-                assert self.moe_router_group_topk <= self.moe_router_num_groups, (
-                    f"moe_router_group_topk ({self.moe_router_group_topk}) should be smaller than "
-                    f"moe_router_num_groups ({self.moe_router_num_groups})."
-                )
-                assert self.moe_router_topk % self.moe_router_group_topk == 0, (
-                    f"`moe_router_topk` must be divisible by `moe_router_group_topk`. "
-                    f"Got moe_router_topk={self.moe_router_topk} and "
-                    f"moe_router_group_topk={self.moe_router_group_topk}."
-                )
+            assert self.num_moe_experts % self.moe_router_num_groups == 0, (
+                f"num_moe_experts ({self.num_moe_experts}) should be divisible by "
+                f"moe_router_num_groups ({self.moe_router_num_groups})."
+            )
+            assert self.moe_router_group_topk <= self.moe_router_num_groups, (
+                f"moe_router_group_topk ({self.moe_router_group_topk}) should be smaller than "
+                f"moe_router_num_groups ({self.moe_router_num_groups})."
+            )
+            assert self.moe_router_topk % self.moe_router_group_topk == 0, (
+                f"`moe_router_topk` must be divisible by `moe_router_group_topk`. "
+                f"Got moe_router_topk={self.moe_router_topk} and "
+                f"moe_router_group_topk={self.moe_router_group_topk}."
+            )
 
         if (
                 self.num_moe_experts is not None
@@ -2132,8 +2131,7 @@ class TransformerConfig:
                         "Configuration conflict: 'first_k_dense_replace' cannot be "
                         "used together with 'moe_layer_freq > 1'."
                     )
-                else:
-                    self.moe_layer_freq = moe_layer_freq_template
+                self.moe_layer_freq = moe_layer_freq_template
             elif isinstance(self.moe_layer_freq, list):
                 if self.moe_layer_freq != moe_layer_freq_template:
                     raise ValueError(
@@ -2176,7 +2174,7 @@ class TransformerConfig:
                     f"When using moe_dry_run, seq_length ({self.seq_length}) must be divisible by "
                     f"num_moe_experts ({self.num_moe_experts})"
                 )
-            elif self.moe_token_dispatcher_type not in ("alltoall", "alltoall_deredundency"):
+            if self.moe_token_dispatcher_type not in ("alltoall", "alltoall_deredundency"):
                 raise ValueError(
                     "When using moe_dry_run, moe_token_dispatcher_type must be 'alltoall' or 'alltoall_deredundency'."
                 )
@@ -2208,11 +2206,11 @@ class TransformerConfig:
         elif self.nope_layer_interval <= 0:
             raise ValueError("nope_layer_interval must be larger than 0.")
 
-        if self.bias_swiglu_fusion and self.hidden_act != 'swiglu':
-            raise ValueError(
-                "When using bias_swiglu_fusion, hidden_act must be swiglu."
-            )
-        elif self.bias_swiglu_fusion and self.hidden_act == 'swiglu':
+        if self.bias_swiglu_fusion:
+            if self.hidden_act != 'swiglu':
+                raise ValueError(
+                    "When using bias_swiglu_fusion, hidden_act must be swiglu."
+                )
             self.hidden_act = 'fusedswiglu'
 
         if (self.moe_router_load_balancing_type is not None
