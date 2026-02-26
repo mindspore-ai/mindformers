@@ -289,15 +289,17 @@ class PretrainedConfig(PushToHubMixin):
 
     def convert_to_transformer_config(self, is_mla_model: bool = False):
         """
-        Convert the model configuration to TransformerConfig.
+        Convert the model configuration to TransformerConfig or MLATransformerConfig object.
         Config subclasses must override this method.
 
-        Returns:
-            TransformerConfig: The transformed transformer configuration.
+        Args:
+            is_mla_model (bool, optional): Whether converting to MLATransformerConfig.
+                Default: ``False``.
 
+        Returns:
+            TransformerConfig or MLATransformerConfig after conversion.
         Raises:
-            NotImplementedError: Raised when a subclass fails to implement, indicating the need to implement
-            the ConfigConverter for the corresponding model.
+            NotImplementedError: Raised when ConfigConverter subclass has not implemented this method.
         """
         raise NotImplementedError(
             f"{self.__class__.__name__} has not implemented convert_to_transformer_config."

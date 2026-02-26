@@ -1818,8 +1818,8 @@ class BaseTrainer:
                     if ms.context.get_auto_parallel_context('parallel_mode') in \
                             ['semi_auto_parallel', 'auto_parallel', 'hybrid_parallel']:
                         if network.config:
-                            batch_size = network.config.batch_size
-                            seq_length = network.config.seq_length
+                            batch_size = network.transformer_config.batch_size
+                            seq_length = network.transformer_config.seq_length
                         else:
                             batch_size = config.model.model_config.batch_size
                             seq_length = config.model.model_config.seq_length
