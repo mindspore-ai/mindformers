@@ -1168,6 +1168,7 @@ class TestMFLossMonitorMcoreFlops:
                 self.is_hybrid_model = True
                 self.hybrid_attention_ratio = 0.5
                 self.hybrid_mlp_ratio = 0.3
+                self.mtp_num_layers = 0
 
         mock_config = MockConfig()
 
