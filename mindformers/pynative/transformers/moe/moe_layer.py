@@ -90,7 +90,7 @@ class MoELayer(nn.Cell):
 
         self.tokens_per_expert.add_(num_tokens_per_expert)
 
-        routed_output = self.experts(hidden_states, top_scores, selected_experts_indices)
+        routed_output = self.experts(hidden_states, top_scores, selected_experts_indices, num_tokens_per_expert)
 
         shared_output = None
         if self.shared_experts is not None:
