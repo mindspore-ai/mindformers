@@ -17,10 +17,13 @@ import numpy as np
 import mindspore as ms
 from mindspore import nn, Tensor
 from mindspore.ops import operations as P
+from mindspore.ops import auto_generate as aclnn_ops
 from mindspore.context import ParallelMode
 import mindspore.common.dtype as mstype
 from mindspore.parallel._utils import _get_parallel_mode, _is_sharding_propagation
 from mindformers.parallel_core.transformer_config import TransformerConfig
+from mindformers.parallel_core.training_graph.device_matrix import layout
+from mindformers.parallel_core.training_graph.communication import get_dp_cp_id
 
 
 class CausalMaskGenerate(nn.Cell):
@@ -133,3 +136,86 @@ class CausalMaskGenerate(nn.Cell):
 
     def sharding_propagation(self, config: TransformerConfig):
         pass
+
+
+class CausalEODMaskGenerate(nn.Cell):
+    """
+    Get the upper triangular eod matrix from the actual sequence length. Only support self-attention.
+
+    Args:
+        config (TransformerConfig): The transformer configuration.
+    """
+
+    def __init__(self, config: TransformerConfig):
+        super().__init__()
+        self.seq_length = config.seq_length
+        self.dtype = config.compute_dtype
+
+        _, cp_id = get_dp_cp_id(config)
+        self.cp = config.context_parallel_size
+        self.cp_id = cp_id
+
+        self.is_first_iteration = True
+        self.one = Tensor([1.0], dtype=self.dtype)
+        self.clamp= aclnn_ops.ClampScalar()
+        self.slice = aclnn_ops.SliceExt()
+        self.cast = aclnn_ops.Cast()
+        self.reshape = aclnn_ops.Reshape()
+        self.sub = aclnn_ops.SubExt()
+        self.tril = aclnn_ops.TrilExt()
+        self.roll = aclnn_ops.Roll(1, 1)
+        self.arange = aclnn_ops.Arange()
+        self.repeat = aclnn_ops.RepeatInterleaveTensor()
+        self.tile = aclnn_ops.Tile()
+        self.equal = aclnn_ops.Equal()
+        self.generate_full_mask = P.Morph(self._generate_full_mask,
+                                          self.eod_full_infer_shape,
+                                          lambda *args: mstype.uint8
+                                          ).add_prim_attr("self_define_shard", True)
+        if _get_parallel_mode() in (ParallelMode.SEMI_AUTO_PARALLEL,):
+            self.shard()
+
+    def eod_full_infer_shape(self, *args):
+        """morph infer shape"""
+        b, _ = args[0]
+        return [b, 1, self.seq_length, self.seq_length]
+
+    def _generate_full_mask(self, actual_seq_len):
+        """generate full eod mask given actual_seq_len"""
+        bsz = actual_seq_len.shape[0]
+        offset_bsz = self.cast(self.reshape(self.arange(0, bsz, 1) * self.seq_length, (bsz, 1)), mstype.int32)
+        new_actual_seq_len = self.clamp(actual_seq_len, 0, bsz * self.seq_length)
+        new_actual_seq_len = new_actual_seq_len - offset_bsz
+        prev_seq_len = self.roll(new_actual_seq_len)
+        prev_seq_len[:, 0] = 0
+        interleave_seq_len = self.sub(new_actual_seq_len, prev_seq_len)
+        interleave_seq_len = self.reshape(interleave_seq_len, (-1,))
+        mask_1d = self.repeat(self.arange(0, interleave_seq_len.shape[0], 1), interleave_seq_len)
+        mask_1d = self.reshape(mask_1d, (bsz, -1))
+
+        sliced_sq = self.seq_length // self.cp
+        sliced_mask_1d = self.slice(mask_1d, 1, sliced_sq * self.cp_id, sliced_sq * (self.cp_id + 1), 1)
+        eod_row = self.reshape(sliced_mask_1d, (bsz, -1, 1))
+        eod_col = self.reshape(mask_1d, (bsz, 1, -1))
+        eod_mat1 = self.tile(eod_row, (1, 1, self.seq_length))
+        eod_mat2 = self.tile(eod_col, (1, sliced_sq, 1))
+        eod_mat = self.equal(eod_mat1, eod_mat2)
+        mask = self.cast(self.sub(self.one, self.tril(eod_mat, self.cp_id * sliced_sq)), mstype.uint8)
+        mask = self.reshape(mask, (-1, 1, sliced_sq, self.seq_length))
+        return mask
+
+    def construct(self, actual_seq_len):
+        """
+        Forward process of the CausalEodMask
+
+        Args:
+            actual_seq_len (Tensor): Size of sequence corresponding to each sub-sequence, array with increasing values.
+
+        Returns:
+            Tensor, the eod attention mask carrying 0 and 1 values
+        """
+        return self.generate_full_mask(actual_seq_len)
+
+    def shard(self):
+        """sharding operators"""
+        self.generate_full_mask.shard((layout("dp", "None"),), (layout("dp", "None", "cp", "None"),))
