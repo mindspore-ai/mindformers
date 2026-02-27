@@ -32,6 +32,8 @@ from mindspore.common.initializer import Zero, Normal
 from mindspore.ops.operations._infer_ops import QuantV2
 import mindspore as ms
 
+import ms_custom_ops
+
 from mindformers.parallel_core.inference.quantization import QuantizationConfig
 from mindformers.parallel_core.utils.spec_utils import ModuleSpec, build_module
 from mindformers.parallel_core.inference.utils import divide, get_tp_world_size, use_ms_custom_ops
@@ -172,6 +174,8 @@ class MultiLatentAttention(Attention):
         self.dim_slice_3d = P.Slice()
         self.transpose = P.Transpose()
         self.out_absorb_matmul = P.BatchMatMul(transpose_b=True)
+        self.q_no_pe_batch_matmul = mint.matmul
+        self.matmul = mint.matmul
 
     def construct(
             self,
@@ -501,7 +505,8 @@ class MLASelfAttention(MultiLatentAttention):
 
             return query, None, key, None, value, None
 
-        q_no_pe = self.transpose(mint.matmul(self.transpose(q_no_pe, (1, 0, 2)), self.q_absorb), (1, 0, 2))
+        q_no_pe = self.transpose(self.q_no_pe_batch_matmul(self.transpose(q_no_pe, (1, 0, 2)), self.q_absorb),
+                                 (1, 0, 2))
         query_states = mint.cat((q_no_pe, q_pos_emb), dim=-1)
         query = query_states.reshape(-1,
                                      self.num_attention_heads_per_partition *
@@ -688,7 +693,8 @@ class FusedMLASelfAttention(MLASelfAttention):
                 q_no_pe = self.depend(q_no_pe, key_out)
 
             if self.is_chunked:
-                q_no_pe = self.transpose(mint.matmul(self.transpose(q_no_pe, (1, 0, 2)), self.q_absorb), (1, 0, 2))
+                q_no_pe = self.transpose(self.matmul(self.transpose(q_no_pe, (1, 0, 2)), self.q_absorb),
+                                         (1, 0, 2))
                 return q_no_pe, q_pos_emb, None, None, None, self.out_absorb
 
             k_no_pe, k_pos_emb, value_states = self.split_kv(kv_compressed, k_pos_emb)
@@ -817,7 +823,7 @@ class FusedMLASelfAttention(MLASelfAttention):
             core_attn_out = self.paged_attention(query, kv_cache, kv_cache, block_tables, batch_valid_length,
                                                  None, None, attention_mask, q_seq_lens)
             core_attn_out = core_attn_out.reshape(-1, self.num_attention_heads_per_partition, self.config.kv_lora_rank)
-            core_attn_out = mint.matmul(self.transpose(core_attn_out, (1, 0, 2)),
+            core_attn_out = self.matmul(self.transpose(core_attn_out, (1, 0, 2)),
                                         self.transpose(out_absorb, (0, 2, 1)))
             core_attn_out = self.transpose(core_attn_out, (1, 0, 2))
         else:
@@ -866,3 +872,36 @@ class FusedMLASelfAttention(MLASelfAttention):
             raise ValueError(
                 f"'{param.name}.shape' should be equal to 'loaded_weight.shape',"
                 f" but got the shape of param is {param.shape} and the shape of weight is{loaded_weight.shape}")
+
+
+class BatchInvariantMLASelfAttention(MLASelfAttention):
+    """Multi-Latent Attention layer abstract class.
+
+    This layer only contains common modules required for the "self attn" and
+    "cross attn" specializations.
+    """
+    def __init__(
+            self,
+            config: MLATransformerConfig,
+            submodules: MLASelfAttentionSubmodules,
+            layer_number: int,
+            attn_mask_type=None,
+            cp_comm_type: str = None,
+            delay_allreduce: bool = False,
+            model_comm_pgs: Optional[ModelCommProcessGroups] = default_model_comm_pgs,
+            quant_config: Optional[QuantizationConfig] = None,
+            prefix: str = "",
+        ):
+        super().__init__(
+            config=config,
+            submodules=submodules,
+            layer_number=layer_number,
+            attn_mask_type=attn_mask_type,
+            cp_comm_type=cp_comm_type,
+            delay_allreduce=delay_allreduce,
+            model_comm_pgs=model_comm_pgs,
+            quant_config=quant_config,
+            prefix=prefix,
+        )
+        self.q_no_pe_batch_matmul = P.BatchMatMul()
+        self.matmul = ms_custom_ops.matmul_batch_invariant

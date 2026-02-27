@@ -1,4 +1,8 @@
-# Copyright 2025 Huawei Technologies Co., Ltd
+# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+# 
+# Modification points:
+# 1. The corresponding classes have been replaced with the classes implemented by minformers.
+# 2. Added an interface implementation for ensuring batch consistency
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,6 +17,7 @@
 # limitations under the License.
 # ============================================================================
 """gpt spec utils"""
+import os
 from typing import Optional
 
 from mindformers.parallel_core.utils.spec_utils import ModuleSpec
@@ -26,7 +31,9 @@ from mindformers.parallel_core.inference.transformer.multi_latent_attention impo
     MLASelfAttention,
     MLASelfAttentionSubmodules,
     FusedMLASelfAttention,
+    BatchInvariantMLASelfAttention
 )
+
 from mindformers.parallel_core.inference.transformer.attention import (
     SelfAttention,
     SelfAttentionSubmodules,
@@ -39,12 +46,19 @@ from mindformers.parallel_core.inference.tensor_parallel.layers import (
     ReplicatedLinear,
     MergedColumnParallelLinear
 )
+from mindformers.parallel_core.inference.tensor_parallel.batch_invariant_layers import (
+    BatchInvariantColumnParallelLinear,
+    BatchInvariantRowParallelLinear,
+    BatchInvariantQKVParallelLinear,
+    BatchInvariantReplicatedLinear,
+    BatchInvariantMergedColumnParallelLinear
+)
 from mindformers.parallel_core.inference.transformer.identity_op import IdentityOp
 from mindformers.parallel_core.inference.transformer.norm import get_norm_cls
 from mindformers.parallel_core.inference.base_models.gpt.moe_module_spec import get_moe_module_spec
 from mindformers.parallel_core.inference.transformer.transformer_block import TransformerBlockSubmodules
 from mindformers.parallel_core.transformer_config import TransformerConfig
-from mindformers.parallel_core.inference.utils import get_num_layers_and_offset
+from mindformers.parallel_core.inference.utils import get_num_layers_and_offset, is_batch_invariant
 
 
 def get_gpt_layer_local_spec(
@@ -79,9 +93,10 @@ def get_gpt_layer_local_spec(
         ModuleSpec: Module specification with MCore modules
 
     """
-
     if qk_l2_norm:
         raise NotImplementedError("`qk_l2_norm` is not currently supported.")
+
+    vllm_batch_invariant = is_batch_invariant()
 
     mlp = get_mlp_module_spec(
         num_experts=num_experts,
@@ -89,6 +104,53 @@ def get_gpt_layer_local_spec(
         moe_grouped_gemm=moe_grouped_gemm,
         use_alltoall=use_alltoall,
     )
+
+    if vllm_batch_invariant and multi_latent_attention:
+        return ModuleSpec(
+            module=TransformerLayer,
+            submodules=TransformerLayerSubmodules(
+                input_layernorm=get_norm_cls(normalization) if not use_fused_mla else IdentityOp,
+                self_attention=ModuleSpec(
+                    module=BatchInvariantMLASelfAttention if not use_fused_mla else FusedMLASelfAttention,
+                    submodules=MLASelfAttentionSubmodules(
+                        input_layernorm=get_norm_cls(normalization) if use_fused_mla else IdentityOp,
+                        linear_q_proj=BatchInvariantColumnParallelLinear,
+                        linear_qkv_down_proj=BatchInvariantReplicatedLinear,
+                        linear_q_up_proj=BatchInvariantColumnParallelLinear,
+                        linear_kv_down_proj=BatchInvariantReplicatedLinear,
+                        linear_kv_up_proj=BatchInvariantColumnParallelLinear,
+                        core_attention=FlashAttention if use_flash_attention else DotProductAttention,
+                        linear_proj=BatchInvariantRowParallelLinear,
+                        q_layernorm=get_norm_cls(normalization),
+                        kv_layernorm=get_norm_cls(normalization),
+                    ),
+                ),
+                pre_mlp_layernorm=get_norm_cls(normalization),
+                mlp=mlp,
+            )
+        )
+    elif vllm_batch_invariant:
+        self_attn = ModuleSpec(
+            module=SelfAttention,
+            submodules=SelfAttentionSubmodules(
+                core_attention=FlashAttention if use_flash_attention else DotProductAttention,
+                linear_proj=BatchInvariantRowParallelLinear,
+                linear_qkv=BatchInvariantQKVParallelLinear,
+                q_layernorm=get_norm_cls(normalization) if qk_layernorm else IdentityOp,
+                k_layernorm=get_norm_cls(normalization) if qk_layernorm else IdentityOp,
+            )
+        )
+        return ModuleSpec(
+            module=TransformerLayer,
+            submodules=TransformerLayerSubmodules(
+                input_layernorm=get_norm_cls(normalization),
+                self_attention=self_attn,
+                post_self_attn_layernorm=get_norm_cls(normalization) if sandwich_norm else IdentityOp,
+                pre_mlp_layernorm=get_norm_cls(normalization),
+                mlp=mlp,
+                post_mlp_layernorm=get_norm_cls(normalization) if sandwich_norm else IdentityOp,
+            )
+        )
 
     if multi_latent_attention:
         return ModuleSpec(
@@ -220,6 +282,14 @@ def get_mlp_module_spec(
     """Helper function to get module spec for MLP/MoE."""
     if num_experts is None:
         # Dense MLP w or w/o modules.
+        if is_batch_invariant():
+            return ModuleSpec(
+            module=MLP,
+            submodules=MLPSubmodules(
+                linear_fc1=BatchInvariantMergedColumnParallelLinear if gated_linear_unit else BatchInvariantColumnParallelLinear,
+                linear_fc2=BatchInvariantRowParallelLinear,
+            ),
+        )
         return ModuleSpec(
             module=MLP,
             submodules=MLPSubmodules(
