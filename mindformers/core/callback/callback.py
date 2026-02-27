@@ -206,10 +206,12 @@ def _get_separate_loss():
     aux_loss = parameter_register.get("aux_loss").asnumpy()
     mtp_loss = parameter_register.get("mtp_loss").asnumpy()
     lm_loss = parameter_register.get("lm_loss").asnumpy()
+    indexer_loss = parameter_register.get("indexer_loss").asnumpy()
     parameter_register.clear("aux_loss")
     parameter_register.clear("mtp_loss")
     parameter_register.clear("lm_loss")
-    return lm_loss, aux_loss, mtp_loss
+    parameter_register.clear("indexer_loss")
+    return lm_loss, aux_loss, mtp_loss, indexer_loss
 
 
 def _log_grouped_lr_info():
@@ -469,12 +471,13 @@ class MFLossMonitor(Callback):
         loss = self._fix_loss_for_parallel(loss)
         self.loss_list.append(loss)
 
-        lm_loss, aux_loss, mtp_loss = None, None, None
+        lm_loss, aux_loss, mtp_loss, indexer_loss = None, None, None, None
         if self.print_separate_loss:
-            lm_loss, aux_loss, mtp_loss = _get_separate_loss()
+            lm_loss, aux_loss, mtp_loss, indexer_loss = _get_separate_loss()
             lm_loss = self._fix_loss_for_parallel(lm_loss, print_warning=False)
             aux_loss = self._fix_loss_for_parallel(aux_loss, print_warning=False)
             mtp_loss = self._fix_loss_for_parallel(mtp_loss, print_warning=False)
+            indexer_loss = self._fix_loss_for_parallel(indexer_loss, print_warning=False)
 
         if not overflow:
             overflow = "False"
@@ -519,7 +522,7 @@ class MFLossMonitor(Callback):
             self.print_output_info(cb_params, cur_epoch_num, origin_epochs, throughput,
                                    cur_step_num, steps_per_epoch, loss, per_step_seconds,
                                    overflow, scaling_sens, time_remain, percent, global_norm,
-                                   lm_loss, aux_loss, mtp_loss)
+                                   lm_loss, aux_loss, mtp_loss, indexer_loss)
 
         if auto_parallel:
             set_auto_parallel_context(parallel_mode=parallel_mode, full_batch=full_batch)
@@ -654,8 +657,8 @@ class MFLossMonitor(Callback):
                     full_model_flops, shard_model_flops)
 
     def print_output_info(self, cb_params, cur_epoch_num, origin_epochs, throughput,
-                          cur_step_num, steps_per_epoch, loss, per_step_seconds,
-                          overflow, scaling_sens, time_remain, percent, global_norm, main_loss, extra_loss, mtp_loss):
+                          cur_step_num, steps_per_epoch, loss, per_step_seconds, overflow, scaling_sens,
+                          time_remain, percent, global_norm, main_loss, extra_loss, mtp_loss, indexer_loss):
         """print output information."""
         if self.learning_rate is not None:
             if isinstance(self.learning_rate, (float, Tensor, np.ndarray)):
@@ -724,6 +727,8 @@ class MFLossMonitor(Callback):
                 separate_loss += f"load_balancing_loss: {extra_loss[0]:5.6f}, "
             if self.is_mtp_model:
                 separate_loss += f"mtp_loss: {mtp_loss[0]:5.6f}, "
+            if np.all(indexer_loss > 0):
+                separate_loss += f"indexer_loss: {indexer_loss[0]:5.6f}, "
         else:
             separate_loss = ""
         if current_lr is not None:
@@ -781,7 +786,8 @@ class MFLossMonitor(Callback):
                     self.tensor_writer.add_scalar('mtp-loss', mtp_loss, global_step=global_step)
                 if self.is_moe_model:
                     self.tensor_writer.add_scalar('load-balancing-loss', extra_loss, global_step=global_step)
-
+                if np.all(indexer_loss > 0):
+                    self.tensor_writer.add_scalar('indexer-loss', indexer_loss, global_step=global_step)
 
 @MindFormerRegister.register(MindFormerModuleType.CALLBACK)
 class TrainingStateMonitor(Callback):

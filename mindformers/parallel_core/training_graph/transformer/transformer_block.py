@@ -144,6 +144,7 @@ class TransformerBlock(nn.Cell):
         self._build_layers(config)
 
         self.init_extra_loss = Tensor([0], mstype.float32)
+        self.init_attention_loss = Tensor([0], mstype.float32)
 
         self.shard(config)
 
@@ -180,6 +181,7 @@ class TransformerBlock(nn.Cell):
                   actual_seq_len=None):
         """ Construct function of transformer. """
         extra_loss = self.init_extra_loss
+        attention_loss = self.init_attention_loss
         sharded_key = None
         sharded_value = None
         for index in range(self.num_layers):
@@ -188,7 +190,7 @@ class TransformerBlock(nn.Cell):
             layer = self._get_layer(index)
             prefix_kv = prefix_keys_values[index] if prefix_keys_values is not None else None
             # pylint: disable=W0612
-            hidden_states, context, extra_loss = layer(
+            hidden_states, context, extra_loss, attention_loss = layer(
                 hidden_states,
                 attention_mask,
                 rotary_pos_emb=rotary_pos_emb,
@@ -196,7 +198,8 @@ class TransformerBlock(nn.Cell):
                 extra_loss=extra_loss,
                 actual_seq_len=actual_seq_len,
                 sharded_key=sharded_key,
-                sharded_value=sharded_value
+                sharded_value=sharded_value,
+                attention_loss=attention_loss
                 # context/context_mask/inference_context/packed_seq_params/sequence_len_offset is useless,
                 # In Megatron v0.12.0, this is primarily used for inference-related processing and
                 # has no practical impact on training.
@@ -207,7 +210,7 @@ class TransformerBlock(nn.Cell):
         if self.post_layer_norm:
             hidden_states = self.final_layernorm(hidden_states)
 
-        return hidden_states, extra_loss
+        return hidden_states, extra_loss, attention_loss
 
     def shard(self, config: TransformerConfig):
         """ shard function of mlp block. """

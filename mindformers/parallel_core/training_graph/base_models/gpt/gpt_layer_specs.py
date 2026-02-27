@@ -20,6 +20,8 @@ from mindformers.parallel_core.training_graph.tensor_parallel.layers import Colu
     SequenceParallelLinear
 from mindformers.parallel_core.training_graph.transformer.attention import SelfAttentionContiguous, SelfAttentionSubmodules, \
     SelfAttention
+from mindformers.parallel_core.training_graph.transformer.dsa.dsa_attention import DSAttention, DSAttentionSubmodules
+from mindformers.parallel_core.training_graph.transformer.dsa.dsa_indexer import DSAIndexer, DSAIndexerSubmodules
 from mindformers.parallel_core.training_graph.transformer.flash_attention import FlashAttention
 from mindformers.parallel_core.training_graph.transformer.identity_op import IdentityOp
 from mindformers.parallel_core.training_graph.transformer.mlp import MLP, MLPSubmodules, MLPInterleaved
@@ -58,11 +60,32 @@ def get_mlp_module_spec(
     )
 
 
+def get_attention_module_spec(sparse_attention: Optional[bool] = False, fused_norm: Optional[bool] = True):
+    """Helper function to get module spec for Core Attention"""
+    if sparse_attention:
+        return ModuleSpec(
+            module=DSAttention,
+            submodules=DSAttentionSubmodules(
+                indexer=ModuleSpec(
+                    module=DSAIndexer,
+                    submodules=DSAIndexerSubmodules(
+                        linear_wq_b=ColumnParallelLinear,
+                        linear_wk=SequenceParallelLinear,
+                        k_norm=get_norm_cls(fused_norm),
+                        linear_weights_proj=SequenceParallelLinear,
+                    ),
+                )
+            ),
+        )
+    return FlashAttention
+
+
 def get_gpt_layer_local_spec(
         num_experts: Optional[int] = None,
         moe_grouped_gemm: Optional[bool] = False,
         qk_layernorm: Optional[bool] = False,
         multi_latent_attention: Optional[bool] = False,
+        sparse_attention: Optional[bool] = False,
         qk_l2_norm: Optional[bool] = False,
         use_contiguous_weight_layout_attention: Optional[bool] = False,
         mla_qkv_concat: Optional[bool] = True,
@@ -77,6 +100,7 @@ def get_gpt_layer_local_spec(
         moe_grouped_gemm (bool, optional): To use Grouped GEMM. Defaults to False.
         qk_layernorm (bool, optional): To use layernorm for queries/keys. Defaults to False.
         multi_latent_attention (bool, optional): To use MultiLatentAttention. Defaults to False.
+        sparse_attention  (bool, optional): To use sparse attention. Defaults to False.
         qk_l2_norm (bool, optional): To use l2 norm for queries/keys. Defaults to False.
         use_contiguous_weight_layout_attention(bool, optional): Determines the weight arrangement in SelfAttention's
             QKV linear projection. Only affects SelfAttention layers. Uses contiguous layout: [Q_weights, K_weights,
@@ -103,6 +127,7 @@ def get_gpt_layer_local_spec(
     if multi_latent_attention:
         if qk_l2_norm:
             raise ValueError("qk_l2_norm is not supported with MLA.")
+        core_attention = get_attention_module_spec(sparse_attention, fused_norm)
         if mla_qkv_concat:
             self_attention = ModuleSpec(
                 module=MLASelfAttentionConcatenated,
@@ -110,7 +135,7 @@ def get_gpt_layer_local_spec(
                     linear_qkv=SequenceParallelLinear,
                     linear_qb=ColumnParallelLinear,
                     linear_kvb=ColumnParallelLinear,
-                    core_attention=FlashAttention,
+                    core_attention=core_attention,
                     linear_proj=RowParallelLinear,
                     q_layernorm=get_norm_cls(fused_norm) if qk_layernorm else IdentityOp,
                     k_layernorm=get_norm_cls(fused_norm) if qk_layernorm else IdentityOp,
@@ -125,7 +150,7 @@ def get_gpt_layer_local_spec(
                     linear_q_up_proj=ColumnParallelLinear,
                     linear_kv_down_proj=SequenceParallelLinear,
                     linear_kv_up_proj=ColumnParallelLinear,
-                    core_attention=FlashAttention,
+                    core_attention=core_attention,
                     linear_proj=RowParallelLinear,
                     q_layernorm=get_norm_cls(fused_norm) if qk_layernorm else IdentityOp,
                     kv_layernorm=get_norm_cls(fused_norm) if qk_layernorm else IdentityOp,
@@ -173,6 +198,7 @@ def get_gpt_decoder_block_spec(
         moe_grouped_gemm=False,
         qk_layernorm=config.qk_layernorm,
         multi_latent_attention=config.multi_latent_attention,
+        sparse_attention=config.experimental_attention_variant == 'dsa',
         qk_l2_norm=qk_l2_norm,
         use_contiguous_weight_layout_attention=config.use_contiguous_weight_layout_attention,
         mla_qkv_concat=config.mla_qkv_concat,
@@ -185,6 +211,7 @@ def get_gpt_decoder_block_spec(
         moe_grouped_gemm=config.moe_grouped_gemm,
         qk_layernorm=config.qk_layernorm,
         multi_latent_attention=config.multi_latent_attention,
+        sparse_attention=config.experimental_attention_variant == 'dsa',
         qk_l2_norm=qk_l2_norm,
         use_contiguous_weight_layout_attention=config.use_contiguous_weight_layout_attention,
         mla_qkv_concat=config.mla_qkv_concat,

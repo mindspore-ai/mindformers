@@ -210,6 +210,7 @@ class MultiTokenPredictionLayer(nn.Cell):
                   hidden_states: Tensor,
                   attention_mask: Tensor,
                   extra_loss=0.,
+                  attention_loss=0.,
                   rotary_pos_emb: Tensor = None,
                   actual_seq_len: Tensor = None):
         """
@@ -240,10 +241,11 @@ class MultiTokenPredictionLayer(nn.Cell):
         # and the (i + K)-th tocken's embedding, and combine them with linear projection.
         hidden_states = self.concat((decoder_input, hidden_states))
         hidden_states, _ = self.eh_proj(hidden_states)
-        hidden_states, _, extra_loss = self.transformer_layer(
+        hidden_states, _, extra_loss, attention_loss = self.transformer_layer(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             extra_loss=extra_loss,
+            attention_loss=attention_loss,
             rotary_pos_emb=rotary_pos_emb,
             actual_seq_len=actual_seq_len
         )
@@ -251,7 +253,7 @@ class MultiTokenPredictionLayer(nn.Cell):
         # Layer norm before shared head layer.
         hidden_states = self.final_layernorm(hidden_states)
 
-        return hidden_states, extra_loss
+        return hidden_states, extra_loss, attention_loss
 
 
 @dataclass
@@ -327,6 +329,7 @@ class MultiTokenPredictionBlock(nn.Cell):
             raise ValueError("MultiTokenPredictionBlock must have at least one layer.")
 
         self.init_extra_loss = Tensor([0], mstype.float32)
+        self.init_attention_loss = Tensor([0], mstype.float32)
         self.compute_language_model_loss = VocabParallelCrossEntropy(config=config, loss_tag="mtp")
 
         self.embedding = MtpSharedLanguageModelEmbedding(
@@ -443,6 +446,7 @@ class MultiTokenPredictionBlock(nn.Cell):
             tokentype_embeddings_weight: Optional[Tensor] = None,
             output_weight: Tensor = None,
             extra_loss=None,
+            attention_loss=None,
     ):
         """
         Perform the forward pass through all of the MTP modules.
@@ -463,6 +467,8 @@ class MultiTokenPredictionBlock(nn.Cell):
             loss_mask = self.ones_like(labels)
         if extra_loss is None:
             extra_loss = self.init_extra_loss
+        if attention_loss is None:
+            attention_loss = self.init_attention_loss
 
         mtp_loss = 0
         numerator, denominator = 0, 0
@@ -478,11 +484,12 @@ class MultiTokenPredictionBlock(nn.Cell):
                 tokentype_embeddings_weight=tokentype_embeddings_weight,
             )
             # norm, linear projection and transformer
-            hidden_states, extra_loss = layer(
+            hidden_states, extra_loss, attention_loss = layer(
                 decoder_input=decoder_input,
                 hidden_states=hidden_states,
                 attention_mask=attention_mask,
                 extra_loss=extra_loss,
+                attention_loss=attention_loss,
                 rotary_pos_emb=rotary_pos_emb,
                 **(extra_block_kwargs or {}),
             )
@@ -515,8 +522,8 @@ class MultiTokenPredictionBlock(nn.Cell):
                 mtp_loss = mtp_loss + mtp_layer_loss
 
         if self.calculate_per_token_loss:
-            return (numerator, denominator), extra_loss
-        return mtp_loss, extra_loss
+            return (numerator, denominator), extra_loss, attention_loss
+        return mtp_loss, extra_loss, attention_loss
 
 
 class MtpSharedVocabParallelEmbedding(VocabParallelEmbedding):

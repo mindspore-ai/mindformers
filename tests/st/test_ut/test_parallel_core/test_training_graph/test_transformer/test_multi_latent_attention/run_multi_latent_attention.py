@@ -137,7 +137,7 @@ class MLARunner:
             weight[k] = ms.Parameter(ms.Tensor(weight[k], dtype=ms.float32))
         ms.load_param_into_net(net, weight)
 
-        output = net(
+        output, _ = net(
             hidden_state,
             attention_mask=ms.Tensor(attention_mask),
             rotary_pos_emb=(ms.Tensor(rotary_pos_emb), 1)

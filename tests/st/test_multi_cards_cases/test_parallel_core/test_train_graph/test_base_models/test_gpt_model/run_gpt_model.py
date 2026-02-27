@@ -150,7 +150,7 @@ class TransformerLayerRunner:
         if self.rank_id is None or int(self.rank_id) == 0:
             output_np = {}
 
-            loss = output[0] + output[1] + output[2]
+            loss = output[0] + output[1] + output[2] + output[3]
             if loss.dtype == ms.bfloat16:
                 output_np["output"] = loss.to(ms.float32).asnumpy()
             else:

@@ -95,6 +95,7 @@ class TransformerLayer(nn.Cell, BaseTransformerLayer):
         self.sequence_parallel = config.sequence_parallel
         self.fp32_residual_connection = config.fp32_residual_connection
         self.compute_dtype = config.compute_dtype
+        self.use_mla = config.multi_latent_attention
 
         self.input_layernorm = build_module(
             submodules.input_layernorm,
@@ -176,7 +177,8 @@ class TransformerLayer(nn.Cell, BaseTransformerLayer):
             extra_loss=0.,
             actual_seq_len=None,
             sharded_key=None,
-            sharded_value=None
+            sharded_value=None,
+            attention_loss=0.
     ):
         """
         Perform a forward pass through the transformer layer.
@@ -212,13 +214,23 @@ class TransformerLayer(nn.Cell, BaseTransformerLayer):
             residual = hidden_states
 
         # Self-Attention
-        attention_output_with_bias = self.self_attention(
-            input_layernorm_output,
-            attention_mask=attention_mask,
-            rotary_pos_emb=rotary_pos_emb,
-            prefix_keys_values=prefix_keys_values,
-            actual_seq_len=actual_seq_len
-        )
+        if self.use_mla:
+            attention_output_with_bias, attention_loss = self.self_attention(
+                input_layernorm_output,
+                attention_mask=attention_mask,
+                rotary_pos_emb=rotary_pos_emb,
+                prefix_keys_values=prefix_keys_values,
+                actual_seq_len=actual_seq_len,
+                attention_loss=attention_loss
+            )
+        else:
+            attention_output_with_bias = self.self_attention(
+                input_layernorm_output,
+                attention_mask=attention_mask,
+                rotary_pos_emb=rotary_pos_emb,
+                prefix_keys_values=prefix_keys_values,
+                actual_seq_len=actual_seq_len,
+            )
 
         if isinstance(attention_output_with_bias, tuple):
             attention_output, self_attention_bias = attention_output_with_bias
@@ -307,7 +319,7 @@ class TransformerLayer(nn.Cell, BaseTransformerLayer):
         output = self.cast(output, self.compute_dtype)
 
         # 'return context' is useless, this param may be deprecated later.
-        return output, context, extra_loss
+        return output, context, extra_loss, attention_loss
 
     def shard(self, config: TransformerConfig):
         """ shard function of mlp block. """
