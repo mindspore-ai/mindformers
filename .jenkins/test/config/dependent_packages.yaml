@@ -1,6 +1,6 @@
 mindspore:
-  'https://repo.mindspore.cn/mindspore/mindspore/version/202602/20260205/master_20260205010015_b88045850f7a501164d177d76c64ca35fd44dee4_newest'
+  'https://repo.mindspore.cn/mindspore/mindspore/version/202602/20260224/master_20260224160014_09a0d4c72a6cfad160f3ff7b65487cc6c9220428_newest'
 ms_custom_ops:
-  'https://repo.mindspore.cn/mindspore/ms_custom_ops/version/202602/20260205/main_20260205041506_2de8cf392cad4a6a8d1b9aca897d307ea4640dd6_newest'
+  'https://repo.mindspore.cn/mindspore/ms_custom_ops/version/202602/20260224/main_20260224041507_86b0ec5e861ee6f69ef268a9cdea71ed8693a4a2_newest'
 hyper-parallel:
-  'https://repo.mindspore.cn/mindspore/hyper-parallel/version/202602/20260208/master_20260208020005_4d10740076dc6f9bce0a214fddc307b2973eb621_newest/'
+  'https://repo.mindspore.cn/mindspore/hyper-parallel/version/202602/20260226/master_20260226020005_44ebfb46b36dfe9f2e0cab43654842ce4d7417e5_newest'

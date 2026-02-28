@@ -291,7 +291,9 @@ def main():
     args = parser.parse_args()
 
     init()
-    device_mesh = init_device_mesh(mesh_shape=(args.tp,), alias_name=("tp",))
+    device_mesh = init_device_mesh(
+        device_type='npu', mesh_shape=(args.tp,), mesh_dim_names=("tp",)
+    )
 
     test_tensors = create_test_tensors()
 
