@@ -1731,6 +1731,10 @@ class CheckpointMonitor(ModelCheckpoint):
                                      exception_save=exception_save,
                                      remove_redundancy=remove_redundancy)
         super().__init__(prefix, ckpt_directory if self.use_legacy_format else None, config=config_ck)
+        # Remove empty checkpoint directory created too early to avoid errors when reading empty folder on second launch
+        if ckpt_directory and os.path.exists(ckpt_directory) and not os.listdir(ckpt_directory):
+            os.rmdir(ckpt_directory)
+        self._graph_saved = True
         self.meta_json = os.path.join(self._directory, "meta.json")
         if self._config.async_save:
             self.last_epoch_num = None
@@ -1803,6 +1807,10 @@ class CheckpointMonitor(ModelCheckpoint):
 
         if save_ckpt:
             # NOTE: origin checkpoint processes are remained here
+            # Create checkpoint directory only before saving weights to avoid empty folder if training stops early
+            if not os.path.exists(self._directory):
+                os.makedirs(self._directory, exist_ok=True)
+                set_safe_mode_for_file_or_dir(self._directory)
             self.save_checkpoint(cb_params)
             self.save_checkpoint_network(cb_params)
 
