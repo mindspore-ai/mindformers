@@ -51,6 +51,7 @@ class MoESubmodules:
             Defaults to None.
     """
 
+    router: Union[ModuleSpec, type] = None
     experts: Union[ModuleSpec, type] = None
     shared_experts: Union[ModuleSpec, type] = None
     token_dispatcher: Union[ModuleSpec, type] = None
@@ -128,7 +129,11 @@ class MoELayer(BaseMoELayer):
         )
 
         # Initialize router
-        self.router = TopKRouter(config=self.config, model_comm_pgs=model_comm_pgs)
+        self.router = build_module(
+            self.submodules.router,
+            config=self.config,
+            model_comm_pgs=model_comm_pgs
+        )
 
         # Initialize token dispatcher
         self.token_dispatcher = build_module(

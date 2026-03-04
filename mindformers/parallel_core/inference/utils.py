@@ -373,3 +373,9 @@ def use_ms_custom_ops():
         return False
 
     return not is_310p()
+
+def is_batch_invariant() -> bool:
+    vllm_batch_invariant = os.getenv("VLLM_BATCH_INVARIANT", "").strip().lower()
+    vllm_batch_invariant = vllm_batch_invariant in ("1", "true")
+    logger.info(f"VLLM_BATCH_INVARIANT is {vllm_batch_invariant}.")
+    return vllm_batch_invariant

@@ -18,14 +18,16 @@ Language model embedding for transformer.
 __all__ = [
     "LanguageModelEmbedding",
 ]
-
+import os
 from typing import Literal, Optional
 
 from mindspore import nn, Tensor
 
 from mindformers.parallel_core.transformer_config import TransformerConfig
 from mindformers.parallel_core.inference.tensor_parallel.layers import VocabParallelEmbedding
+from mindformers.parallel_core.inference.tensor_parallel.batch_invariant_layers import BatchInvariantVocabParallelEmbedding
 from mindformers.parallel_core.process_group_config import ModelCommProcessGroups, default_model_comm_pgs
+from mindformers.parallel_core.inference.utils import is_batch_invariant
 
 
 class LanguageModelEmbedding(nn.Cell):
@@ -76,7 +78,8 @@ class LanguageModelEmbedding(nn.Cell):
         self.add_position_embedding: bool = position_embedding_type == 'learned_absolute'
 
         # Word embeddings
-        self.word_embeddings = VocabParallelEmbedding(
+        embedding_cls = VocabParallelEmbedding if not is_batch_invariant() else BatchInvariantVocabParallelEmbedding
+        self.word_embeddings = embedding_cls(
             num_embeddings=self.vocab_size,
             embedding_dim=self.config.hidden_size,
             config=config,

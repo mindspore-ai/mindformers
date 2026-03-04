@@ -18,7 +18,10 @@ __all__ = ['SharedExpertMLP']
 from copy import deepcopy
 from typing import Optional
 
-from mindspore import mint
+from mindspore import mint, ops
+
+import ms_custom_ops
+
 from mindformers.parallel_core.inference.quantization import QuantizationConfig
 from mindformers.parallel_core.transformer_config import TransformerConfig
 from mindformers.parallel_core.inference.transformer.mlp import MLP, MLPSubmodules
@@ -86,5 +89,56 @@ class SharedExpertMLP(MLP):
             logits = self.gate(hidden_states)
             gate_score = self.activation_func(logits)
             output = mint.matmul(output, gate_score)
+
+        return output
+
+
+class BatchInvariantSharedExpertMLP(SharedExpertMLP):
+    """
+    MLP layer for Shared Experts.
+    """
+
+    def __init__(
+            self,
+            config: TransformerConfig,
+            submodules: MLPSubmodules,
+            gate: bool,
+            model_comm_pgs: Optional[ModelCommProcessGroups] = default_model_comm_pgs,
+            quant_config: Optional[QuantizationConfig] = None,
+            prefix: str = "",
+    ):
+        # In AlltoAll communication, shared expert will not be split in parallel
+        super().__init__(
+            config=config,
+            submodules=submodules,
+            gate=gate,
+            model_comm_pgs=model_comm_pgs,
+            quant_config=quant_config,
+            prefix=prefix)
+
+        self.matmul = ms_custom_ops.matmul_batch_invariant
+
+    def construct(self, hidden_states):
+        """ Construct function of SharedExpertMLP block. """
+        # [T, H] -> [T, ffn_H]
+        intermediate_parallel = self.linear_fc1(hidden_states)
+
+        if self.config.gated_linear_unit:
+            gate, hidden = ops.function.array_func.split_ext(intermediate_parallel,
+                                      (self.ffn_hidden_size_per_partition,
+                                       self.ffn_hidden_size_per_partition), -1)
+            gate = self.activation_func(gate) if self.activation_type else gate
+            intermediate_parallel = mint.mul(hidden, gate)
+        else:
+            intermediate_parallel = self.activation_func(
+                intermediate_parallel) if self.activation_type else intermediate_parallel
+
+        # [T, ffn_H] -> [T, H]
+        output = self.linear_fc2(intermediate_parallel)
+
+        if self.use_shared_expert_gate:
+            logits = self.gate(hidden_states)
+            gate_score = self.activation_func(logits)
+            output = self.matmul(output, gate_score)
 
         return output
