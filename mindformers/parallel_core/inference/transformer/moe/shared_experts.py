@@ -20,8 +20,6 @@ from typing import Optional
 
 from mindspore import mint, ops
 
-import ms_custom_ops
-
 from mindformers.parallel_core.inference.quantization import QuantizationConfig
 from mindformers.parallel_core.transformer_config import TransformerConfig
 from mindformers.parallel_core.inference.transformer.mlp import MLP, MLPSubmodules
@@ -115,7 +113,7 @@ class BatchInvariantSharedExpertMLP(SharedExpertMLP):
             model_comm_pgs=model_comm_pgs,
             quant_config=quant_config,
             prefix=prefix)
-
+        import ms_custom_ops
         self.matmul = ms_custom_ops.matmul_batch_invariant
 
     def construct(self, hidden_states):

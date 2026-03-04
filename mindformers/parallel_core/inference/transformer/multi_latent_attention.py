@@ -32,8 +32,6 @@ from mindspore.common.initializer import Zero, Normal
 from mindspore.ops.operations._infer_ops import QuantV2
 import mindspore as ms
 
-import ms_custom_ops
-
 from mindformers.parallel_core.inference.quantization import QuantizationConfig
 from mindformers.parallel_core.utils.spec_utils import ModuleSpec, build_module
 from mindformers.parallel_core.inference.utils import divide, get_tp_world_size, use_ms_custom_ops
@@ -904,4 +902,5 @@ class BatchInvariantMLASelfAttention(MLASelfAttention):
             prefix=prefix,
         )
         self.q_no_pe_batch_matmul = P.BatchMatMul()
+        import ms_custom_ops
         self.matmul = ms_custom_ops.matmul_batch_invariant
