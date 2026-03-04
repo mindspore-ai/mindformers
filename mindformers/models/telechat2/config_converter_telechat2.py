@@ -27,7 +27,8 @@ class Telechat2ConfigConverter(ConfigConverter):
         "layer_norm_epsilon": "layernorm_epsilon",
         "n_head": "num_attention_heads",
         "n_layer": "num_layers",
-
+        "num_key_value_heads": "num_query_groups",
+        "rope_theta": "rotary_base",
         # Flash Attention
         "initializer_range": "init_method_std",
     }
