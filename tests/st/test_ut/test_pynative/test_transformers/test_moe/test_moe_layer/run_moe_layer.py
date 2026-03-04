@@ -117,7 +117,7 @@ class MoELayerRunner:
         net = self.build_model()
         net.set_train(True)
         inputs = self.inputs.to(ms.bfloat16)
-        output, _ = net(inputs)
+        output = net(inputs)
 
         output_ms = {
             "output_case0": output,

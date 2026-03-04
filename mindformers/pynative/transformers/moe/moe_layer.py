@@ -94,7 +94,7 @@ class MoELayer(nn.Cell):
 
         shared_output = None
         if self.shared_experts is not None:
-            shared_output, _ = self.shared_experts(hidden_states)
+            shared_output = self.shared_experts(hidden_states)
 
         out_experts = self.reshape(routed_output, (bs, seq_length, dim))
 
@@ -103,4 +103,4 @@ class MoELayer(nn.Cell):
         else:
             final_out = out_experts
 
-        return final_out, None
+        return final_out
