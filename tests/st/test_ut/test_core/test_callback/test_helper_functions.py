@@ -172,7 +172,8 @@ class TestGetSeparateLoss:
         mock_param_register.get.side_effect = lambda x, default=None: {
             'aux_loss': mock_aux_loss,
             'mtp_loss': mock_mtp_loss,
-            'lm_loss': mock_lm_loss
+            'lm_loss': mock_lm_loss,
+            'indexer_loss': mock_indexer_loss
         }.get(x, default)
 
         lm_loss, aux_loss, mtp_loss, indexer_loss = _get_separate_loss()
@@ -183,7 +184,7 @@ class TestGetSeparateLoss:
         assert indexer_loss[0] == 0.4
 
         # Verify clear was called
-        assert mock_param_register.clear.call_count == 3
+        assert mock_param_register.clear.call_count == 4
 
 
 class TestLogGroupedLrInfo:

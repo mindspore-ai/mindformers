@@ -148,7 +148,8 @@ class TestHelperFunctions(unittest.TestCase):
         mock_parameter_register.get.side_effect = lambda x: {
             "aux_loss": mock_aux_loss,
             "mtp_loss": mock_mtp_loss,
-            "lm_loss": mock_lm_loss
+            "lm_loss": mock_lm_loss,
+            "indexer_loss": mock_indexer_loss
         }[x]
 
         # Mock clear method
