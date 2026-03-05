@@ -1011,7 +1011,7 @@ class BaseTrainer:
             if dataloader_config.streaming and isinstance(config.callbacks, list):
                 for callback in config.callbacks:
                     if callback.get('type') == 'CheckpointMonitor':
-                        dataloader_config.save_step = int(callback.get('save_checkpoint_steps'))
+                        dataloader_config.save_step = int(config.checkpoint.save_interleaved_steps)
 
             if dataloader_config.get('use_broadcast_data', True):
                 self._set_dataset_broadcast_opt_level(config)
@@ -1058,15 +1058,15 @@ class BaseTrainer:
         if len(src_strategy_files) - 1 < cur_rank:
             raise ValueError(f" rank {cur_rank} src_strategy is not exist")
         src_strategy_file = os.path.join(config.src_strategy_path_or_dir, src_strategy_files[cur_rank])
-        if os.path.isfile(config.load_checkpoint):
-            return get_ckpt_path_with_strategy(config.load_checkpoint, src_strategy_file)
+        if os.path.isfile(config.checkpoint.load_path):
+            return get_ckpt_path_with_strategy(config.checkpoint.load_path, src_strategy_file)
 
-        if os.path.isdir(config.load_checkpoint):
+        if os.path.isdir(config.checkpoint.load_path):
             device_nums = get_group_size()
             max_ckpt_path = ""
             max_time = 0
             for i in range(device_nums):
-                cur_rank_ckpt_dir = os.path.join(config.load_checkpoint, f"rank_{i}")
+                cur_rank_ckpt_dir = os.path.join(config.checkpoint.load_path, f"rank_{i}")
                 last_ckpt = get_last_checkpoint(cur_rank_ckpt_dir, config.load_ckpt_format)
                 if last_ckpt is None:
                     continue
@@ -1131,13 +1131,13 @@ class BaseTrainer:
             if (self.config.monitor_config and self.config.monitor_config.health_checkpoint and
                     self.config.monitor_config.health_checkpoint.embedding_local_norm_threshold):
                 use_checkpoint_health_monitor = True
-                if config.resume_training:
-                    config.load_checkpoint = get_healthy_checkpoint_path()
-            if config.resume_training and config.load_checkpoint and not check_is_reboot_node():
+                if not config.checkpoint.no_load_optim:
+                    config.checkpoint.load_path = get_healthy_checkpoint_path()
+            if not config.checkpoint.no_load_optim and config.checkpoint.load_path and not check_is_reboot_node():
                 logger.info(".............Start load resume context from common.json..................")
-                common_file = os.path.join(config.load_checkpoint, 'common.json')
+                common_file = os.path.join(config.checkpoint.load_path, 'common.json')
                 if not os.path.exists(common_file):
-                    error_msg = f"No common.json found in directory '{config.load_checkpoint}'."
+                    error_msg = f"No common.json found in directory '{config.checkpoint.load_path}'."
                     logger.error(error_msg)
                     raise FileNotFoundError(error_msg)
                 common_info = CommonInfo.load_common(common_file)
@@ -1167,18 +1167,18 @@ class BaseTrainer:
                 config.runner_config.initial_epoch = 0
                 config.runner_config.initial_step = 0
         else:
-            if config.resume_training and config.load_checkpoint and not check_is_reboot_node():
+            if not config.checkpoint.no_load_optim and config.checkpoint.load_path and not check_is_reboot_node():
                 logger.info(".............Start load resume context from checkpoint..................")
                 if check_tft_valid() and not config.remove_redundancy:
                     logger.info("..............Start resume checkpoint path from strategy..............")
                     resume_ckpt_path = self.resume_ckpt_path_with_strategy(config)
                     if resume_ckpt_path is None:
                         err_msg = (f"Try to resume from checkpoints with strategy in directory "
-                                   f"'{config.load_checkpoint}' failed, please specify load_checkpoint to "
+                                   f"'{config.checkpoint.load_path}' failed, please specify load_checkpoint to "
                                    f"specific checkpoint file to resume training.")
                         logger.error(err_msg)
                         raise ValueError(err_msg)
-                    config.load_checkpoint = resume_ckpt_path
+                    config.checkpoint.load_path = resume_ckpt_path
                 load_resume_context_from_checkpoint(config, dataset)
                 resume_dict = {
                     "step_num": config.runner_config.initial_step,
@@ -1197,11 +1197,11 @@ class BaseTrainer:
                 config.runner_config.initial_step = 0
 
         # preload ckpt format file via MindIO
-        if config.load_checkpoint and config.load_ckpt_format == "ckpt":
+        if config.checkpoint.load_path and config.load_ckpt_format == "ckpt":
             preload_ckpt(config)
 
         # check if skip datasets
-        if config.data_skip_steps or config.resume_training:
+        if config.data_skip_steps or not config.checkpoint.no_load_optim:
             if not config.ignore_data_skip:
                 data_skip_steps = config.data_skip_steps if config.data_skip_steps \
                     else config.runner_config.initial_step
@@ -1214,7 +1214,7 @@ class BaseTrainer:
         # set resume training for hf iterable dataset
         dataloader_config = config.train_dataset.get('data_loader', {})
         dataloader_type = dataloader_config.get('type')
-        if config.resume_training and dataloader_type in ['HFDataLoader', 'CommonDataLoader']:
+        if not config.checkpoint.no_load_optim and dataloader_type in ['HFDataLoader', 'CommonDataLoader']:
             resume_step = config.runner_config.initial_step
             _resume_hf_iterable_dataset(dataset, resume_step)
 
@@ -1239,7 +1239,7 @@ class BaseTrainer:
         logger.info(".........Build Net For Train..........")
         if network is None and self.network is None:
             calculate_per_token_loss = getattr(config, "calculate_per_token_loss", False)
-            if config.load_checkpoint:
+            if config.checkpoint.load_path:
                 network = self.create_network_without_param_init(
                     default_args={"parallel_config": config.parallel_config,
                                   "moe_config": config.moe_config,
@@ -1289,7 +1289,7 @@ class BaseTrainer:
             transformer_config = network.get_gpt_transformer_config()
 
         if config.get('use_legacy_format', True):
-            config.load_checkpoint = get_load_path_after_hf_convert(config, network)
+            config.checkpoint.load_path = get_load_path_after_hf_convert(config, network)
         self._check_training_network_no_use_past(network)
 
         eval_network = None
@@ -1307,7 +1307,7 @@ class BaseTrainer:
         # build optimizer
         logger.info(".........Build Optimizer For Train..........")
         if optimizer is None:
-            if config.load_checkpoint:
+            if config.checkpoint.load_path:
                 optimizer = self.create_optimizer_scheduler_without_param_init(network, model_params)
             else:
                 optimizer = self.create_optimizer_scheduler(network, model_params)
@@ -1390,7 +1390,7 @@ class BaseTrainer:
                 # load params into net
                 default_args = {"append_info": append_info,
                                 "global_batch_size": self.global_batch_size,
-                                "remove_redundancy": callback.get("remove_redundancy", False),
+                                "remove_redundancy": config.checkpoint.save_remove_redundancy,
                                 "checkpoint_format": callback.get("checkpoint_format", "ckpt"),
                                 "embedding_size": embedding_size,
                                 "embedding_local_norm_threshold": embedding_local_norm_threshold,
@@ -1398,6 +1398,15 @@ class BaseTrainer:
                                 "health_ckpts_record_dir": config.output_dir,
                                 "use_legacy_format": config.get('use_legacy_format', True)
                                 }
+                if not config.use_legacy_format:
+                    default_args.update({
+                        "keep_checkpoint_max": config.checkpoint.save_max,
+                        "save_checkpoint_steps": config.checkpoint.save_interleaved_steps,
+                        "save_optimizer": not config.checkpoint.no_save_optim,
+                        "directory": os.path.join(config.checkpoint.save_path, "checkpoint"),
+                        "async_save": config.checkpoint.async_save,
+                        "prefix": config.checkpoint.prefix
+                    })
                 if not config.get("use_legacy", True) and default_args.get("checkpoint_format") == "ckpt":
                     logger.warning(
                         "When use_legacy=False, it's not supported to save 'ckpt' files and switch to 'safetensors'.")
@@ -1451,7 +1460,7 @@ class BaseTrainer:
                     network,
                     optimizer,
                     global_step,
-                    config.balanced_load)
+                    config.checkpoint.load_balanced)
                 logger.info("..........Load Checkpoint for TFT Done..........")
                 param_dict = {
                     'epoch_num': ms.tensor(common_info.epoch_num),
@@ -1514,13 +1523,13 @@ class BaseTrainer:
             model = Model(network, optimizer=optimizer, metrics=compute_metrics, eval_network=eval_network)
 
         # resume checkpoint
-        if not config.use_legacy_format and config.load_checkpoint:
+        if not config.use_legacy_format and config.checkpoint.load_path:
             if config.use_parallel:
                 compile_model(model, dataset, mode=config.context.mode, sink_mode=config.runner_config.sink_mode,
                               epoch=config.runner_config.epochs, sink_size=config.runner_config.sink_size)
 
-            if config.resume_training:
-                if is_hf_checkpoint(config.load_checkpoint):
+            if not config.checkpoint.no_load_optim:
+                if is_hf_checkpoint(config.checkpoint.load_path):
                     raise ValueError(
                         "Resume training is not supported for HuggingFace checkpoints."
                     )
@@ -1535,30 +1544,30 @@ class BaseTrainer:
                         f"(batch size changed from {common_info.global_batch_size} to {self.global_batch_size})"
                     )
                 load_checkpoint(
-                    checkpoint=config.load_checkpoint,
+                    checkpoint=config.checkpoint.load_path,
                     network=network,
                     optimizer=optimizer,
                     global_step=global_step,
-                    balanced_load=config.balanced_load,
-                    reshard_worker_num=config.reshard_worker_num
+                    balanced_load=config.checkpoint.load_balanced,
+                    reshard_worker_num=config.checkpoint.reshard_worker_num
                 )
             else:
-                if is_hf_checkpoint(config.load_checkpoint):
+                if is_hf_checkpoint(config.checkpoint.load_path):
                     load_hf_checkpoint(
-                        pretrained_model_dir=config.load_checkpoint,
+                        pretrained_model_dir=config.checkpoint.load_path,
                         network=network,
-                        balanced_load=config.balanced_load,
-                        reshard_worker_num=config.reshard_worker_num
+                        balanced_load=config.checkpoint.load_balanced,
+                        reshard_worker_num=config.checkpoint.reshard_worker_num
                     )
                 else:
                     load_checkpoint(
-                        checkpoint=config.load_checkpoint,
+                        checkpoint=config.checkpoint.load_path,
                         network=network,
-                        balanced_load=config.balanced_load,
-                        reshard_worker_num=config.reshard_worker_num
+                        balanced_load=config.checkpoint.load_balanced,
+                        reshard_worker_num=config.checkpoint.reshard_worker_num
                     )
-        elif (config.load_checkpoint or config.only_save_strategy) and not check_is_reboot_node():
-            if config.resume_training:
+        elif (config.checkpoint.load_path or config.only_save_strategy) and not check_is_reboot_node():
+            if not config.checkpoint.no_load_optim:
                 logger.info(".............Start resume training from checkpoint..................")
                 transform_and_load_checkpoint(config, model, network, dataset, optimizer=optimizer)
             else:
@@ -1704,7 +1713,7 @@ class BaseTrainer:
         elif network is None and self.network is not None:
             logger.info(".........Using The Existing Network For Evaluate: %s", self.network.__class__.__name__)
             network = self.network
-        config.load_checkpoint = get_load_path_after_hf_convert(config, network)
+        config.checkpoint.load_path = get_load_path_after_hf_convert(config, network)
         if network is not None and construct_args_key is not None:
             network = self.warp_data_order_with_tool_cells(network, construct_args_key)
 
@@ -1729,7 +1738,7 @@ class BaseTrainer:
         logger.info(".........Starting Init Evaluate Model..........")
         model = Model(network, metrics=compute_metrics, eval_network=network)
 
-        if config.load_checkpoint or config.only_save_strategy:
+        if config.checkpoint.load_path or config.only_save_strategy:
             logger.info(".............Start load checkpoint for eval..................")
             transform_and_load_checkpoint(config, model, network, next(dataset.create_tuple_iterator()), do_eval=True)
 
@@ -1773,7 +1782,7 @@ class BaseTrainer:
 
             # build network
             if network is None:
-                if config.load_checkpoint:
+                if config.checkpoint.load_path:
                     network = self.create_network_without_param_init(
                         default_args={"parallel_config": config.parallel_config,
                                       "moe_config": config.moe_config})
@@ -1785,7 +1794,7 @@ class BaseTrainer:
 
             self.set_network(network, is_train=False)
             self.count_parameters()
-            config.load_checkpoint = get_load_path_after_hf_convert(config, network)
+            config.checkpoint.load_path = get_load_path_after_hf_convert(config, network)
 
             processor_config = config.get("processor", {})
             tokenizer_config = processor_config.get("tokenizer", None)
@@ -1808,13 +1817,13 @@ class BaseTrainer:
 
             model = Model(network)
 
-            if not config.use_legacy and config.load_checkpoint and config.run_mode != "predict_with_train_model":
+            if not config.use_legacy and config.checkpoint.load_path and config.run_mode != "predict_with_train_model":
                 if self.config.load_ckpt_format == 'safetensors':
-                    network.load_weights(config.load_checkpoint)
+                    network.load_weights(config.checkpoint.load_path)
                 else:
                     raise ValueError('The process of MCore does not support the weights of ckpt.')
             else:
-                if config.load_checkpoint or config.only_save_strategy:
+                if config.checkpoint.load_path or config.only_save_strategy:
                     if ms.context.get_auto_parallel_context('parallel_mode') in \
                             ['semi_auto_parallel', 'auto_parallel', 'hybrid_parallel']:
                         if network.config:

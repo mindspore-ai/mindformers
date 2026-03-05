@@ -127,7 +127,7 @@ class WrapperType(BaseEnum):
 def preload_ckpt(config):
     """Preload data into memory using MindIO for faster access."""
     rank_id = get_real_rank() if get_real_rank() else 0
-    ckpt_path = config.load_checkpoint
+    ckpt_path = config.checkpoint.load_path
     mindio_pool_capacity = config.get("mindio_pool_capacity", 128)
     set_mindio_server_info(mindio_pool_capacity)
 
@@ -354,37 +354,37 @@ def load_distributed_checkpoint_async(checkpoint_dir, choice_func=None, rank_id=
 
 def load_resume_context_from_checkpoint(config, dataset):
     """resume training, load training info from checkpoint to config"""
-    if not os.path.realpath(config.load_checkpoint) or \
-            not os.path.exists(config.load_checkpoint):
-        err_log = f"The load_checkpoint must be correct, but get {config.load_checkpoint}"
+    if not os.path.realpath(config.checkpoint.load_path) or \
+            not os.path.exists(config.checkpoint.load_path):
+        err_log = f"The load_checkpoint must be correct, but get {config.checkpoint.load_path}"
         logger.error(err_log)
         raise FileNotFoundError(err_log)
 
-    if os.path.isdir(config.load_checkpoint):
+    if os.path.isdir(config.checkpoint.load_path):
         # When graceful exit is enabled or auto checkpoint transformation is disabled,
         # use real rank ID to locate the checkpoint.
         if config.use_graceful_exit or not config.auto_trans_ckpt:
             rank_id = get_real_rank()
         else:
             rank_id = 0
-        if isinstance(config.resume_training, bool):
+        if isinstance(not config.checkpoint.no_load_optim, bool):
             # if load checkpoint is complete safetensors, get resume param from hyper_param.safetensors
-            if is_hyper_param_existed_in_sf_dir(config.load_checkpoint, config.load_ckpt_format):
-                hyper_param_file = os.path.join(config.load_checkpoint, 'hyper_param.safetensors')
+            if is_hyper_param_existed_in_sf_dir(config.checkpoint.load_path, config.load_ckpt_format):
+                hyper_param_file = os.path.join(config.checkpoint.load_path, 'hyper_param.safetensors')
                 resume_param = load_checkpoint(hyper_param_file, format='safetensors')
                 resume_dict = {'loss_scale': resume_param['loss_scale'],
                                'epoch_num': resume_param['epoch_num'],
                                'step_num': resume_param['step_num'],
                                'global_batch_size': resume_param['global_batch_size']}
             else:
-                resume_dict = load_distributed_checkpoint(config.load_checkpoint,
+                resume_dict = load_distributed_checkpoint(config.checkpoint.load_path,
                                                           choice_func=lambda x: x in ["loss_scale", "epoch_num",
                                                                                       "step_num", "global_batch_size"],
                                                           rank_id=rank_id, ckpt_format=config.load_ckpt_format,
                                                           remove_redundancy=config.remove_redundancy)
         else:
-            checkpoint_tmp = os.path.join(config.load_checkpoint, f"rank_{rank_id}",
-                                          replace_rank_id_in_ckpt_name(config.resume_training, rank_id))
+            checkpoint_tmp = os.path.join(config.checkpoint.load_path, f"rank_{rank_id}",
+                                          replace_rank_id_in_ckpt_name(not config.checkpoint.no_load_optim, rank_id))
             if not os.path.isfile(checkpoint_tmp):
                 err_msg = f"{checkpoint_tmp} is not found!"
                 logger.error(err_msg)
@@ -396,7 +396,7 @@ def load_resume_context_from_checkpoint(config, dataset):
 
     else:
         resume_dict = load_checkpoint(
-            config.load_checkpoint,
+            config.checkpoint.load_path,
             choice_func=lambda x: x in ["loss_scale", "epoch_num", "step_num", "global_batch_size"],
             format=config.load_ckpt_format, remove_redundancy=config.remove_redundancy)
 
@@ -463,7 +463,7 @@ def transform_and_load_checkpoint(config, model, network, dataset, optimizer=Non
         return
 
     if (not config.auto_trans_ckpt and not config.only_save_strategy and
-            check_path_include_total_ckpt(config.load_checkpoint)):
+            check_path_include_total_ckpt(config.checkpoint.load_path)):
         load_ckpt(config, network, optimizer=optimizer)
         return
 
@@ -516,8 +516,8 @@ def transform_and_load_checkpoint(config, model, network, dataset, optimizer=Non
                                        transform_process_num=transform_process_num,
                                        transform_by_rank=transform_by_rank,
                                        npu_num_per_node=npu_num_per_node)
-        config.load_checkpoint = transform_ckpt(
-            src_checkpoint=config.load_checkpoint,
+        config.checkpoint.load_path = transform_ckpt(
+            src_checkpoint=config.checkpoint.load_path,
             src_strategy=config.src_strategy_path_or_dir
         )
 
@@ -528,9 +528,9 @@ def transform_and_load_checkpoint(config, model, network, dataset, optimizer=Non
 def check_checkpoint_config_valid(config):
     """Check valid load checkpoint path in config."""
     # check valid load checkpoint path
-    if not config.only_save_strategy and (not os.path.realpath(config.load_checkpoint) or
-                                          not os.path.exists(config.load_checkpoint)):
-        err_msg = f"The load_checkpoint must be correct, but get {config.load_checkpoint}"
+    if not config.only_save_strategy and (not os.path.realpath(config.checkpoint.load_path) or
+                                          not os.path.exists(config.checkpoint.load_path)):
+        err_msg = f"The load_checkpoint must be correct, but get {config.checkpoint.load_path}"
         logger.error(err_msg)
         raise FileNotFoundError(err_msg)
 
@@ -674,40 +674,40 @@ def get_load_checkpoint_result(config):
     checkpoint_future = None
     rank_id = get_real_rank() if get_real_rank() else 0
     if config.auto_trans_ckpt:
-        for checkpoint_name in os.listdir(config.load_checkpoint):
-            checkpoint_path = os.path.join(config.load_checkpoint, checkpoint_name)
+        for checkpoint_name in os.listdir(config.checkpoint.load_path):
+            checkpoint_path = os.path.join(config.checkpoint.load_path, checkpoint_name)
             # auto_trans_ckpt is set to true, loading ckpt with async is not supported
             checkpoint_dict.update(load_distributed_checkpoint(checkpoint_path))
             logger.info("loaded checkpoint: %s", str(checkpoint_path))
     else:
-        if os.path.isdir(config.load_checkpoint) and check_ckpt_file_exist(config.load_checkpoint):
-            for ckpt_file in os.listdir(config.load_checkpoint):
+        if os.path.isdir(config.checkpoint.load_path) and check_ckpt_file_exist(config.checkpoint.load_path):
+            for ckpt_file in os.listdir(config.checkpoint.load_path):
                 if ckpt_file.endswith('.ckpt'):
-                    checkpoint_path = os.path.join(config.load_checkpoint, ckpt_file)
+                    checkpoint_path = os.path.join(config.checkpoint.load_path, ckpt_file)
                     if load_ckpt_async:
                         checkpoint_future = load_checkpoint_async(checkpoint_path)
                     else:
                         checkpoint_dict.update(load_checkpoint(checkpoint_path))
-        elif os.path.isfile(config.load_checkpoint) and config.load_checkpoint.endswith('.ckpt'):
+        elif os.path.isfile(config.checkpoint.load_path) and config.checkpoint.load_path.endswith('.ckpt'):
             if load_ckpt_async:
-                checkpoint_future = load_checkpoint_async(config.load_checkpoint)
+                checkpoint_future = load_checkpoint_async(config.checkpoint.load_path)
             else:
-                checkpoint_dict = load_checkpoint(config.load_checkpoint)
-        elif os.path.isdir(config.load_checkpoint) and check_rank_folders(config.load_checkpoint, rank_id):
-            if isinstance(config.resume_training, str):
-                checkpoint_tmp = os.path.join(config.load_checkpoint, f"rank_{config.rank_id}",
-                                              config.resume_training)
+                checkpoint_dict = load_checkpoint(config.checkpoint.load_path)
+        elif os.path.isdir(config.checkpoint.load_path) and check_rank_folders(config.checkpoint.load_path, rank_id):
+            if isinstance(not config.checkpoint.no_load_optim, str):
+                checkpoint_tmp = os.path.join(config.checkpoint.load_path, f"rank_{config.rank_id}",
+                                              not config.checkpoint.no_load_optim)
                 if load_ckpt_async:
                     checkpoint_future = load_checkpoint_async(checkpoint_tmp)
                 else:
                     checkpoint_dict = load_checkpoint(checkpoint_tmp)
             else:
                 if load_ckpt_async:
-                    checkpoint_future = load_distributed_checkpoint_async(config.load_checkpoint)
+                    checkpoint_future = load_distributed_checkpoint_async(config.checkpoint.load_path)
                 else:
-                    checkpoint_dict = load_distributed_checkpoint(config.load_checkpoint)
+                    checkpoint_dict = load_distributed_checkpoint(config.checkpoint.load_path)
         else:
-            err_msg = f"{config.load_checkpoint} is not a valid path to load checkpoint when auto_trans_ckpt is False."
+            err_msg = f"{config.checkpoint.load_path} is not a valid path to load checkpoint when auto_trans_ckpt is False."
             logger.error(err_msg)
             raise ValueError(err_msg)
     return checkpoint_dict if checkpoint_dict else checkpoint_future
@@ -726,7 +726,7 @@ def load_ckpt(config, network, optimizer=None, model=None, future=None):
                 of the asynchronous task can be obtained through future.result()
     """
     # load checkpoint params into dict
-    config.load_checkpoint = format_path(config.load_checkpoint)
+    config.checkpoint.load_path = format_path(config.checkpoint.load_path)
 
     if future is not None:
         # get ckpt dict when load checkpoint async
