@@ -70,6 +70,8 @@ from .utils import config2dict, get_last_checkpoint
 
 __all__ = ['Trainer']
 
+from ..checkpoint.utils import is_hf_checkpoint
+
 PREFIX_CHECKPOINT_DIR = "checkpoint"
 SUPPORT_TASKS = MindFormerBook().get_trainer_support_task_list()
 SUPPORT_MODEL_NAMES = MindFormerBook().get_model_name_support_list()
@@ -470,21 +472,21 @@ class Trainer:
         self._check_config_rules()
         self._init_model(is_train=True)
         # if enable_tft is False or remove_redundancy is True, can use record last_ckpt to json
-        if self.config.use_legacy_format and self.config.resume_training and \
+        if self.config.use_legacy_format and not self.config.checkpoint.no_load_optim and \
             (not check_tft_valid() or self.config.remove_redundancy):
-            if os.path.isfile(self.config.load_checkpoint) and \
-                    isinstance(self.config.resume_training, str):
-                logger.warning(f"`resume_training={self.config.resume_training}` is not valid "
+            if os.path.isfile(self.config.checkpoint.load_path) and \
+                    isinstance(not self.config.checkpoint.no_load_optim, str):
+                logger.warning(f"`resume_training={not self.config.checkpoint.no_load_optim}` is not valid "
                                "when `load_checkpoint` is a file path.")
-                self.config.resume_training = True
-            elif os.path.isdir(self.config.load_checkpoint):
+                self.config.checkpoint.no_load_optim = False
+            elif os.path.isdir(self.config.checkpoint.load_path):
                 use_checkpoint_health_monitor = False
                 if self.config.get('use_checkpoint_health_monitor', None) is not None\
                         and isinstance(self.config.use_checkpoint_health_monitor, bool):
                     use_checkpoint_health_monitor = self.config.use_checkpoint_health_monitor
-                self.config.resume_training = get_resume_checkpoint(
-                    checkpoint_dir=self.config.load_checkpoint,
-                    resume_training=self.config.resume_training,
+                self.config.checkpoint.no_load_optim = not get_resume_checkpoint(
+                    checkpoint_dir=self.config.checkpoint.load_path,
+                    resume_training=not self.config.checkpoint.no_load_optim,
                     resume_by_meta=not self.config.resume_by_last_timestamp_ckpt,
                     ckpt_format=self.config.load_ckpt_format,
                     use_checkpoint_health_monitor=use_checkpoint_health_monitor,
@@ -492,9 +494,9 @@ class Trainer:
                 )
 
         if not self.config.use_legacy_format:
-            self.config.load_checkpoint = get_checkpoint_path(self.config.load_checkpoint)
+            self.config.checkpoint.load_path = get_checkpoint_path(self.config.checkpoint.load_path)
         else:
-            self.config.load_checkpoint = self.get_load_checkpoint(self.config.load_checkpoint)
+            self.config.checkpoint.load_path = self.get_load_checkpoint(self.config.checkpoint.load_path)
         self.trainer.train(
             config=self.config, network=self.model,
             dataset=self.train_dataset, optimizer=self.optimizers,
@@ -614,19 +616,19 @@ class Trainer:
         self._check_config_rules()
         self._init_model(is_train=True)
 
-        if self.config.use_legacy_format and self.config.resume_training:
-            if os.path.isfile(self.config.load_checkpoint) and \
-                    isinstance(self.config.resume_training, str):
-                logger.warning(f"`resume_training={self.config.resume_training}` is not valid "
+        if self.config.use_legacy_format and not self.config.checkpoint.no_load_optim:
+            if os.path.isfile(self.config.checkpoint.load_path) and \
+                    isinstance(self.config.checkpoint.no_load_optim, str):
+                logger.warning(f"`resume_training={not self.config.checkpoint.no_load_optim}` is not valid "
                                "when `load_checkpoint` is a file path.")
-                self.config.resume_training = True
-            elif os.path.isdir(self.config.load_checkpoint):
+                self.config.checkpoint.no_load_optim = False
+            elif os.path.isdir(self.config.checkpoint.load_path):
                 use_checkpoint_health_monitor = False
                 if self.config.get('use_checkpoint_health_monitor', None) is not None:
                     use_checkpoint_health_monitor = self.config.use_checkpoint_health_monitor
-                self.config.resume_training = get_resume_checkpoint(
-                    checkpoint_dir=self.config.load_checkpoint,
-                    resume_training=self.config.resume_training,
+                self.config.checkpoint.no_load_optim = not get_resume_checkpoint(
+                    checkpoint_dir=self.config.checkpoint.load_path,
+                    resume_training=not self.config.checkpoint.no_load_optim,
                     resume_by_meta=not self.config.resume_by_last_timestamp_ckpt,
                     ckpt_format=self.config.load_ckpt_format,
                     use_checkpoint_health_monitor=use_checkpoint_health_monitor,
@@ -634,9 +636,9 @@ class Trainer:
                 )
 
         if not self.config.use_legacy_format:
-            self.config.load_checkpoint = get_checkpoint_path(self.config.load_checkpoint)
+            self.config.checkpoint.load_path = get_checkpoint_path(self.config.checkpoint.load_path)
         else:
-            self.config.load_checkpoint = self.get_load_checkpoint(self.config.load_checkpoint)
+            self.config.checkpoint.load_path = self.get_load_checkpoint(self.config.checkpoint.load_path)
 
         self.trainer.train(
             config=self.config, network=self.model,
@@ -721,7 +723,7 @@ class Trainer:
         self._check_config_rules()
         self._init_model()
 
-        self.config.load_checkpoint = self.get_load_checkpoint(self.config.load_checkpoint)
+        self.config.checkpoint.load_path = self.get_load_checkpoint(self.config.checkpoint.load_path)
 
         self.trainer.evaluate(
             config=self.config, network=self.model,
@@ -813,7 +815,7 @@ class Trainer:
         self._check_config_rules()
         self._init_model()
 
-        self.config.load_checkpoint = self.get_load_checkpoint(self.config.load_checkpoint)
+        self.config.checkpoint.load_path = self.get_load_checkpoint(self.config.checkpoint.load_path)
 
         if input_data is None:
             input_data = build_dataset_loader(self.config.eval_dataset.data_loader)
@@ -1359,6 +1361,72 @@ class Trainer:
         self._check_balanced_load_if_not_use_parallel()
         self._convert_health_checkpoint_config()
         self._convert_quick_resume_training_config()
+        self._migrate_checkpoint_config()
+
+    def _compatible_with_both_old_new_config(self, deprecated_configs, old_config, new_config, opposite_value_config):
+        for old_name, new_name, default_value in deprecated_configs:
+            old_value = old_config.get(old_name, default_value)
+            if new_name in opposite_value_config:
+                old_value = not old_value
+            if new_config.get(new_name, None) is None and old_value is not None:
+                logger.warning(
+                    f"The config {old_name} is deprecated. Please use config {new_name} in `checkpoint_config` instead.")
+                setattr(new_config, new_name, old_value)
+
+    def _migrate_checkpoint_config(self):
+        """Migrate checkpoint config."""
+        checkpoint_config = self.config.get("checkpoint")
+        if checkpoint_config:
+            self.config.use_legacy_format = False
+        if not checkpoint_config:
+            checkpoint_config = MindFormerConfig()
+
+        opposite_value_config = ["no_load_optim", "no_save_optim"]
+        deprecated_config_configs = [
+            ("load_checkpoint", "load_path", ""),
+            ("balanced_load", "load_balanced", False),
+            ("resume_training", "no_load_optim", True),
+            ("reshard_worker_num", "reshard_worker_num", 1),
+            ("output_dir", "save_path", "./output")
+        ]
+        self._compatible_with_both_old_new_config(deprecated_config_configs, self.config, checkpoint_config, opposite_value_config)
+
+        deprecated_callback_configs = [
+            ("keep_checkpoint_max", "save_max", 5),
+            ("save_checkpoint_steps", "save_interleaved_steps", 1),
+            ("save_optimizer", "no_save_optim", True),
+            ("remove_redundancy", "save_remove_redundancy", False),
+            ("async_save", "async_save", False),
+            ("prefix", "prefix", "CKP"),
+        ]
+        if self.config.get("callbacks"):
+            for callback in self.config.callbacks:
+                if callback.get("type") == "CheckpointMonitor":
+                    self._compatible_with_both_old_new_config(deprecated_callback_configs, callback, checkpoint_config, opposite_value_config)
+
+        self._validate_checkpoint_config(checkpoint_config)
+        self.config.checkpoint = checkpoint_config
+
+
+    def _validate_checkpoint_config(self, ckpt_config: MindFormerConfig) -> None:
+        """Validate checkpoint config."""
+        if not ckpt_config:
+            raise ValueError("checkpoint_config should not be empty.")
+
+        if ckpt_config.get("save_max", 5) < 1:
+            raise ValueError("save_max in checkpoint_config should be at least 1.")
+        if ckpt_config.get("save_interleaved_steps", 1) < 1:
+            raise ValueError("save_interleaved_steps in checkpoint_config should be at least 1.")
+        if ckpt_config.get("reshard_worker_num", 1) < 1:
+            raise ValueError("reshard_worker_num in checkpoint_config should be at least 1.")
+
+        no_load_optim = ckpt_config.get("no_load_optim", True)
+        load_path = ckpt_config.get("load_path", None)
+        if not no_load_optim and not load_path:
+            raise ValueError("Resume training requires checkpoint.load_path.")
+        if not no_load_optim and load_path:
+            if is_hf_checkpoint(load_path):
+                raise ValueError(f"Resume training not supported for HuggingFace checkpoints.")
 
     def _convert_quick_resume_training_config(self):
         """Convert quick resume training config."""
