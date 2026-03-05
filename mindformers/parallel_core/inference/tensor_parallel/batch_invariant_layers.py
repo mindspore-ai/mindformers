@@ -30,8 +30,6 @@ import mindspore.ops.operations as P
 from mindspore import Parameter, Tensor, mint, nn, ops
 from mindspore.common.initializer import initializer
 
-import ms_custom_ops
-
 from mindformers.parallel_core.transformer_config import TransformerConfig
 from mindformers.parallel_core.inference.parallel_state import ProcessGroup, default_pgs
 from mindformers.parallel_core.inference.tensor_parallel.layers import (LinearMethodBase,
@@ -68,6 +66,7 @@ class BatchInvariantLinearMethod(LinearMethodBase):
         self.config = layer.config
         self.transpose_b = extra_weight_attrs.get('transpose_b')
         self.tarnspose = ops.Transpose()
+        import ms_custom_ops
         self.matmul = ms_custom_ops.matmul_batch_invariant
         self.cast = ops.Cast()
 
@@ -109,6 +108,7 @@ class BatchInvariantEmbeddingMethod(QuantizeMethodBase):
         self.config = layer.config
         self.transpose_b = True
         self.transpose = ops.Transpose()
+        import ms_custom_ops
         self.matmul = ms_custom_ops.matmul_batch_invariant
         self.gather = ops.Gather()
         self.bias_add = ops.Add()

@@ -20,8 +20,6 @@ from mindspore import Tensor, nn, Parameter, ops, mint
 import mindspore.common.dtype as mstype
 from mindspore.common.initializer import initializer
 
-import ms_custom_ops
-
 from mindformers.parallel_core.transformer_config import TransformerConfig
 from mindformers.parallel_core.process_group_config import ModelCommProcessGroups, default_model_comm_pgs
 from mindformers.parallel_core.inference.weights_utils import set_weight_attrs
@@ -194,6 +192,7 @@ class BatchInvariantTopKRouter(TopKRouter):
             self, config: TransformerConfig, model_comm_pgs: Optional[ModelCommProcessGroups] = default_model_comm_pgs
     ) -> None:
         super().__init__(config=config, model_comm_pgs=model_comm_pgs)
+        import ms_custom_ops
         self.matmul = ms_custom_ops.matmul_batch_invariant
         self.transpose = ops.Transpose()
 
