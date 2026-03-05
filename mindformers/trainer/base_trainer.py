@@ -114,9 +114,12 @@ class BaseTrainer:
 
     def __init__(self, task: str = None, model_name: str = None):
 
-        host_name = socket.gethostname()
-        host_ip = socket.gethostbyname(host_name)
-        logger.info(f"host_name: {host_name}, host_ip: {host_ip}")
+        try:
+            host_name = socket.gethostname()
+            host_ip = socket.gethostbyname(host_name)
+            logger.info(f"host_name: {host_name}, host_ip: {host_ip}")
+        except socket.gaierror:
+            logger.warning("Cannot get host name and host ip.")
 
         if model_name is None:
             model_name = "model name unspecified."
