@@ -20,6 +20,8 @@ from pathlib import Path
 import numpy as np
 import mindspore as ms
 from mindspore.communication import init
+from data_gen_utils import get_init_params, DEFAULT_SEQ_LENGTH, DEFAULT_BATCH_SIZE, DEFAULT_HIDDEN_SIZE, \
+    DEFAULT_FFN_HIDDEN_SIZE, DEFAULT_NUM_HEADS
 
 from mindformers.parallel_core.training_graph.transformer.identity_op import IdentityOp
 from mindformers.parallel_core.transformer_config import TransformerConfig
@@ -35,8 +37,6 @@ from mindformers.parallel_core.training_graph.tensor_parallel.layers import Colu
 from mindformers.parallel_core.training_graph.transformer.flash_attention import FlashAttention
 from mindformers.core.context.build_context import build_context
 
-from data_gen_utils import get_init_params, DEFAULT_SEQ_LENGTH, DEFAULT_BATCH_SIZE, DEFAULT_HIDDEN_SIZE, \
-    DEFAULT_FFN_HIDDEN_SIZE, DEFAULT_NUM_HEADS
 
 SCRIPT_DIR = Path(__file__).parent.resolve()
 
@@ -185,7 +185,7 @@ def main():
     args = parser.parse_args()
 
     build_context({"use_legacy": False})
-    ms.context.set_context(deterministic="ON")
+    ms.set_deterministic(True)
     ms.set_context(mode=ms.GRAPH_MODE)  # GRAPH_MODE is typical for MindSpore model execution
     ms.set_auto_parallel_context(parallel_mode=ms.ParallelMode.SEMI_AUTO_PARALLEL)
     ms.set_seed(42)

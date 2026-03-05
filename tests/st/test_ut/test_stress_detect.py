@@ -19,7 +19,7 @@ import mindspore as ms
 from mindformers.core.callback import StressDetectCallBack
 from mindformers.tools.logger import get_logger
 
-ms.set_context(device_target='CPU')
+ms.set_device(device_target='CPU')
 
 PASS_CODE = 0
 VOLTAGE_ERROR_CODE = 574007

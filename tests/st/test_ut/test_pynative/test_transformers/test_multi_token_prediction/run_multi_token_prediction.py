@@ -209,7 +209,7 @@ def main():
     args = parser.parse_args()
 
     build_context({"use_legacy": False})
-    set_context(deterministic="ON")
+    ms.set_deterministic(True)
     set_context(mode=ms.PYNATIVE_MODE)
     set_seed(42)
 

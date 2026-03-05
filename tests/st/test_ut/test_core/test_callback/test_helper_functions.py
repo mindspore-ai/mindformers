@@ -349,7 +349,7 @@ class TestGetEmbeddingInfo:
     @pytest.mark.platform_x86_cpu
     @patch('mindformers.core.callback.callback.get_group_size', return_value=8)
     @patch('mindformers.core.callback.callback.get_rank', return_value=0)
-    @patch('mindspore.context.get_auto_parallel_context', return_value=2)
+    @patch('mindspore.get_auto_parallel_context', return_value=2)
     def test_get_embedding_info(self, *mocks):
         """Test get_embedding_info extracts embedding local norm"""
 

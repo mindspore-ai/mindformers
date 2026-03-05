@@ -29,7 +29,9 @@ from mindformers.tools.logger import logger
 from mindformers.tools.register.register import MindFormerModuleType, MindFormerRegister
 from mindformers.version_control import skip_barrier_controller
 from mindformers.utils.file_utils import is_publicly_accessible_path
+from mindformers.core.context.build_context import get_context
 from mindformers.tools.utils import (
+    MODE,
     get_dp_from_dataset_strategy,
     get_real_group_size,
     get_real_rank,
@@ -109,7 +111,7 @@ class MegatronDatasetBuilder:
                                         num_shards: int = None,
                                         shard_id: int = None,
                                         phase: str = "train",
-                                        **kwargs):
+                                        **kwargs):  # pylint: disable=unused-argument
         """ build gpt dataset or fake dataset, return dataset obj."""
         # create BlendedMegatronDatasetConfig
         blended_config = self.init_gpt_dataset_config()
@@ -143,7 +145,7 @@ class MegatronDatasetBuilder:
                                            shard_id=shard_id)
             return gen_dataset
 
-        if get_real_group_size() > 1 and ms.get_context('mode') != ms.context.PYNATIVE_MODE:
+        if get_real_group_size() > 1 and get_context('mode') != MODE['PYNATIVE_MODE']:
             global_rank_id = get_real_rank()
             stage_num = ms.get_auto_parallel_context("pipeline_stages")
             total_device_num = get_real_group_size() // stage_num

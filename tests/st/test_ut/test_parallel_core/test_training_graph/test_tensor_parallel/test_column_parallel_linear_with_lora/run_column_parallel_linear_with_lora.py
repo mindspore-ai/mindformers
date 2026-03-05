@@ -16,6 +16,7 @@
 import argparse
 import os
 from pathlib import Path
+from data_gen_utils import get_init_params
 import numpy as np
 import mindspore as ms
 from mindspore.communication import init
@@ -23,7 +24,6 @@ from mindformers.parallel_core.training_graph.tensor_parallel.lora_layers import
 from mindformers.parallel_core.training_graph.device_matrix import layout
 from mindformers.parallel_core.transformer_config import TransformerConfig
 from mindformers.parallel_core.utils.init_method import init_method_normal
-from data_gen_utils import get_init_params
 SCRIPT_DIR = Path(__file__).parent.resolve()
 
 class ColumnParallelLinearWithLoRARunner:
@@ -122,7 +122,7 @@ def main():
 
     args = parser.parse_args()
 
-    ms.context.set_context(deterministic="ON")
+    ms.set_deterministic(True)
     ms.set_context(mode=ms.GRAPH_MODE)
     ms.set_seed(42)
 

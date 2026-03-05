@@ -28,7 +28,7 @@ from mindformers import MindFormerConfig
 from mindformers.tools.logger import logger
 from mindformers.tools.utils import set_safe_mode_for_file_or_dir
 
-ms.set_context(device_target='CPU')
+ms.set_device(device_target='CPU')
 cpu_cast = Cast().set_device('CPU')
 
 
@@ -239,7 +239,7 @@ def ms_ckpt_convertor(input_path, output_path, config):
         save_file(pt_layer_weights, os.path.join(output_path, saving_file_name))
         logger.info(f"saving weights in layer-{layer_id + 1} to file {saving_file_name}")
     converted_st_map["metadata"]["total_size"] = total_size
-    converted_model_index_file = os.path.join(output_path, f"model.safetensors.index.json")
+    converted_model_index_file = os.path.join(output_path, "model.safetensors.index.json")
     with open(converted_model_index_file, "w") as f:
         json_string = json.dumps(converted_st_map, default=lambda x: x.__dict__, sort_keys=False, indent=2)
         f.write(json_string)
@@ -282,7 +282,7 @@ def ms_safetensors_convertor(input_path, output_path, config):
         logger.info(f"saving weights in layer-{layer_id + 1} to file {saving_file_name}")
 
     converted_st_map["metadata"]["total_size"] = total_size
-    converted_model_index_file = os.path.join(output_path, f"model.safetensors.index.json")
+    converted_model_index_file = os.path.join(output_path, "model.safetensors.index.json")
     with open(converted_model_index_file, "w") as f:
         json_string = json.dumps(converted_st_map, default=lambda x: x.__dict__, sort_keys=False, indent=2)
         f.write(json_string)

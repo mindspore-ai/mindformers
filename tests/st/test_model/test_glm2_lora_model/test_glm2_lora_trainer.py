@@ -24,10 +24,14 @@ import numpy as np
 import pytest
 
 import mindspore
-from mindspore import context
 from mindspore.dataset import GeneratorDataset
 
-from mindformers import ChatGLM2Config, ChatGLM2ForConditionalGeneration, ChatGLM2Tokenizer
+from mindformers import (
+    ChatGLM2Config,
+    ChatGLM2ForConditionalGeneration,
+    ChatGLM2Tokenizer,
+    build_context,
+)
 from mindformers.pet.pet_config import LoraConfig
 from mindformers.pet import get_pet_model
 from mindformers import Trainer, TrainingArguments
@@ -63,7 +67,7 @@ class TestGLM2WithLoRATrainerMethod:
 
     def setup_method(self):
         """init task trainer."""
-        context.set_context(mode=0, device_target="Ascend")
+        build_context({"mode": 0, "device_target": "Ascend"})
 
         args = TrainingArguments(num_train_epochs=1, batch_size=2)
         train_dataset = GeneratorDataset(generator_train,
@@ -80,7 +84,7 @@ class TestGLM2WithLoRATrainerMethod:
         model = ChatGLM2ForConditionalGeneration(model_config)
         model = get_pet_model(model, model_config.pet_config)
 
-        temp_dir = tempfile.TemporaryDirectory()
+        temp_dir = tempfile.TemporaryDirectory()  # pylint: disable=consider-using-with
         temp_path = temp_dir.name
         get_sp_vocab_model("chatglm2", temp_path)
         tokenizer_model_path = os.path.join(temp_path, "chatglm2_tokenizer.model")

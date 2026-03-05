@@ -17,6 +17,7 @@ import argparse
 import os
 from pathlib import Path
 import numpy as np
+from data_gen_utils import get_init_params
 import mindspore as ms
 from mindspore.communication import init
 from mindformers.parallel_core.transformer_config import TransformerConfig
@@ -24,8 +25,6 @@ from mindformers.parallel_core.training_graph.transformer.fused_softmax import F
 from mindformers.parallel_core.training_graph.transformer.utils import get_attn_mask_func
 from mindformers.parallel_core.training_graph.transformer.enums import AttnMaskType
 from mindformers.parallel_core.utils.init_method import init_method_normal
-
-from data_gen_utils import get_init_params
 
 SCRIPT_DIR = Path(__file__).parent.resolve()
 
@@ -143,7 +142,7 @@ def main():
     parser.add_argument("--tensor_parallel", type=int, default=1)
     args = parser.parse_args()
 
-    ms.context.set_context(deterministic="ON")
+    ms.set_deterministic(True)
     ms.set_context(mode=ms.GRAPH_MODE)
     ms.set_seed(42)
 

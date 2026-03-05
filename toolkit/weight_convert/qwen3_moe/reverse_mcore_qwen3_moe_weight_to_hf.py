@@ -34,7 +34,7 @@ from mindspore.ops.operations import Cast
 from mindformers.tools.utils import set_safe_mode_for_file_or_dir
 from mindformers.tools.logger import logger
 
-ms.set_context(device_target='CPU')
+ms.set_device(device_target='CPU')
 cpu_cast = Cast().set_device('CPU')
 
 DTYPE_MAP = {

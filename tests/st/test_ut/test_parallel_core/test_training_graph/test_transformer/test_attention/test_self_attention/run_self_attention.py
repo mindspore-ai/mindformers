@@ -17,6 +17,7 @@ import argparse
 import os
 from pathlib import Path
 import numpy as np
+from data_gen_utils import get_init_params
 import mindspore as ms
 from mindspore.communication import init
 from mindformers.parallel_core.training_graph.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
@@ -27,8 +28,6 @@ from mindformers.parallel_core.training_graph.transformer.attention import SelfA
 from mindformers.parallel_core.training_graph.transformer.flash_attention import FlashAttention
 from mindformers.parallel_core.inference.parallel_state import initialize_model_parallel
 # from mindformers.parallel_core.training_graph.transformer.dot_product_attention import DotPruductAttention
-
-from data_gen_utils import get_init_params
 
 SCRIPT_DIR = Path(__file__).parent.resolve()
 
@@ -257,7 +256,7 @@ def main():
 
     args = parser.parse_args()
 
-    ms.context.set_context(deterministic="ON")
+    ms.set_deterministic(True)
     ms.set_context(mode=ms.GRAPH_MODE)
     ms.set_seed(42)
 

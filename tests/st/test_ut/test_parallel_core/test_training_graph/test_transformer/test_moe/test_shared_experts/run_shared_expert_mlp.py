@@ -15,6 +15,7 @@
 """Test module for testing SharedExpertMLP used for mindformers."""
 import argparse
 import os
+from data_gen_utils import get_init_params, get_golden_datas, get_gpu_datas
 
 import mindspore as ms
 from mindspore import nn
@@ -24,14 +25,13 @@ from mindformers.parallel_core.training_graph.transformer.moe.shared_experts imp
 from mindformers.parallel_core.training_graph.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from mindformers.parallel_core.training_graph.device_matrix import layout
 from mindformers.parallel_core.inference.parallel_state import initialize_model_parallel
-from data_gen_utils import get_init_params, get_golden_datas, get_gpu_datas
 from tests.utils.double_benchmark import DoubleBenchmarkComparator, DoubleBenchmarkStandard
 
-ms.context.set_context(deterministic="ON")
+ms.set_deterministic(True)
 ms.set_context(mode=ms.GRAPH_MODE)
 
 
-def get_config():
+def get_config(args):
     """get TransformerConfig for test"""
     return TransformerConfig(data_parallel_size=args.dp,
                              tensor_model_parallel_size=args.tp,
@@ -102,10 +102,10 @@ if __name__ == "__main__":
         help='use a gated linear unit in the SharedExpertMLP')
 
     parser.set_defaults(gate=False)
-    args, rest_args = parser.parse_known_args()
+    args_, rest_args = parser.parse_known_args()
 
-    transformer_config = get_config()
-    transformer_config.use_shared_expert_gating = args.gate
+    transformer_config = get_config(args_)
+    transformer_config.use_shared_expert_gating = args_.gate
     input_, state_dict = get_init_params(transformer_config)
     net = TestModel(transformer_config)
     ms.load_param_into_net(net, state_dict)
@@ -113,6 +113,6 @@ if __name__ == "__main__":
     output = net(input_)
     output_npu = output.asnumpy()
     standard = DoubleBenchmarkStandard(dtype="bfloat16")
-    output_gpu = get_gpu_datas(args)
-    output_golden = get_golden_datas(args)
+    output_gpu = get_gpu_datas(args_)
+    output_golden = get_golden_datas(args_)
     DoubleBenchmarkComparator.check_pass_or_not(output_npu, output_gpu, output_golden, standard)

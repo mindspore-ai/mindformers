@@ -16,18 +16,18 @@
 Test module for testing ColumnParallelBatchedLinear used for mindformers.
 """
 import argparse
+from data_gen_utils import get_data, get_output
 
 import mindspore as ms
 from mindformers.parallel_core.transformer_config import TransformerConfig
 from mindformers.parallel_core.training_graph.tensor_parallel.batched_layers import ColumnParallelBatchedLinear
-from data_gen_utils import get_data, get_output
 from tests.utils.double_benchmark import DoubleBenchmarkComparator
 
-ms.context.set_context(deterministic="ON")
+ms.set_deterministic(True)
 ms.set_context(mode=ms.GRAPH_MODE)
 
 
-def get_config():
+def get_config(args):
     """get TransformerConfig for test"""
     return TransformerConfig(data_parallel_size=args.dp,
                              tensor_model_parallel_size=args.tp,
@@ -80,16 +80,16 @@ if __name__ == "__main__":
 
     parser.set_defaults(skip_weight_param_allocation=False)
     parser.set_defaults(weight=False)
-    args, rest_args = parser.parse_known_args()
+    args_, rest_args = parser.parse_known_args()
 
-    config = get_config()
+    config = get_config(args_)
     state_dict, input_ = get_data(config)
     net = ColumnParallelBatchedLinear(input_size=config.hidden_size, output_size=config.ffn_hidden_size,
                                       config=config, init_method=config.init_method,
-                                      skip_weight_param_allocation=args.skip_weight_param_allocation)
-    if not args.skip_weight_param_allocation and not args.weight:
+                                      skip_weight_param_allocation=args_.skip_weight_param_allocation)
+    if not args_.skip_weight_param_allocation and not args_.weight:
         ms.load_param_into_net(net, state_dict)
-    if args.weight:
+    if args_.weight:
         output, bias = net(input_, state_dict['linear.weight'])
     else:
         output, bias = net(input_)

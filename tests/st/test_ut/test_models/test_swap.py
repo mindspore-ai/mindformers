@@ -28,7 +28,8 @@ logger = get_logger()
 logger.propagate = True
 
 build_context({"use_legacy": False})
-ms.set_context(device_target='CPU', mode=ms.GRAPH_MODE)
+ms.set_context(mode=ms.GRAPH_MODE)
+ms.set_device(device_target='CPU')
 
 
 @pytest.mark.level0

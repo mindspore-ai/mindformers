@@ -17,7 +17,6 @@ from __future__ import absolute_import
 
 from functools import wraps
 
-from mindspore import context
 from mindspore.common import dtype as mstype
 from mindspore.log import logging
 from mindspore.common.initializer import initializer
@@ -36,6 +35,7 @@ except ImportError:
 from mindspore.nn.optim.optimizer import Optimizer
 from mindspore.nn.optim.optimizer import opt_init_args_register
 
+from mindformers.core.context.build_context import get_context
 from mindformers.tools.register import MindFormerRegister, MindFormerModuleType
 
 
@@ -341,7 +341,7 @@ class Came(Optimizer):
         self.fused_ada_factor = P.FusedAdaFactor(enable_scale_parameter=self.scale_parameter,
                                                  enable_first_moment=self.use_first_moment,
                                                  enable_weight_decay=self.weight_decay_flag)
-        if context.get_context("device_target") == "CPU":
+        if get_context("device_target") == "CPU":
             self.use_fused_ada_factor = True
         else:
             self.use_fused_ada_factor = False

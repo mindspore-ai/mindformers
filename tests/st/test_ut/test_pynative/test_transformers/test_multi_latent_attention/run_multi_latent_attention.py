@@ -158,7 +158,7 @@ def main():
     args = parser.parse_args()
     args.q_lora_rank = None if args.q_lora_rank == 0 else args.q_lora_rank
 
-    ms.context.set_context(deterministic="ON")
+    ms.set_deterministic(True)
     ms.set_context(mode=ms.PYNATIVE_MODE)
     ms.set_seed(42)
 

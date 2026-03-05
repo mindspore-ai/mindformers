@@ -61,7 +61,7 @@ from mindspore.mint.distributed import all_to_all_single
 
 from mindformers.wrapper.wrapper import get_real_models
 from mindformers.checkpoint.sharded_tensor import get_all_sharded_tensor
-from mindformers.core.context.build_context import is_legacy_model
+from mindformers.core.context.build_context import get_context, is_legacy_model
 from mindformers.tools import get_output_root_path
 from mindformers.tools.logger import logger
 from mindformers.tools.register import MindFormerRegister, MindFormerModuleType
@@ -601,7 +601,7 @@ class MFLossMonitor(Callback):
         else:
             logger.warning('Model Flops computation only support train and eval mode!')
             return False
-        if ms.get_context('mode') != ms.GRAPH_MODE:
+        if get_context('mode') != ms.GRAPH_MODE:
             logger.warning('Model Flops computation only support graph mode in legacy mode!')
             return False
         if not hasattr(network, 'current_phase'):
@@ -664,11 +664,11 @@ class MFLossMonitor(Callback):
             if isinstance(self.learning_rate, (float, Tensor, np.ndarray)):
                 current_lr = str(self.learning_rate)
             elif isinstance(self.learning_rate, LearningRateSchedule):
-                if ms.context.get_context('device_target') == 'CPU':
+                if get_context('device_target') == 'CPU':
                     if self.print_warning_flag:
                         logger.warning(
                             "device target not support CPU when generating the learning rate value, "
-                            "please use: mindspore.context.set_context(device_target='Ascend')")
+                            "please use: mindspore.set_device('Ascend')")
                         self.print_warning_flag = False
                     current_lr = None
                 else:
@@ -1991,7 +1991,7 @@ class CheckpointMonitor(ModelCheckpoint):
         """
         Checks if a trainable parameter should be skipped based on execution mode and parameter properties.
         """
-        is_graph_mode = context.get_context('mode') == context.GRAPH_MODE
+        is_graph_mode = get_context('mode') == context.GRAPH_MODE
         in_auto_parallel = ms.get_auto_parallel_context("parallel_mode") in [
             ms.ParallelMode.SEMI_AUTO_PARALLEL,
             ms.ParallelMode.AUTO_PARALLEL,
@@ -2315,7 +2315,7 @@ class ProfileMonitor(Callback):
                 output_path = os.path.join(output_path, 'profile', f'rank_{rank_id}')
             logger.info(f"Profile save path: {output_path}")
 
-            if ms.get_context("device_target") == "GPU" and profile_memory:
+            if get_context("device_target") == "GPU" and profile_memory:
                 logger.warning("The parameter profile_memory is not supported on GPU currently, "
                                "so is changed to False. ")
                 profile_memory = False
@@ -2858,7 +2858,7 @@ class MaxLogitsMonitor(Callback):
         while hasattr(network, 'network'):
             network = network.network
         parallel_mode = get_auto_parallel_context("parallel_mode")
-        if parallel_mode in ["semi_auto_parallel", "auto_parallel"] and ms.get_context('mode') == 0:
+        if parallel_mode in ["semi_auto_parallel", "auto_parallel"] and get_context('mode') == ms.GRAPH_MODE:
             network = network._backbone
         self._reset_max_attention_logit(network)
 
@@ -2960,7 +2960,7 @@ class TopkBiasBalanceCallback(Callback):
         while hasattr(network, 'network'):
             network = network.network
         parallel_mode = get_auto_parallel_context("parallel_mode")
-        if parallel_mode in ["semi_auto_parallel", "auto_parallel"] and ms.get_context('mode') == 0:
+        if parallel_mode in ["semi_auto_parallel", "auto_parallel"] and get_context('mode') == ms.GRAPH_MODE:
             network = network._backbone
         self._update_topk_bias(network)
 
@@ -3017,7 +3017,7 @@ class MoEDropRateCallback(Callback):
         while hasattr(network, 'network'):
             network = network.network
         parallel_mode = get_auto_parallel_context("parallel_mode")
-        if parallel_mode in ["semi_auto_parallel", "auto_parallel"] and ms.get_context('mode') == 0:
+        if parallel_mode in ["semi_auto_parallel", "auto_parallel"] and get_context('mode') == ms.GRAPH_MODE:
             network = network._backbone
         self._callback_droprate(network)
 
@@ -3607,7 +3607,7 @@ class ExpertMigrateCallback(Callback):
                 if "mlp.experts.weight" in param_name:
                     optimizer_param_dict[param_name] = param
 
-        original_mode = ms.get_context("mode")
+        original_mode = get_context("mode")
 
         for layer_index, layer in self._get_moe_layers_in_current_stage():
             # Initialize relocation
@@ -3733,7 +3733,7 @@ class ExpertMigrateCallback(Callback):
         while hasattr(network, 'network'):
             network = network.network
         parallel_mode = get_auto_parallel_context("parallel_mode")
-        if parallel_mode in ["semi_auto_parallel", "auto_parallel"] and ms.get_context('mode') == 0:
+        if parallel_mode in ["semi_auto_parallel", "auto_parallel"] and get_context('mode') == ms.GRAPH_MODE:
             network = network._backbone
         while hasattr(network, "network"):
             network = network.network

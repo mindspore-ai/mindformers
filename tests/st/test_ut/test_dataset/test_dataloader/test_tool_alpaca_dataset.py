@@ -19,7 +19,8 @@ import pytest
 import mindspore as ms
 from mindformers import ToolAlpacaDataLoader
 
-ms.set_context(mode=1, device_target='CPU')
+ms.set_context(mode=1)
+ms.set_device(device_target='CPU')
 
 
 def make_test_tool_alpaca_dataset(dataset_dir="./checkpoint_download", valid_num=8):

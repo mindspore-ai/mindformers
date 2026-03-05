@@ -39,7 +39,8 @@ class TestProfileMonitor(unittest.TestCase):
     @pytest.mark.platform_x86_cpu
     @pytest.mark.env_onecard
     @patch('mindformers.core.callback.callback._check_mspti_is_on')
-    def test_mstx_enabled_initialization(self, mock_check_mspti):
+    @patch('mindformers.core.callback.callback.get_context', return_value="CPU")
+    def test_mstx_enabled_initialization(self, mock_get_context, mock_check_mspti):
         """Test MSTX enabled initialization"""
         # Test when MSPTI is off
         mock_check_mspti.return_value = False
@@ -55,7 +56,8 @@ class TestProfileMonitor(unittest.TestCase):
     @pytest.mark.platform_x86_cpu
     @pytest.mark.env_onecard
     @patch('mindspore.profiler.Profiler')
-    def test_on_train_begin_starts_profiling(self, mock_profiler):
+    @patch('mindformers.core.callback.callback.get_context', return_value="CPU")
+    def test_on_train_begin_starts_profiling(self, mock_get_context, mock_profiler):
         """Test that profiling starts on train begin"""
         monitor = ProfileMonitor(start_step=1, start_profile=True)
         mock_run_context = Mock()
@@ -73,7 +75,8 @@ class TestProfileMonitor(unittest.TestCase):
     @pytest.mark.level1
     @pytest.mark.platform_x86_cpu
     @pytest.mark.env_onecard
-    def test_on_train_step_begin_mstx_range_start(self):
+    @patch('mindformers.core.callback.callback.get_context', return_value="CPU")
+    def test_on_train_step_begin_mstx_range_start(self, mock_get_context):
         """Test MSTX range start on train step begin"""
         monitor = ProfileMonitor(start_step=1, mstx=True)
         # Force mstx_enabled to True for testing
@@ -96,7 +99,8 @@ class TestProfileMonitor(unittest.TestCase):
     @pytest.mark.level1
     @pytest.mark.platform_x86_cpu
     @pytest.mark.env_onecard
-    def test_on_train_step_end_mstx_range_end(self):
+    @patch('mindformers.core.callback.callback.get_context', return_value="CPU")
+    def test_on_train_step_end_mstx_range_end(self, mock_get_context):
         """Test MSTX range end on train step end"""
         monitor = ProfileMonitor(start_step=1, stop_step=10, mstx=True)
         # Force mstx_enabled to True for testing
@@ -119,7 +123,8 @@ class TestProfileMonitor(unittest.TestCase):
     @pytest.mark.platform_x86_cpu
     @pytest.mark.env_onecard
     @patch('mindspore.profiler.Profiler')
-    def test_on_train_end_stops_profiling(self, mock_profiler):
+    @patch('mindformers.core.callback.callback.get_context')
+    def test_on_train_end_stops_profiling(self, mock_get_context, mock_profiler):
         """Test that profiling stops on train end"""
         monitor = ProfileMonitor(start_step=1, stop_step=10)
 
@@ -136,7 +141,8 @@ class TestProfileMonitor(unittest.TestCase):
     @pytest.mark.level1
     @pytest.mark.platform_x86_cpu
     @pytest.mark.env_onecard
-    def test_step_range_validation(self):
+    @patch('mindformers.core.callback.callback.get_context', return_value="CPU")
+    def test_step_range_validation(self, mock_get_context):
         """Test step range validation"""
         # Test valid step ranges
         monitor = ProfileMonitor(start_step=1, stop_step=10)
@@ -151,7 +157,8 @@ class TestProfileMonitor(unittest.TestCase):
     @pytest.mark.platform_x86_cpu
     @pytest.mark.env_onecard
     @patch('mindformers.core.callback.callback.get_real_rank')
-    def test_profile_rank_ids_filtering(self, mock_get_real_rank):
+    @patch('mindformers.core.callback.callback.get_context', return_value="CPU")
+    def test_profile_rank_ids_filtering(self, mock_get_context, mock_get_real_rank):
         """Test profile rank IDs filtering"""
         mock_get_real_rank.return_value = 0
 
@@ -213,7 +220,7 @@ class TestProfileMonitorInit:
     @patch('mindformers.core.callback.callback.get_real_rank', return_value=0)
     @patch('mindformers.core.callback.callback.get_pipeline_rank_ids', return_value=[0, 1])
     @patch('mindformers.core.callback.callback.get_output_subpath', return_value='/output/profile')
-    @patch('mindformers.core.callback.callback.ms.get_context', return_value='Ascend')
+    @patch('mindformers.core.callback.callback.get_context', return_value='Ascend')
     @patch('mindformers.core.callback.callback.is_version_ge', return_value=True)
     @patch('mindformers.core.callback.callback._check_mspti_is_on', return_value=False)
     def test_profile_monitor_init_with_pipeline(self, mock_mspti, mock_version, mock_context,
@@ -259,7 +266,7 @@ class TestProfileMonitorInit:
     @patch('mindformers.core.callback.callback.get_real_rank', return_value=0)
     @patch('mindformers.core.callback.callback.get_pipeline_rank_ids', return_value=[0])
     @patch('mindformers.core.callback.callback.get_output_subpath', return_value='/output/profile')
-    @patch('mindformers.core.callback.callback.ms.get_context', return_value='Ascend')
+    @patch('mindformers.core.callback.callback.get_context', return_value='Ascend')
     @patch('mindformers.core.callback.callback.is_version_ge', return_value=True)
     @patch('mindformers.core.callback.callback._check_mspti_is_on', return_value=False)
     def test_on_train_step_begin_start_profiler(self, mock_mspti, mock_version, mock_context,

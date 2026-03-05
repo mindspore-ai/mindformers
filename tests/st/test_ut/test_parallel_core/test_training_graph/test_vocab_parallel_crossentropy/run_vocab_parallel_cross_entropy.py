@@ -18,12 +18,12 @@ import argparse
 import os
 from pathlib import Path
 import numpy as np
+from data_gen_utils import get_init_params
 import mindspore as ms
 from mindspore.communication import init
 from mindformers.core.context.build_context import init_context, set_context
 from mindformers.parallel_core.training_graph.loss_func import VocabParallelCrossEntropy
 from mindformers.parallel_core.transformer_config import TransformerConfig
-from data_gen_utils import get_init_params
 
 SCRIPT_DIR = Path(__file__).parent.resolve()
 
@@ -116,7 +116,7 @@ def main():
 
     args = parser.parse_args()
 
-    ms.context.set_context(deterministic="ON")
+    ms.set_deterministic(True)
     ms.set_context(mode=ms.GRAPH_MODE)
     ms.set_seed(42)
 

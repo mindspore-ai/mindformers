@@ -18,11 +18,12 @@ import pytest
 import mindspore as ms
 from mindformers.core.callback.callback import _get_stable_rank
 
-ms.set_context(mode=1, device_target='Ascend')
+ms.set_context(mode=1)
+ms.set_device(device_target='Ascend')
 
 
 @pytest.mark.level0
-@pytest.mark.platform_x86_cpu
+@pytest.mark.platform_arm_ascend910b_training
 @pytest.mark.env_onecard
 def test_stable_rank():
     """
@@ -39,7 +40,7 @@ def test_stable_rank():
     assert abs(eigenvalue - eigenvalue_ops) < (eigenvalue * 0.05)
 
 @pytest.mark.level0
-@pytest.mark.platform_x86_cpu
+@pytest.mark.platform_arm_ascend910b_training
 @pytest.mark.env_onecard
 def test_3d_param_stable_rank():
     """
@@ -76,7 +77,7 @@ def test_3d_param_stable_rank():
     assert eig[5] == 0.0
 
 @pytest.mark.level0
-@pytest.mark.platform_x86_cpu
+@pytest.mark.platform_arm_ascend910b_training
 @pytest.mark.env_onecard
 def test_2d_zero_stable_rank():
     """

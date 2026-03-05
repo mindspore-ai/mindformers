@@ -26,7 +26,8 @@ from mindformers.models.llama.llama_transformer import LLamaDecodeLayer
 from mindformers.parallel_core.training_graph.transformer.utils import LayerSetting
 from mindformers.modules.transformer.transformer import TransformerOpParallelConfig
 
-mindspore.set_context(device_target='CPU', mode=0)
+mindspore.set_context(mode=0)
+mindspore.set_device(device_target='CPU')
 
 
 for path in sys.path:

@@ -126,7 +126,7 @@ def dequant_layer_weights(layer_id, pt_layer_weights):
     for weight_name, weight in pt_layer_weights.items():
         if weight_name.endswith("_scale_inv"):
             continue
-        elif weight.element_size() == 1 and (f"model.layers.{layer_id}." in weight_name):  # FP8 weight
+        if weight.element_size() == 1 and (f"model.layers.{layer_id}." in weight_name):  # FP8 weight
             scale_inv_name = f"{weight_name}_scale_inv"
             try:
                 # Get scale_inv from the correct file
@@ -559,7 +559,7 @@ def ms_safetensors_convertor(input_path, output_path, config):
         ms.save_checkpoint(to_save_ckpt, os.path.join(output_path, saving_file), format="safetensors")
         print(f"saving weights in layer-{layer_id} to file {saving_file}")
 
-    converted_model_index_file = os.path.join(output_path, f"param_name_map.json")
+    converted_model_index_file = os.path.join(output_path, "param_name_map.json")
     with open(converted_model_index_file, "w") as f:
         json_string = json.dumps(converted_st_map, default=lambda x: x.__dict__, sort_keys=False, indent=2)
         f.write(json_string)
@@ -775,8 +775,7 @@ def infer_convert_layer_weight(src_hf_dir, dst_ms_dir, layer, queue):
     for key, value in params_dict.items():  # pylint: disable=redefined-outer-name
         if not key.startswith(f"model.layers.{layer}."):
             continue
-        value = params_dict[key]
-        dtype = params_dict[key].dtype
+        dtype = value.dtype
         ms_key = infer_name_replace(key)
 
         # l2q_proj
@@ -837,7 +836,6 @@ def infer_convert_outer_weight(src_hf_dir, dst_ms_dir, ms_meta, param_json):
     for key, value in params_dict.items():  # pylint: disable=redefined-outer-name
         if "model.layers." in key:
             continue
-        value = params_dict[key]
         ms_key = infer_name_replace(key)
         ms_param[ms_key] = ms.Parameter(ms.Tensor(value), name=ms_key)
         ms_meta[ms_key] = dst_name
@@ -902,7 +900,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.infer:
-        ms.set_context(device_target="CPU")
+        ms.set_device(device_target="CPU")
         infer_trans_ckpt_pt_to_ms(src_hf_dir=args.torch_ckpt_path,
                                   dst_ms_dir=args.mindspore_ckpt_path,
                                   worker_num=args.worker_num,

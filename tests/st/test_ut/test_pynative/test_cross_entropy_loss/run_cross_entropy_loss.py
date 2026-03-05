@@ -87,7 +87,7 @@ def main():
 
     args = parser.parse_args()
 
-    ms.context.set_context(deterministic="ON")
+    ms.set_deterministic(True)
     ms.set_seed(42)
 
     runner = CrossEntropyLossRunner(args)

@@ -44,7 +44,8 @@ def test_repetition_penalty():
     Description: Check the accuracy of RepetitionPenalty between Numpy and MindSpore operators.
     Expectation: Outputs between them are the same.
     """
-    set_context(device_target="Ascend", mode=ms.GRAPH_MODE)
+    set_context(mode=ms.GRAPH_MODE)
+    ms.set_device(device_target='Ascend')
     input_ids = np.random.uniform(low=0, high=4096, size=(1, 4096)).astype(np.int32)
     scores = np.random.randn(1, 4096).astype(np.float32)
 
@@ -78,7 +79,8 @@ def test_frequency_penalty():
     Description: Check the accuracy of Frequency Penalty between Numpy and MindSpore operators.
     Expectation: Outputs between them are the same.
     """
-    set_context(device_target="Ascend", mode=ms.GRAPH_MODE)
+    set_context(mode=ms.GRAPH_MODE)
+    ms.set_device(device_target='Ascend')
     input_ids = np.random.uniform(low=0, high=4096, size=(1, 4096)).astype(np.int32)
     scores = np.random.randn(1, 4096).astype(np.float32)
     frequency_penalty = float(np.random.uniform(low=0.1))
@@ -115,7 +117,8 @@ def test_presence_penalty():
     Description: Check the accuracy of Presence Penalty between Numpy and MindSpore operators.
     Expectation: Outputs between them are the same.
     """
-    set_context(device_target="Ascend", mode=ms.GRAPH_MODE)
+    set_context(mode=ms.GRAPH_MODE)
+    ms.set_device(device_target='Ascend')
     input_ids = np.random.uniform(low=0, high=4096, size=(1, 4096)).astype(np.int32)
     scores = np.random.randn(1, 4096).astype(np.float32)
     presence_penalty = float(np.random.uniform(low=0.1))
@@ -153,7 +156,8 @@ def test_temperature():
     Description: Check the accuracy of Temperature between Numpy and MindSpore operators.
     Expectation: Outputs between them are the same.
     """
-    set_context(device_target="Ascend", mode=ms.GRAPH_MODE)
+    set_context(mode=ms.GRAPH_MODE)
+    ms.set_device(device_target='Ascend')
     input_ids = np.random.uniform(low=0, high=4096, size=(1, 4096)).astype(np.int32)
     scores = np.random.randn(1, 4096).astype(np.float32)
 
@@ -187,7 +191,8 @@ def test_top_k():
     Description: Check the accuracy of TopK between Numpy and MindSpore operators.
     Expectation: Outputs between them are the same.
     """
-    set_context(device_target="Ascend", mode=ms.GRAPH_MODE)
+    set_context(mode=ms.GRAPH_MODE)
+    ms.set_device(device_target='Ascend')
     input_ids = np.random.uniform(low=0, high=4096, size=(1, 4096)).astype(np.int32)
     scores = np.random.randn(1, 4096).astype(np.float32)
 
@@ -227,7 +232,8 @@ def test_top_p():
     Description: Check the accuracy of TopP between Numpy and MindSpore operators.
     Expectation: Outputs between them are the same.
     """
-    set_context(device_target="Ascend", mode=ms.GRAPH_MODE)
+    set_context(mode=ms.GRAPH_MODE)
+    ms.set_device(device_target='Ascend')
     input_ids = np.random.uniform(low=0, high=4096, size=(1, 4096)).astype(np.int32)
     scores = np.random.randn(1, 4096).astype(np.float32)
 
@@ -265,7 +271,8 @@ def test_sampling():
     Description: Check the accuracy of MinLength between Numpy and MindSpore operators.
     Expectation: Outputs between them are the same.
     """
-    set_context(device_target="Ascend", mode=ms.GRAPH_MODE)
+    set_context(mode=ms.GRAPH_MODE)
+    ms.set_device(device_target='Ascend')
     input_ids = np.random.uniform(low=0, high=4096, size=(1, 4096)).astype(np.int32)
     scores = np.random.randn(32, 4096).astype(np.float32)
     do_sample = np.random.uniform(size=(32,)) > 0.5
@@ -301,7 +308,8 @@ def test_min_length():
     Description: Check the accuracy of MinLength between Numpy and MindSpore operators.
     Expectation: Outputs between them are the same.
     """
-    set_context(device_target="Ascend", mode=ms.GRAPH_MODE)
+    set_context(mode=ms.GRAPH_MODE)
+    ms.set_device(device_target='Ascend')
     input_ids = np.random.uniform(low=0, high=4096, size=(1, 4096)).astype(np.int32)
     scores = np.random.randn(1, 4096).astype(np.float32)
 
@@ -339,7 +347,8 @@ def test_min_new_tokens_length():
     Description: Check the accuracy of MinNewTokensLength between Numpy and MindSpore operators.
     Expectation: Outputs between them are the same.
     """
-    set_context(device_target="Ascend", mode=ms.GRAPH_MODE)
+    set_context(mode=ms.GRAPH_MODE)
+    ms.set_device(device_target='Ascend')
     input_ids = np.random.uniform(low=0, high=4096, size=(1, 4096)).astype(np.int32)
     scores = np.random.randn(1, 4096).astype(np.float32)
 
@@ -384,7 +393,8 @@ def test_normalization():
     Description: Check the accuracy of Normalization between Numpy and MindSpore operators.
     Expectation: Outputs between them are the same.
     """
-    set_context(device_target="Ascend", mode=ms.GRAPH_MODE)
+    set_context(mode=ms.GRAPH_MODE)
+    ms.set_device(device_target='Ascend')
     input_ids = np.random.uniform(low=0, high=4096, size=(1, 4096)).astype(np.int32)
     scores = np.random.randn(1, 4096).astype(np.float32)
 
@@ -410,7 +420,8 @@ def test_greedy_search():
     Description: Check the accuracy of GreedySearch between Numpy and MindSpore operators.
     Expectation: Outputs between them are the same.
     """
-    set_context(device_target="Ascend", mode=ms.GRAPH_MODE)
+    set_context(mode=ms.GRAPH_MODE)
+    ms.set_device(device_target='Ascend')
     input_ids = np.random.uniform(low=0, high=4096, size=(1, 4096)).astype(np.int32)
     scores = np.random.randn(1, 4096).astype(np.float32)
 
@@ -453,7 +464,8 @@ def test_logits_processor_list():
     Description: Check the accuracy of LogitsProcessorList between Numpy and MindSpore operators.
     Expectation: Outputs between them are the same.
     """
-    set_context(device_target="Ascend", mode=ms.GRAPH_MODE)
+    set_context(mode=ms.GRAPH_MODE)
+    ms.set_device(device_target='Ascend')
     input_ids = np.random.uniform(low=0, high=4096, size=(32, 4096)).astype(np.int32)
     scores = np.random.randn(32, 4096).astype(np.float32)
 

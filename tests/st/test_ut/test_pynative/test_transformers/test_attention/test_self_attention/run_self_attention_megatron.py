@@ -150,7 +150,7 @@ def main():
 
     args = parser.parse_args()
 
-    context.set_context(deterministic="ON")
+    ms.set_deterministic(True)
     context.set_context(mode=context.PYNATIVE_MODE)
     ms.set_seed(42)
 

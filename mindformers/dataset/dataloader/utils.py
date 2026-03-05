@@ -16,6 +16,7 @@
 
 import mindspore as ms
 
+from mindformers.core.context.build_context import get_context
 from mindformers.tools.utils import (
     get_dp_from_dataset_strategy,
     get_real_group_size,
@@ -25,7 +26,7 @@ from mindformers.tools.utils import (
 
 def is_dataset_built_on_rank() -> bool:
     """check which rank need to build dataset."""
-    ds_broadcast_level = ms.context.get_context("dataset_broadcast_opt_level")
+    ds_broadcast_level = get_context("dataset_broadcast_opt_level")
 
     global_rank_id = get_real_rank()
     stage_num = ms.get_auto_parallel_context("pipeline_stages")

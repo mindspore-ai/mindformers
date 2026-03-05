@@ -13,8 +13,10 @@
 # limitations under the License.
 # ============================================================================
 """Test build_context.py"""
+
 import multiprocessing
 import os
+import tempfile
 from unittest.mock import patch
 
 import pytest
@@ -38,7 +40,7 @@ from mindformers.tools.register import MindFormerConfig
 
 
 def get_config_tpl():
-    return {'context': {'mode': 'PYNATIVE_MODE'}, 'parallel': {}}
+    return {"context": {"mode": "PYNATIVE_MODE"}, "parallel": {}}
 
 
 def run_in_subprocess(func, *args):
@@ -50,65 +52,87 @@ def run_in_subprocess(func, *args):
 
 
 def run_deterministic_setting(
-        mode, switch, hccl_deterministic_env, te_parallel_compiler_env,
-        custom_matmul_shuffle_env, lccl_deterministic_env,
-        hccl_deterministic_expect, te_parallel_compiler_expect,
-        custom_matmul_shuffle_expect, lccl_deterministic_expect):
+    mode,
+    switch,
+    hccl_deterministic_env,
+    te_parallel_compiler_env,
+    custom_matmul_shuffle_env,
+    lccl_deterministic_env,
+    hccl_deterministic_expect,
+    te_parallel_compiler_expect,
+    custom_matmul_shuffle_expect,
+    lccl_deterministic_expect,
+):
     """Execute deterministic setting testcase."""
     os.environ.clear()
     env = {
-        'HCCL_DETERMINISTIC': hccl_deterministic_env,
-        'TE_PARALLEL_COMPILER': te_parallel_compiler_env,
-        'CUSTOM_MATMUL_SHUFFLE': custom_matmul_shuffle_env,
-        'LCCL_DETERMINISTIC': lccl_deterministic_env,
+        "HCCL_DETERMINISTIC": hccl_deterministic_env,
+        "TE_PARALLEL_COMPILER": te_parallel_compiler_env,
+        "CUSTOM_MATMUL_SHUFFLE": custom_matmul_shuffle_env,
+        "LCCL_DETERMINISTIC": lccl_deterministic_env,
     }
     os.environ.update({k: v for k, v in env.items() if v is not None})
     config_tpl = get_config_tpl()
-    config_tpl['run_mode'] = mode
+    config_tpl["run_mode"] = mode
     build_context(config_tpl)
-    if mode in ('train', 'finetune'):
+    if mode in ("train", "finetune"):
         set_context(train_precision_sync=switch)
-        assert get_context('train_precision_sync') == switch
+        assert get_context("train_precision_sync") == switch
     else:
         set_context(infer_precision_sync=switch)
-        assert get_context('infer_precision_sync') == switch
-    assert os.getenv('HCCL_DETERMINISTIC') == hccl_deterministic_expect
-    assert os.getenv('TE_PARALLEL_COMPILER') == te_parallel_compiler_expect
-    assert os.getenv('CUSTOM_MATMUL_SHUFFLE') == custom_matmul_shuffle_expect
-    assert os.getenv('LCCL_DETERMINISTIC') == lccl_deterministic_expect
+        assert get_context("infer_precision_sync") == switch
+    assert os.getenv("HCCL_DETERMINISTIC") == hccl_deterministic_expect
+    assert os.getenv("TE_PARALLEL_COMPILER") == te_parallel_compiler_expect
+    assert os.getenv("CUSTOM_MATMUL_SHUFFLE") == custom_matmul_shuffle_expect
+    assert os.getenv("LCCL_DETERMINISTIC") == lccl_deterministic_expect
 
 
 @pytest.mark.level1
 @pytest.mark.platform_x86_cpu
 @pytest.mark.parametrize(
-    'mode, switch, hccl_deterministic_env, te_parallel_compiler_env, '
-    'custom_matmul_shuffle_env, lccl_deterministic_env, '
-    'hccl_deterministic_expect, te_parallel_compiler_expect, '
-    'custom_matmul_shuffle_expect, lccl_deterministic_expect', (
-        ('train', False, 'true', '1', None, None, None, None, 'on', '0'),
-        ('train', False, 'false', '0', None, None, 'false', '0', 'on', '0'),
-        ('train', True, 'false', '0', None, None, 'true', '1', 'on', '0'),
-        ('finetune', True, 'false', '0', None, None, 'true', '1', 'on', '0'),
-        ('predict', False, None, None, 'off', '1', None, None, 'on', '0'),
-        ('predict', True, None, None, 'on', '0', 'true', '1', 'off', '1'),
-    )
+    "mode, switch, hccl_deterministic_env, te_parallel_compiler_env, "
+    "custom_matmul_shuffle_env, lccl_deterministic_env, "
+    "hccl_deterministic_expect, te_parallel_compiler_expect, "
+    "custom_matmul_shuffle_expect, lccl_deterministic_expect",
+    (
+        ("train", False, "true", "1", None, None, None, None, "on", "0"),
+        ("train", False, "false", "0", None, None, "false", "0", "on", "0"),
+        ("train", True, "false", "0", None, None, "true", "1", "on", "0"),
+        ("finetune", True, "false", "0", None, None, "true", "1", "on", "0"),
+        ("predict", False, None, None, "off", "1", None, None, "on", "0"),
+        ("predict", True, None, None, "on", "0", "true", "1", "off", "1"),
+    ),
 )
-def test_deterministic(mode, switch, hccl_deterministic_env,
-                       te_parallel_compiler_env, custom_matmul_shuffle_env,
-                       lccl_deterministic_env, hccl_deterministic_expect,
-                       te_parallel_compiler_expect,
-                       custom_matmul_shuffle_expect,
-                       lccl_deterministic_expect):
+def test_deterministic(
+    mode,
+    switch,
+    hccl_deterministic_env,
+    te_parallel_compiler_env,
+    custom_matmul_shuffle_env,
+    lccl_deterministic_env,
+    hccl_deterministic_expect,
+    te_parallel_compiler_expect,
+    custom_matmul_shuffle_expect,
+    lccl_deterministic_expect,
+):
     """
     Feature: Test deterministic computing setting through set_context().
     Description: Compare the setting env variables and expected variables.
     Expectation: setting env variables and expected variables is different.
     """
-    run_in_subprocess(run_deterministic_setting, mode, switch,
-                      hccl_deterministic_env, te_parallel_compiler_env,
-                      custom_matmul_shuffle_env, lccl_deterministic_env,
-                      hccl_deterministic_expect, te_parallel_compiler_expect,
-                      custom_matmul_shuffle_expect, lccl_deterministic_expect)
+    run_in_subprocess(
+        run_deterministic_setting,
+        mode,
+        switch,
+        hccl_deterministic_env,
+        te_parallel_compiler_env,
+        custom_matmul_shuffle_env,
+        lccl_deterministic_env,
+        hccl_deterministic_expect,
+        te_parallel_compiler_expect,
+        custom_matmul_shuffle_expect,
+        lccl_deterministic_expect,
+    )
 
 
 @pytest.mark.level1
@@ -133,22 +157,25 @@ def test_context_singleton():
     Description: Test that Context is a singleton.
     Expectation: Multiple Context instances are the same object.
     """
+
     def is_singleton_context():
         config_tpl = get_config_tpl()
         ctx1 = build_context(config_tpl)
         ctx2 = build_context(config_tpl)
         assert ctx1 is ctx2
+
     run_in_subprocess(is_singleton_context)
 
 
 @pytest.mark.level1
 @pytest.mark.platform_x86_cpu
 @pytest.mark.parametrize(
-    'cfg, is_legacy_model_except', (
+    "cfg, is_legacy_model_except",
+    (
         ({}, True),
-        ({'use_legacy': True}, True),
-        ({'use_legacy': False}, False),
-    )
+        ({"use_legacy": True}, True),
+        ({"use_legacy": False}, False),
+    ),
 )
 def test_get_use_legacy(cfg, is_legacy_model_except):
     """
@@ -174,13 +201,13 @@ def test_context_set_mf_ctx_run_mode():
     ctx = build_context(config_tpl)
 
     # Test valid run_mode
-    ctx.set_mf_ctx_run_mode('train')
-    assert ctx.mf_ctx_opr.run_mode == 'train'
+    ctx.set_mf_ctx_run_mode("train")
+    assert ctx.mf_ctx_opr.run_mode == "train"
 
     # Test invalid run_mode
     with pytest.raises(ValueError) as exc_info:
-        ctx.set_mf_ctx_run_mode('invalid_mode')
-    assert 'Invalid value' in str(exc_info.value)
+        ctx.set_mf_ctx_run_mode("invalid_mode")
+    assert "Invalid value" in str(exc_info.value)
 
     # Test None run_mode
     ctx.set_mf_ctx_run_mode(None)
@@ -191,16 +218,16 @@ def test_context_set_mf_ctx_run_mode():
 @pytest.mark.platform_x86_cpu
 def test_ms_context_operator_set_save_graphs_path():
     """
-    Feature: Test MSContextOperator._set_save_graphs_path.
-    Description: Test save_graphs_path setting.
+    Feature: Test MSContextOperator save_graphs_path setting.
+    Description: Test save_graphs_path setting via environment variable.
     Expectation: save_graphs_path is set when save_graphs is True.
     """
     config = MindFormerConfig(
-        context={'save_graphs': True, 'save_graphs_path': '/tmp/graphs'},
-        parallel={}
+        context={"save_graphs": True, "save_graphs_path": "/tmp/graphs"},
+        parallel={},
     )
     operator = MSContextOperator(config)
-    assert operator.get_context('save_graphs_path') == '/tmp/graphs'
+    assert operator.get_context("save_graphs_path") == "/tmp/graphs"
 
 
 @pytest.mark.level1
@@ -212,13 +239,11 @@ def test_ms_context_operator_predict_jit_config_o1():
     Expectation: ValueError is raised.
     """
     config = MindFormerConfig(
-        run_mode='predict',
-        context={'jit_level': 'O1'},
-        parallel={}
+        run_mode="predict", context={"jit_level": "O1"}, parallel={}
     )
     with pytest.raises(ValueError) as exc_info:
         MSContextOperator(config)
-    assert 'O1 is not supported' in str(exc_info.value)
+    assert "O1 is not supported" in str(exc_info.value)
 
 
 @pytest.mark.level1
@@ -230,13 +255,13 @@ def test_ms_context_operator_predict_jit_config_o2_with_boost():
     Expectation: ValueError is raised.
     """
     config = MindFormerConfig(
-        run_mode='predict',
-        context={'jit_level': 'O2', 'infer_boost': 'on'},
-        parallel={}
+        run_mode="predict",
+        context={"jit_level": "O2", "infer_boost": "on"},
+        parallel={},
     )
     with pytest.raises(ValueError) as exc_info:
         MSContextOperator(config)
-    assert 'infer_boost must set off' in str(exc_info.value)
+    assert "infer_boost must set off" in str(exc_info.value)
 
 
 @pytest.mark.level1
@@ -247,15 +272,19 @@ def test_ms_context_operator_predict_jit_config_o2_without_boost():
     Description: Test that O2 with infer_boost=off works.
     Expectation: jit_config is set correctly.
     """
+
     def is_ms_context_operator_predict_jit_config():
         config = MindFormerConfig(
-            run_mode='predict',
-            context={'jit_level': 'O2', 'infer_boost': 'off'},
-            parallel={}
+            run_mode="predict",
+            context={"jit_level": "O2", "infer_boost": "off"},
+            parallel={},
         )
         operator = MSContextOperator(config)
-        assert operator.get_context("jit_level") == "O2"
-        assert operator.get_context("infer_boost") == "off"
+        jit_config = operator.get_context("jit_config")
+        assert jit_config is not None
+        assert jit_config.get("jit_level") == "O2"
+        assert jit_config.get("infer_boost") == "off"
+
     run_in_subprocess(is_ms_context_operator_predict_jit_config)
 
 
@@ -268,17 +297,171 @@ def test_ms_context_operator_predict_jit_config_from_jit_config():
     Expectation: jit_config values are taken from jit_config dict.
     """
     config = MindFormerConfig(
-        run_mode='predict',
+        run_mode="predict",
         context={
-            'jit_level': 'O0',
-            'infer_boost': 'on',
-            'jit_config': {'jit_level': 'O2', 'infer_boost': 'off'}
+            "jit_level": "O0",
+            "infer_boost": "on",
+            "jit_config": {"jit_level": "O2", "infer_boost": "off"},
         },
-        parallel={}
+        parallel={},
     )
     operator = MSContextOperator(config)
-    assert operator.get_context("jit_level") == "O2"
-    assert operator.get_context("infer_boost") == "off"
+    jit_config = operator.get_context("jit_config")
+    assert jit_config is not None
+    assert jit_config.get("jit_level") == "O2"
+    assert jit_config.get("infer_boost") == "off"
+
+
+@pytest.mark.level1
+@pytest.mark.platform_x86_cpu
+def test_ms_context_applier_apply_device():
+    """
+    Feature: Test _MSContextApplier._apply_device method.
+    Description: Test that device_id and device_target are applied via mindspore.set_device().
+    Expectation: mindspore.set_device is called and attributes are cached.
+    """
+    def run_apply_device_test():
+        config = MindFormerConfig(
+            context={"device_target": "CPU", "device_id": 0},
+            use_parallel=False,
+        )
+        operator = MSContextOperator(config)
+
+        # Verify attributes are cached
+        assert operator.get_context("device_target") == "CPU"
+        assert operator.get_context("device_id") == 0
+
+    run_in_subprocess(run_apply_device_test)
+
+
+@pytest.mark.level1
+@pytest.mark.platform_x86_cpu
+def test_ms_context_applier_apply_memory():
+    """
+    Feature: Test _MSContextApplier._apply_memory method.
+    Description: Test that max_device_memory is applied via mindspore.runtime.set_memory().
+    Expectation: mindspore.runtime.set_memory is called and attributes are cached.
+    """
+    config = MindFormerConfig(
+        context={"max_device_memory": "2GB"}, parallel={}
+    )
+    operator = MSContextOperator(config)
+
+    # Verify attributes are cached
+    assert operator.get_context("max_device_memory") == "2GB"
+
+
+@pytest.mark.level1
+@pytest.mark.platform_x86_cpu
+def test_ms_context_applier_apply_env():
+    """
+    Feature: Test _MSContextApplier._apply_env method.
+    Description: Test that save_graphs and save_graphs_path are applied via environment variables.
+    Expectation: Environment variables are set and attributes are cached.
+    """
+    # Clear environment first
+    os.environ.pop("MS_DEV_SAVE_GRAPHS", None)
+    os.environ.pop("MS_DEV_SAVE_GRAPHS_PATH", None)
+
+    config = MindFormerConfig(
+        context={"save_graphs": True, "save_graphs_path": "/tmp/graphs"},
+        parallel={},
+    )
+    operator = MSContextOperator(config)
+
+    # Verify environment variables are set
+    assert os.getenv("MS_DEV_SAVE_GRAPHS") == "1"
+    assert os.getenv("MS_DEV_SAVE_GRAPHS_PATH") == "/tmp/graphs"
+
+    # Verify attributes are cached
+    assert operator.get_context("save_graphs") is True
+    assert operator.get_context("save_graphs_path") == "/tmp/graphs"
+
+
+@pytest.mark.level1
+@pytest.mark.platform_x86_cpu
+def test_ms_context_applier_apply_extra():
+    """
+    Feature: Test _MSContextApplier._apply_extra method.
+    Description: Test that max_call_depth is applied via mindspore.set_recursion_limit().
+    Expectation: mindspore.set_recursion_limit is called and attribute is cached.
+    """
+    config = MindFormerConfig(context={"max_call_depth": 200}, parallel={})
+    operator = MSContextOperator(config)
+
+    # Verify attribute is cached
+    assert operator.get_context("max_call_depth") == 200
+
+
+def _make_parallel_speed_up_temp_file():
+    """
+    Create a temp file with valid parallel_speed_up JSON content.
+    Returns (path, parallel_json_path). Caller must os.unlink(path) when done.
+    """
+    fd, path = tempfile.mkstemp(suffix=".json", prefix="parallel_speed_up_")
+    os.close(fd)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write('{"dataset_broadcast_opt_level": 3}')
+    return path, os.path.abspath(path)
+
+
+@pytest.mark.level1
+@pytest.mark.platform_x86_cpu
+def test_ms_context_operator_ascend_config_precision_mode():
+    """
+    Feature: Test MSContextOperator with ascend_config precision_mode.
+    Description: Test that precision_mode is applied via new API and removed from ascend_config.
+    Expectation: precision_mode is applied via new API; ascend_config is cached without precision_mode.
+    """
+    path, parallel_json_path = _make_parallel_speed_up_temp_file()
+    try:
+        config = MindFormerConfig(
+            context={
+                "ascend_config": {
+                    "precision_mode": "must_keep_origin_dtype",
+                    "parallel_speed_up_json_path": parallel_json_path,
+                }
+            },
+            parallel={},
+        )
+        operator = MSContextOperator(config)
+
+        cached_config = operator.get_context("ascend_config")
+        assert cached_config is not None
+        assert cached_config == config.get('context').get('ascend_config')
+    finally:
+        if os.path.exists(path):
+            os.unlink(path)
+
+
+@pytest.mark.level1
+@pytest.mark.platform_x86_cpu
+def test_ms_context_operator_ascend_config_only_parallel_speed_up():
+    """
+    Feature: Test MSContextOperator with ascend_config containing only parallel_speed_up_json_path.
+    Description: Test that parallel_speed_up_json_path is passed to set_context when precision_mode is absent.
+    Expectation: ascend_config is cached correctly; set_context is called with a real parallel_speed_up JSON path.
+    """
+    path, parallel_json_path = _make_parallel_speed_up_temp_file()
+    try:
+        config = MindFormerConfig(
+            context={
+                "ascend_config": {
+                    "parallel_speed_up_json_path": parallel_json_path
+                }
+            },
+            parallel={},
+        )
+        operator = MSContextOperator(config)
+
+        cached_config = operator.get_context("ascend_config")
+        assert cached_config is not None
+        assert (
+            cached_config.get("parallel_speed_up_json_path") == parallel_json_path
+        )
+    finally:
+        if os.path.exists(path):
+            os.unlink(path)
 
 
 @pytest.mark.level1
@@ -291,8 +474,8 @@ def test_set_context_without_build():
     """
     Context.reset_instance()
     with pytest.raises(RuntimeError) as exc_info:
-        set_context(run_mode='train')
-    assert 'Build a Context instance' in str(exc_info.value)
+        set_context(run_mode="train")
+    assert "Build a Context instance" in str(exc_info.value)
 
 
 @pytest.mark.level1
@@ -305,8 +488,8 @@ def test_get_context_without_build():
     """
     Context.reset_instance()
     with pytest.raises(RuntimeError) as exc_info:
-        get_context('mode')
-    assert 'Build a Context instance' in str(exc_info.value)
+        get_context("mode")
+    assert "Build a Context instance" in str(exc_info.value)
 
 
 @pytest.mark.level1
@@ -320,8 +503,8 @@ def test_build_parallel_context():
     config_tpl = get_config_tpl()
     parallel_opr = build_parallel_context(config_tpl)
     assert parallel_opr is not None
-    assert hasattr(parallel_opr, 'parallel_ctx')
-    assert hasattr(parallel_opr, 'parallel')
+    assert hasattr(parallel_opr, "parallel_ctx")
+    assert hasattr(parallel_opr, "parallel")
 
 
 @pytest.mark.level1
@@ -426,17 +609,26 @@ def test_set_ms_affinity_with_invalid_device_id(mock_rank, mock_group_size):
 
 @pytest.mark.level1
 @pytest.mark.platform_x86_cpu
-@pytest.mark.parametrize('cann_workqueue_cores, cpu_affinity', [
-    ([0, 1], [2, 3]),
-    ([0, 1, 2, 3], [0, 1, 2, 3])
-])
-@patch('mindformers.utils.get_cann_workqueue_cores')
-@patch('psutil.Process')
-@patch('psutil.cpu_count', return_value=8)
-@patch('mindspore.dataset.config.set_numa_enable')
+@pytest.mark.parametrize(
+    "cann_workqueue_cores, cpu_affinity",
+    (
+        ([0, 1], [2, 3]),
+        ([0, 1, 2, 3], [0, 1, 2, 3]),
+    ),
+)
+@patch("mindformers.utils.get_cann_workqueue_cores")
+@patch("psutil.Process")
+@patch("psutil.cpu_count", return_value=8)
+@patch("mindspore.dataset.config.set_numa_enable")
 def test_set_cpu_affinity(
-    mock_set_numa, mock_cpu_count, mock_process_cls, mock_get_cores,
-    monkeypatch, cann_workqueue_cores, cpu_affinity):
+    mock_set_numa,
+    mock_cpu_count,
+    mock_process_cls,
+    mock_get_cores,
+    monkeypatch,
+    cann_workqueue_cores,
+    cpu_affinity,
+):
     """
     Feature: Test set_cpu_affinity fallback behavior.
     Description: Verify that the original CPU list is used when CANN occupies all candidate cores,
@@ -444,7 +636,7 @@ def test_set_cpu_affinity(
     Expectation: Process cpu_affinity receives unfiltered CPU list.
     """
     mock_get_cores.return_value = cann_workqueue_cores
-    monkeypatch.setenv('CPU_AFFINITY', 'True')
+    monkeypatch.setenv("CPU_AFFINITY", "True")
     process_mock = mock_process_cls.return_value
 
     set_cpu_affinity(rank_id=0, rank_size=2)

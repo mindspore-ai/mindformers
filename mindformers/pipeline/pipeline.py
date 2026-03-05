@@ -25,7 +25,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple, Union
 
-from mindspore import Model, set_context
+from mindspore import Model, set_context, set_device
 
 from mindformers.models.auto import AutoConfig, AutoModel, AutoTokenizer, AutoImageProcessor
 from mindformers.mindformer_book import MindFormerBook
@@ -308,16 +308,16 @@ def get_ms_experimental_pipeline(
         logger.warning("ms pipeline do not support keyword `torch_dtype`, please use `ms_dtype` instead.")
 
     # set mindspore context
-    context_kwargs = {}
     if mode is None:
         logger.info("mindspore mode not set, using default graph mode.")
         mode = 0
-    context_kwargs["mode"] = mode
-    if device_id is not None:
-        context_kwargs["device_id"] = device_id
+    set_context(mode=mode)
+    device_kwargs = {}
     if device_target is not None:
-        context_kwargs["device_target"] = device_target
-    set_context(**context_kwargs)
+        device_kwargs["device_target"] = device_target
+        if device_id is not None:
+            device_kwargs["device_id"] = device_id
+        set_device(**device_kwargs)
 
     model_name = model if isinstance(model, str) else None
 
