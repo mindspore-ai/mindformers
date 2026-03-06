@@ -33,6 +33,7 @@ from mindformers.dataset.dataloader.blended_megatron_dataloader import (
     BlendedMegatronDatasetDataLoader,
 )
 from mindformers.dataset.dataloader.hf_dataloader import HFDataLoader
+from mindformers.dataset.dataloader.utils import _get_mindrecord_files
 
 
 def compute_parameters(model: nn.Cell) -> None:
@@ -283,13 +284,21 @@ def _build_dataset(
         dataloader_config['use_broadcast_data'] = False
         dataset = HFDataLoader(**dataloader_config)
         create_compressed_eod_mask = dataloader_config['create_compressed_eod_mask']
+    elif dataloader_type == "MindDataset":
+        dataloader_config['dataset_files'] = _get_mindrecord_files(dataloader_config.pop("dataset_files", None))
+        # MindDataset does not support column_names
+        dataloader_config['columns_list'] = dataloader_config.pop('column_names', None)
+        dataloader_config.pop('python_multiprocessing', False)
+        dataset = ms_dataset.MindDataset(**dataloader_config)
+        if 'actual_seq_len' in dataset.get_col_names():
+            create_compressed_eod_mask = True
     else:
         raise ValueError(f"Unsupported dataloader type: {dataloader_type}")
 
     per_batch_map_func = None
     if create_compressed_eod_mask:
         per_batch_map_func = partial(
-            _actual_seq_len_batch_map, num_grad_acc=num_grad_acc
+            _actual_seq_len_batch_map, micro_batch_size=num_grad_acc
         )
 
     dataset = dataset.batch(

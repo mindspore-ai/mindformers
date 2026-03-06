@@ -264,6 +264,9 @@ class CheckpointConfig(BaseConfig):
     Configuration for model checkpoint saving and loading.
     """
 
+    enable_save: bool = True
+    """Whether to enable checkpoint saving"""
+
     save_path: str = ""
     """Directory to save checkpoints"""
 
@@ -321,6 +324,13 @@ class TrainingConfig(BaseConfig):
 
     deterministic: bool = False
     """Enable deterministic training behavior"""
+
+    def post_init(self):
+        """Post-initialization validation."""
+        if self.global_batch_size <= 0:
+            raise ValueError("training.global_batch_size in config must be positive")
+        if self.local_batch_size <= 0:
+            raise ValueError("training.local_batch_size in config must be positive")
 
 
 @dataclass
