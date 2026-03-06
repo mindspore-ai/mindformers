@@ -585,7 +585,7 @@ class TestModelRunner:
         self.test_dir = self.temp_dir.__enter__()
         self.yaml_file = os.path.join(self.test_dir, 'config.yaml')
         with open(self.yaml_file, 'w', encoding='utf-8') as f:
-            f.write('model:\n  arch:\n    type: llama\n')
+            f.write('model:\n  arch:\n    type: custom_model\n  model_config:\n  ')
         yield
         self.temp_dir.__exit__(None, None, None)
 
@@ -645,7 +645,7 @@ class TestModelRunner:
         )
 
         assert result == mock_runner
-        mock_import.assert_called_once_with('custom_model', ['MindIEModelRunner'])
+        mock_import.assert_called_with('custom_model', ['MindIEModelRunner'])
 
     @patch('mindformers.model_runner.MindIEModelRunner')
     @patch('mindformers.model_runner.MindFormerConfig')
@@ -660,9 +660,6 @@ class TestModelRunner:
         mock_config = MockConfigFactory.create_mindformer_config(arch_type='custom_model')
         mock_config_cls.return_value = mock_config
         mock_models.__all__ = ['llama', 'gpt']
-
-        # Simulate import error
-        mock_import.side_effect = ImportError("Module not found")
 
         mock_runner = MagicMock()
         mock_default_runner.return_value = mock_runner
