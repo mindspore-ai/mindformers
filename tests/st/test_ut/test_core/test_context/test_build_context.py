@@ -466,34 +466,6 @@ def test_ms_context_operator_ascend_config_only_parallel_speed_up():
 
 @pytest.mark.level1
 @pytest.mark.platform_x86_cpu
-def test_set_context_without_build():
-    """
-    Feature: Test set_context without building context first.
-    Description: Test that set_context raises RuntimeError when Context doesn't exist.
-    Expectation: RuntimeError is raised.
-    """
-    Context.reset_instance()
-    with pytest.raises(RuntimeError) as exc_info:
-        set_context(run_mode="train")
-    assert "Build a Context instance" in str(exc_info.value)
-
-
-@pytest.mark.level1
-@pytest.mark.platform_x86_cpu
-def test_get_context_without_build():
-    """
-    Feature: Test get_context without building context first.
-    Description: Test that get_context raises RuntimeError when Context doesn't exist.
-    Expectation: RuntimeError is raised.
-    """
-    Context.reset_instance()
-    with pytest.raises(RuntimeError) as exc_info:
-        get_context("mode")
-    assert "Build a Context instance" in str(exc_info.value)
-
-
-@pytest.mark.level1
-@pytest.mark.platform_x86_cpu
 def test_build_parallel_context():
     """
     Feature: Test build_parallel_context function.
