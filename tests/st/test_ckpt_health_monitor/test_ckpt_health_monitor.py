@@ -29,7 +29,7 @@ from mindformers import LlamaConfig, LlamaForCausalLM, build_context
 from mindformers import Trainer, TrainingArguments
 from mindformers.core.callback import MFLossMonitor, TrainingStateMonitor, CheckpointMonitor
 
-build_context({"mode": 0})
+build_context({"context": {"mode": 0}})
 
 EPOCHS = 1
 NUM_LAYERS = 1

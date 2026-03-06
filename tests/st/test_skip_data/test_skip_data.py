@@ -29,7 +29,7 @@ from mindformers import Trainer, TrainingArguments, build_context
 from mindformers.core.callback import MFLossMonitor, TrainingStateMonitor
 
 cur_dir = os.path.dirname(os.path.abspath(__file__))
-build_context({"mode": 0})
+build_context({"context": {"mode": 0}})
 
 EPOCHS = 1
 NUM_LAYERS = 1

@@ -35,7 +35,7 @@ from mindformers.models.llama import LlamaForCausalLM, LlamaConfig
 cur_dir = os.path.dirname(os.path.abspath(__file__))
 _GLOBAL_TENSORBOARD_WRITER = None
 
-build_context({"mode": 0})
+build_context({"context": {"mode": 0}})
 
 _CHECK_TEXT_MAPPING = {
     'seed', 'output_dir', 'run_mode', 'use_parallel', 'resume_training', 'ignore_data_skip', 'data_skip_steps',

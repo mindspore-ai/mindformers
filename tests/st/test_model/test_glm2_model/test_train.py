@@ -24,7 +24,7 @@ from mindformers import build_context
 from tests.utils.model_tester import ModelTester
 from .base_model import get_config, get_model
 
-build_context({"mode": 0})
+build_context({"context": {"mode": 0}})
 
 
 class TestGLM2Train:

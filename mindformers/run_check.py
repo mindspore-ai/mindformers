@@ -63,7 +63,6 @@ class BaseCheck:
 
     def check(self):
         """The actual checking flow control."""
-        pass
 
     def _next(self):
         self.next_check.check()
@@ -407,7 +406,7 @@ def run_check():
     os.environ['MS_ALLOC_CONF'] = "enable_vmm:False"
 
     start = time.perf_counter()
-    mf.build_context({"mode": 0})
+    mf.build_context({"context": {"mode": 0}})
 
     ms_checker = MSCheck(start, version_mapping=version_mapping)
     mf_checker = MFCheck(start, version_mapping=version_mapping)
