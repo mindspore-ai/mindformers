@@ -103,7 +103,7 @@ class TestTransFormersBlock:
     def run_test(self, accuracy=True, compare_type=None):
         """Helper function to run test and check results"""
 
-        output, _ = self.net(self.hidden_states,
+        output, _, _ = self.net(self.hidden_states,
                           attention_mask=self.attention_mask,
                           rotary_pos_emb=self.rotary_pos_emb
                           )
