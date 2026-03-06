@@ -48,8 +48,9 @@ from mindformers.version_control import (
 )
 
 _MS_CONTEXT_DEFAULTS = {
+    "device_target": "Ascend",
     "device_id": "0",
-    "mode": MODE.get("GRAPH_MODE", 0),
+    "mode": "GRAPH_MODE",
     "max_device_memory": "1024GB",
 }
 
@@ -159,7 +160,14 @@ class _MSContextApplier:
             device['device_id'] = dev_id
         if target:
             device['device_target'] = target
-            mindspore.set_device(**device)
+            try:
+                mindspore.set_device(**device)
+            except RuntimeError as e:
+                error_msg = str(e)
+                if "The 'mindspore.set_device' can not be modified" in error_msg:
+                    logger.warning(f"Fail to set device: {error_msg}.")
+                else:
+                    raise e
             self.device_target = target
             if dev_id is not None:
                 self.device_id = dev_id
@@ -385,11 +393,10 @@ class MSContextOperator:
         """Get the valid ms config."""
         ctx = self.config.get('context', {})
         ms_ctx = {
+            'mode': MODE.get(ctx.get('mode', _MS_CONTEXT_DEFAULTS["mode"])),
+            "device_target": ctx.get("device_target", _MS_CONTEXT_DEFAULTS["device_target"]),
             "device_id": ctx.get("device_id", int(os.getenv("DEVICE_ID", _MS_CONTEXT_DEFAULTS["device_id"]))),
-            "max_device_memory": ctx.get(
-                "max_device_memory", _MS_CONTEXT_DEFAULTS["max_device_memory"]
-            ),
-            'mode': MODE.get(ctx.get('mode', 'GRAPH_MODE')),
+            "max_device_memory": ctx.get("max_device_memory", _MS_CONTEXT_DEFAULTS["max_device_memory"]),
         }
         self._set_device_id(ctx, ms_ctx)
         self._set_save_graphs_path(ctx, ms_ctx)
@@ -908,8 +915,6 @@ def set_context(run_mode=None, **kwargs):
         Key environment variables: HCCL_DETERMINISTIC: true, TE_PARALLEL_COMPILER: 1,
         CUSTOM_MATMUL_SHUFFLE: off, LCCL_DETERMINISTIC: 1
     """
-    if not Context.is_exists():
-        raise RuntimeError("Build a Context instance before set_context().")
     ctx = Context()
     ctx.set_mf_ctx_run_mode(run_mode)
 
@@ -962,8 +967,6 @@ def get_context(attr_key):
         >>> build_context(config=config)
         >>> get_context('max_device_memory')
     """
-    if not Context.is_exists():
-        raise RuntimeError("Build a Context instance before get_context().")
     ctx = Context()
 
     if attr_key in MFContextConfig.get_supported_kwargs():

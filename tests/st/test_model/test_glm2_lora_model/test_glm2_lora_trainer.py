@@ -67,7 +67,7 @@ class TestGLM2WithLoRATrainerMethod:
 
     def setup_method(self):
         """init task trainer."""
-        build_context({"mode": 0, "device_target": "Ascend"})
+        build_context({"context": {"mode": 0, "device_target": "Ascend"}})
 
         args = TrainingArguments(num_train_epochs=1, batch_size=2)
         train_dataset = GeneratorDataset(generator_train,

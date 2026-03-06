@@ -27,9 +27,8 @@ from mindformers.tools.logger import get_logger
 logger = get_logger()
 logger.propagate = True
 
-build_context({"use_legacy": False})
+build_context({'context': {'device_target': 'CPU'}, "use_legacy": False})
 ms.set_context(mode=ms.GRAPH_MODE)
-ms.set_device(device_target='CPU')
 
 
 @pytest.mark.level0
