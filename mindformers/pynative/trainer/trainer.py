@@ -283,6 +283,12 @@ class Trainer:
         data_parallel = self.world_size // (
             tensor_parallel * pipeline_parallel * context_parallel
         )
+        if data_parallel <= 0:
+            raise ValueError(
+                f"tensor_parallel({tensor_parallel}) * pipeline_parallel({pipeline_parallel}) * "
+                f"context_parallel({context_parallel}) must be less than or equal to world_size({self.world_size})."
+            )
+
         self.config.parallelism.data_parallel = data_parallel
         logger.info(
             f"Got parallelism settings: {data_parallel=}, {tensor_parallel=}, "
@@ -388,12 +394,15 @@ class Trainer:
         optimizer = _build_optimizer(optim_config, self.model, lr_scheduler)
         return optimizer, lr_scheduler
 
-    def _create_build_in_callbacks(self) -> List[TrainerCallback]:
+    def _create_built_in_callbacks(self) -> List[TrainerCallback]:
         """
         Create default callbacks.
         """
-        # build checkpoint callback
         checkpoint = self.config.checkpoint
+        if not checkpoint.enable_save:
+            return [LossCallback()]
+
+        # build checkpoint callback
         checkpoint_callback = CheckpointCallback(
             save_path=checkpoint.save_path,
             save_max=checkpoint.save_max,
@@ -423,7 +432,7 @@ class Trainer:
             CallbackHandler: The created callback handler.
         """
         # Prepare initial callback list
-        callback_list = self._create_build_in_callbacks()
+        callback_list = self._create_built_in_callbacks()
         if callbacks:
             callback_list.extend(callbacks)
 

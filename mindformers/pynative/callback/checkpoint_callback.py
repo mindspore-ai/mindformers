@@ -59,6 +59,9 @@ class CheckpointCallback(TrainerCallback):
         self.async_save = async_save
         self.remove_redundancy = remove_redundancy
 
+        if not self.save_path:
+            raise ValueError("save_path must be provided for CheckpointCallback.")
+
         # Initialize the async save manager
         self.async_save_manager = None
         if self.async_save:
@@ -161,7 +164,7 @@ class CheckpointCallback(TrainerCallback):
                 f"(async={self.async_save}, remove_redundancy={self.remove_redundancy})"
             )
 
-        except Exception as e:
+        except (RuntimeError, ValueError, FileNotFoundError) as e:
             logger.error(f"Error saving checkpoint: {e}")
 
     def _create_common_info(self, state) -> CommonInfo:

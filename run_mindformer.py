@@ -23,7 +23,6 @@ from mindformers.core.context import build_context
 from mindformers.trainer import Trainer
 from mindformers.tools.logger import logger
 from mindformers.utils.file_utils import set_output_path
-from mindformers.pynative.trainer import Trainer as PynativeTrainer
 
 SUPPORT_MULTI_MODAL_FILETYPES = {
     "video": (".mp4", ".avi", ".mkv"),
@@ -61,10 +60,13 @@ def create_multi_modal_predict_data(predict_data_list, modal_type_list):
 def main(config):
     """main."""
     if config.mode == 1:
+        logger.info("Running MindFormers in PYNATIVE_MODE.")
+        from mindformers.pynative.trainer import Trainer as PynativeTrainer
         trainer = PynativeTrainer(config.config)
         trainer.train()
         return
 
+    logger.info("Running MindFormers in GRAPH_MODE.")
     # set output path
     set_output_path(config.output_dir)
 

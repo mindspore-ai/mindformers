@@ -14,6 +14,9 @@
 # ============================================================================
 """Dataset Utils."""
 
+import os
+from typing import List, Union
+
 import mindspore as ms
 
 from mindformers.core.context.build_context import get_context
@@ -45,3 +48,48 @@ def is_dataset_built_on_rank() -> bool:
         return False
 
     return True
+
+
+def _get_mindrecord_files(dataset_files: Union[str, List[str]]) -> List[str]:
+    """
+    Get all MindRecord format files from given file paths or directories.
+
+    This function recursively traverses specified directories, collects all files with the .mindrecord extension,
+    and supports handling single file paths or lists of file paths.
+
+    Args:
+        dataset_files (Union[str, List[str]]): A single file path string or a list of file paths.
+            Can be a specific .mindrecord file path or a directory path containing .mindrecord files.
+
+    Returns:
+        List[str]: A list of full paths to all found MindRecord files. Returns an empty list if no files are found.
+
+    Raises:
+        ValueError: Triggered when the input dataset_files is empty.
+    """
+    if not dataset_files:
+        raise ValueError("dataset_files must be provided for MindDataset.")
+
+    def _get_files_from_path(path: str) -> List[str]:
+        if not isinstance(path, str):
+            return []
+        if path.endswith(".mindrecord"):
+            return [path]
+        if os.path.isdir(path):
+            files_in_dir = []
+            for root, _, files in os.walk(path):
+                for file in files:
+                    if file.endswith(".mindrecord"):
+                        files_in_dir.append(os.path.join(root, file))
+            return files_in_dir
+        return []
+
+    if isinstance(dataset_files, str):
+        dataset_files = [dataset_files]
+
+    mindrecord_files = []
+    if isinstance(dataset_files, list):
+        for dataset_file in dataset_files:
+            mindrecord_files.extend(_get_files_from_path(dataset_file))
+
+    return mindrecord_files

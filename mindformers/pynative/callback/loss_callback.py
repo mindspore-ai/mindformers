@@ -59,6 +59,19 @@ class LossCallback(TrainerCallback):
         """
         self.step_time = time.time()
         self.epoch_time = time.time()
+    
+    def on_train_end(self, args, state, **kwargs):
+        """
+        Called at the end of training.
+
+        Args:
+            args: Training arguments.
+            state: Trainer state.
+            **kwargs: Additional keyword arguments.
+        """
+        # update train state
+        state.is_train_begin = False
+        state.is_train_end = True
 
     def on_epoch_begin(self, args, state, **kwargs):
         """
