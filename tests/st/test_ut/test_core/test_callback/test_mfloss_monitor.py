@@ -99,7 +99,7 @@ class TestMFLossMonitor(unittest.TestCase):
     @pytest.mark.env_onecard
     def test_fix_loss_for_parallel_no_adjustment(self):
         """Test _fix_loss_for_parallel without adjustment"""
-        with patch('mindspore.get_auto_parallel_context') as mock_get_context:
+        with patch('mindspore.context.get_auto_parallel_context') as mock_get_context:
             mock_get_context.return_value = 1  # pipeline_stages = 1
 
             original_loss = 1.0
@@ -115,7 +115,7 @@ class TestMFLossMonitor(unittest.TestCase):
         self.monitor.mirco_size = 2
         self.monitor.calculate_per_token_loss = False
 
-        with patch('mindspore.get_auto_parallel_context') as mock_get_context:
+        with patch('mindspore.context.get_auto_parallel_context') as mock_get_context:
             mock_get_context.return_value = 2  # pipeline_stages = 2
 
             original_loss = 2.0
@@ -192,7 +192,7 @@ class TestMFLossMonitorIntegration(unittest.TestCase):
 
         # Mock auto parallel context
         with patch('mindspore.get_auto_parallel_context') as mock_auto_parallel, \
-                patch('mindspore.get_auto_parallel_context') as mock_context_auto_parallel:
+                patch('mindspore.context.get_auto_parallel_context') as mock_context_auto_parallel:
             mock_auto_parallel.return_value = 'data_parallel'
             mock_context_auto_parallel.return_value = 1  # pipeline_stages
 
@@ -296,7 +296,7 @@ class TestMFLossMonitorExtended:
         )
 
         # Mock both context.get_auto_parallel_context and get_auto_parallel_context
-        with patch('mindspore.get_auto_parallel_context', return_value=2), \
+        with patch('mindspore.context.get_auto_parallel_context', return_value=2), \
                 patch('mindspore.get_auto_parallel_context', return_value='not_zero_bubble_v'):
             loss = 8.0
             fixed_loss = monitor._fix_loss_for_parallel(loss, print_warning=False)
@@ -320,7 +320,7 @@ class TestMFLossMonitorExtended:
         )
 
         # Mock pipeline_stages=1 (no pipeline)
-        with patch('mindspore.get_auto_parallel_context', return_value=1), \
+        with patch('mindspore.context.get_auto_parallel_context', return_value=1), \
                 patch('mindspore.get_auto_parallel_context', return_value='not_zero_bubble_v'):
             loss = 8.0
             fixed_loss = monitor._fix_loss_for_parallel(loss, print_warning=False)
@@ -343,7 +343,7 @@ class TestMFLossMonitorExtended:
             calculate_per_token_loss=False
         )
 
-        with patch('mindspore.get_auto_parallel_context', return_value=1), \
+        with patch('mindspore.context.get_auto_parallel_context', return_value=1), \
                 patch('mindspore.get_auto_parallel_context', return_value='data_parallel'):
             loss = 8.0
             fixed_loss = monitor._fix_loss_for_parallel(loss)

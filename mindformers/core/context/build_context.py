@@ -48,9 +48,8 @@ from mindformers.version_control import (
 )
 
 _MS_CONTEXT_DEFAULTS = {
-    "device_target": "Ascend",
     "device_id": "0",
-    "mode": "GRAPH_MODE",
+    "mode": "PYNATIVE_MODE",
     "max_device_memory": "1024GB",
 }
 
@@ -165,6 +164,8 @@ class _MSContextApplier:
             except RuntimeError as e:
                 error_msg = str(e)
                 if "The 'mindspore.set_device' can not be modified" in error_msg:
+                    logger.warning(f"Fail to set device: {error_msg}.")
+                elif "The runtime has been initialized" in error_msg:
                     logger.warning(f"Fail to set device: {error_msg}.")
                 else:
                     raise e
@@ -394,7 +395,6 @@ class MSContextOperator:
         ctx = self.config.get('context', {})
         ms_ctx = {
             'mode': MODE.get(ctx.get('mode', _MS_CONTEXT_DEFAULTS["mode"])),
-            "device_target": ctx.get("device_target", _MS_CONTEXT_DEFAULTS["device_target"]),
             "device_id": ctx.get("device_id", int(os.getenv("DEVICE_ID", _MS_CONTEXT_DEFAULTS["device_id"]))),
             "max_device_memory": ctx.get("max_device_memory", _MS_CONTEXT_DEFAULTS["max_device_memory"]),
         }
@@ -517,8 +517,9 @@ class MSContextOperator:
         """
         Get context attribute from applier cache.
         Returns default for essential params (device_target, device_id, mode, max_device_memory) if not set.
-        See https://www.mindspore.cn/docs/zh-CN/r2.4.1/api_python/mindspore/mindspore.get_context.html
         """
+        if attr_key == "device_target":
+            return getattr(self.context_applier, attr_key, "Ascend")
         return getattr(self.context_applier, attr_key)
 
 
