@@ -213,8 +213,11 @@ class TestCheckpointMonitorHelpers:
             mock_get_output_subpath.return_value = tmpdir
 
             monitor = CheckpointMonitor(prefix='TEST')
-            monitor._directory = tmpdir
-            monitor.meta_json = os.path.join(tmpdir, 'meta.json')
+            # Ensure _directory exists before record_last_ckpt_to_json
+            # (NamedTemporaryFile dir= parameter requires the directory to exist;
+            # parent may set _directory to a subpath that does not exist yet)
+            os.makedirs(monitor._directory, exist_ok=True)
+            monitor.meta_json = os.path.join(monitor._directory, 'meta.json')
 
             monitor.record_last_ckpt_to_json(5, 10, 'test_ckpt.ckpt')
 
@@ -283,39 +286,55 @@ class TestCheckpointMonitorSaveAndHealth:
     @pytest.mark.level1
     @pytest.mark.platform_x86_cpu
     @patch('mindformers.core.callback.callback.time.time', return_value=1000.0)
-    @patch('mindformers.core.callback.callback.os.path.exists', return_value=True)
     @patch('mindformers.core.callback.callback.os.path.getmtime', return_value=1005.0)
-    def test_print_savetime(self, mock_getmtime, mock_exists, mock_time):
+    def test_print_savetime(self, mock_getmtime, mock_time):
         """Test print_savetime method"""
 
-        monitor = CheckpointMonitor(
-            prefix='TEST',
-            directory='./test_ckpt'
-        )
+        # Only mock exists for the ckpt file path used in print_savetime, not for init paths
+        # (broad exists=True would cause init to os.rmdir the checkpoint dir)
+        with patch('mindformers.core.callback.callback.os.path.exists') as mock_exists:
+            mock_exists.side_effect = lambda path: path == '/path/to/ckpt.ckpt'
 
-        # Setup save_info_list
-        monitor.save_info_list[10] = {
-            'ckpt': {
-                'save_start_time': 1000.0,
-                'ckpt_file_path': '/path/to/ckpt.ckpt',
-                'save_end_time': None
-            },
-            'network': {
-                'save_start_time': None,
-                'ckpt_file_path': None,
-                'save_end_time': None
-            },
-            'trainable_params': {
-                'save_start_time': None,
-                'ckpt_file_path': None,
-                'save_end_time': None
-            }
-        }
+            with tempfile.TemporaryDirectory() as tmpdir:
+                ckpt_dir = os.path.join(tmpdir, 'test_ckpt')
+                os.makedirs(os.path.join(ckpt_dir, 'checkpoint', 'rank_0'), exist_ok=True)
+                os.makedirs(os.path.join(ckpt_dir, 'checkpoint_network', 'rank_0'), exist_ok=True)
+                os.makedirs(os.path.join(ckpt_dir, 'checkpoint_trainable', 'rank_0'), exist_ok=True)
 
-        monitor.print_savetime(10, 100)
+                # Mock get_output_subpath so parent class uses our temp dir instead of test_ckpt
+                with patch('mindformers.core.callback.callback.get_output_subpath') as mock_subpath:
+                    def _subpath(sub_class, rank_id=0, append_rank=True):
+                        return os.path.join(ckpt_dir, sub_class, f'rank_{rank_id}')
+                    mock_subpath.side_effect = _subpath
 
-        # Verify the save_end_time was set
-        assert monitor.save_info_list[10]['ckpt']['save_end_time'] is not None
+                    monitor = CheckpointMonitor(
+                        prefix='TEST',
+                        directory=ckpt_dir
+                    )
+
+                # Setup save_info_list
+                monitor.save_info_list[10] = {
+                    'ckpt': {
+                        'save_start_time': 1000.0,
+                        'ckpt_file_path': '/path/to/ckpt.ckpt',
+                        'save_end_time': None
+                    },
+                    'network': {
+                        'save_start_time': None,
+                        'ckpt_file_path': None,
+                        'save_end_time': None
+                    },
+                    'trainable_params': {
+                        'save_start_time': None,
+                        'ckpt_file_path': None,
+                        'save_end_time': None
+                    }
+                }
+
+                monitor.print_savetime(10, 100)
+
+                # Verify the save_end_time was set
+                assert monitor.save_info_list[10]['ckpt']['save_end_time'] is not None
 
 
 class TestCheckpointMonitorStepEndAndTrainEnd:
