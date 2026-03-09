@@ -374,7 +374,7 @@ class TestMFLossMonitorExtended:
 
         monitor.print_output_info(
             cb_params, 1, 10, 100.0, 1, 100, 0.5, 100.0,
-            False, 1024.0, 3600, 10.0, 2.5, None, None, None
+            False, 1024.0, 3600, 10.0, 2.5, None, None, None, None
         )
 
         # Verify tensorboard writer was called
@@ -558,7 +558,7 @@ class TestMFLossMonitorPrintOutputInfo:
 
         monitor.print_output_info(
             cb_params, 1, 10, 100.0, 1, 100, 0.5, 100.0,
-            False, 1024.0, 3600, 10.0, 2.5, None, None, None
+            False, 1024.0, 3600, 10.0, 2.5, None, None, None, None
         )
 
         # Verify tensorboard writer was called for various metrics
@@ -600,10 +600,11 @@ class TestMFLossMonitorPrintOutputInfo:
         lm_loss = np.array([0.3])
         aux_loss = np.array([0.1])
         mtp_loss = np.array([0.05])
+        indexer_loss = np.array([0.02])
 
         monitor.print_output_info(
             cb_params, 1, 10, 100.0, 1, 100, 0.5, 100.0,
-            False, 1024.0, 3600, 10.0, 2.5, lm_loss, aux_loss, mtp_loss
+            False, 1024.0, 3600, 10.0, 2.5, lm_loss, aux_loss, mtp_loss, indexer_loss
         )
 
         # Verify separate loss was logged to tensorboard
@@ -613,6 +614,7 @@ class TestMFLossMonitorPrintOutputInfo:
 
         assert 'lm-loss' in tags_called, f"'lm-loss' not found in {tags_called}"
         assert 'mtp-loss' in tags_called, f"'mtp-loss' not found in {tags_called}"
+        assert 'indexer-loss' in tags_called, f"'indexer-loss' not found in {tags_called}"
         assert 'load-balancing-loss' in tags_called, \
             f"'load-balancing-loss' not found in {tags_called}"
 
@@ -777,7 +779,7 @@ class TestMFLossMonitorPrintOutputInfoLearningRate:
 
         monitor.print_output_info(
             cb_params, 1, 10, 100.0, 1, 100, 0.5, 100.0,
-            False, 1024.0, 3600, 10.0, 2.5, None, None, None
+            False, 1024.0, 3600, 10.0, 2.5, None, None, None, None
         )
 
         # Should log warning about CPU not supported
@@ -827,7 +829,7 @@ class TestMFLossMonitorPrintOutputInfoLearningRate:
 
             monitor.print_output_info(
                 cb_params, 1, 10, 100.0, 1, 100, 0.5, 100.0,
-                False, 1024.0, 3600, 10.0, 2.5, None, None, None
+                False, 1024.0, 3600, 10.0, 2.5, None, None, None, None
             )
 
             # Verify set_train was called to temporarily disable training
@@ -853,7 +855,7 @@ class TestMFLossMonitorPrintOutputInfoLearningRate:
 
         monitor.print_output_info(
             cb_params, 1, 10, 100.0, 1, 100, 0.5, 100.0,
-            False, 1024.0, 3600, 10.0, 2.5, None, None, None
+            False, 1024.0, 3600, 10.0, 2.5, None, None, None, None
         )
 
         # Should log warning about invalid type
@@ -879,7 +881,7 @@ class TestMFLossMonitorPrintOutputInfoLearningRate:
 
         monitor.print_output_info(
             cb_params, 1, 10, 100.0, 1, 100, 0.5, 100.0,
-            False, 1024.0, 3600, 10.0, 2.5, None, None, None
+            False, 1024.0, 3600, 10.0, 2.5, None, None, None, None
         )
 
         # Should log warning about missing learning rate
@@ -989,7 +991,7 @@ class TestMFLossMonitorPrintOutputInfoDataSinkMode:
 
         monitor.print_output_info(
             cb_params, 1, 10, 100.0, 1, 100, 0.5, 100.0,
-            False, 1024.0, 3600, 10.0, 2.5, None, None, None
+            False, 1024.0, 3600, 10.0, 2.5, None, None, None, None
         )
 
         # In sink mode, loss_info format is different
