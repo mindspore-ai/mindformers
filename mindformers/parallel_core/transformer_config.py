@@ -2058,6 +2058,8 @@ class TransformerConfig:
             if not self.use_flash_attention:
                 raise ValueError("DeepSeek Sparse Attention is only available for flash attention for now, "
                                  "please set use_flash_attention=True.")
+            if ms.get_auto_parallel_context("pipeline_scheduler") == "zero_bubble_v":
+                raise ValueError("When experimental_attention_variant == 'dsa', zero_bubble_v is not supported.")
 
         if self.use_flash_attention:
             if self.use_eod_attn_mask_compression and not self.use_ring_attention:
