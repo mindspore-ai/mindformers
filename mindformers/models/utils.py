@@ -24,7 +24,7 @@ import json
 import os
 from dataclasses import dataclass
 from functools import wraps
-from typing import Union, Optional
+from typing import Union, Optional, Dict
 import mindspore.common.dtype as mstype
 import mindspore as ms
 from mindspore import nn
@@ -198,6 +198,11 @@ lazy_inline = get_lazy_inline
 predict_lazy_inline = get_predict_lazy_inline
 
 
+def is_hybrid_model(args):
+    """Returns True if the model is a hybrid Mamba-Transformer model."""
+    return args.hybrid_layer_pattern is not None
+
+
 def is_linear_attention_variant(experimental_attention_variant):
     """Check if the experimental attention variant is a linear attention variant."""
     linear_attention_variants = ["gated_delta_net"]
@@ -212,10 +217,7 @@ def convert_transformer_config_to_args_for_tflops(
         config.seq_length = seq_length
 
     default_args = {
-        'hybrid_override_pattern': None,
-        'hybrid_attention_ratio': 0.0,
-        'hybrid_mlp_ratio': 0.0,
-        'is_hybrid_model': False,
+        'hybrid_layer_pattern': None,
         'attention_output_gate': False,
         'experimental_attention_variant': None,
         'linear_attention_freq': None,
@@ -248,14 +250,15 @@ def convert_transformer_config_to_args_for_tflops(
 
 
 class Symbols:
-    """Symbols for different layer types."""
+    """Symbols for different layer types and pattern separators."""
 
     MAMBA = "M"
     ATTENTION = "*"
     MLP = "-"
     MOE = 'E'
+    PIPE = '|'
     MTP_SEPARATOR = "/"
-    VALID = {MAMBA, ATTENTION, MLP, MOE}
+    VALID_LAYERS = {MAMBA, ATTENTION, MLP, MOE}
 
 
 @dataclass
@@ -263,7 +266,9 @@ class ParsedHybridPattern:
     """Result of parsing a unified hybrid pattern string.
 
     A unified pattern encodes both the main decoder pattern and the MTP pattern
-    in a single string using "/" as a separator.
+    in a single string using "/" as a separator. The main pattern may also
+    contain "|" pipe symbols to define pipeline stage boundaries for flexible
+    virtual pipeline parallelism (fVPP).
 
     Format: "<main_pattern>/<mtp_pattern>/<mtp_pattern>/..."
 
@@ -271,12 +276,15 @@ class ParsedHybridPattern:
         - "M*M*" -> main="M*M*", mtp=None, depths=0 (no MTP)
         - "M*M*/MM/MM" -> main="M*M*", mtp="MM", depths=2
         - "MMMM/*M/*M/*M" -> main="MMMM", mtp="*M", depths=3
+        - "M-M-|M-M*-/MM/MM" -> main="M-M-|M-M*-" (2 PP stages), mtp="MM", depths=2
 
     The "/" symbol introduces MTP patterns. Each repeated pattern after the main
     decoder represents one MTP prediction depth.
 
+    The "|" symbol in the main pattern defines pipeline stage boundaries.
+
     Attributes:
-        main_pattern: The main decoder layer pattern (e.g., "M*M*")
+        main_pattern: The main decoder layer pattern (e.g., "M*M*" or "M-M-|M-M*-")
         mtp_pattern: The MTP layer pattern per depth (e.g., "MM"), or None if no MTP
         mtp_num_depths: Number of MTP prediction depths (0 if no MTP)
     """
@@ -286,12 +294,52 @@ class ParsedHybridPattern:
     mtp_num_depths: int
 
 
+def get_hybrid_layer_counts(pattern: str) -> Dict[str, int]:
+    """Count layers by type across the full hybrid pattern (main + MTP).
+
+    Parses the pattern to extract main and MTP components, then counts
+    each layer type. Main pattern '|' separators are skipped. MTP layers
+    are counted once per MTP depth.
+
+    Args:
+        pattern: Full hybrid layer pattern string.
+
+    Returns:
+        Dictionary mapping layer symbol to count. Keys are Symbols.ATTENTION,
+        Symbols.MAMBA, Symbols.MLP, and Symbols.MOE.
+
+    Examples:
+        >>> get_hybrid_layer_counts("M*M*")
+        {'*': 2, 'M': 2, '-': 0, 'E': 0}
+
+        >>> get_hybrid_layer_counts("M-M-|M-M*-/MM/MM")
+        {'*': 1, 'M': 8, '-': 4, 'E': 0}
+    """
+    parsed = parse_hybrid_pattern(pattern)
+    counts = {Symbols.ATTENTION: 0, Symbols.MAMBA: 0, Symbols.MLP: 0, Symbols.MOE: 0}
+
+    # Count main decoder layers (skip '|' pipe separators)
+    if parsed.main_pattern:
+        for char in parsed.main_pattern:
+            if char in counts:
+                counts[char] += 1
+
+    # Count MTP layers (pattern repeated mtp_num_depths times)
+    if parsed.mtp_pattern and parsed.mtp_num_depths > 0:
+        for char in parsed.mtp_pattern:
+            if char in counts:
+                counts[char] += parsed.mtp_num_depths
+
+    return counts
+
+
 def parse_hybrid_pattern(pattern: Optional[str]) -> ParsedHybridPattern:
     """Parse a unified hybrid pattern string into main and MTP components.
 
     The pattern uses "/" as a separator between the main decoder pattern and
     MTP patterns. Each MTP pattern after the separator represents one prediction
-    depth.
+    depth. The main pattern may contain "|" pipe symbols for pipeline stage
+    boundaries.
 
     Format: "<main_pattern>/<mtp_pattern>/<mtp_pattern>/..."
 
@@ -314,6 +362,9 @@ def parse_hybrid_pattern(pattern: Optional[str]) -> ParsedHybridPattern:
 
         >>> parse_hybrid_pattern("MMMM/*M/*M/*M")
         ParsedHybridPattern(main_pattern="MMMM", mtp_pattern="*M", mtp_num_depths=3)
+
+        >>> parse_hybrid_pattern("M-M-|M-M*-/MM/MM")
+        ParsedHybridPattern(main_pattern="M-M-|M-M*-", mtp_pattern="MM", mtp_num_depths=2)
     """
     if pattern is None:
         return ParsedHybridPattern(main_pattern=None, mtp_pattern=None, mtp_num_depths=0)
@@ -323,13 +374,13 @@ def parse_hybrid_pattern(pattern: Optional[str]) -> ParsedHybridPattern:
     if len(parts) == 1:
         # No MTP separator found - pattern is main decoder only
         main_pattern = parts[0]
-        _validate_pattern(main_pattern, "main")
+        _validate_pattern(main_pattern, "main", allow_pipe=True)
         return ParsedHybridPattern(main_pattern=main_pattern, mtp_pattern=None, mtp_num_depths=0)
 
     # First part is main decoder pattern
     main_pattern = parts[0]
     if main_pattern:
-        _validate_pattern(main_pattern, "main")
+        _validate_pattern(main_pattern, "main", allow_pipe=True)
 
     # Remaining parts are MTP patterns (one per depth)
     mtp_parts = parts[1:]
@@ -350,7 +401,7 @@ def parse_hybrid_pattern(pattern: Optional[str]) -> ParsedHybridPattern:
                 f"Full pattern: '{pattern}'"
             )
 
-    _validate_pattern(mtp_pattern, "MTP")
+    _validate_pattern(mtp_pattern, "MTP", allow_pipe=False)
 
     return ParsedHybridPattern(
         main_pattern=main_pattern if main_pattern else None,
@@ -359,49 +410,27 @@ def parse_hybrid_pattern(pattern: Optional[str]) -> ParsedHybridPattern:
     )
 
 
-def _validate_pattern(pattern: str, pattern_name: str) -> None:
+def _validate_pattern(pattern: str, pattern_name: str, allow_pipe: bool = False) -> None:
     """Validate that a pattern contains only valid layer symbols.
 
     Args:
         pattern: Layer pattern string to validate
         pattern_name: Name of pattern for error messages (e.g., "main" or "MTP")
+        allow_pipe: Whether to allow the pipe '|' separator (for main patterns)
 
     Raises:
         ValueError: If pattern contains invalid symbols
     """
+    valid_chars = Symbols.VALID_LAYERS | {Symbols.PIPE} if allow_pipe else Symbols.VALID_LAYERS
     for char in pattern:
-        if char not in Symbols.VALID:
+        if char not in valid_chars:
             raise ValueError(
                 f"In {pattern_name} pattern, '{char}' is not a valid layer symbol. "
-                f"Valid symbols are: {Symbols.VALID}"
+                f"Valid symbols are: {valid_chars}"
             )
 
 
 def num_floating_point_operations(args, batch_size):
-    """Calculate the total floating point operations for the model."""
-    def calculate_layer_counts():
-        """Calculate the number of attention, Mamba, and MLP layers."""
-        if args.hybrid_override_pattern:
-            # Parse unified pattern to separate main and MTP components
-            parsed = parse_hybrid_pattern(args.hybrid_override_pattern)
-            counts = {'M': 0, '*': 0, '-': 0, 'E': 0}
-            # Count main decoder layers
-            if parsed.main_pattern:
-                for layer_type in parsed.main_pattern:
-                    if layer_type in counts:
-                        counts[layer_type] += 1
-            # Count MTP layers (pattern repeated mtp_num_depths times)
-            if parsed.mtp_pattern and parsed.mtp_num_depths > 0:
-                for layer_type in parsed.mtp_pattern:
-                    if layer_type in counts:
-                        counts[layer_type] += parsed.mtp_num_depths
-            return counts['*'], counts['M'], counts['-'], counts['E']
-        num_attn_layers = round(args.num_layers * args.hybrid_attention_ratio)
-        num_mlp_layers = round(args.num_layers * args.hybrid_mlp_ratio)
-        num_mamba_layers = args.num_layers - num_attn_layers - num_mlp_layers
-        num_moe_layers = 0
-        return num_attn_layers, num_mamba_layers, num_mlp_layers, num_moe_layers
-
     def mlp_layer_flops(batch_size, seq_len, hidden_size, expansion=4.0, swiglu=False):
         """Calculate FLOPs for an MLP layer."""
         scale_factor = 3.0 / 2.0 if swiglu else 1.0
@@ -755,9 +784,13 @@ def num_floating_point_operations(args, batch_size):
         return total_floating_point_operations
 
     # Main entrypoint for FLOPs calculation.
-    if args.is_hybrid_model:
+    if is_hybrid_model(args):
         # Calculate the number of each type of layer.
-        num_attn_layers, num_mamba_layers, num_mlp_layers, num_moe_layers = calculate_layer_counts()
+        from operator import itemgetter
+
+        num_attn_layers, num_mamba_layers, num_mlp_layers, num_moe_layers = itemgetter(
+            Symbols.ATTENTION, Symbols.MAMBA, Symbols.MLP, Symbols.MOE
+        )(get_hybrid_layer_counts(args.hybrid_layer_pattern))
 
         mtp_num_layers = args.mtp_num_layers
         if mtp_num_layers is None:

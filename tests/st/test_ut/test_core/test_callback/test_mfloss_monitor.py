@@ -1168,9 +1168,8 @@ class TestMFLossMonitorMcoreFlops:
                 self.moe_router_topk = 2
                 self.moe_ffn_hidden_size = None
                 self.moe_shared_expert_intermediate_size = None
-                self.is_hybrid_model = True
-                self.hybrid_attention_ratio = 0.5
-                self.hybrid_mlp_ratio = 0.3
+                self.hybrid_layer_pattern = "M*M*"
+
                 self.mtp_num_layers = 0
 
         mock_config = MockConfig()
@@ -1204,7 +1203,7 @@ class TestMFLossMonitorMcoreFlops:
         assert monitor.mf_calculated
         assert monitor.full_model_flops > 0
 
-        expected_flops = 59929289293824
+        expected_flops = 46322832900096
         assert monitor.full_model_flops == expected_flops, \
             f"FLOPs value {monitor.full_model_flops} does not match expected {expected_flops}"
 
