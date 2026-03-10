@@ -501,13 +501,13 @@ class MSContextOperator:
         if not set_context_excluded:
             return
         if "deterministic" in set_context_excluded:
-            logger.info(
+            logger.warning(
                 "context.deterministic is no longer set via set_context; "
                 "use MF config train_precision_sync or infer_precision_sync for equivalent behavior."
             )
         others = [key for key in set_context_excluded if key != "deterministic"]
         if others:
-            logger.info(
+            logger.warning(
                 "The following context options did not take effect via set_context; "
                 "please refer to the official MindSpore documentation for corresponding APIs: %s",
                 others,
