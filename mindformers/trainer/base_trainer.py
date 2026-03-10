@@ -1174,7 +1174,7 @@ class BaseTrainer:
                 config.runner_config.initial_epoch = 0
                 config.runner_config.initial_step = 0
         else:
-            if not config.checkpoint.no_load_optim and config.checkpoint.load_path and not check_is_reboot_node():
+            if config.resume_training and config.checkpoint.load_path and not check_is_reboot_node():
                 logger.info(".............Start load resume context from checkpoint..................")
                 if check_tft_valid() and not config.remove_redundancy:
                     logger.info("..............Start resume checkpoint path from strategy..............")
@@ -1208,7 +1208,7 @@ class BaseTrainer:
             preload_ckpt(config)
 
         # check if skip datasets
-        if config.data_skip_steps or not config.checkpoint.no_load_optim:
+        if config.data_skip_steps or config.resume_training or not config.checkpoint.no_load_optim:
             if not config.ignore_data_skip:
                 data_skip_steps = config.data_skip_steps if config.data_skip_steps \
                     else config.runner_config.initial_step
@@ -1221,7 +1221,7 @@ class BaseTrainer:
         # set resume training for hf iterable dataset
         dataloader_config = config.train_dataset.get('data_loader', {})
         dataloader_type = dataloader_config.get('type')
-        if not config.checkpoint.no_load_optim and dataloader_type in ['HFDataLoader', 'CommonDataLoader']:
+        if (config.resume_training or not config.checkpoint.no_load_optim) and dataloader_type in ['HFDataLoader', 'CommonDataLoader']:
             resume_step = config.runner_config.initial_step
             _resume_hf_iterable_dataset(dataset, resume_step)
 
@@ -1410,7 +1410,7 @@ class BaseTrainer:
                         "keep_checkpoint_max": config.checkpoint.save_max,
                         "save_checkpoint_steps": config.checkpoint.save_interleaved_steps,
                         "save_optimizer": not config.checkpoint.no_save_optim,
-                        "directory": os.path.join(config.checkpoint.save_path, "checkpoint"),
+                        "directory": config.checkpoint.save_path,
                         "async_save": config.checkpoint.async_save,
                         "prefix": config.checkpoint.prefix
                     })
@@ -1574,7 +1574,7 @@ class BaseTrainer:
                         reshard_worker_num=config.checkpoint.reshard_worker_num
                     )
         elif (config.checkpoint.load_path or config.only_save_strategy) and not check_is_reboot_node():
-            if not config.checkpoint.no_load_optim:
+            if config.resume_training:
                 logger.info(".............Start resume training from checkpoint..................")
                 transform_and_load_checkpoint(config, model, network, dataset, optimizer=optimizer)
             else:
