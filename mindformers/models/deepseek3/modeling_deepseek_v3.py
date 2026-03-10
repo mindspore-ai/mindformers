@@ -16,13 +16,19 @@
 import os
 import mindspore as ms
 
+from mindformers.tools.logger import logger
 from mindformers.core.context.build_context import get_context
 from mindformers.tools.register import MindFormerRegister, MindFormerModuleType
 
 from .configuration_deepseek_v3 import DeepseekV3Config
 from .modeling_deepseek_v3_train import TrainingDeepseekV3ForCausalLM
 from .modeling_deepseek_v3_infer import InferenceDeepseekV3ForCausalLM
-from .modeling_deepseek_v3_pynative import PyNativeDeepseekV3ForCausalLM
+
+try:
+    from .modeling_deepseek_v3_pynative import PyNativeDeepseekV3ForCausalLM
+except ImportError as e:
+    PyNativeDeepseekV3ForCausalLM = None
+    logger.warning(f"Import PyNativeDeepseekV3ForCausalLM failed: {e}.")
 
 
 @MindFormerRegister.register(MindFormerModuleType.MODELS, legacy=False)

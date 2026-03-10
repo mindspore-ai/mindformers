@@ -21,11 +21,18 @@ import os
 
 import mindspore as ms
 
+from mindformers.tools.logger import logger
 from mindformers.core.context.build_context import get_context
 from mindformers.tools.register import MindFormerRegister, MindFormerModuleType
 from .utils import Qwen3PreTrainedModel
 from .modeling_qwen3_infer import InferenceQwen3ForCausalLM
 from .modeling_qwen3_train import TrainingQwen3ForCausalLM
+
+try:
+    from .modeling_qwen3_train_pynative import PyNativeQwen3ForCausalLM
+except ImportError as e:
+    PyNativeQwen3ForCausalLM = None
+    logger.warning(f"Import PyNativeQwen3ForCausalLM failed: {e}.")
 
 
 @MindFormerRegister.register(MindFormerModuleType.MODELS, legacy=False)
@@ -57,6 +64,5 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel):
             return InferenceQwen3ForCausalLM(config=config)
 
         if get_context("mode") == ms.context.PYNATIVE_MODE:
-            from .modeling_qwen3_train_pynative import PyNativeQwen3ForCausalLM
             return PyNativeQwen3ForCausalLM(config=config)
         return TrainingQwen3ForCausalLM(config=config)
