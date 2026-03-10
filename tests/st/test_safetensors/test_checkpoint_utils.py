@@ -50,11 +50,14 @@ def mock_config():
         """Mock configuration class for testing"""
 
         def __init__(self):
+            self.checkpoint = MindFormerConfig()
+            self.checkpoint.load_path = "/path/to/checkpoint"
             self.load_checkpoint = "/path/to/checkpoint"
             self.load_ckpt_format = "safetensors"
             self.use_parallel = False
             self.auto_trans_ckpt = False
             self.resume_training = None
+            self.checkpoint.no_load_optim = None
             self.remove_redundancy = False
             self.output_dir = "/output"
             self.src_strategy_path_or_dir = None
@@ -402,7 +405,7 @@ class TestCommonCheckpointMethod:
                 patch('os.path.dirname') as mock_dirname, \
                 patch('mindformers.utils.load_checkpoint_utils.logger'):
             # Test case 1: input_src_strategy is provided
-            mock_config.load_checkpoint = "/test/checkpoint.ckpt"
+            mock_config.checkpoint.load_path = "/test/checkpoint.ckpt"
             mock_config.src_strategy_path_or_dir = "/input/strategy"
             mock_isdir.return_value = True
             result = _get_src_strategy(mock_config)
@@ -429,7 +432,7 @@ class TestCommonCheckpointMethod:
             # Setup mock_join to return a valid path
             mock_join.return_value = "/test/strategy"
 
-            mock_config.load_checkpoint = "/test/checkpoint_dir"
+            mock_config.checkpoint.load_path = "/test/checkpoint_dir"
             mock_config.src_strategy_path_or_dir = None
 
             result = _get_src_strategy(mock_config)
@@ -448,7 +451,7 @@ class TestCommonCheckpointMethod:
             # test when is_main_rank is True and resume_training is string
             mock_is_main_rank.return_value = True
             mock_config.resume_training = "checkpoint-10_200.safetensors"
-            mock_config.load_checkpoint = "/path/to/checkpoint"
+            mock_config.checkpoint.load_path = "/path/to/checkpoint"
             mock_config.load_ckpt_format = "safetensors"
 
             with patch('mindformers.utils.load_checkpoint_utils.extract_suffix', return_value="-10_200"):
@@ -459,7 +462,7 @@ class TestCommonCheckpointMethod:
             mock_isfile.return_value = True
             mock_isdir.return_value = False
             mock_config.resume_training = None
-            mock_config.load_checkpoint = "/path/to/rank_0/checkpoint-10_200.safetensors"
+            mock_config.checkpoint.load_path = "/path/to/rank_0/checkpoint-10_200.safetensors"
 
             with patch('mindformers.utils.load_checkpoint_utils.extract_suffix', return_value="-10_200"):
                 result = _get_src_file_suffix(mock_config)
@@ -468,7 +471,7 @@ class TestCommonCheckpointMethod:
             # test when is_main_rank is True and load_checkpoint is dir
             mock_isfile.return_value = False
             mock_isdir.return_value = True
-            mock_config.load_checkpoint = "/path/to/checkpoint"
+            mock_config.checkpoint.load_path = "/path/to/checkpoint"
             mock_get_last_checkpoint.return_value = "/path/to/checkpoint/rank_0/checkpoint-10_200.safetensors"
 
             with patch('mindformers.utils.load_checkpoint_utils.extract_suffix', return_value="-10_200"):
@@ -826,7 +829,7 @@ class TestBuildModel:
     model = MagicMock()
     dataset = MagicMock()
 
-    @patch('mindspore.get_auto_parallel_context')
+    @patch('mindspore.context.get_auto_parallel_context')
     def test_build_model_sink_mode_value_error(self, mock_get_auto_parallel_context):
         """test build model sink mode value error"""
         mock_get_auto_parallel_context.return_value = 'auto_parallel'
@@ -843,7 +846,7 @@ class TestBuildModel:
                 do_eval=False, do_predict=False
             )
 
-    @patch('mindspore.get_auto_parallel_context')
+    @patch('mindspore.context.get_auto_parallel_context')
     def test_build_model_infer_predict_layout_when_do_eval_is_true(self, mock_get_auto_parallel_context):
         """test build model infer predict layout when do eval is true"""
         mock_get_auto_parallel_context.return_value = 'auto_parallel'
@@ -859,7 +862,7 @@ class TestBuildModel:
         )
         self.model.infer_predict_layout.assert_called_once_with(*self.dataset)
 
-    @patch('mindspore.get_auto_parallel_context')
+    @patch('mindspore.context.get_auto_parallel_context')
     def test_build_model_infer_predict_layout_when_do_predict_is_true(self, mock_get_auto_parallel_context):
         """test build model infer predict layout when do predict is true"""
         mock_get_auto_parallel_context.return_value = 'auto_parallel'
@@ -875,7 +878,7 @@ class TestBuildModel:
         )
         self.model.infer_predict_layout.assert_called_once_with(*self.dataset)
 
-    @patch('mindspore.get_auto_parallel_context')
+    @patch('mindspore.context.get_auto_parallel_context')
     def test_build_model_model_build(self, mock_get_auto_parallel_context):
         """test build model build"""
         mock_get_auto_parallel_context.return_value = 'auto_parallel'
@@ -904,8 +907,9 @@ class TestGetCheckpointMode:
         """test single checkpoint file"""
         mock_isfile.return_value = True
         mock_isdir.return_value = False
-        config = type('', (), {})()
-        config.load_checkpoint = '/test/checkpoint_file.safetensors'
+        config = MindFormerConfig()
+        config.checkpoint = MindFormerConfig()
+        config.checkpoint.load_path = '/test/checkpoint_file.safetensors'
         assert _get_checkpoint_mode(config) == CheckpointFileMode.SINGLE_CHECKPOINT_FILE.value
 
     @pytest.mark.level0
@@ -918,8 +922,9 @@ class TestGetCheckpointMode:
             mock_isfile.return_value = False
             mock_isdir.return_value = True
             with patch('os.listdir', return_value=['rank_0']):
-                config = type('', (), {})()
-                config.load_checkpoint = '/test/checkpoint_dir/'
+                config = MindFormerConfig()
+                config.checkpoint = MindFormerConfig()
+                config.checkpoint.load_path = '/test/checkpoint_dir/'
                 assert _get_checkpoint_mode(config) == CheckpointFileMode.MULTI_CHECKPOINT_FILE_WITH_RANK_ID.value
 
     @pytest.mark.level0
@@ -932,8 +937,9 @@ class TestGetCheckpointMode:
             mock_isfile.return_value = False
             mock_isdir.return_value = True
             with patch('os.listdir', return_value=['checkpoint.safetensors']):
-                config = type('', (), {})()
-                config.load_checkpoint = '/test/checkpoint_dir/'
+                config = MindFormerConfig()
+                config.checkpoint = MindFormerConfig()
+                config.checkpoint.load_path = '/test/checkpoint_dir/'
                 config.load_ckpt_format = '.safetensors'
                 assert _get_checkpoint_mode(config) == CheckpointFileMode.MULTI_CHECKPOINT_FILE.value
 
@@ -946,8 +952,9 @@ class TestGetCheckpointMode:
                 patch('os.path.isdir') as mock_isdir:
             mock_isfile.return_value = False
             mock_isdir.return_value = False
-            config = type('', (), {})()
-            config.load_checkpoint = 'invalid_path'
+            config = MindFormerConfig()
+            config.checkpoint = MindFormerConfig()
+            config.checkpoint.load_path = 'invalid_path'
             with pytest.raises(ValueError, match="Provided path is neither a file nor a directory."):
                 _get_checkpoint_mode(config)
 
@@ -961,8 +968,9 @@ class TestGetCheckpointMode:
             mock_isfile.return_value = False
             mock_isdir.return_value = True
             with patch('os.listdir', return_value=['not_a_checkpoint_file']):
-                config = type('', (), {})()
-                config.load_checkpoint = '/test/checkpoint_dir/'
+                config = MindFormerConfig()
+                config.checkpoint = MindFormerConfig()
+                config.checkpoint.load_path = '/test/checkpoint_dir/'
                 config.load_ckpt_format = '.safetensors'
                 with pytest.raises(ValueError, match="not support mode: no valid checkpoint files found"):
                     _get_checkpoint_mode(config)

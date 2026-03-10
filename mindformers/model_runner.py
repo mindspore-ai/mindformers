@@ -38,7 +38,7 @@ from mindformers.utils import contains_safetensors_files
 
 from mindformers.tools.logger import logger
 from mindformers.tools.register.config import MindFormerConfig
-from mindformers.trainer.utils import transform_and_load_checkpoint
+from mindformers.trainer.utils import transform_and_load_checkpoint, convert_checkpoint_config
 from mindformers.tools.hub.dynamic_module_utils import get_class_from_dynamic_module
 from mindformers.generation.parallel_decoding import parallel_decoding_control
 from mindformers.version_control import need_nz
@@ -319,8 +319,9 @@ class MindIEModelRunner:
             inputs = self.model.prepare_inputs_for_predict_layout(input_ids)
         else:
             inputs = None
-        self.config.load_checkpoint = get_load_path_after_hf_convert(self.config, self.model)
-        if self.config.load_checkpoint:
+        convert_checkpoint_config(self.config)
+        self.config.checkpoint.load_path = get_load_path_after_hf_convert(self.config, self.model)
+        if self.config.checkpoint.load_path:
             transform_and_load_checkpoint(self.config, ms_model, self.model, inputs, do_predict=True)
         else:
             logger.warning("No checkpoint loaded. Network will be inited randomly.")

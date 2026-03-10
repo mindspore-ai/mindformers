@@ -31,6 +31,7 @@ from mindspore import save_checkpoint
 from mindspore.communication.comm_func import barrier
 from mindspore.common.file_system import mindio_preload, set_mindio_server_info
 
+from mindformers.checkpoint.utils import is_hf_checkpoint
 from mindformers.tools.logger import logger
 from mindformers.tools.utils import get_real_rank
 from mindformers.utils.load_checkpoint_utils import \
@@ -367,7 +368,7 @@ def load_resume_context_from_checkpoint(config, dataset):
             rank_id = get_real_rank()
         else:
             rank_id = 0
-        if isinstance(not config.checkpoint.no_load_optim, bool):
+        if isinstance(config.resume_training, bool):
             # if load checkpoint is complete safetensors, get resume param from hyper_param.safetensors
             if is_hyper_param_existed_in_sf_dir(config.checkpoint.load_path, config.load_ckpt_format):
                 hyper_param_file = os.path.join(config.checkpoint.load_path, 'hyper_param.safetensors')
@@ -384,7 +385,7 @@ def load_resume_context_from_checkpoint(config, dataset):
                                                           remove_redundancy=config.remove_redundancy)
         else:
             checkpoint_tmp = os.path.join(config.checkpoint.load_path, f"rank_{rank_id}",
-                                          replace_rank_id_in_ckpt_name(not config.checkpoint.no_load_optim, rank_id))
+                                          replace_rank_id_in_ckpt_name(config.resume_training, rank_id))
             if not os.path.isfile(checkpoint_tmp):
                 err_msg = f"{checkpoint_tmp} is not found!"
                 logger.error(err_msg)
@@ -694,9 +695,9 @@ def get_load_checkpoint_result(config):
             else:
                 checkpoint_dict = load_checkpoint(config.checkpoint.load_path)
         elif os.path.isdir(config.checkpoint.load_path) and check_rank_folders(config.checkpoint.load_path, rank_id):
-            if isinstance(not config.checkpoint.no_load_optim, str):
+            if isinstance(config.resume_training, str):
                 checkpoint_tmp = os.path.join(config.checkpoint.load_path, f"rank_{config.rank_id}",
-                                              not config.checkpoint.no_load_optim)
+                                              config.resume_training)
                 if load_ckpt_async:
                     checkpoint_future = load_checkpoint_async(checkpoint_tmp)
                 else:
@@ -763,3 +764,77 @@ def load_ckpt(config, network, optimizer=None, model=None, future=None):
         if optimizer:
             not_load_optim_params = load_param_into_net(optimizer, checkpoint_dict)
             logger.info("Optimizer parameters are not loaded: %s", not_load_optim_params)
+
+def validate_checkpoint_config(ckpt_config: MindFormerConfig):
+    """Validate checkpoint config."""
+    if not ckpt_config:
+        raise ValueError("checkpoint_config should not be empty.")
+
+    if ckpt_config.get("save_max", 5) < 1:
+        raise ValueError("save_max in checkpoint_config should be at least 1.")
+    if ckpt_config.get("save_interleaved_steps", 1) < 1:
+        raise ValueError("save_interleaved_steps in checkpoint_config should be at least 1.")
+    if ckpt_config.get("reshard_worker_num", 1) < 1:
+        raise ValueError("reshard_worker_num in checkpoint_config should be at least 1.")
+
+    no_load_optim = ckpt_config.get("no_load_optim", True)
+    if isinstance(no_load_optim, str):
+        no_load_optim = False
+    load_path = ckpt_config.get("load_path", None)
+    if not no_load_optim and load_path:
+        if is_hf_checkpoint(load_path):
+            raise ValueError(f"Resume training not supported for HuggingFace checkpoints.")
+
+
+def compatible_with_both_old_new_config(deprecated_configs, old_config, new_config, opposite_value_config):
+    """compatible old config and new config"""
+    for old_name, new_name, default_value in deprecated_configs:
+        old_value = old_config.get(old_name, default_value)
+        if new_name in opposite_value_config:
+            old_value = not old_value
+        if new_config.get(new_name, None) is None and old_value is not None:
+            logger.warning(
+                f"The config {old_name} is deprecated. Please use config {new_name} in `checkpoint_config` instead.")
+            setattr(new_config, new_name, old_value)
+
+
+def convert_checkpoint_config(config):
+    """Convert checkpoint config"""
+    checkpoint_config = config.get("checkpoint")
+    if checkpoint_config:
+        config.use_legacy_format = False
+        logger.warning("Since the checkpoint has been set, the use_legacy_format is automatically set to False.")
+    if not checkpoint_config:
+        checkpoint_config = MindFormerConfig()
+    if not config.use_legacy_format:
+        if isinstance(config.resume_training, str):
+            raise ValueError("resume_training should be a bool value when the use_legacy_format is False.")
+        if config.only_save_strategy:
+            raise ValueError("only_save_strategy is not supported when the use_legacy_format is False.")
+
+    opposite_value_config = ["no_load_optim", "no_save_optim"]
+    deprecated_config_configs = [
+        ("load_checkpoint", "load_path", ""),
+        ("balanced_load", "load_balanced", False),
+        ("resume_training", "no_load_optim", True),
+        ("reshard_worker_num", "reshard_worker_num", 1)
+    ]
+    compatible_with_both_old_new_config(deprecated_config_configs, config, checkpoint_config,
+                                              opposite_value_config)
+
+    deprecated_callback_configs = [
+        ("keep_checkpoint_max", "save_max", 5),
+        ("save_checkpoint_steps", "save_interleaved_steps", 1),
+        ("save_optimizer", "no_save_optim", True),
+        ("remove_redundancy", "save_remove_redundancy", False),
+        ("async_save", "async_save", False),
+        ("directory", "save_path", os.path.join(config.output_dir, "checkpoint")),
+        ("prefix", "prefix", "CKP"),
+    ]
+    if config.get("callbacks"):
+        for callback in config.callbacks:
+            if callback.get("type") == "CheckpointMonitor":
+                compatible_with_both_old_new_config(deprecated_callback_configs, callback, checkpoint_config,
+                                                          opposite_value_config)
+    validate_checkpoint_config(checkpoint_config)
+    config.checkpoint = checkpoint_config

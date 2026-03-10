@@ -75,17 +75,17 @@ def _get_origin_network(network):
 
 def get_load_path_after_hf_convert(config, network):
     """check if it is hf safetensors and convert"""
-    if (config.load_checkpoint and config.get('load_ckpt_format', 'ckpt') == 'safetensors' and
-            is_hf_safetensors_dir(config.load_checkpoint, network)):
+    if (config.checkpoint.load_path and config.get('load_ckpt_format', 'ckpt') == 'safetensors' and
+            is_hf_safetensors_dir(config.checkpoint.load_path, network)):
         # 'qkv_concat is True' save ms safetensors
         if (config.model.model_config.get("qkv_concat", False) or not check_safetensors_addition_param_support()):
             logger.info(".......Load Checkpoint format is hf safetensors, start convert to ms safetensors!.......")
-            converted_sf_path = process_hf_checkpoint(network, config.output_dir, config.load_checkpoint)
+            converted_sf_path = process_hf_checkpoint(network, config.output_dir, config.checkpoint.load_path)
             # Wait for main rank to convert HF safetensors
             if config.use_parallel:
                 barrier()
             return converted_sf_path
-    return config.load_checkpoint
+    return config.checkpoint.load_path
 
 
 def _check_checkpoint_path(path):
@@ -106,7 +106,7 @@ def _check_checkpoint_path(path):
 
 def _get_checkpoint_mode(config):
     """get checkpoint place mode."""
-    checkpoint_path = config.load_checkpoint
+    checkpoint_path = config.checkpoint.load_path
 
     if os.path.isfile(checkpoint_path):
         # check if checkpoint_path upper folder is rank_x/
@@ -135,10 +135,10 @@ def _get_checkpoint_mode(config):
 
 def _get_src_strategy(config):
     """search and get strategy file path from load_checkpoint directory."""
-    if os.path.isfile(config.load_checkpoint):
-        upper_dir = '/'.join(config.load_checkpoint.split('/')[:-3])
+    if os.path.isfile(config.checkpoint.load_path):
+        upper_dir = '/'.join(config.checkpoint.load_path.split('/')[:-3])
     else:
-        upper_dir = os.path.dirname(config.load_checkpoint)
+        upper_dir = os.path.dirname(config.checkpoint.load_path)
 
     input_src_strategy = config.get('src_strategy_path_or_dir')
     if input_src_strategy and os.path.isdir(input_src_strategy):
@@ -207,14 +207,14 @@ def _get_src_file_suffix(config):
     file_suffix = None
     if is_main_rank():
         if isinstance(config.resume_training, str):
-            checkpoint_dir = config.load_checkpoint
+            checkpoint_dir = config.checkpoint.load_path
             checkpoint_name = config.resume_training.split('.')[0] + f'.{config.load_ckpt_format}'
-        elif os.path.isfile(config.load_checkpoint):
+        elif os.path.isfile(config.checkpoint.load_path):
             # only support path format: path/rank_x/prefix-{epoch}_{step}.{config.load_ckpt_format}
-            checkpoint_dir = '/'.join(config.load_checkpoint.split('/')[:-2])
-            checkpoint_name = os.path.basename(config.load_checkpoint)
+            checkpoint_dir = '/'.join(config.checkpoint.load_path.split('/')[:-2])
+            checkpoint_name = os.path.basename(config.checkpoint.load_path)
         else:
-            checkpoint_dir = config.load_checkpoint
+            checkpoint_dir = config.checkpoint.load_path
             rank_path = f"{checkpoint_dir}/rank_0"
             last_checkpoint = get_last_checkpoint(rank_path, config.load_ckpt_format)
             checkpoint_name = os.path.basename(last_checkpoint)
@@ -268,9 +268,9 @@ def load_checkpoint_with_safetensors(config, model, network, input_data, do_eval
     logger.info(f"......Start load checkpoint from {config.load_ckpt_format}......")
     if config.load_ckpt_async:
         logger.warning("The configuration 'load_ckpt_async=True' is not supported for safetensor files currently.")
-    config.load_checkpoint = _check_checkpoint_path(config.load_checkpoint)
-    load_checkpoint = config.load_checkpoint
-    logger.info(f"Load checkpoint from {config.load_checkpoint}.")
+    config.checkpoint.load_path = _check_checkpoint_path(config.checkpoint.load_path)
+    load_checkpoint = config.checkpoint.load_path
+    logger.info(f"Load checkpoint from {config.checkpoint.load_path}.")
 
     pet_config = config.model.model_config.get("pet_config")
     if pet_config and pet_config.pet_type == "slora" and network.lora_list:
@@ -288,7 +288,7 @@ def load_checkpoint_with_safetensors(config, model, network, input_data, do_eval
     strategy_path = ms.get_auto_parallel_context('strategy_ckpt_save_file')
     if ckpt_file_mode == CheckpointFileMode.SINGLE_CHECKPOINT_FILE.value:
         logger.info("......Use single checkpoint file mode......")
-        load_checkpoint_files = [config.load_checkpoint]
+        load_checkpoint_files = [config.checkpoint.load_path]
     if ckpt_file_mode == CheckpointFileMode.MULTI_CHECKPOINT_FILE.value:
         logger.info("......Use multi checkpoint file mode......")
         load_checkpoint_files = glob(
