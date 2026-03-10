@@ -506,9 +506,18 @@ class GPTModel(nn.Cell):
         # labels origin shape is [b s], Transpose is not required.
         loss = self.compute_language_model_loss(local_labels, logits, local_loss_mask)
 
+        # temporarily circumvention for zero_bubble_v
+        if self.is_zbv and not self.config.experimental_attention_variant == "dsa":
+            if self.calculate_per_token_loss:
+                numerator0, denominator0 = loss
+                return numerator0, denominator0, numerator1, denominator1, extra_loss * denominator0
+            return loss, mtp_loss, extra_loss
+
         if self.calculate_per_token_loss:
             numerator0, denominator0 = loss
-            return numerator0, denominator0, numerator1, denominator1, extra_loss * denominator0, attention_loss
+            extra_loss = extra_loss * denominator0
+            attention_loss = attention_loss * denominator0
+            return numerator0, denominator0, numerator1, denominator1, extra_loss, attention_loss
         return loss, mtp_loss, extra_loss, attention_loss
 
     def forward_func_logits(self, input_):
