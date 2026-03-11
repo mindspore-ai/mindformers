@@ -951,7 +951,7 @@ class MFPipelineWithLossScaleCell(nn.TrainOneStepWithLossScaleCell):
         real_network = get_real_models(self.network)
         transformer_config = real_network.get_gpt_transformer_config() if not self.use_legacy else None
         self.is_zbv = get_auto_parallel_context("pipeline_scheduler") == "zero_bubble_v"
-        self.is_dsa = transformer_config.experimental_attention_variant == "dsa"
+        self.is_dsa = getattr(transformer_config, "experimental_attention_variant", None) == "dsa"
 
         # loss
         self.print_separate_loss = bool(print_separate_loss and not self.use_legacy)
