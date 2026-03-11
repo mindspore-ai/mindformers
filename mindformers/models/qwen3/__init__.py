@@ -19,7 +19,6 @@ from .configuration_qwen3 import Qwen3Config
 from .modeling_qwen3 import Qwen3ForCausalLM
 from .modeling_qwen3_infer import InferenceQwen3ForCausalLM
 from .modeling_qwen3_train import TrainingQwen3ForCausalLM
-from .modeling_qwen3_train_pynative import PyNativeQwen3ForCausalLM
 
 __all__ = [
     "Qwen3Config",
@@ -27,5 +26,4 @@ __all__ = [
     "InferenceQwen3ForCausalLM",
     "TrainingQwen3ForCausalLM",
     "Qwen3PreTrainedModel",
-    "PyNativeQwen3ForCausalLM",
 ]
