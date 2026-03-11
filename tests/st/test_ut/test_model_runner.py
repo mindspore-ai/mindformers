@@ -27,6 +27,7 @@ import numpy as np
 import mindspore as ms
 from mindspore import Tensor
 
+from mindformers import MindFormerConfig
 from mindformers.model_runner import (
     register_auto_class,
     get_model,
@@ -183,7 +184,9 @@ class MockConfigFactory:
         load_checkpoint=None
     ):
         """Create a mock MindFormerConfig"""
-        mock_config = MagicMock()
+        mock_config = MindFormerConfig()
+        mock_config.output_dir = './output'
+        mock_config.model = MagicMock()
         mock_config.use_parallel = use_parallel
         mock_config.model.arch.type = arch_type
         mock_config.model.model_config = {'type': arch_type}
@@ -191,6 +194,11 @@ class MockConfigFactory:
         mock_config.load_checkpoint = load_checkpoint
         mock_config.context = MagicMock()
         mock_config.parallel_config = MagicMock()
+        mock_config.callbacks = []
+        callback = MagicMock()
+        callback.type = 'CheckpointMonitor'
+        callback.keep_checkpoint_max = 5
+        mock_config.callbacks.append(callback)
         return mock_config
 
 
@@ -213,7 +221,8 @@ class MockRunnerFactory:
         runner.is_multi_modal_model = is_multi_modal
         runner.model_config = MagicMock()
         runner.processor = MagicMock()
-        runner.config = MagicMock()
+        runner.config = MindFormerConfig()
+        runner.config.output_dir = './output'
         return runner
 
 
