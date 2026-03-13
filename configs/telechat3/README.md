@@ -127,7 +127,7 @@ bash scripts/msrun_launcher.sh "run_mindformer.py \
 --auto_trans_ckpt False \
 --use_parallel True \
 --run_mode train" \
-48 8 $master_ip $port $node_rank output/msrun_log False 7200
+16 8 $master_ip $port $node_rank output/msrun_log False 7200
 ```
 
 > 此处样例代码假设主节点为`192.168.1.1`、当前Rank序号为`0`。实际执行时请将`master_ip`设置为实际的主节点IP地址；将`node_rank`设置为当前节点的Rank序号；将`port`设置为当前进程的端口号。
@@ -272,26 +272,25 @@ TeleChat3-36B的模型文件包括以下内容：
   </tr>
   <tr>
     <td>TeleChat3</td>
-    <td>105B</td>
+    <td>36B</td>
     <td>6 × Atlas 800T A2 (8P)</td>
-    <td>48</td>
-    <td>4096</td>
+    <td>16</td>
+    <td>8192</td>
     <td>
       <pre><code class="language-yaml">parallel_config:
   data_parallel: &dp 1
   model_parallel: 8
-  pipeline_stage: 6
+  pipeline_stage: 2
   micro_batch_num: 4
-  vocab_emb_dp: True
-  use_seq_parallel: False
-  gradient_aggregation_group: 1</code></pre>
+  use_seq_parallel: True
+  gradient_aggregation_group: 4</code></pre>
     </td>
     <td>
       <pre><code class="language-yaml">recompute_config:
-  recompute: True
+  recompute: [[14, 14], [14, 14]]
   select_recompute: False
-  parallel_optimizer_comm_recompute: True
-  mp_comm_recompute: True</code></pre>
+  parallel_optimizer_comm_recompute: False
+  mp_comm_recompute: False</code></pre>
     </td>
     <td>
       <pre><code class="language-yaml">context:
