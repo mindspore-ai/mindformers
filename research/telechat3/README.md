@@ -112,6 +112,12 @@ output_path: 生成数据集的路径
 
 开发者可以下载获取官方权重后，通过下面提供的**权重转换脚本**，将官方权重转换为MindSpore权重。
 
+权重转换脚本依赖torch，运行前请执行如下指令安装torch：
+
+```shell
+pip install torch>=2.10.0
+```
+
 torch模型权重及词模型下载链接：
 
 - [TeleChat3-36b](https://modelscope.cn/models/TeleAI/TeleChat3-36B-Thinking/files)
@@ -119,9 +125,9 @@ torch模型权重及词模型下载链接：
 下载完成后，运行如下转换脚本，将全量微调的权重转换为完整的ckpt权重。
 
 ```shell
-python mindformers/research/telechat3/convert_weight_torch_to_ms.py \
+python mindformers/research/telechat3/convert_weight.py \
 --torch_path TORCH_CKPT_DIR \
---mindspore_path {path} \
+--mindspore_path {path}
 ```
 
 ```text
