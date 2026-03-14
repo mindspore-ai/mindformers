@@ -24,6 +24,8 @@ from mindformers.parallel_core.inference.quantization import QuantizationConfig
 from mindformers.parallel_core.transformer_config import TransformerConfig
 from mindformers.parallel_core.utils.spec_utils import ModuleSpec, build_module
 from mindformers.parallel_core.inference.tensor_parallel.layers import ColumnParallelLinear
+from mindformers.parallel_core.inference.tensor_parallel.batch_invariant_layers import \
+    BatchInvariantColumnParallelLinear
 from mindformers.parallel_core.inference.base_models.common.embeddings.language_model_embedding import \
     LanguageModelEmbedding
 from mindformers.parallel_core.inference.transformer.transformer_block import TransformerBlock
@@ -36,6 +38,7 @@ from mindformers.parallel_core.inference.parallel_state import is_pipeline_last_
 from mindformers.parallel_core.process_group_config import get_model_comm_pgs
 from mindformers.tools.logger import logger
 from mindformers.tools.utils import is_pynative
+from mindformers.parallel_core.inference.utils import is_batch_invariant
 
 
 class GPTModel(nn.Cell):
@@ -184,7 +187,17 @@ class GPTModel(nn.Cell):
                                         model_comm_pgs=model_comm_pgs, quant_config=quant_config)
 
         # Output
-        if self.post_process:
+        if self.post_process and is_batch_invariant():
+            self.output_layer = BatchInvariantColumnParallelLinear(
+                self.config.hidden_size,
+                self.vocab_size,
+                config=self.config,
+                bias=False,
+                gather_output=self.parallel_output,
+                compute_dtype=self.config.compute_dtype,
+                tp_group=model_comm_pgs.tp,
+            )
+        elif self.post_process:
             self.output_layer = ColumnParallelLinear(
                 self.config.hidden_size,
                 self.vocab_size,
@@ -249,6 +262,7 @@ class GPTModel(nn.Cell):
         })
         return model_inputs
 
+    # pylint: disable=W0613
     def construct(self, input_ids, hidden_states=None, positions=None, batch_valid_length=None,
                   context_lens_tensor=None, q_seq_lens=None, block_tables=None, slot_mapping=None,
                   attention_mask=None, attn_metadata=None, attn_padding_idx=None, attn_unpadding_idx=None,
