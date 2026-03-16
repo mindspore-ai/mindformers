@@ -1017,10 +1017,7 @@ class TransformerConfig:
     ulysses_degree_in_cp: int = field(
         default=1,
         metadata={
-            "description": "The number of parallel slices of the Ulysses sequence. For configuration method of "
-                           "distributed parallel parameters, refer to the contents of the Parallel Configuration "
-                           "section in MindSpore Transformers configuration description: ("
-                           "https://www.mindspore.cn/mindformers/docs/zh-CN/master/feature/configuration.html)",
+            "description": "The number of parallel slices of the Ulysses sequence.",
             "usage": ParamUsage.COMMON,
             "source": ParamSource.MF,
             "mode": ParamMode.COMMON
