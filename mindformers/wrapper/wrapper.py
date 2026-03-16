@@ -96,24 +96,6 @@ def get_aux_loss_scale(moe_aux_loss_coeff, moe_layer_freq, num_layers):
     return num_moe_layers * moe_aux_loss_coeff
 
 
-def _reset_accu_gbs_fi(network):
-    """
-    Reset the accumulated FI tensor of each MoE router back to zeros.
-
-    This method traverses down through nested `network` objects until it reaches
-    the backbone. For each layer that contains a `router` module, its
-    `fi_accu` parameter is reassigned to a zero tensor.
-
-    Args:
-        network (nn.Cell): Training network backbone containing decoder layers.
-    """
-    model = network.get_gpt_model()
-    if hasattr(model, "reset_accu_gbs_fi"):
-        model.reset_accu_gbs_fi()
-    else:
-        raise NotImplementedError(f"network: {network} does not Implemented function `reset_accu_gbs_fi`")
-
-
 def _check_network_with_micro_size(cls_name, network, micro_size):
     """
     Check the validity of network and micro_size parameters for cls_name
@@ -576,14 +558,6 @@ class GradAccumulationCellWithMultiOutputs(nn.Cell):
             self.add_list.append(self.add)
         self._get_attr_from_cell(network)
 
-        # reset for gbs_aux_loss
-        real_network = get_real_models(self.network)
-        self.use_legacy = is_legacy_model()
-        transformer_config = real_network.get_gpt_transformer_config() if not self.use_legacy else None
-        self.is_reset_accu_gbs_fi = bool(
-            not self.use_legacy and
-            transformer_config.moe_router_load_balancing_type == "gbs_aux_loss"
-        )
 
     def construct(self, *inputs):
         """Construct function for pipeline with multiple outputs."""
@@ -632,9 +606,6 @@ class GradAccumulationCellWithMultiOutputs(nn.Cell):
                     ret5 = self.add_list[i](ret5, output[4])
                 else:
                     ret5 = output[4]
-
-        if self.is_reset_accu_gbs_fi:
-            _reset_accu_gbs_fi(get_real_models(self.network))
 
         if not isinstance(output, tuple):
             return ret
@@ -751,14 +722,6 @@ class PipelineCellWithMultiOutputs(nn.Cell):
             self.add_list.append(self.add)
         self._get_attr_from_cell(network)
 
-        # reset for gbs_aux_loss
-        self.use_legacy = is_legacy_model()
-        real_network = get_real_models(self.network)
-        transformer_config = real_network.get_gpt_transformer_config() if not self.use_legacy else None
-        self.is_reset_accu_gbs_fi = bool(
-            not self.use_legacy and
-            transformer_config.moe_router_load_balancing_type == "gbs_aux_loss"
-        )
 
     def construct(self, *inputs):
         """
@@ -815,8 +778,6 @@ class PipelineCellWithMultiOutputs(nn.Cell):
                 else:
                     ret5 = output[4]
 
-        if self.is_reset_accu_gbs_fi:
-            _reset_accu_gbs_fi(get_real_models(self.network))
 
         if not isinstance(output, tuple):
             return ret

@@ -489,6 +489,7 @@ class MFLossMonitor(Callback):
             self._calculate_flops_legacy(cb_params)
         else:
             self._calculate_flops_mcore(cb_params)
+            self._reset_accu_gbs_fi(cb_params)
 
         origin_epochs = self.origin_epochs
 
@@ -526,6 +527,17 @@ class MFLossMonitor(Callback):
 
         if auto_parallel:
             set_auto_parallel_context(parallel_mode=parallel_mode, full_batch=full_batch)
+
+    def _reset_accu_gbs_fi(self, cb_params):
+        """Reset the accumulated FI tensor of each MoE router back to zeros."""
+        network = get_real_models(cb_params.train_network)
+        transformer_config = network.get_gpt_transformer_config()
+        if transformer_config.moe_router_load_balancing_type == "gbs_aux_loss":
+            model = network.get_gpt_model()
+            if hasattr(model, "reset_accu_gbs_fi"):
+                model.reset_accu_gbs_fi()
+            else:
+                raise NotImplementedError(f"network: {network} does not Implemented function 'reset_accu_gbs_fi'")
 
     def _fix_loss_for_parallel(self, loss, print_warning=True):
         """Fix loss value in pipeline or double parallel mode."""

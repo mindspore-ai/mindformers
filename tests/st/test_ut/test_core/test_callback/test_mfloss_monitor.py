@@ -1084,6 +1084,7 @@ class TestMFLossMonitorMcoreFlops:
                 self.qk_pos_emb_head_dim = 64
                 self.kv_lora_rank = 512
                 self.v_head_dim = 128
+                self.moe_router_load_balancing_type = "gbs_aux_loss"
 
         mock_config = MockConfig()
 
@@ -1123,7 +1124,8 @@ class TestMFLossMonitorMcoreFlops:
             f"FLOPs value {monitor.full_model_flops} does not match expected {expected_flops}"
 
         # Verify get_gpt_transformer_config was called
-        mock_network.get_gpt_transformer_config.assert_called_once()
+        expected_calls = 2
+        assert mock_network.get_gpt_transformer_config.call_count == expected_calls
 
     @pytest.mark.level0
     @pytest.mark.platform_x86_cpu
@@ -1169,7 +1171,7 @@ class TestMFLossMonitorMcoreFlops:
                 self.moe_ffn_hidden_size = None
                 self.moe_shared_expert_intermediate_size = None
                 self.hybrid_layer_pattern = "M*M*"
-
+                self.moe_router_load_balancing_type = "gbs_aux_loss"
                 self.mtp_num_layers = 0
 
         mock_config = MockConfig()
@@ -1207,7 +1209,8 @@ class TestMFLossMonitorMcoreFlops:
         assert monitor.full_model_flops == expected_flops, \
             f"FLOPs value {monitor.full_model_flops} does not match expected {expected_flops}"
 
-        mock_network.get_gpt_transformer_config.assert_called_once()
+        expected_calls = 2
+        assert mock_network.get_gpt_transformer_config.call_count == expected_calls
 
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])
