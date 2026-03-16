@@ -30,7 +30,7 @@ from typing import (
 from pathlib import Path
 
 import yaml
-
+from mindformers.tools.check_rules import check_yaml_depth_before_loading
 from .utils import check_type
 
 
@@ -61,6 +61,8 @@ class BaseConfig:
 
         # Load YAML content and parse into dictionary
         with open(path, "r", encoding="utf-8") as f:
+            check_yaml_depth_before_loading(f)
+            f.seek(0)
             data = yaml.safe_load(f)
 
         return cls.from_dict(data)
