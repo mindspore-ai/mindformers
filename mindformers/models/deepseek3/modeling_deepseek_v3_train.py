@@ -15,6 +15,7 @@
 """Deepseek-V3 Model for training."""
 from mindspore import Tensor
 
+from mindformers.models.utils import adjust_dsa_for_pipeline
 from mindformers.models.deepseek3.utils import DeepseekV3PreTrainedModel
 from mindformers.parallel_core.training_graph.base_models.gpt.gpt_model import GPTModel
 from mindformers.parallel_core.training_graph.base_models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec, \
@@ -61,12 +62,13 @@ class TrainingDeepseekV3ForCausalLM(TrainModelMixin, DeepseekV3PreTrainedModel):
             logger.warning("`dsa_indexer_use_sparse_loss` is set to False, so Dense Warm-up Stage of DeepSeek-V3.2 "
                            "will be applied. Freeze all parameters except indexer.")
             self.freeze()
+            if transformer_config.pipeline_model_parallel_size > 1:
+                adjust_dsa_for_pipeline(self.model)
 
     def freeze(self):
-        for cell_name, cell in self.model.cells_and_names():
-            for param in cell.trainable_params():
-                if "indexer" not in param.name:
-                    param.requires_grad = False
+        for param in self.model.trainable_params():
+            if "indexer" not in param.name:
+                param.requires_grad = False
 
     def construct(
             self,

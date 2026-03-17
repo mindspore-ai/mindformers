@@ -82,6 +82,9 @@ def get_model_parameters(cell: nn.Cell, only_trainable=True):
 def is_current_pipeline_stage(layer: nn.Cell, current_pipeline_stage):
     """judge the layer belongs to the current pipeline state."""
     if not hasattr(layer, "pipeline_stage"):
+        for cell in layer.cells():
+            if hasattr(cell, "pipeline_stage"):
+                return current_pipeline_stage == cell.pipeline_stage
         raise ValueError(f"You should set the pipeline_stage for the {type(layer)}")
     if current_pipeline_stage == layer.pipeline_stage:
         return True
@@ -431,6 +434,7 @@ def _validate_pattern(pattern: str, pattern_name: str, allow_pipe: bool = False)
 
 
 def num_floating_point_operations(args, batch_size):
+    """Calculate FLOPs"""
     def mlp_layer_flops(batch_size, seq_len, hidden_size, expansion=4.0, swiglu=False):
         """Calculate FLOPs for an MLP layer."""
         scale_factor = 3.0 / 2.0 if swiglu else 1.0
@@ -825,3 +829,69 @@ def num_floating_point_operations(args, batch_size):
         )
     # Compute standard Transformer model FLOPs.
     return transformer_flops()
+
+
+def adjust_dsa_for_pipeline(model):
+    """Temporarily adjust method for DSA pipeline parallel"""
+    ms_runtime_conf = os.getenv("MS_DEV_RUNTIME_CONF", "").replace(";", ",").split(",")
+    if "inline:False" not in ms_runtime_conf and "inline:false" not in ms_runtime_conf:
+        raise ValueError("When DSA is applied in pipeline parallel with dsa_indexer_use_sparse_loss = False, "
+                         "'inline:False' will be explict set in environment variable `MS_DEV_RUNTIME_CONF`.")
+    class AddCell(nn.Cell):
+        """replace the original AddExt operator with a functionally equivalent cell."""
+        def __init__(self):
+            super().__init__()
+            self.add = ms.ops.auto_generate.AddExt()
+        def construct(self, a, b):
+            return self.add(a, b)
+        def shard(self, in_strategy, out_strategy=None):
+            self.add.shard(in_strategy, out_strategy)
+
+    class CastCell(nn.Cell):
+        """replace the original Cast operator with a functionally equivalent cell."""
+        def __init__(self):
+            super().__init__()
+            self.cast = ms.ops.auto_generate.Cast()
+        def construct(self, a, b):
+            return self.cast(a, b)
+
+    def update_pipeline_attr(cell, layer):
+        """update cell.pipeline_stage and cell.pipeline_segment"""
+        cell.pipeline_stage = layer.pipeline_stage
+        if hasattr(layer, "_pipeline_segment"):
+            cell.pipeline_segment = layer.pipeline_segment
+
+    def del_pipeline_attr(cell):
+        """delete cell.pipeline_stage and cell.pipeline_segment"""
+        delattr(cell, "_pipeline_stage")
+        if hasattr(cell, "_pipeline_segment"):
+            delattr(cell, "_pipeline_segment")
+
+    def process_transformer_layers(module, is_mtp=False):
+        """reassign pipeline stage and freeze tag to cells of transformer_layers"""
+        module.add_flags_recursive(freeze=True)
+        for layer in module.layers:
+            for name, cell in layer.cells_and_names():
+                update_pipeline_attr(cell, layer)
+                if "core_attention" in name:
+                    cell.add_flags(freeze=False)
+            if is_mtp:
+                layer.add_flags(freeze=False)
+                update_pipeline_attr(layer.transformer_layer, layer)
+                del_pipeline_attr(layer)
+                layer = layer.transformer_layer
+            layer.add = AddCell().add_flags(freeze=True)
+            layer.cast = CastCell().add_flags(freeze=True)
+            update_pipeline_attr(layer.add, layer)
+            update_pipeline_attr(layer.cast, layer)
+            layer.shard(layer.config)
+            del_pipeline_attr(layer)
+            layer.add_flags(freeze=False)
+            layer.self_attention.add_flags(freeze=False)
+        module.add_flags(freeze=False)
+        module.layers.add_flags(freeze=False)
+
+    model.add_flags_recursive(freeze=True)
+    process_transformer_layers(model.decoder)
+    if hasattr(model, 'mtp'):
+        process_transformer_layers(model.mtp, True)

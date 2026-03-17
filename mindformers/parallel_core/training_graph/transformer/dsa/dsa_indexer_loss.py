@@ -77,6 +77,7 @@ class DSAIndexerLoss(nn.Cell):
         self.transpose_k = aclnn_ops.Transpose()
         self.bmm = aclnn_ops.BatchMatMul()
         self.mul_scalar1 = aclnn_ops.Mul()
+        self.slice = aclnn_ops.SliceExt().add_prim_attr("self_define_shard", True)
         self.equal = aclnn_ops.Equal()
         self.tile = aclnn_ops.Tile()
         self.gather = aclnn_ops.GatherD().add_prim_attr("self_define_shard", True)
@@ -122,7 +123,10 @@ class DSAIndexerLoss(nn.Cell):
             # when use sparse loss, the input `index_scores` is already in topk format
             # topk_indices: [b, 1, sq, sk] -> [b, n, sq, sk]
             # attention_score: [b, n, sq, sk] -> [b, n, sq, topk] -> [b, sq, topk]
-            mask = self.equal(topk_indices, self.ignore)
+            if self.is_tnd:
+                mask = self.equal(topk_indices, self.ignore)
+            else:
+                mask = self.slice(mask, 3, 0, self.sparse_count, 1)
             topk_indices = self.tile(topk_indices, (1, self.num_attention_heads, 1, 1))
             attention_scores = self.gather(attention_scores, -1, topk_indices)
 
@@ -192,6 +196,7 @@ class DSAIndexerLoss(nn.Cell):
         self.tile.shard((topk_shard,), (attn_shard,))
         self.gather.shard((attn_shard, layout(), attn_shard), (attn_shard,))
         self.equal.shard((mask_shard, scalar_shard))
+        self.slice.shard((mask_shard,), (mask_shard,))
         self.add.shard((attn_shard, mask_shard))
         self.add_scalar.shard((pooled_attn_shard, scalar_shard))
         self.softmax1.shard((attn_shard,))
