@@ -149,6 +149,12 @@ pad_token: padding时补齐的token，默认值：<_pad>
 
 MindFormers提供已经转换完成的预训练权重、词表文件用于预训练、微调和推理，开发者可以下载获取官方权重后，通过下面提供的**权重转换脚本**，将官方权重转换为MindSpore权重；或直接使用MindFormers提供的**已转换权重**
 
+权重转换脚本依赖torch，运行前请执行如下指令安装torch：
+
+```shell
+pip install torch>=2.10.0
+```
+
 1.torch模型权重及词模型下载链接：
 
 - [TeleChat2-7B](https://modelscope.cn/models/TeleAI/TeleChat2-7B-32K)
