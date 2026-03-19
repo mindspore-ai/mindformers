@@ -18,6 +18,19 @@ mindformers.models.PretrainedConfig
     返回：
         PretrainedConfig类实例。
 
+    .. py:method:: convert_to_transformer_config(is_mla_model)
+
+        从 PretrainedConfig 转换为 TransformerConfig。
+
+        参数：
+            - **is_mla_model** (bool, 可选) - 是否是MLA模型, 默认值： ``False``。
+
+        返回：
+            TransformerConfig, 从 PretrainedConfig 转换后的配置对象。
+
+        异常：
+            - **NotImplementedError** - 继承自 PretrainedConfig 的模型配置类未实现该方法。
+
     .. py:method:: from_dict(config_dict, **kwargs)
         :classmethod:
 
@@ -39,19 +52,6 @@ mindformers.models.PretrainedConfig
 
         返回：
             PretrainedConfig, 从该 JSON 文件实例化的配置对象。
-
-    .. py:method:: convert_to_transformer_config(is_mla_model)
-
-        从 PretrainedConfig 转换为 TransformerConfig。
-
-        参数：
-            - **is_mla_model** (bool, 可选) - 是否是MLA模型, 默认值： ``False``。
-
-        返回：
-            TransformerConfig, 从 PretrainedConfig 转换后的配置对象。
-
-        异常：
-            - **NotImplementedError** - 继承自 PretrainedConfig 的模型配置类未实现该方法。
 
     .. py:method:: from_pretrained(yaml_name_or_path, **kwargs)
         :classmethod:
