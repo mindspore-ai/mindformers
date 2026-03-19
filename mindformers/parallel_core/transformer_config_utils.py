@@ -427,7 +427,13 @@ COMMON_CONFIG_MAPPING = {
     "coeff": "coeff",
 
     # Pet
-    "pet_config": "pet_config"
+    "pet_config": "pet_config",
+
+    # Manifold-Constrained Hyper-Connections (mHC)
+    "enable_hyper_connections": "enable_hyper_connections",
+    "num_residual_streams": "num_residual_streams",
+    "mhc_sinkhorn_iterations": "mhc_sinkhorn_iterations",
+    "mhc_init_gating_factor": "mhc_init_gating_factor",
 }
 
 

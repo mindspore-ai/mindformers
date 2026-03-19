@@ -16,8 +16,9 @@
 from dataclasses import dataclass
 from typing import Union
 import mindspore as ms
-from mindspore.ops import auto_generate as aclnn_ops
 from mindspore import nn
+from mindspore.ops import auto_generate as aclnn_ops
+from mindspore.ops import operations as P
 from mindspore.context import ParallelMode
 from mindspore.parallel._utils import _get_parallel_mode, _is_sharding_propagation
 from mindformers.parallel_core.utils.spec_utils import ModuleSpec, build_module
@@ -25,6 +26,10 @@ from mindformers.parallel_core.transformer_config import TransformerConfig
 from mindformers.parallel_core.training_graph.transformer.dropout import Dropout
 from mindformers.parallel_core.training_graph.transformer.identity_op import IdentityOp
 from mindformers.parallel_core.training_graph.device_matrix import layout
+from mindformers.tools.utils import get_predict_run_mode
+from mindformers.parallel_core.training_graph.transformer.norm import get_norm_cls
+from mindformers.parallel_core.training_graph.transformer.hyper_connection import HyperConnectionModule
+
 
 
 @dataclass
@@ -85,6 +90,8 @@ class TransformerLayer(nn.Cell, BaseTransformerLayer):
                  submodules: TransformerLayerSubmodules,
                  layer_number: int = 1,
                  hidden_dropout: float = None,
+                 hc=None,
+                 rate=None,
                  ):
         super().__init__()
         self.config = config
@@ -96,7 +103,6 @@ class TransformerLayer(nn.Cell, BaseTransformerLayer):
         self.fp32_residual_connection = config.fp32_residual_connection
         self.compute_dtype = config.compute_dtype
         self.use_mla = config.multi_latent_attention
-
         self.input_layernorm = build_module(
             submodules.input_layernorm,
             config=config,
@@ -165,6 +171,55 @@ class TransformerLayer(nn.Cell, BaseTransformerLayer):
             self.sharding_propagation(config)
         else:
             self.shard(config)
+        
+        self.hc = hc
+        if self.hc:
+            self.rate = rate
+            self.reshape = P.Reshape()
+            self.mhc_dtype = self.compute_dtype
+            self.hidden_size = config.hidden_size
+            sinkhorn_iters = config.mhc_sinkhorn_iterations
+            init_gating_factor = config.mhc_init_gating_factor
+
+            # One shared RMSNorm per HC block (attn / ffn).
+            # A single norm call now covers pre + post + res — 3× fewer forward
+            # passes than the previous design with three separate PrePostHC/ResHC.
+            self.shared_rms_norm = build_module(
+                get_norm_cls(True),
+                config=config,
+                dim=config.hidden_size * self.rate,
+                eps=config.layernorm_epsilon
+            )
+            self.ffn_shared_rms_norm = build_module(
+                get_norm_cls(True),
+                config=config,
+                dim=config.hidden_size * self.rate,
+                eps=config.layernorm_epsilon
+            )
+            self.shared_rms_norm.shard((layout("tp", "dp", "None"),))
+            self.ffn_shared_rms_norm.shard((layout("tp", "dp", "None"),))
+
+            # Two unified modules replace the previous six (pre/post/res × attn/ffn).
+            self.attn_hc = HyperConnectionModule(
+                rate=self.rate,
+                hidden_size=self.hidden_size,
+                config=config,
+                sinkhorn_iters=sinkhorn_iters,
+                init_gating_factor=init_gating_factor,
+                dtype=self.mhc_dtype,
+                shared_rms_norm=self.shared_rms_norm,
+                expand_post=2.0,
+            )
+            self.ffn_hc = HyperConnectionModule(
+                rate=self.rate,
+                hidden_size=self.hidden_size,
+                config=config,
+                sinkhorn_iters=sinkhorn_iters,
+                init_gating_factor=init_gating_factor,
+                dtype=self.mhc_dtype,
+                shared_rms_norm=self.ffn_shared_rms_norm,
+                expand_post=2.0,
+            )
 
     def construct(
             self,
@@ -200,10 +255,16 @@ class TransformerLayer(nn.Cell, BaseTransformerLayer):
                 context (Tensor): Updated context tensor if cross-attention is used,
                 otherwise None.
         """
-        # context/context_mask are only used in cross_attention modules, unused in GPTModel.
         if context_mask:
             raise NotImplementedError("context_mask is not supported for now.")
 
+        if self.hc:
+            return self._construct_hc(
+                hidden_states, attention_mask, context, rotary_pos_emb,
+                prefix_keys_values, extra_loss, actual_seq_len,
+                sharded_key, sharded_value, attention_loss)
+
+        # ── Original (non-HC) path — kept unchanged ──────────────────────────
         # Layer norm at the beginning
         input_layernorm_output = self.input_layernorm(hidden_states)
 
@@ -321,6 +382,70 @@ class TransformerLayer(nn.Cell, BaseTransformerLayer):
         # 'return context' is useless, this param may be deprecated later.
         return output, context, extra_loss, attention_loss
 
+    def _construct_hc(
+            self, hidden_states, attention_mask, context, rotary_pos_emb,
+            prefix_keys_values, extra_loss, actual_seq_len,
+            sharded_key, sharded_value, attention_loss):  # pylint: disable=unused-argument
+        """mHC forward path (Megatron-style: hc → norm → sublayer → dropout → output_cell)."""
+        # ── Attention block ───────────────────────────────────────────────────
+        streams_before_attn = hidden_states                        # [s, b, n*H]
+        aggregated_attn, h_res_attn, h_post_attn = self.attn_hc(hidden_states)
+
+        input_layernorm_output = self.input_layernorm(aggregated_attn)
+
+        # Self-Attention
+        if self.use_mla:
+            attention_output_with_bias, attention_loss = self.self_attention(
+                input_layernorm_output,
+                attention_mask=attention_mask,
+                rotary_pos_emb=rotary_pos_emb,
+                prefix_keys_values=prefix_keys_values,
+                actual_seq_len=actual_seq_len,
+                attention_loss=attention_loss
+            )
+        else:
+            attention_output_with_bias = self.self_attention(
+                input_layernorm_output,
+                attention_mask=attention_mask,
+                rotary_pos_emb=rotary_pos_emb,
+                prefix_keys_values=prefix_keys_values,
+                actual_seq_len=actual_seq_len,
+            )
+
+        if isinstance(attention_output_with_bias, tuple):
+            attention_output, self_attention_bias = attention_output_with_bias
+        else:
+            attention_output = attention_output_with_bias
+            self_attention_bias = None
+
+        if self_attention_bias is not None:
+            attention_output = self.add_bias(attention_output, self_attention_bias)
+
+        dropout_output = self.hidden_states_dropout(attention_output)
+        hidden_states = self.attn_hc.output_cell(
+            h_res_attn, h_post_attn, streams_before_attn, dropout_output)
+
+        # ── FFN block ─────────────────────────────────────────────────────────
+        streams_before_ffn = hidden_states                         # [s, b, n*H]
+        aggregated_ffn, h_res_ffn, h_post_ffn = self.ffn_hc(hidden_states)
+
+        pre_mlp_layernorm_output = self.pre_mlp_layernorm(aggregated_ffn)
+
+        mlp_output, mlp_output_bias, extra_loss = self.mlp(
+            pre_mlp_layernorm_output,
+            extra_loss=extra_loss
+        )
+
+        if mlp_output_bias is not None:
+            mlp_output = self.add_bias(mlp_output, mlp_output_bias)
+
+        dropout_output = self.hidden_states_dropout(mlp_output)
+        output = self.ffn_hc.output_cell(
+            h_res_ffn, h_post_ffn, streams_before_ffn, dropout_output)
+        output = self.cast(output, self.compute_dtype)
+
+        return output, context, extra_loss, attention_loss
+
     def shard(self, config: TransformerConfig):
         """ shard function of mlp block. """
         dp = config.data_parallel_size if config.data_parallel_size is not None else 1
@@ -339,6 +464,8 @@ class TransformerLayer(nn.Cell, BaseTransformerLayer):
             self.add.shard(((1, dp, 1), (1, dp, 1)))
             self.hidden_states_dropout.shard((1, dp, 1))
             self.add_bias.shard(((1, dp, 1), (1,)))
+        
+
 
     def sharding_propagation(self, config: TransformerConfig):
         pass
