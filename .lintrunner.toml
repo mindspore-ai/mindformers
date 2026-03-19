@@ -1,0 +1,21 @@
+[[linter]]
+name = "pylint"
+code = "PYLINT"
+include_patterns = ["**/*.py"]
+exclude_patterns = [
+    ".git/**",
+    "**/*.pyi",
+]
+command = [
+    'bash',
+    '-c',
+    'python -m pylint --rcfile=toolkit/linter/adapters/pylintrc --score=no --msg-template="{path}:{line}:{column}: {msg_id}: {msg}" $(cat {{PATHSFILE}})',
+]
+
+init_command = [
+    "python",
+    "toolkit/linter/adapters/pip_init.py",
+    "--dry-run={{DRYRUN}}",
+    "pylint==3.2.6",
+]
+is_formatter = true

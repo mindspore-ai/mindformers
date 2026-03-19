@@ -4167,7 +4167,7 @@
         "signature": "(self, query_layer, key_layer, value_layer, attention_mask)"
     },
     "mindformers.parallel_core.inference.transformer.enums.AttnMaskType": {
-        "signature": "(value, names=None, *, module=None, qualname=None, type=None, start=1)"
+        "signature": "(value, names=None, *, module=None, qualname=None, type=None, start=1, boundary=None)"
     },
     "mindformers.parallel_core.inference.transformer.flash_attention.FlashAttention": {
         "signature": "(head_num, head_dim=None, kv_head_num=None, keep_prob=1.0, scale_value=1.0, pre_tokens=2147483647, next_tokens=2147483647, sparse_mode=0, input_layout='TH', pa_kv_head_num=None, pa_mla_v_dim=0)"
@@ -4698,7 +4698,7 @@
         "signature": "(self, strategy)"
     },
     "mindformers.parallel_core.training_graph.transformer.enums.AttnMaskType": {
-        "signature": "(value, names=None, *, module=None, qualname=None, type=None, start=1)"
+        "signature": "(value, names=None, *, module=None, qualname=None, type=None, start=1, boundary=None)"
     },
     "mindformers.parallel_core.training_graph.transformer.flash_attention.FlashAttention": {
         "signature": "(config: mindformers.parallel_core.transformer_config.MLATransformerConfig, layer_number, attn_mask_type: mindformers.parallel_core.training_graph.transformer.enums.AttnMaskType = None, attention_type: str = None, attention_dropout: float = None, softmax_scale: float = None, cp_comm_type: str = None)"
