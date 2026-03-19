@@ -298,9 +298,11 @@ class PretrainedConfig(PushToHubMixin):
 
         Returns:
             TransformerConfig or MLATransformerConfig after conversion.
+
         Raises:
             NotImplementedError: Raised when ConfigConverter subclass has not implemented this method.
         """
+        _ = is_mla_model
         raise NotImplementedError(
             f"{self.__class__.__name__} has not implemented convert_to_transformer_config."
             "Please implement this method in the Config class of the model and create ConfigConverter for this "
