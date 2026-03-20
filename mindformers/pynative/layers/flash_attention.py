@@ -160,7 +160,7 @@ class FlashAttention(Cell):
         else:
             query = self.reshape(query, (q_seq_len, bsz, -1))
             key = self.reshape(key, (kv_seq_len, bsz, -1))
-            value = self.reshape(key, (kv_seq_len, bsz, -1))
+            value = self.reshape(value, (kv_seq_len, bsz, -1))
         if self.use_alibi_mask:
             alibi_mask = self.alibi_rescale_mul(alibi_mask, self.cast(self.alibi_rescale_factor, alibi_mask.dtype))
 
