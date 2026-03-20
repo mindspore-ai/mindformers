@@ -208,7 +208,7 @@ class FlashAttention(Cell):
             return bool(window_attn_skip_freq[layer_number])
         return False
 
-    def _generate_flash_attention_strategy(self, dp, tp, cp, cp_ds=1):
+    def _generate_flash_attention_strategy(self, tp, cp, cp_ds=1):
         """get FA generate strategies"""
         # ulysses fa strategy
         cp_co = cp // cp_ds
@@ -325,7 +325,7 @@ class FlashAttention(Cell):
         else:
             query = self.reshape(query, (q_seq_len, bsz, -1))
             key = self.reshape(key, (kv_seq_len, bsz, -1))
-            value = self.reshape(key, (kv_seq_len, bsz, -1))
+            value = self.reshape(value, (kv_seq_len, bsz, -1))
         if self.enable_dropout:
             drop_mask_bits = self.reshape(
                 self.drop_gen_mask((bsz, self.head_num, q_seq_len, kv_seq_len), self.keep_prob_tensor),
@@ -381,7 +381,7 @@ class FlashAttention(Cell):
         self.merge_head_transpose.shard((layout("dp", "tp", "cp", "None"),))
         self.fa_out_transpose.shard((layout("dp", "cp", "tp"),))
 
-        fa_strategies = self._generate_flash_attention_strategy(dp, tp, cp)
+        fa_strategies = self._generate_flash_attention_strategy(tp, cp)
         self.flash_attention.shard(fa_strategies)
 
         if self.use_alibi_mask:
