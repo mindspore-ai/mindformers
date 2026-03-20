@@ -18,7 +18,7 @@ mindformers.models.PretrainedConfig
     返回：
         PretrainedConfig类实例。
 
-    .. py:method:: convert_to_transformer_config(is_mla_model)
+    .. py:method:: convert_to_transformer_config(is_mla_model=False)
 
         从 PretrainedConfig 转换为 TransformerConfig。
 
