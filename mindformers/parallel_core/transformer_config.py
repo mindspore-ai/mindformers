@@ -5,7 +5,7 @@
 
 import enum
 import os
-import re
+import regex
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional, Tuple, Union
 
@@ -89,6 +89,8 @@ class TransformerConfig:
     ########################################################
     # General Configuration Items For MindSpore Transformers
     ########################################################
+
+    MAX_PATTERN_LEN = 256
 
     batch_size: int = field(
         default=1,
@@ -2380,9 +2382,32 @@ class TransformerConfig:
                     raise ValueError(f"Rule {idx}: 'init_method_std' must be >= 0, but got {init_std}")
 
                 # Compile the regex pattern and replace the string in-place
-                compiled_pattern = re.compile(target)
+                self.validate_rule_target_pattern(target, idx)
+                compiled_pattern = regex.compile(target)
                 rule["target"] = compiled_pattern
 
+    def validate_rule_target_pattern(self, pattern, idx):
+        """Validate regex pattern to reduce ReDoS risk from untrusted rules."""
+        if len(pattern) > self.MAX_PATTERN_LEN:
+            raise ValueError(
+                f"Rule {idx}: 'target' is too long ({len(pattern)}), max allowed is {self.MAX_PATTERN_LEN}."
+            )
+        unsafe_tokens = ("(?=", "(?!", "(?<=", "(?<!", "(?>", "\\g<")
+        if any(token in pattern for token in unsafe_tokens):
+            raise ValueError(
+                f"Rule {idx}: 'target' contains unsupported high-risk regex syntax."
+            )
+        # Reject nested quantifier patterns like '(a+)+' or '(a{1,3})*' prone to catastrophic backtracking.
+        nested_quantifier_pattern = (
+            r"\((?:[^()\\]|\\.)*"
+            r"(?:\*|\+|\{\d+(?:,\d*)?\})"
+            r"(?:[^()\\]|\\.)*\)\s*"
+            r"(?:\*|\+|\{\d+(?:,\d*)?\})"
+        )
+        if regex.search(nested_quantifier_pattern, pattern):
+            raise ValueError(
+                f"Rule {idx}: 'target' contains nested quantifiers and is not allowed."
+            )
 
 @dataclass
 class ModelArchitecture(enum.Enum):

@@ -17,6 +17,7 @@ __all__ = ['GPTModel']
 
 from typing import Literal, Optional, Union
 import numpy as np
+import regex
 
 import mindspore as ms
 from mindspore.communication import get_group_size, get_rank
@@ -62,6 +63,8 @@ from mindformers.tools.logger import logger
 from mindformers.models.utils import get_current_rank_stage, get_model_parameters
 from mindformers.version_control import get_lazy_inline as lazy_inline
 from mindformers.core.optim.muon_utils import make_muon_fns
+
+MAX_REGEX_MATCH_TIME = 2
 
 class PreprocessLabelsAndMasks(nn.Cell):
     """Preprocess input_ids and generate labels and masks.
@@ -419,10 +422,13 @@ class GPTModel(nn.Cell):
             pattern = rule_['target']
             init_method_std = rule_['init_method_std']
             for param_name, param in self.parameters_and_names():
-                if pattern.match(param_name):
-                    weight_shape = list(param.shape)
-                    param.set_data(init_method_normal(init_method_std)(weight_shape))
-                    logger.info(f"{param_name} initial weight will be update, new init_std: {init_method_std}")
+                try:
+                    if pattern.match(param_name, timeout=MAX_REGEX_MATCH_TIME):
+                        weight_shape = list(param.shape)
+                        param.set_data(init_method_normal(init_method_std)(weight_shape))
+                        logger.info(f"{param_name} initial weight will be updated, new init_std: {init_method_std}")
+                except TimeoutError as e:
+                    raise TimeoutError(f"Regex matching for '{param_name}' exceeded {MAX_REGEX_MATCH_TIME} seconds") from e
 
     def construct(
             self,

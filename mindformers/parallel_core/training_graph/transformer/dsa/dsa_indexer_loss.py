@@ -137,7 +137,7 @@ class DSAIndexerLoss(nn.Cell):
         attention_scores = self.softmax1(attention_scores)
         attention_scores = self.presum(attention_scores)
         attention_scores = self.sum1(attention_scores, dim=1)
-        attention_scores = self.div(attention_scores, self.sum2(attention_scores, -1, keepdim=True))
+        attention_scores = self.div(attention_scores, self.sum2(attention_scores, -1, keepdim=True) + self.eps)
 
         # index_scores is already masked. Just do softmax.
         index_scores = self.cast(index_scores, mstype.float32)

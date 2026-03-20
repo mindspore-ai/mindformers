@@ -97,7 +97,7 @@ def regex_match(pattern, string, timeout=1):
         return regex.fullmatch(pattern, string, timeout=timeout)
     except TimeoutError as e:
         logger.warning(f"{e} Please check and fix it.")
-    return []
+    return None
 
 
 class LayerSetting:
@@ -266,13 +266,11 @@ class LayerSetting:
     def _check_layer_swap_recompute_conflict(self, layer_idx, layer_list, op_name="All"):
         "Check if the layer is enable swap and recompute at the same time."
         for swap_layer in layer_list:
-            if isinstance(swap_layer.get(self.layers), bool) and swap_layer.get(self.layers):
+            swap_layer_val = swap_layer.get(self.layers)
+            if (isinstance(swap_layer_val, bool) and swap_layer_val or (not (isinstance(swap_layer_val, bool)) and
+                    layer_idx in swap_layer_val)):
                 logger.warning(f"{op_name} operator in layer {layer_idx} that\
                                is enabled swap do not work! Because it is enabled recompute.")
-            else:
-                if layer_idx in swap_layer.get(self.layers):
-                    logger.warning(f"{op_name} operator in layer {layer_idx} that\
-                                   is enabled swap do not work! Because it is enabled recompute.")
 
     def _check_op_swap_recompute_conflict(self, op_name, layer_list):
         "Check if the operator is enable swap and recompute at the same time."
