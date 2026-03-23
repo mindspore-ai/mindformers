@@ -1441,6 +1441,9 @@ class TransformerConfig:
     mhc_init_gating_factor: float = 0.01
     """Initial value of alpha gating factors for mHC projection."""
 
+    enable_fused_triton_sinkhorn: bool = False
+    """If True, use fused Triton Sinkhorn kernel."""
+
     ####################
     # Initialization
     ####################

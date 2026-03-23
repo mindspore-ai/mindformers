@@ -28,7 +28,7 @@ from mindformers.parallel_core.training_graph.transformer.identity_op import Ide
 from mindformers.parallel_core.training_graph.device_matrix import layout
 from mindformers.tools.utils import get_predict_run_mode
 from mindformers.parallel_core.training_graph.transformer.norm import get_norm_cls
-from mindformers.parallel_core.training_graph.transformer.hyper_connection import HyperConnectionModule
+from mindformers.parallel_core.training_graph.transformer.hyper_connection import HyperConnectionModule, HyperConnectionModuleFused
 
 
 
@@ -200,7 +200,13 @@ class TransformerLayer(nn.Cell, BaseTransformerLayer):
             self.ffn_shared_rms_norm.shard((layout("tp", "dp", "None"),))
 
             # Two unified modules replace the previous six (pre/post/res × attn/ffn).
-            self.attn_hc = HyperConnectionModule(
+            enable_fused_triton_sinkhorn = config.enable_fused_triton_sinkhorn
+            if enable_fused_triton_sinkhorn:
+                HyperConnectionClass = HyperConnectionModuleFused
+            else:
+                HyperConnectionClass = HyperConnectionModule
+
+            self.attn_hc = HyperConnectionClass(
                 rate=self.rate,
                 hidden_size=self.hidden_size,
                 config=config,
@@ -210,7 +216,7 @@ class TransformerLayer(nn.Cell, BaseTransformerLayer):
                 shared_rms_norm=self.shared_rms_norm,
                 expand_post=2.0,
             )
-            self.ffn_hc = HyperConnectionModule(
+            self.ffn_hc = HyperConnectionClass(
                 rate=self.rate,
                 hidden_size=self.hidden_size,
                 config=config,
