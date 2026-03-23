@@ -16,6 +16,7 @@
 from dataclasses import dataclass
 from typing import Union, List, Optional
 from mindspore import nn, Tensor, dtype as mstype
+from mindspore.ops import auto_generate as aclnn_ops
 from mindformers.models.utils import is_current_pipeline_stage, get_current_rank_stage
 from mindformers.parallel_core.training_graph.transformer.adapter import SharedKVAdapter
 from mindformers.parallel_core.training_graph.transformer.utils import LayerSetting
@@ -156,8 +157,18 @@ class TransformerBlock(nn.Cell):
                                           config.offset,
                                           config,
                                           config.virtual_pipeline_model_parallel_size)
+        self.hc = config.enable_hyper_connections
+        self.rate = config.num_residual_streams
+        self.hidden_size = config.hidden_size
+        self.tile_h = aclnn_ops.Tile()
+        self.expand_dims_h = aclnn_ops.ExpandDims()
+        self.reshape_hc_pack   = aclnn_ops.Reshape()
+        self.reshape_hc_unpack = aclnn_ops.Reshape()
+        self.reduce_mean_hc = aclnn_ops.MeanExt()
         for layer_id in range(config.num_layers):
-            layer = build_module(self.submodules.layer_specs[layer_id], config=config, layer_number=layer_id)
+            layer = build_module(self.submodules.layer_specs[layer_id],
+                                 config=config, layer_number=layer_id,
+                                 hc=self.hc, rate=self.rate)
             self.layer_setting(layer, layer_id)
             self.layers.append(layer)
 
@@ -184,6 +195,14 @@ class TransformerBlock(nn.Cell):
         attention_loss = self.init_attention_loss
         sharded_key = None
         sharded_value = None
+        if self.hc:
+            # Replicate H → n streams, then pack to [s, b, n*H]
+            s = hidden_states.shape[0]
+            hidden_states = self.expand_dims_h(hidden_states, 2)             # [s, b, 1, H]
+            hidden_states = self.tile_h(hidden_states, (1, 1, self.rate, 1)) # [s, b, n, H]
+            hidden_states = self.reshape_hc_pack(
+                hidden_states, (s, -1, self.rate * self.hidden_size))        # [s, b, n*H]
+
         for index in range(self.num_layers):
             if self.use_sharedkv and index == self.config.num_encoder_layers:
                 sharded_key, sharded_value = self.adapter(hidden_states, rotary_pos_emb)
@@ -205,7 +224,12 @@ class TransformerBlock(nn.Cell):
                 # has no practical impact on training.
                 # attention_bias is useless by default, only used for T5 in Megatron v0.12.0.
             )
-
+        if self.hc:
+            # Unpack [s, b, n*H] → [s, b, n, H], then mean over streams → [s, b, H]
+            s = hidden_states.shape[0]
+            hidden_states = self.reshape_hc_unpack(
+                hidden_states, (s, -1, self.rate, self.hidden_size))  # [s, b, n, H]
+            hidden_states = self.reduce_mean_hc(hidden_states, 2)     # [s, b, H]
         # final layernorm.
         if self.post_layer_norm:
             hidden_states = self.final_layernorm(hidden_states)
@@ -215,7 +239,13 @@ class TransformerBlock(nn.Cell):
     def shard(self, config: TransformerConfig):
         """ shard function of mlp block. """
         cp = config.context_parallel_size if config.context_parallel_size is not None else 1
-
+        if self.hc:
+            dp = config.data_parallel_size if config.data_parallel_size is not None else 1
+            mp = config.tensor_model_parallel_size \
+                if config.tensor_model_parallel_size is not None else 1
+            self.tile_h.shard(((mp, dp, 1, 1),))
+            self.expand_dims_h.shard(((mp, dp, 1),))
+            self.reduce_mean_hc.shard(((mp, dp, 1, 1),))
         if self.post_layer_norm:
             if config.sequence_parallel or cp > 1:
                 self.final_layernorm.shard(config, in_strategy=(layout("cp_tp", "dp", "None"), layout("None",)))

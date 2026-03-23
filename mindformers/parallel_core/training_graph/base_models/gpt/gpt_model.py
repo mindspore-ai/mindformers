@@ -943,7 +943,25 @@ class GPTModel(nn.Cell):
             "self_attention.linear_kv_up_proj.weight",
             "self_attention.linear_kv_down_proj.weight",
             "eh_proj",
-            "max_logits_val"
+            "max_logits_val",
+            "shared_rms_norm.weight",
+            # mHC (HyperConnectionModule) parameters — not TP-sharded, no op group needed
+            "attn_hc.mapping_weight",
+            "attn_hc.alpha_pre",
+            "attn_hc.alpha_post",
+            "attn_hc.alpha_res",
+            "attn_hc.bias_pre",
+            "attn_hc.bias_post",
+            "attn_hc.bias_res",
+            "attn_hc.rms_norm",       # shared_rms_norm registered under attn_hc.rms_norm alias
+            "ffn_hc.mapping_weight",
+            "ffn_hc.alpha_pre",
+            "ffn_hc.alpha_post",
+            "ffn_hc.alpha_res",
+            "ffn_hc.bias_pre",
+            "ffn_hc.bias_post",
+            "ffn_hc.bias_res",
+            "ffn_hc.rms_norm",        # ffn_shared_rms_norm registered under ffn_hc.rms_norm alias
         ]
 
         sharded_state_dict = self.sharded_state_dict()
@@ -974,6 +992,13 @@ class GPTModel(nn.Cell):
 
             # compute real op size
             sharded_info = sharded_state_dict.get(param.name)
+            if sharded_info is None:
+                op_list.append(1)
+                op_groups.append("")
+                logger.warning(
+                    f"Parameter {param.name}: not found in sharded_state_dict, skipping op group."
+                )
+                continue
             real_op_size, weight_sharded_size = compute_repeat_num_and_model_parallel_size(sharded_info, world_size, pp,
                                                                                            op)
             if real_op_size == 1:

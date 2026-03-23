@@ -1426,6 +1426,22 @@ class TransformerConfig:
     )
 
     ####################
+    # Manifold-Constrained Hyper-Connections (mHC)
+    ####################
+
+    enable_hyper_connections: bool = False
+    """If True, enable Manifold-Constrained Hyper-Connections (mHC) between Attention and FFN layers."""
+
+    num_residual_streams: int = 4
+    """Number of residual streams (tile factor n) used by mHC."""
+
+    mhc_sinkhorn_iterations: int = 20
+    """Number of Sinkhorn-Knopp iterations for mHC residual matrix normalization."""
+
+    mhc_init_gating_factor: float = 0.01
+    """Initial value of alpha gating factors for mHC projection."""
+
+    ####################
     # Initialization
     ####################
 
