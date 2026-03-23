@@ -45,7 +45,7 @@ class BlockSplitReshape(nn.Cell):
 
     def reshape_fn(self, x, shp):
         """Reshape function."""
-        return P.Reshape()(x, shp)
+        return x.reshape(shp)
 
     def reshape_infer_shape(self, *args):
         *prefix, dim = args[0]
@@ -86,7 +86,7 @@ class TensorReshapeTo3D(nn.Cell):
 
     def reshape_fn(self, x, shp):
         """Reshape function."""
-        return P.Reshape()(x, shp)
+        return x.reshape(shp)
 
     def reshape_infer_shape(self, *args):
         tensor_shape = args[0]
@@ -125,7 +125,7 @@ class PrefixDimensionReshape(nn.Cell):
 
     def reshape_fn(self, x, shp):
         """Reshape function."""
-        return P.Reshape()(x, shp)
+        return x.reshape(shp)
 
     def reshape_infer_shape(self, *args):
         tensor_shape = args[0]
@@ -165,7 +165,7 @@ class TensorReshapeTo2D(nn.Cell):
 
     def reshape_fn(self, x, shp):
         """Reshape function."""
-        return P.Reshape()(x, shp)
+        return x.reshape(shp)
 
     def reshape_infer_shape(self, *args):
         tensor_shape = args[0]
@@ -197,6 +197,7 @@ def muon_split(tensor, part_a: int, part_b: int, num_blocks: int):
           - first_part contains all part_a segments of each block.
           - second_part contains all part_b segments of each block.
     """
+    _ = num_blocks
     tensor = tensor.T
     *prefix, _ = tensor.shape
     block = part_a + part_b
@@ -222,6 +223,7 @@ def muon_merge(tensor_a, tensor_b, part_a: int, part_b: int, num_blocks: int):
     Returns:
         A single tensor of the same shape as before muon_split().
     """
+    _ = num_blocks
     tensor_a = tensor_a.T
     tensor_b = tensor_b.T
     *prefix, _ = tensor_a.shape
