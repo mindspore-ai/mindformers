@@ -16,8 +16,11 @@
 # pylint: disable=W0621
 import os
 import json
+from unittest.mock import MagicMock, patch
+
 import pytest
 import numpy as np
+import mindspore as ms
 
 from mindspore import Tensor, Parameter, nn
 from mindspore.common import dtype as mstype
@@ -29,8 +32,14 @@ from mindformers.checkpoint.checkpoint import (
     check_the_param_for_load_ckpt,
     load_parameters,
     get_checkpoint_path,
-    CommonInfo
+    CommonInfo,
+    load_hf_checkpoint,
 )
+from mindformers.checkpoint.converter.template import WeightTemplate
+from mindformers.checkpoint.sharded_tensor import build_sharded_tensor
+from mindformers.models.qwen3.configuration_qwen3 import Qwen3Config
+from mindformers.models.qwen3.utils import Qwen3PreTrainedModel
+from mindformers.parallel_core.transformer_config_utils import convert_to_transformer_config
 from mindformers.checkpoint.utils import (
     get_common_filename,
     get_checkpoint_name,
@@ -66,6 +75,92 @@ def simple_network():
 def optimizer(simple_network):
     """Create an optimizer for testing."""
     return nn.Adam(simple_network.trainable_params(), learning_rate=0.001)
+
+
+def _qwen3_hf_mock_weight_shapes():
+    """HF tensor name -> shape for Qwen3 dense mock (single layer 0)."""
+    h, mi, v = 32, 64, 128
+    hs2 = h // 2
+    return {
+        "model.embed_tokens.weight": (v, h),
+        "model.norm.weight": (h,),
+        "lm_head.weight": (v, h),
+        "model.layers.0.self_attn.q_proj.weight": (h, h),
+        "model.layers.0.self_attn.k_proj.weight": (hs2, h),
+        "model.layers.0.self_attn.v_proj.weight": (hs2, h),
+        "model.layers.0.self_attn.o_proj.weight": (h, h),
+        "model.layers.0.input_layernorm.weight": (h,),
+        "model.layers.0.self_attn.q_norm.weight": (8,),
+        "model.layers.0.self_attn.k_norm.weight": (8,),
+        "model.layers.0.mlp.gate_proj.weight": (mi, h),
+        "model.layers.0.mlp.up_proj.weight": (mi, h),
+        "model.layers.0.mlp.down_proj.weight": (h, mi),
+        "model.layers.0.post_attention_layernorm.weight": (h,),
+    }
+
+
+def _write_qwen3_hf_mock_checkpoint(checkpoint_dir):
+    """
+    Create a HuggingFace-style directory layout with Qwen3 dense tensor names
+    (index.json + single safetensors shard). Shapes are minimal and self-consistent.
+    """
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    st_name = "model-00001-of-00001.safetensors"
+    st_path = os.path.join(checkpoint_dir, st_name)
+
+    shape_map = _qwen3_hf_mock_weight_shapes()
+    weights = {k: np.random.randn(*s).astype(np.float32) for k, s in shape_map.items()}
+
+    to_save = [{"name": name, "data": Tensor(arr, dtype=ms.float32)} for name, arr in weights.items()]
+    ms.save_checkpoint(to_save, st_path, format="safetensors")
+
+    index_path = os.path.join(checkpoint_dir, "model.safetensors.index.json")
+    weight_map = {k: st_name for k in weights}
+    with open(index_path, "w", encoding="utf-8") as f:
+        json.dump({"metadata": {"total_size": 0}, "weight_map": weight_map}, f)
+
+
+def _qwen3_reshard_numpy_dict():
+    """Simulated ReshardLoader output: HF tensor names for Qwen3 dense."""
+    shape_map = _qwen3_hf_mock_weight_shapes()
+    return {k: np.random.randn(*s).astype(np.float32) for k, s in shape_map.items()}
+
+
+def _qwen3_minimal_dst_sharded_metas_layer0():
+    """MF-side ShardedTensor metas (layout=None; tests only need keys + shapes for wiring)."""
+    h = 32
+    mf_shapes = (
+        ("embedding.word_embeddings.weight", (128, h)),
+        ("decoder.final_layernorm.weight", (h,)),
+        ("output_layer.weight", (128, h)),
+        ("decoder.layers.0.self_attention.linear_qkv.weight", (h * 2, h)),
+        ("decoder.layers.0.self_attention.linear_proj.weight", (h, h)),
+        ("decoder.layers.0.input_layernorm.weight", (h,)),
+        ("decoder.layers.0.self_attention.q_layernorm.weight", (8,)),
+        ("decoder.layers.0.self_attention.k_layernorm.weight", (8,)),
+        ("decoder.layers.0.mlp.linear_fc1.weight", (128, h)),
+        ("decoder.layers.0.mlp.linear_fc2.weight", (h, 64)),
+        ("decoder.layers.0.pre_mlp_layernorm.weight", (h,)),
+    )
+    return {
+        name: build_sharded_tensor(
+            param_name=name,
+            param_dtype=ms.float32,
+            local_shape=shape,
+            global_shape=shape,
+            global_offset=(0,) * len(shape),
+            axis_fragmentations=(1,) * len(shape),
+            layout=None,
+        )
+        for name, shape in mf_shapes
+    }
+
+
+@pytest.fixture
+def qwen3_hf_mock_checkpoint_dir(tmp_path):
+    """Directory containing Qwen3 dense HF mock checkpoint (index + safetensors)."""
+    _write_qwen3_hf_mock_checkpoint(str(tmp_path))
+    return tmp_path
 
 
 class TestSaveCheckpoint:
@@ -646,3 +741,97 @@ class TestCheckParamForLoad:
             network = simple_network
         with pytest.raises(ValueError):
             check_the_param_for_load_ckpt(ckpt_path, network)
+
+
+class TestLoadHfCheckpoint:
+    """Test load_hf_checkpoint scenarios."""
+
+    @pytest.mark.level0
+    @pytest.mark.platform_x86_cpu
+    @pytest.mark.env_onecard
+    def test_load_hf_checkpoint_invalid_template(self, qwen3_hf_mock_checkpoint_dir):
+        """
+        Feature: Test load_hf_checkpoint when core network has no WeightTemplate.
+        Description: Mock core_network.template=None (e.g. model without register_hf_weight_template).
+        Expectation: ValueError is raised and message mentions template registration.
+        """
+        net = MagicMock()
+        net.template = None
+        ckpt_dir = str(qwen3_hf_mock_checkpoint_dir)
+        with patch("mindformers.checkpoint.checkpoint.get_core_network", return_value=net):
+            with pytest.raises(ValueError, match="template"):
+                load_hf_checkpoint(ckpt_dir, net)
+
+    @pytest.mark.level0
+    @pytest.mark.platform_x86_cpu
+    @pytest.mark.env_onecard
+    def test_load_hf_checkpoint_with_qwen3_mock_weights(self, qwen3_hf_mock_checkpoint_dir):
+        """
+        Feature: Test load_hf_checkpoint with Qwen3 dense HF mock weights.
+        Description: Disk layout uses Qwen3 dense tensor names; Reshard/metadata/load_parameters are patched
+            to drive the Reshard -> WeightTemplate.get_mf_state_dict -> load_parameters path.
+        Expectation: load_parameters is called once; pure-rename embedding (HF->MF name + same shape);
+            fused QKV linear_qkv shape matches QKVConvertOp (GQA: ng * (dim*nh/ng + 2*dim) rows x hidden).
+        """
+        ckpt_dir = str(qwen3_hf_mock_checkpoint_dir)
+
+        qwen_cfg = Qwen3Config(
+            vocab_size=128,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=8,
+            max_position_embeddings=128,
+        )
+        template = WeightTemplate(weight_converters=Qwen3PreTrainedModel.weight_converters)
+        template.set_model_config(convert_to_transformer_config(qwen_cfg))
+
+        core = MagicMock()
+        core.template = template
+
+        mock_net = MagicMock()
+        mock_net.parameters_dict = MagicMock(return_value={
+            "embedding.word_embeddings.weight": MagicMock(),
+            "decoder.layers.0.self_attention.linear_qkv.weight": MagicMock(),
+        })
+
+        reshard_out = _qwen3_reshard_numpy_dict()
+
+        with patch("mindformers.checkpoint.checkpoint.get_core_network", return_value=core):
+            with patch(
+                "mindformers.checkpoint.checkpoint.get_sharded_tensor_from_cell",
+                return_value=_qwen3_minimal_dst_sharded_metas_layer0(),
+            ):
+                with patch(
+                    "mindformers.checkpoint.checkpoint.get_metadata_of_checkpoint",
+                    return_value=({}, {}),
+                ):
+                    with patch("mindformers.checkpoint.checkpoint.ReshardLoader") as mock_rl:
+                        mock_rl.return_value.load.return_value = reshard_out
+                        with patch("mindformers.checkpoint.checkpoint.load_parameters") as mock_lp:
+                            load_hf_checkpoint(ckpt_dir, mock_net, reshard_worker_num=1)
+                            mock_lp.assert_called_once()
+                            args, _ = mock_lp.call_args
+                            state_dict = args[1]
+                            assert isinstance(state_dict, dict)
+                            assert len(state_dict) > 0
+
+                            qkv_mf = "decoder.layers.0.self_attention.linear_qkv.weight"
+                            assert qkv_mf in state_dict
+                            assert state_dict[qkv_mf].name == qkv_mf
+                            nh = qwen_cfg.num_attention_heads
+                            ng = qwen_cfg.num_key_value_heads
+                            dim = qwen_cfg.head_dim
+                            hidden = qwen_cfg.hidden_size
+                            # Same layout as QKVConvertOp._hf_to_mf: concat q/k/v then [*, hidden_size]
+                            expected_qkv_rows = ng * (dim * (nh // ng) + dim + dim)
+                            assert tuple(state_dict[qkv_mf].shape) == (expected_qkv_rows, hidden)
+
+                            hf_shapes = _qwen3_hf_mock_weight_shapes()
+                            # Pure RenameConvertOp sample: HF model.embed_tokens -> MF embedding.word_embeddings, shape unchanged
+                            emb_mf = "embedding.word_embeddings.weight"
+                            assert emb_mf in state_dict
+                            assert state_dict[emb_mf].name == emb_mf
+                            assert tuple(state_dict[emb_mf].shape) == hf_shapes["model.embed_tokens.weight"]
