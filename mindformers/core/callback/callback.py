@@ -1764,6 +1764,7 @@ class CheckpointMonitor(ModelCheckpoint):
         self.need_remove_extra_ckpt = False
         self.common_info = CommonInfo()
         self.save_checkpoint_steps = save_checkpoint_steps
+        self.current_ckpt_step_list = []
 
     def print_savetime(self, record_step, batch_num):
         """print the time cost of saving checkpoint files."""
@@ -2179,7 +2180,8 @@ class CheckpointMonitor(ModelCheckpoint):
             user_prefix=self.origin_prefix,
             save_checkpoint_path=self.directory,
             sharded_tensor_metas=sharded_tensor_metas,
-            remove_redundancy=self.need_remove_redundancy
+            remove_redundancy=self.need_remove_redundancy,
+            current_ckpt_step_list=self.current_ckpt_step_list,
         )
 
         # After saving, update the counter of last saved step.
