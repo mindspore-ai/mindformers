@@ -18,6 +18,7 @@ __all__ = ["TrainingQwen3MoeForCausalLM"]
 
 from mindspore import Tensor
 
+from mindformers.checkpoint.converter.template import register_hf_weight_template
 from mindformers.tools.register.register import MindFormerModuleType, MindFormerRegister
 from mindformers.tools.logger import logger
 from mindformers.parallel_core.transformer_config import TransformerConfig
@@ -41,6 +42,7 @@ class TrainingQwen3MoeForCausalLM(TrainModelMixin, Qwen3MoePreTrainedModel):
 
     """
 
+    @register_hf_weight_template
     def __init__(self, config):
         super().__init__(config, auto_prefix=False)
         config: TransformerConfig = self.convert_to_transformer_config(self.config)
@@ -87,6 +89,7 @@ class TrainingQwen3MoeForCausalLM(TrainModelMixin, Qwen3MoePreTrainedModel):
             actual_seq_len=actual_seq_len,
         )
 
+    # pylint: disable=W0221
     def convert_weight_dict(self, source_dict, **kwargs):
         """
         convert HuggingFace weight dict to MindFormers weight dict.
@@ -163,6 +166,7 @@ class TrainingQwen3MoeForCausalLM(TrainModelMixin, Qwen3MoePreTrainedModel):
 
         return ms_weight_dict
 
+    # pylint: disable=W0221
     def convert_map_dict(self, hf_name_map_dict, **kwargs):
         """
         convert HuggingFace map dict to MindFormers map dict.

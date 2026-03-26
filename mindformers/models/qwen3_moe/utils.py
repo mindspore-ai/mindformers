@@ -13,6 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """Qwen3 models' utils."""
+from mindformers.checkpoint.converter.convert_op import RenameConvertOp, QKVConvertOp, ExpertsConvertOp
 from mindformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 from mindformers.models.modeling_utils import PreTrainedModel
 from mindformers.parallel_core.utils.model_mixin import ModelMixin
@@ -43,6 +44,74 @@ class Qwen3MoePreTrainedModel(PreTrainedModel, ModelMixin):
         ('model.norm.', 'decoder.final_layernorm.'),
         ('lm_head.', 'output_layer.'),
         ('model.layers.', 'decoder.layers.')
+    ]
+
+    weight_converters = [
+        # ========== Embedding and Output ==========
+        RenameConvertOp(
+            hf_names="model.embed_tokens.weight",
+            mf_names="embedding.word_embeddings.weight"
+        ),
+        RenameConvertOp(
+            hf_names="lm_head.weight",
+            mf_names="output_layer.weight"
+        ),
+        RenameConvertOp(
+            hf_names="model.norm.weight",
+            mf_names="decoder.final_layernorm.weight"
+        ),
+        # ========== Attention ==========
+        QKVConvertOp(
+            hf_names=[
+                "model.layers.{}.self_attn.q_proj.weight",
+                "model.layers.{}.self_attn.k_proj.weight",
+                "model.layers.{}.self_attn.v_proj.weight"
+            ],
+            mf_names=["decoder.layers.{}.self_attention.linear_qkv.weight"]
+        ),
+        RenameConvertOp(
+            hf_names="model.layers.{}.self_attn.o_proj.weight",
+            mf_names="decoder.layers.{}.self_attention.linear_proj.weight"
+        ),
+        RenameConvertOp(
+            hf_names="model.layers.{}.input_layernorm.weight",
+            mf_names="decoder.layers.{}.input_layernorm.weight"
+        ),
+        RenameConvertOp(
+            hf_names="model.layers.{}.self_attn.k_norm.weight",
+            mf_names="decoder.layers.{}.self_attention.k_layernorm.weight"
+        ),
+        RenameConvertOp(
+            hf_names="model.layers.{}.self_attn.q_norm.weight",
+            mf_names="decoder.layers.{}.self_attention.q_layernorm.weight"
+        ),
+        # ========== MOE Experts ==========
+        ExpertsConvertOp(
+            hf_names=[
+                "model.layers.{}.mlp.experts.{}.gate_proj.weight",
+                "model.layers.{}.mlp.experts.{}.up_proj.weight",
+            ],
+            mf_names=[
+                "decoder.layers.{}.mlp.experts.weight1",
+            ],
+        ),
+        ExpertsConvertOp(
+            hf_names=[
+                "model.layers.{}.mlp.experts.{}.down_proj.weight"
+            ],
+            mf_names=[
+                "decoder.layers.{}.mlp.experts.weight2"
+            ],
+        ),
+        # ========== Router ==========
+        RenameConvertOp(
+            hf_names="model.layers.{}.mlp.gate.weight",
+            mf_names="decoder.layers.{}.mlp.router.weight"
+        ),
+        RenameConvertOp(
+            hf_names="model.layers.{}.post_attention_layernorm.weight",
+            mf_names="decoder.layers.{}.pre_mlp_layernorm.weight"
+        ),
     ]
 
     def get_model_parameters(self, only_trainable=True):

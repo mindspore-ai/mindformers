@@ -550,6 +550,9 @@ class ReshardLoader:
 
         # Calculate the offset of all parameters
         start_time = time()
+        self.num_moe_experts = None
+        self.experts_weights = {}
+        self.qkv_weights = {}
         self.params_info = self._compute_all_offsets()
         self.build_all_offsets_time = time() - start_time
 
@@ -657,6 +660,9 @@ class ReshardLoader:
                 logger.warning(f"No source parameters found for dst_param: {dst_name}, skipping")
                 continue
 
+            if self.template and self.template.check_weights_for_experts(dst_name) and self.num_moe_experts is None:
+                self.num_moe_experts = self.template.get_num_moe_experts(dst_name, len(src_names))
+
             # 3. For each source parameter, calculate the offset information.
             for src_name in src_names:
                 # Skip processed source parameters (to avoid duplication).
@@ -675,11 +681,22 @@ class ReshardLoader:
                     else src_tensor_list
                 )
 
+                if self.template and self.template.check_weights_for_experts(dst_name):
+                    src_tensor = self.template.stack_hf_experts_weight(
+                        dst_name,
+                        self.num_moe_experts,
+                        src_tensor
+                    )
+
+                global_shape = src_tensor.global_shape
+                if self.template and self.template.check_weights_for_qkv(src_name):
+                    global_shape = self.dst_metas[dst_name].global_shape
+
                 # Create ReshardHandler
                 # Note: Use the source parameter's `global_shape` and the target parameter's `layout`.
                 reshard_handler = ReshardHandler(
                     param_name=src_name,
-                    full_shape=src_tensor.global_shape,
+                    full_shape=global_shape,
                     from_layout=src_tensor.layout,
                     to_layout=dst_tensor.layout,
                     to_rank_id=self.rank_id
@@ -913,6 +930,16 @@ class ReshardLoader:
                 reshard_handler = src_info["reshard_handler"]
                 all_offset = src_info["all_offset"]
                 need_reshard = len(all_offset) > 1
+
+                if self.template and (self.template.check_weights_for_experts(src_name) or
+                                      self.template.check_weights_for_qkv(src_name)):
+                    src_name, parameter = self.template.preprocess_hf_weights(src_name,
+                                             parameter,
+                                             self.experts_weights,
+                                             self.qkv_weights,
+                                             self.num_moe_experts)
+                    if parameter is None:
+                        continue
 
                 sliced_tensor = smart_slice(
                     parameter, param_slice, need_reshard

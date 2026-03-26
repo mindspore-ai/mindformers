@@ -593,6 +593,8 @@ def load_hf_checkpoint(
         dst_sharded_tensor_metas = get_cur_sharded_tensor(network, filter_func) \
             if get_real_group_size() > 1 else get_sharded_tensor_from_cell(network)
 
+    template.network_tensor_info = dst_sharded_tensor_metas
+
     # 3. Get source metadata (built from HF weights)
     src_sharded_tensor_metas, param_file_mappings = get_metadata_of_checkpoint(pretrained_model_dir)
 
