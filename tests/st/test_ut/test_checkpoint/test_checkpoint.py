@@ -322,16 +322,18 @@ class TestSaveCheckpoint:
         Expectation: Old checkpoints should be cleaned up.
         """
         common_info = CommonInfo(epoch_num=1, global_step=600)
-
+        current_ckpt_step_list = []
         # Save multiple checkpoints
         for i in range(3):
+
             save_checkpoint(
                 iteration=600 + i,
                 network=simple_network,
                 optimizer=None,
                 common_info=common_info,
                 keep_max_num=2,
-                save_checkpoint_path=tmp_path
+                save_checkpoint_path=tmp_path,
+                current_ckpt_step_list=current_ckpt_step_list
             )
         # Check that only keep_max_num checkpoints exist
         checkpoint_dirs = [d for d in os.listdir(tmp_path) if d.startswith("iteration_")]

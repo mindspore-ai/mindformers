@@ -14,6 +14,7 @@
 # ============================================================================
 """APIs of checkpoint utils."""
 
+import datetime
 import os
 import re
 import json
@@ -68,7 +69,8 @@ class CkptHealthStatus(Enum):
     ABNORMAL = 1
 
 
-def check_checkpoints_dir_max_num(max_keep_num: int, checkpoints_root_path: str = None):
+def check_checkpoints_dir_max_num(max_keep_num: int,
+                                  current_ckpt_step_list: List[int] = None):
     """
     Monitor the maximum number of weights that can be stored.
     If the number of checkpoint directory greater than 'max_keep_num',
@@ -77,44 +79,28 @@ def check_checkpoints_dir_max_num(max_keep_num: int, checkpoints_root_path: str 
     checkpoints_root_path (str): The root directory where weights are saved,
         including the weight directories of all iterations.
     """
-    # Matches regular expressions to get numbers.
-    pattern: str = PER_ITERATION_CKPT_DIR_PREFIX + r"(\d+)"
-
-    # Get the root path information.
-    root_path = Path(checkpoints_root_path)
-
-    # Get all matching directory.
-    matched_dirs = []
-    for item in root_path.iterdir():
-        if item.is_dir():
-            match = re.fullmatch(pattern, item.name)
-            if match:
-                # Convert to integer comparison
-                num = int(match.group(1))
-                matched_dirs.append((num, item))
-
-    # Sort by number in ascending order.
-    matched_dirs.sort(key=lambda x: x[0])
-
     # If the quantity does not exceed the limit, no need to delete.
-    if len(matched_dirs) <= max_keep_num:
-        logger.info(f"The current number of weights is: {len(matched_dirs)}, "
-                    f"no more than 'keep_checkpoint_max': {max_keep_num}. "
-                    f"So no need to remove any checkpoints directory.")
+    if not current_ckpt_step_list:
+        return
+    if len(current_ckpt_step_list) <= max_keep_num:
         return
 
-    # Calculate how many directory should be deleted.
-    num_to_delete = len(matched_dirs) - max_keep_num
-    logger.warning(f"The current number of weights is: {len(matched_dirs)}, "
-                   f"more than 'keep_checkpoint_max': {max_keep_num}.")
+    # Get the root path information.
+    remove_iteration = ""
+    # Get all matching directory.
+    if current_ckpt_step_list:
+        remove_iteration = current_ckpt_step_list[0]
+    if not os.path.exists(remove_iteration):
+        raise RuntimeError(f"Failed to find directory to remove with iteration {remove_iteration}")
 
-    for i in range(num_to_delete):
-        num, dir_path = matched_dirs[i]
-        logger.warning(f"So, the oldest directory: '{dir_path.name}' (iteration: {num}) will be removed!")
-        try:
-            shutil.rmtree(dir_path)  # Delete entire directory
-        except Exception as e:
-            raise RuntimeError(f"Failed to delete folder '{dir_path}'") from e
+    logger.warning(f"The current number of weights is: {len(current_ckpt_step_list)}, "
+                   f"more than 'keep_checkpoint_max': {max_keep_num}. "
+                   f"So, the oldest directory: '{remove_iteration}' will be removed!")
+    current_ckpt_step_list.pop(0)
+    try:
+        shutil.rmtree(remove_iteration)  # Delete entire directory
+    except Exception as e:
+        raise RuntimeError(f"Failed to delete folder '{remove_iteration}'") from e
 
 
 def get_checkpoint_iter_dir(checkpoints_path: str, iteration: int) -> str:

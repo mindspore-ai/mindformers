@@ -15,6 +15,7 @@
 """load/save checkpoint apis."""
 import os
 import json
+import shutil
 import tempfile
 from time import time
 from typing import Callable, Union, Dict, Optional, Tuple, List
@@ -265,7 +266,8 @@ class AsyncSaveManager:
 def save_checkpoint(iteration: int, network: Cell, optimizer: Optimizer = None,
                     async_save_manager: AsyncSaveManager = None, common_info: CommonInfo = None,
                     keep_max_num: int = 5, user_prefix: str = None, save_checkpoint_path: str = None,
-                    sharded_tensor_metas: Dict = None, remove_redundancy: bool = False):
+                    sharded_tensor_metas: Dict = None, remove_redundancy: bool = False,
+                    current_ckpt_step_list: List[int] = None):
     """
     Saves the current state of the training process,
         including the model, optimizer, and learning rate scheduler, to a checkpoint file.
@@ -283,8 +285,11 @@ def save_checkpoint(iteration: int, network: Cell, optimizer: Optimizer = None,
             And 'output_dir' is configured in yaml and defaults to './output' in the execution script path.
         sharded_tensor_metas (Dict): The ShardedTensor metas of this network.
         remove_redundancy (bool): Whether to remove redundancy of saving checkpoint.
+        current_ckpt_step_list (list): List of checkpoint step numbers saved during the current training round.
     """
     logger.info('....... Start to save checkpoint as new format .......')
+    if current_ckpt_step_list is None:
+        current_ckpt_step_list = []
 
     # Get the root path of all checkpoints to save.
     if save_checkpoint_path:
@@ -305,6 +310,13 @@ def save_checkpoint(iteration: int, network: Cell, optimizer: Optimizer = None,
     use_async_save = async_save_manager is not None
 
     if get_real_rank() == 0:
+        if os.path.exists(cur_iter_checkpoint_dir):
+            logger.warning(
+                f"The path '{cur_iter_checkpoint_dir}' already exists. It will be overwritten by new checkpoint.")
+            try:
+                shutil.rmtree(cur_iter_checkpoint_dir)
+            except OSError as e:
+                raise RuntimeError(f"Failed to remove directory '{cur_iter_checkpoint_dir}'") from e
         os.makedirs(cur_iter_checkpoint_dir, exist_ok=True)
         set_safe_mode_for_file_or_dir(checkpoints_root_path)
         set_safe_mode_for_file_or_dir(cur_iter_checkpoint_dir)
@@ -331,17 +343,7 @@ def save_checkpoint(iteration: int, network: Cell, optimizer: Optimizer = None,
         if get_real_rank() == 0:
             async_save_manager.add_finalize_fn(iter_finalize_func)
 
-    # Check if the number of saved folders has exceeded, and delete the oldest one.
-    if get_real_rank() == 0:
-        # NOTE: Currently only supports shared storage scenarios.
-        check_checkpoints_dir_max_num(keep_max_num, checkpoints_root_path)
-        # If the current iteration checkpoint directory be removed, raise an error to remind user
-        # to check whether the file path for saving checkpoints is configured correctly.
-        if not os.path.exists(cur_iter_checkpoint_dir):
-            raise FileNotFoundError(f"Can not find current iteration checkpoint directory: "
-                                    f"'{cur_iter_checkpoint_dir}'. Please check your configuration item "
-                                    f"'save_checkpoint_path' under the 'CheckpointMonitor' in yaml, "
-                                    f"to ensure that there is no weight left by other tasks under the path.")
+
     barrier_world("Rank_0 checking saved weights iteration num...")
 
     # Save model weight.
@@ -422,6 +424,11 @@ def save_checkpoint(iteration: int, network: Cell, optimizer: Optimizer = None,
         if get_real_rank() == 0:
             iter_finalize_func()
         logger.info(f"Save checkpoint cost time: {time() - start_save_ckpt_time:.3f}s.")
+
+    current_ckpt_step_list.append(cur_iter_checkpoint_dir)
+    # Check if the number of saved folders has exceeded, and delete the oldest one.
+    if get_real_rank() == 0:
+        check_checkpoints_dir_max_num(keep_max_num, current_ckpt_step_list)
 
 
 def save_metadata_json(sharded_tensor_metas, model_keys, user_prefix, metadata_file_path):

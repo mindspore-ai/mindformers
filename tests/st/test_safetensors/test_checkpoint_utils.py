@@ -1210,23 +1210,23 @@ class TestCheckpointUtils:
         # Create test directory structure
         checkpoints_root_path = tmp_path / "checkpoints"
         checkpoints_root_path.mkdir()
-
+        current_ckpt_step_list = []
         # Create more directories than max_keep_num
-        for i in range(5):
+        for i in range(1, 6):
             dir_path = checkpoints_root_path / f"iteration_{i:08d}"
             dir_path.mkdir()
-
-        # Test with max_keep_num = 3, should keep newest 3 directories
-        check_checkpoints_dir_max_num(3, str(checkpoints_root_path))
+            current_ckpt_step_list.append(dir_path)
+            # Test with max_keep_num = 3, should keep newest 3 directories
+            check_checkpoints_dir_max_num(3, current_ckpt_step_list)
 
         # Verify only 3 directories remain
         remaining_dirs = list(checkpoints_root_path.iterdir())
         remaining_dirs.sort()
         assert len(remaining_dirs) == 3
-        assert [d.name for d in remaining_dirs] == ["iteration_00000002", "iteration_00000003", "iteration_00000004"]
+        assert [d.name for d in remaining_dirs] == ["iteration_00000003", "iteration_00000004", "iteration_00000005"]
 
         # Test with max_keep_num larger than existing directories
-        check_checkpoints_dir_max_num(10, str(checkpoints_root_path))
+        check_checkpoints_dir_max_num(10, current_ckpt_step_list)
         remaining_dirs = list(checkpoints_root_path.iterdir())
         assert len(remaining_dirs) == 3
 
