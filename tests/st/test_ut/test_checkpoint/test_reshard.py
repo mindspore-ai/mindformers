@@ -679,6 +679,10 @@ class TestReshardLoader:
                or "v_proj" in x
             else ("other.weight",)
         )
+        mock_template.check_weights_for_experts = MagicMock(return_value=False)
+        mock_template.check_weights_for_qkv = MagicMock(return_value=False)
+        mock_template.stack_hf_experts_weight = MagicMock(
+            side_effect=lambda dst_name, num_experts, src_tensor: src_tensor)
 
         dst_metas = {
             "qkv.weight": simple_sharded_tensor

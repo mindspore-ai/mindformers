@@ -19,7 +19,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional, Union
 import numpy as np
-
+from mindspore import get_auto_parallel_context
 from mindformers.parallel_core.transformer_config import TransformerConfig
 
 
@@ -112,6 +112,8 @@ class ConvertOp(ABC):
             weights.append(weight)
 
         if match:
+            if isinstance(match[0], tuple):
+                match = match[0]
             to_names = [to_name.format(*match) for to_name in to_names]
 
         return to_names, weights
@@ -228,6 +230,72 @@ class ConcatConvertOp(ConvertOp):
 
 
 @dataclass
+class ExpertsConvertOp(ConvertOp):
+    """
+    Experts operation (N:1 mapping).
+
+    HF → MF: Converts HF experts weights to MF weights
+    MF → HF: Converts MF experts weights to HF weights
+    """
+    num_moe_experts: int = None
+    hidden_size: int = None
+    moe_ffn_hidden_size: Optional[int] = None
+    expert_parallel_size: int = None
+    optimizer_parallel_size: int = None
+
+    def __post_init__(self):
+        super().__post_init__()
+        if len(self.mf_names) != 1:
+            raise ValueError(f"ExpertsConvertOp only support one mf_name: `{self.mf_names}`.")
+
+    def set_model_config(self, config: TransformerConfig):
+        self.mf_config = config
+        self.num_moe_experts = config.num_moe_experts
+        self.hidden_size = config.hidden_size
+        self.moe_ffn_hidden_size = config.moe_ffn_hidden_size
+        self.expert_parallel_size = config.expert_model_parallel_size
+        self.optimizer_parallel_size = get_auto_parallel_context('optimizer_weight_shard_size')
+        if not self.num_moe_experts:
+            raise ValueError("The number of experts is not set.")
+
+    def _hf_to_mf(self, weights: List[np.ndarray]) -> List[np.ndarray]:
+        """Convert experts HF weights to MF weights"""
+        result = []
+        if len(weights) == 2:
+            gate_weight = weights[0]
+            up_weight = weights[1]
+            gate_weight = gate_weight.reshape(self.num_moe_experts // self.expert_parallel_size
+                                              // self.optimizer_parallel_size, -1, self.hidden_size)
+            up_weight = up_weight.reshape(self.num_moe_experts // self.expert_parallel_size
+                                          // self.optimizer_parallel_size, -1, self.hidden_size)
+            gate_weight = gate_weight.transpose(0, 2, 1)
+            up_weight = up_weight.transpose(0, 2, 1)
+            if gate_weight is None or up_weight is None:
+                raise ValueError("Experts are missing weight.")
+            # Concatenate gate_proj and up_proj
+            weight1 = np.concatenate([gate_weight, up_weight], axis=2)
+            weight1 = weight1.reshape(self.num_moe_experts // self.expert_parallel_size
+                                      // self.optimizer_parallel_size * self.hidden_size, -1)
+            result.append(weight1)
+        elif len(weights) == 1:
+            weight2 = weights[0]
+            weight2 = weight2.reshape(self.num_moe_experts // self.expert_parallel_size
+                                      // self.optimizer_parallel_size, -1, self.moe_ffn_hidden_size)
+            weight2 = weight2.transpose(0, 2, 1)
+            weight2 = weight2.reshape(self.num_moe_experts // self.expert_parallel_size
+                                      // self.optimizer_parallel_size * self.moe_ffn_hidden_size, -1)
+            result.append(weight2)
+        else:
+            raise ValueError("The number of weights does not match the expected number of experts.")
+
+        return result
+
+    def _mf_to_hf(self, weights: List[np.ndarray]) -> List[np.ndarray]:
+        """Convert experts MF weights back to HF weights"""
+        raise ValueError("Currently, ExpertsConvertOp does not support MF → HF conversion")
+
+
+@dataclass
 class StackConvertOp(ConvertOp):
     """
     Stack operation (N:1 mapping).
@@ -271,6 +339,7 @@ class QKVConvertOp(ConvertOp):
     kv_channels: int = None
     hidden_size: int = None
     tensor_model_parallel_size: int = None
+    optimizer_parallel_size: int = None
 
     def __post_init__(self):
         super().__post_init__()
@@ -287,14 +356,15 @@ class QKVConvertOp(ConvertOp):
         self.kv_channels = config.kv_channels
         self.hidden_size = config.hidden_size
         self.tensor_model_parallel_size = config.tensor_model_parallel_size
+        self.optimizer_parallel_size = get_auto_parallel_context('optimizer_weight_shard_size')
 
     def _hf_to_mf(self, weights: List[np.ndarray]) -> List[np.ndarray]:
         """Convert Q, K, V weights to QKV fused weight"""
         if len(weights) < 3:
             raise ValueError(f"Expected at least 3 weights for QKV conversion, but got {len(weights)}")
         q_weight, k_weight, v_weight = weights
-        nh = self.num_attention_heads // self.tensor_model_parallel_size
-        ng = self.num_query_groups // self.tensor_model_parallel_size
+        nh = self.num_attention_heads // self.tensor_model_parallel_size // self.optimizer_parallel_size
+        ng = self.num_query_groups // self.tensor_model_parallel_size // self.optimizer_parallel_size
         dim = self.kv_channels
 
         if nh % ng != 0:
@@ -330,6 +400,7 @@ class QKVBiasConvertOp(ConvertOp):
     num_query_groups: int = None
     kv_channels: int = None
     tensor_model_parallel_size: int = None
+    optimizer_parallel_size: int = None
 
     def set_model_config(self, config):
         """Set parameters from model configuration"""
@@ -337,14 +408,15 @@ class QKVBiasConvertOp(ConvertOp):
         self.num_query_groups = config.num_query_groups
         self.kv_channels = config.kv_channels
         self.tensor_model_parallel_size = config.tensor_model_parallel_size
+        self.optimizer_parallel_size = get_auto_parallel_context('optimizer_weight_shard_size')
 
     def _hf_to_mf(self, weights: List[np.ndarray]) -> List[np.ndarray]:
         """Convert Q, K, V bias to QKV fused bias"""
         if len(weights) < 3:
             raise ValueError(f"Expected at least 3 bias weights for QKV bias conversion, but got {len(weights)}")
         q_bias, k_bias, v_bias = weights
-        nh = self.num_attention_heads // self.tensor_model_parallel_size
-        ng = self.num_query_groups // self.tensor_model_parallel_size
+        nh = self.num_attention_heads // self.tensor_model_parallel_size // self.optimizer_parallel_size
+        ng = self.num_query_groups // self.tensor_model_parallel_size // self.optimizer_parallel_size
         dim = self.kv_channels
 
         if nh % ng != 0:

@@ -5,9 +5,9 @@
 
 import enum
 import os
-import regex
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional, Tuple, Union
+import regex
 
 import mindspore as ms
 from mindspore import dtype
