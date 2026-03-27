@@ -33,19 +33,20 @@ DeepSeek-V3 系列模型是深度求索（DeepSeek）公司推出的一款高性
 
 DeepSeek-V3 当前支持的版本配套如下。
 
-|           | Mindspore Transformers | MindSpore | CANN  |  HDK   |
+|           | MindSpore Transformers | MindSpore | CANN  |  HDK   |
 |:---------:|:----------------------:|:---------:|:-----:|:------:|
 | 当前支持的版本 |         1.8.0          |   2.7.2   | 8.5.0 | 25.5.0 |
 
 ## 使用样例
 
-MindSpore Transformers 支持使用 DeepSeek-V3 进行预训练，微调和推理。各任务的整体使用流程如下：
+MindSpore Transformers 支持使用 DeepSeek-V3 进行预训练，微调和推理，并支持在 DeepSeek-V3 的基础上使用 DeepSeek-V3.2 的DSA特性进行训练（暂不支持推理）。各任务的整体使用流程如下：
 
 | 任务  | 前期准备                    | 使用流程                       |
 |:---:|:------------------------|:---------------------------|
 | 预训练 | 环境安装 -> 预训练数据集下载        | 数据预处理 -> 修改任务配置 -> 启动预训练任务 |
 | 微调  | 环境安装 -> 模型下载  | 修改任务配置 -> 启动微调任务  |
 | 推理  | 环境安装 -> 模型下载  | 修改任务配置 -> 启动推理任务  |
+| DSA | 环境安装 -> 模型下载  | 修改任务配置 -> 启动训练任务  |
 
 ### 前期准备
 
@@ -248,7 +249,7 @@ model:
 | `lora_b_init` | LoRA的B矩阵初始化方式 |
 | `target_modules` | 应用LoRA的模块，上述配置对word_embeddings、attention和mlp的权重矩阵应用LoRA |
 
-##### 3. 启动微调任务
+#### 2. 启动微调任务
 
 通过指定模型路径和配置文件[configs/deepseek3/finetune_deepseek3_671b.yaml](https://atomgit.com/mindspore/mindformers/blob/master/configs/deepseek3/finetune_deepseek3_671b.yaml)或者[configs/deepseek3/finetune_deepseek3_12b_16p_pp16.yaml](https://atomgit.com/mindspore/mindformers/blob/master/configs/deepseek3/finetune_deepseek3_12b_16p_pp16.yaml)以msrun的方式启动[run_mindformer.py](https://atomgit.com/mindspore/mindformers/blob/master/run_mindformer.py)脚本，启动多卡分布式训练。
 
@@ -456,6 +457,84 @@ bash scripts/msrun_launcher.sh "run_mindformer.py \
 #### 5. 启动服务化推理任务
 
 服务化推理支持量化、大小ep等特性，可以查看以下文档：[服务化推理](https://www.mindspore.cn/mindformers/docs/zh-CN/master/guide/deployment.html)
+
+### DSA样例
+
+DeepSeek-V3.2相较于DeepSeek-V3，创新性的采用了DSA（DeepSeek Sparse Attention）机制，在长上下文场景通过新增了索引器indexer模块，关注最关键的Top-K个词元以显著降低计算复杂度，同时保持模型性能。DeepSeek-V3.2需要在已经预训练过的DeepSeek-V3权重基础上进行训练，当前暂不支持DeepSeek-V3.2的推理功能。
+
+#### 1. 修改任务配置
+
+用户可以基于DeepSeek-V3的配置开启DSA特性进行长序列文本的训练任务，作为基底的配置文件请参考[修改任务配置](#1-修改任务配置)小节。
+开启DSA特性时，模型训练过程会包含连续的两个阶段[Dense阶段](#dense-warm-up-stage)和[Sparse阶段](#sparse-training-stage)，不同阶段需要分别修改配置文件并拉起任务。
+
+> 注意：DSA特性存在如下限制：
+> 1. 部分参数存在数值限制，见对应阶段yaml修改示例中的注释。
+> 2. 流水线并行暂不支持zero_bubble_v调度策略。
+> 3. 数据集生成EOD序列时，务必开启EOD压缩以使能模型内的TND排布，否则计算结果不正确。
+
+##### Dense Warm-up Stage
+
+Dense阶段为第一个阶段，通过设置`dsa_indexer_use_sparse_loss=False`开启。该阶段中模型需要加载**已有**的DeepSeek-V3权重，但这些权重将全部被冻结，仅有DSA特性新增的索引器模块的权重会进行更新。该阶段训练结束后，需要保存权重供Sparse阶段使用。
+
+> 注意：Dense阶段训练时**额外**存在以下限制：
+> 1. 必须设置环境变量`MS_DEV_RUNTIME_CONF`中包含"inline:False"(参考[MindSpore环境变量](https://www.mindspore.cn/docs/zh-CN/master/api_python/env_var_list.html#:~:text=MS_DEV_RUNTIME_CONF))，否则该阶段的训练任务可能无法拉起。
+> 2. 暂不支持开启完全重计算。
+
+使用时相应参数修改如下：
+```yaml
+parallel:
+  parallel_config:
+    pipeline_interleave: True
+    pipeline_scheduler: seqpipe           # 使能流水线并行时，建议使用seqpipe调度策略
+recompute_config:
+  recompute: False                        # Dense阶段需要关闭完全重计算
+model:
+  model_config:
+    kv_lora_rank: 512                     # 开启DSA特性时，当前仅支持512
+    qk_rope_head_dim: 64                  # 开启DSA特性时，当前仅支持64
+    # 以下新增参数，仅DeepSeek-V3模型时生效
+    experimental_attention_variant: dsa   # DSA特性开关，设置为dsa时表示使用DSA特性
+    dsa_indexer_n_heads: 64               # DSA索引器的注意力头数，当前仅支持64
+    dsa_indexer_head_dim: 128             # DSA索引器的注意力头维度， 当前仅支持128
+    dsa_indexer_topk: 2048                # DSA索引器选取词元的Top-K个数，支持1~2048
+    dsa_indexer_loss_coeff: 1.0           # DSA索引器对应loss的系数
+    dsa_indexer_use_sparse_loss: False    # DSA索引器是否使用稀疏loss，设置为False以进入Dense阶段训练
+callbacks:
+  - type: CheckpointMonitor               # 保存权重相关配置根据实际需要进行修改
+    save_checkpoint_steps: 10000
+    remove_redundancy: True
+    async_save: False
+    checkpoint_format: "safetensors"
+```
+
+##### Sparse Training Stage
+
+Sparse阶段为第二个阶段，通过设置`dsa_indexer_use_sparse_loss=True`开启。该阶段中模型需要加载**Dense阶段保存**的权重进行后续训练，并且全部网络参数均会更新。
+
+使用时相应参数修改如下：
+相关参数修改如下：
+
+```yaml
+parallel:
+  parallel_config:
+    pipeline_interleave: True
+    pipeline_scheduler: seqpipe           # 使能流水线并行时，建议使用seqpipe调度策略
+model:
+  model_config:
+    kv_lora_rank: 512                     # 开启DSA特性时，当前仅支持512
+    qk_rope_head_dim: 64                  # 开启DSA特性时，当前仅支持64
+    # 以下新增参数，仅DeepSeek-V3模型时生效
+    experimental_attention_variant: dsa   # DSA特性开关，设置为dsa时表示使用DSA特性
+    dsa_indexer_n_heads: 64               # DSA索引器的注意力头数，当前仅支持64
+    dsa_indexer_head_dim: 128             # DSA索引器的注意力头维度， 当前仅支持128
+    dsa_indexer_topk: 2048                # DSA索引器选取词元的Top-K个数，支持1~2048
+    dsa_indexer_loss_coeff: 1.0           # DSA索引器对应loss的系数
+    dsa_indexer_use_sparse_loss: True     # DSA索引器是否使用稀疏loss，设置为True以进入Sparse阶段训练
+```
+
+#### 2. 启动训练任务
+
+配置文件修改完成后，参考[启动微调任务](#2-启动微调任务)拉起训练任务即可。
 
 ## 附录
 
