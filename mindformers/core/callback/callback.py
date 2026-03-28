@@ -78,7 +78,7 @@ from mindformers.tools.utils import (
 )
 from mindformers.utils.parameter_register import parameter_register
 from mindformers.utils.tensorboard import get_tensorboard_writer, get_tensorboard_args
-from mindformers.version_control import is_version_ge, check_arf_status
+from mindformers.version_control import is_version_ge, check_arf_status, check_tft_valid
 from mindformers.parallel_core.training_graph.loss_func import (
     get_device_local_loss,
     reset_device_local_loss,
@@ -1744,7 +1744,8 @@ class CheckpointMonitor(ModelCheckpoint):
                                      remove_redundancy=remove_redundancy)
         super().__init__(prefix, ckpt_directory if self.use_legacy_format else None, config=config_ck)
         # Remove empty checkpoint directory created too early to avoid errors when reading empty folder on second launch
-        if ckpt_directory and os.path.exists(ckpt_directory) and not os.listdir(ckpt_directory):
+        if (ckpt_directory and os.path.exists(ckpt_directory) and not os.listdir(ckpt_directory) and
+                not check_tft_valid()):
             os.rmdir(ckpt_directory)
         self._graph_saved = True
         self.meta_json = os.path.join(self._directory, "meta.json")
