@@ -15,9 +15,10 @@
 """DeepSeek Sparse Attention."""
 from dataclasses import dataclass
 from typing import Union
+import numpy as np
 
 import mindspore.common.dtype as mstype
-from mindspore import nn, ops
+from mindspore import nn, ops, Parameter, Tensor
 from mindspore.ops import operations as P
 from mindspore.ops import auto_generate as aclnn_ops
 from mindspore.context import ParallelMode
@@ -72,6 +73,7 @@ class DSAttention(nn.Cell):
         self.pe_dim = config.qk_pos_emb_head_dim
         self.input_layout = config.input_layout
         self.is_tnd = config.input_layout == "TND"
+        self.head_num = config.num_attention_heads
         self.layer_number = layer_number
         self.attention_mode = 2 # currently, attention mode only support 2
 
@@ -83,6 +85,21 @@ class DSAttention(nn.Cell):
         )
         self.softmax_scale = softmax_scale or config.kv_channels ** -0.5
         self.indexer_loss = DSAIndexerLoss(config, self.softmax_scale)
+
+        self.track_max_attention_logit = config.track_max_attention_logit
+
+        if self.track_max_attention_logit:
+            # Parameter to store the maximum attention logit value per head.
+            # Note: This is a local max within each device's partition. Cross-device
+            # synchronization (AllReduce-Max across DP/CP dimensions) is performed
+            # later in GPTModel.allreduce_max_attention_logit() to obtain the global max.
+            self.max_logits_val = Parameter(
+                Tensor(np.zeros(self.head_num), dtype=mstype.float32),
+                parallel_optimizer=False, requires_grad=False
+            )
+            self.reduce_max = aclnn_ops.ReduceMax().add_prim_attr("self_define_shard", True)
+            self.assign = ops.Assign().add_prim_attr("self_define_shard", True)
+            self.maximum = ops.Maximum().add_prim_attr("self_define_shard", True)
 
         # common operators
         self.cast = aclnn_ops.Cast()
@@ -165,10 +182,17 @@ class DSAttention(nn.Cell):
         # ===================================
         # Run sparse attention kernel
         # ===================================
-        attention_output = self.sparse_flash_attention(
+        attention_output, softmax_max, _ = self.sparse_flash_attention(
             q_nope, k_nope, value, topk_indices,
             q_rope, k_rope, actual_seq_qlen, actual_seq_kvlen
-        )[0]
+        )
+        if self.track_max_attention_logit:
+            if self.is_tnd:
+                max_logits = self.reduce_max(softmax_max, (0, 1))
+            else:
+                max_logits = self.reduce_max(softmax_max, (0, 1, 2))
+            # Update local maximum; global sync happens in GPTModel.allreduce_max_attention_logit()
+            self.assign(self.max_logits_val, self.maximum(self.max_logits_val, max_logits))
 
         if not self.is_tnd:
             attention_output = self.transpose_attn(attention_output, (1, 0, 2, 3))
@@ -186,14 +210,18 @@ class DSAttention(nn.Cell):
             idx_shard = layout("dp_cp", "None", "None")
             sfa_shard = (q_shard, kv_shard, kv_shard, idx_shard, q_shard, kv_shard, layout("dp"), layout("dp"))
             attn_shard = layout("dp_cp", "tp", "None")
-            softmax_shard = layout("None", "cp", "None")
+            softmax_shard = layout("None", "dp_cp", "tp")
         else:
             q_shard = layout("dp", "None", "tp", "None")
             kv_shard = layout("dp", "None", "None", "None")
             idx_shard = layout("dp", "None", "None", "None")
             attn_shard = layout("dp", "None", "tp", "None")
-            softmax_shard = layout("dp", "None", "None", "None")
+            softmax_shard = layout("dp", "None", "None", "tp")
             sfa_shard = (q_shard, kv_shard, kv_shard, idx_shard, q_shard, kv_shard)
         self.split_q.shard((q_shard,))
         self.split_k.shard((kv_shard,))
         self.sparse_flash_attention.shard(sfa_shard, (attn_shard, softmax_shard, softmax_shard))
+        if self.track_max_attention_logit:
+            self.assign.shard((layout("tp"), layout("tp")), (layout("tp"),))
+            self.maximum.shard((layout("tp"), layout("tp")), (layout("tp"),))
+            self.reduce_max.shard((softmax_shard,), (layout("tp"),))

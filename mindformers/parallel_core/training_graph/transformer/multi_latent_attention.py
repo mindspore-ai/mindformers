@@ -31,6 +31,7 @@ from mindspore.ops.auto_generate import (
     BatchMatMul
 )
 from mindspore.ops import functional as F
+from mindspore.ops import operations as P
 from mindspore.context import ParallelMode
 from mindspore.parallel._utils import _get_parallel_mode, _is_sharding_propagation
 
@@ -167,6 +168,9 @@ class MultiLatentAttention(nn.Cell):
         if self.use_dsa:
             self.split_w_kvb = SplitWithSize()
             self.transpose_weight = Transpose()
+            self.split_weight = P.Morph(
+                self._split_weight, self.split_infer_shape, self.split_infer_dtype
+            ).add_prim_attr("self_define_shard", True)
             self.cat_q = Concat(axis=3).add_prim_attr("self_define_shard", True)
             self.cat_k = Concat(axis=3).add_prim_attr("self_define_shard", True)
             self.bmm = BatchMatMul()
@@ -206,8 +210,10 @@ class MultiLatentAttention(nn.Cell):
         self.tnd_transpose.shard((layout("cp", "dp", "tp", "None"),))
         self.tnd_transpose_one_head.shard((layout("cp", "dp", "None", "None"),))
         if self.use_dsa:
-            self.split_w_kvb.shard((layout("tp", "None", "None"),))
-            self.transpose_weight.shard((layout("tp", "None", "None"),))
+            self.split_weight.shard(
+                in_strategy=(layout("tp", "None"),),
+                out_strategy=(layout("tp", "None", "None"), layout("tp", "None", "None"))
+            )
             self.cat_q.shard(
                 in_strategy=((layout("cp", "dp", "tp", "None"), layout("cp", "dp", "tp", "None")),),
                 out_strategy=(layout("cp", "dp", "tp", "None"),)
@@ -217,6 +223,21 @@ class MultiLatentAttention(nn.Cell):
                 out_strategy=(layout("cp", "dp", "None", "None"),)
             )
             self.bmm.shard((layout("cp", "dp", "tp", "None", "None"), layout("tp", "None", "None")))
+
+    def split_infer_shape(self, *_):
+        q_absorb_shape = (self.num_attention_heads, self.qk_head_dim, self.kv_lora_rank)
+        v_absorb_shape = (self.num_attention_heads, self.kv_lora_rank, self.v_head_dim)
+        return q_absorb_shape, v_absorb_shape
+
+    def split_infer_dtype(self, *_):
+        return self.compute_dtype, self.compute_dtype
+
+    def _split_weight(self, w_kvb):
+        w_kvb = self.cast(w_kvb, self.compute_dtype)
+        w_kvb = self.reshape(w_kvb, (-1, self.qk_head_dim + self.v_head_dim, self.kv_lora_rank))
+        q_absorb, v_absorb = self.split_w_kvb(w_kvb, [self.qk_head_dim, self.v_head_dim], dim=1)
+        v_absorb = self.transpose_weight(v_absorb, (0, 2, 1))
+        return q_absorb, v_absorb
 
     def construct(self, x: Tensor, attention_mask=None, rotary_pos_emb=None, rotary_pos_cos=None, rotary_pos_sin=None,
                   prefix_keys_values=None, pad_zeros=None, actual_seq_len=None, attention_loss=0.):
@@ -244,10 +265,7 @@ class MultiLatentAttention(nn.Cell):
             q_nope, q_rope = query
             k_nope, k_rope = key
             w_kvb = self.linear_kvb.weight if self.mla_qkv_concat else self.linear_kv_up_proj.weight
-            w_kvb = self.cast(w_kvb, self.compute_dtype)
-            w_kvb = self.reshape(w_kvb, (self.num_attention_heads, -1, self.kv_lora_rank))
-            q_absorb, v_absorb = self.split_w_kvb(w_kvb, [self.qk_head_dim, self.v_head_dim], dim=1)
-            v_absorb = self.transpose_weight(v_absorb, (0, 2, 1))
+            q_absorb, v_absorb = self.split_weight(w_kvb)
             q_nope = self.bmm(self.reshape(q_nope, (seq_len, bs, -1, 1, self.qk_head_dim)), q_absorb)
             q_nope = self.reshape(q_nope, (seq_len, bs, -1, self.kv_lora_rank))
             query = self.cat_q([q_nope, q_rope])
