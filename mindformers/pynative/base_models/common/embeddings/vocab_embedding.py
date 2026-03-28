@@ -45,7 +45,9 @@ class VocabEmbedding(nn.Cell):
         super().__init__()
         self.num_embeddings = num_embeddings
         self.embedding_dim = embedding_dim
-        self.embedding = mint.nn.functional.embedding
+        # use gather instead of embedding to avoid the error of hyper-parllel
+        self.embedding = mint.gather
+        self.tile = mint.tile
         self.reshape = mint.reshape
 
         self.weight = Parameter(init_method([self.num_embeddings, self.embedding_dim]), name="weight")
@@ -60,12 +62,13 @@ class VocabEmbedding(nn.Cell):
         """
         Validator.check_type_name("input_ids", input_.dtype, [dtype.int32, dtype.int64], self.cls_name)
 
-        bs, seq_len = input_.shape
-        _, hidden = self.weight.shape
-        input_ = self.reshape(input_, (bs * seq_len,))
+        _, seq_len = input_.shape
+
+        input_ = self.reshape(input_, (-1, 1))
+        input_ = self.tile(input_, (1, self.embedding_dim))
         masked_input = input_
 
-        output = self.embedding(masked_input, self.weight)
-        output = self.reshape(output, (bs, -1, hidden))
+        output = self.embedding(self.weight, 0, masked_input)
+        output = self.reshape(output, (-1, seq_len, self.embedding_dim))
 
         return output
