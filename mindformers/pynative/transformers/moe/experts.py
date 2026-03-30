@@ -122,9 +122,10 @@ class GroupedMLP(nn.Cell):
             (bs * slen * self.top_k, dim),
             dtype=routed_output.dtype,
         )
-        routed_output_unsorted[token_indices_experts_sorted] = routed_output
+        
         probs = self.cast(probs, routed_output.dtype)
-        routed_output_unsorted = self.mul(routed_output_unsorted, self.unsqueeze(probs, -1))
+        routed_output = self.mul(routed_output, self.unsqueeze(probs, -1))
+        routed_output_unsorted[token_indices_experts_sorted] = routed_output
         routed_output_unsorted = self.reshape(routed_output_unsorted, (-1, self.top_k, dim))
         out_experts = routed_output_unsorted.sum(dim=1)
         return out_experts
@@ -158,6 +159,8 @@ class GroupedMLP(nn.Cell):
         original_dtype = permuted_local_hidden_states.dtype
         w1 = self.cast(self.weight1, original_dtype)
         w2 = self.cast(self.weight2, original_dtype)
+        w1 = w1.to_local() if isinstance(w1, DTensor) else w1
+        w2 = w2.to_local() if isinstance(w2, DTensor) else w2
         w1 = self.reshape(w1, (-1, self.hidden_size, self.moe_ffn_hidden_size))
         w2 = self.reshape(w2, (-1, self.config.moe_ffn_hidden_size, self.hidden_size))
 
