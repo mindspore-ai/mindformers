@@ -27,7 +27,10 @@ def check_dataset_config(config):
         config.train_dataset.autotune_per_step = config.autotune_per_step
         config.train_dataset.profile = config.profile
         config.train_dataset.batch_size = config.runner_config.batch_size
-        config.train_dataset.micro_batch_num = config.parallel_config.micro_batch_num
+        if config.parallel_config.pipeline_stage != 1:
+            config.train_dataset.micro_batch_num = config.parallel_config.micro_batch_num
+        else:
+            config.train_dataset.micro_batch_num = config.runner_config.gradient_accumulation_steps
         if config.train_dataset.mixup_op:
             config.train_dataset.mixup_op.num_classes = config.runner_config.num_classes
         if config.train_dataset.output_columns is None:
