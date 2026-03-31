@@ -27,7 +27,6 @@ from mindformers.parallel_core.training_graph.transformer.dropout import Dropout
 from mindformers.parallel_core.training_graph.transformer.identity_op import IdentityOp
 from mindformers.parallel_core.training_graph.device_matrix import layout
 from mindformers.tools.utils import get_predict_run_mode
-from mindformers.parallel_core.training_graph.transformer.norm import get_norm_cls
 from mindformers.parallel_core.training_graph.transformer.hyper_connection import HyperConnectionModule, HyperConnectionModuleFused
 
 
@@ -181,24 +180,6 @@ class TransformerLayer(nn.Cell, BaseTransformerLayer):
             sinkhorn_iters = config.mhc_sinkhorn_iterations
             init_gating_factor = config.mhc_init_gating_factor
 
-            # One shared RMSNorm per HC block (attn / ffn).
-            # A single norm call now covers pre + post + res — 3× fewer forward
-            # passes than the previous design with three separate PrePostHC/ResHC.
-            self.shared_rms_norm = build_module(
-                get_norm_cls(True),
-                config=config,
-                dim=config.hidden_size * self.rate,
-                eps=config.layernorm_epsilon
-            )
-            self.ffn_shared_rms_norm = build_module(
-                get_norm_cls(True),
-                config=config,
-                dim=config.hidden_size * self.rate,
-                eps=config.layernorm_epsilon
-            )
-            self.shared_rms_norm.shard((layout("tp", "dp", "None"),))
-            self.ffn_shared_rms_norm.shard((layout("tp", "dp", "None"),))
-
             # Two unified modules replace the previous six (pre/post/res × attn/ffn).
             enable_fused_triton_sinkhorn = config.enable_fused_triton_sinkhorn
             if enable_fused_triton_sinkhorn:
@@ -213,7 +194,6 @@ class TransformerLayer(nn.Cell, BaseTransformerLayer):
                 sinkhorn_iters=sinkhorn_iters,
                 init_gating_factor=init_gating_factor,
                 dtype=self.mhc_dtype,
-                shared_rms_norm=self.shared_rms_norm,
                 expand_post=2.0,
             )
             self.ffn_hc = HyperConnectionClass(
@@ -223,7 +203,6 @@ class TransformerLayer(nn.Cell, BaseTransformerLayer):
                 sinkhorn_iters=sinkhorn_iters,
                 init_gating_factor=init_gating_factor,
                 dtype=self.mhc_dtype,
-                shared_rms_norm=self.ffn_shared_rms_norm,
                 expand_post=2.0,
             )
 
@@ -448,7 +427,6 @@ class TransformerLayer(nn.Cell, BaseTransformerLayer):
         dropout_output = self.hidden_states_dropout(mlp_output)
         output = self.ffn_hc.output_cell(
             h_res_ffn, h_post_ffn, streams_before_ffn, dropout_output)
-        output = self.cast(output, self.compute_dtype)
 
         return output, context, extra_loss, attention_loss
 
