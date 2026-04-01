@@ -240,12 +240,12 @@ class TransformerBlock(nn.Cell):
         """ shard function of mlp block. """
         cp = config.context_parallel_size if config.context_parallel_size is not None else 1
         if self.hc:
-            dp = config.data_parallel_size if config.data_parallel_size is not None else 1
-            mp = config.tensor_model_parallel_size \
-                if config.tensor_model_parallel_size is not None else 1
-            self.tile_h.shard(((mp, dp, 1, 1),))
-            self.expand_dims_h.shard(((mp, dp, 1),))
-            self.reduce_mean_hc.shard(((mp, dp, 1, 1),))
+            self.tile_h.shard((layout("tp", "dp", "None", "None"),))
+            self.expand_dims_h.shard((layout("tp", "dp", "None"),))
+            self.reduce_mean_hc.shard(
+                in_strategy=(layout("tp", "dp", "None", "None"),),
+                out_strategy=(layout("tp", "dp", "None"),))
+            self.reduce_mean_hc.add_prim_attr("self_define_shard", True)
         if self.post_layer_norm:
             if config.sequence_parallel or cp > 1:
                 self.final_layernorm.shard(config, in_strategy=(layout("cp_tp", "dp", "None"), layout("None",)))
