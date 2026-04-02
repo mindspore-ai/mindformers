@@ -94,13 +94,13 @@ class SinkhornKnopp(nn.Cell):
 
     def shard(self):
         """Set shard strategies for all ops on [s, b, n, n] tensors."""
-        shard_4d  = layout("tp", "dp", "None", "None")
+        shard_4d  = layout("cp_tp", "dp", "None", "None")
         shard_nnn = layout("None", "None", "None", "None")
         self.exp.shard((shard_4d,))
         self.sub.shard((shard_4d, shard_4d))
         self.div.shard((shard_4d, shard_4d))
         self.add_eps.shard((shard_4d, shard_nnn))  # [s,b,n,1] + [1,1,1,1] → broadcast ok
-        shard_3d  = layout("tp", "dp", "None")
+        shard_3d  = layout("cp_tp", "dp", "None")
         self.max_op.shard(in_strategy=(shard_4d,), out_strategy=(shard_3d,))
         self.max_op.add_prim_attr("self_define_shard", True)
         self.expand_max.shard((shard_3d,))
@@ -159,7 +159,7 @@ class HyperConnectionOutputCell(nn.Cell):
 
     def shard(self):
         """Set shard strategies for output cell ops on [s, b, n, H] tensors."""
-        shard_4d = layout("tp", "dp", "None", "None")
+        shard_4d = layout("cp_tp", "dp", "None", "None")
         self.res_mm.shard((shard_4d, shard_4d))
         self.mul_outer.shard((shard_4d, shard_4d))
         self.add_output.shard((shard_4d, shard_4d))
@@ -299,9 +299,9 @@ class HyperConnectionModule(nn.Cell):
 
     def shard(self):
         """Set shard strategies for all HyperConnectionModule ops."""
-        shard_4d  = layout("tp", "dp", "None", "None")
+        shard_4d  = layout("cp_tp", "dp", "None", "None")
         shard_nnn = layout("None", "None", "None", "None")
-        shard_3d  = layout("tp", "dp", "None")
+        shard_3d  = layout("cp_tp", "dp", "None")
 
         self.sigmoid.shard((shard_4d,))
         self.mapping_mm.shard(in_strategy=(shard_4d, layout("None", "None")), out_strategy=(shard_4d,))
@@ -422,21 +422,24 @@ class HyperConnectionModuleFused(nn.Cell):
         dim = n + n + n * n        # pre + post + res output dims
 
         # ── Single projection  [1, 1, n*H, dim] ─────────────────────────────
-        fi = np.random.normal(0, 1e-4, (1, 1, n * h_sz, dim)).astype(np.float32)
+        fi = np.random.normal(0, 1e-4, (n * h_sz, dim)).astype(np.float32)
         self.mapping_weight = Parameter(
             Tensor(fi, mstype.float32), parallel_optimizer=False)
 
-        # ── Bias — legacy-proven initialisation ──────────────────────────────
-        # pre:  -log(3)   →  sigmoid ≈ 0.25  (uniform stream mixing)
-        # post: 0         →  sigmoid ≈ 0.5
-        # res:  (I−1)×5   →  strong diagonal prior
-        pre_b = np.full(n, -np.log(3), np.float32)
-        post_b = np.zeros(n, np.float32)
-        res_b  = ((np.eye(n, dtype=np.float32) - 1) * 5).ravel()
-        bias   = np.concatenate([pre_b, post_b, res_b])  # [dim]
-        self.bias = Parameter(
-            Tensor(bias, mstype.float32),
-            parallel_optimizer=False)
+        def _alpha():
+            return Parameter(
+                Tensor(np.full((1, 1, 1, 1), init_gating_factor, np.float32), mstype.float32),
+                parallel_optimizer=False)
+        self.alpha_pre  = _alpha()
+        self.alpha_post = _alpha()
+        self.alpha_res  = _alpha()
+
+        pre_b  = np.full((1, 1, 1, n), -np.log(3), np.float32)
+        post_b = np.zeros((1, 1, 1, n), dtype=np.float32)
+        res_b  = ((np.eye(n, dtype=np.float32) - 1) * 5).reshape(1, 1, 1, n * n)
+        self.bias_pre  = Parameter(Tensor(pre_b,  mstype.float32), parallel_optimizer=False)
+        self.bias_post = Parameter(Tensor(post_b, mstype.float32), parallel_optimizer=False)
+        self.bias_res  = Parameter(Tensor(res_b,  mstype.float32), parallel_optimizer=False)
 
         # ── Fused RmsNorm (γ=1, no learned params) ──────────────────────────
         self._rms_weight = Tensor(np.ones(n * h_sz, np.float32), mstype.float32)
@@ -444,9 +447,6 @@ class HyperConnectionModuleFused(nn.Cell):
 
         # ── Post-sublayer update cell (Fix: must be a Cell, not a plain method)
         self.output_cell = HyperConnectionOutputCell(rate, hidden_size, dtype)
-
-        hc_scale = np.array([init_gating_factor] * 3, dtype=np.float32)
-        self.hc_scale = Parameter(Tensor(hc_scale, dtype=mstype.float32), parallel_optimizer=False)
 
         # ops
         from ..ops.hc_split_sinkhorn import HcSplitSinkhorn
@@ -456,6 +456,7 @@ class HyperConnectionModuleFused(nn.Cell):
         self.mapping_mm = aclnn_ops.BatchMatMul()
         self.pre_mm = aclnn_ops.BatchMatMul()
         self.squeeze = aclnn_ops.Squeeze(axis=2)
+        self.concat = aclnn_ops.Concat(axis=3)
 
         self.morphed_forward = Morph(self.forward_func, self.func_infer_shape, self.func_infer_dtype).add_prim_attr(
             "self_define_shard", True)
@@ -466,15 +467,19 @@ class HyperConnectionModuleFused(nn.Cell):
         """Set shard strategies for all HyperConnectionModuleFused ops."""
         self.morphed_forward.shard(
             in_strategy=(
-                layout("tp", "dp", "None"),
+                layout("cp_tp", "dp", "None"),
+                layout("None", "None"),
                 layout("None", "None", "None", "None"),
-                layout("None",),
-                layout("None",),
+                layout("None", "None", "None", "None"),
+                layout("None", "None", "None", "None"),
+                layout("None", "None", "None", "None"),
+                layout("None", "None", "None", "None"),
+                layout("None", "None", "None", "None"),
             ),
             out_strategy=(
-                layout("tp", "dp", "None"),
-                layout("tp", "dp", "None", "None"),
-                layout("tp", "dp", "None", "None"),
+                layout("cp_tp", "dp", "None"),
+                layout("cp_tp", "dp", "None", "None"),
+                layout("cp_tp", "dp", "None", "None"),
             ),
         )
 
@@ -485,7 +490,9 @@ class HyperConnectionModuleFused(nn.Cell):
     def func_infer_dtype(self, *args):
         return args[0], self.dtype, self.dtype
 
-    def forward_func(self, hidden_states, mapping_weight, hc_scale, bias):
+    def forward_func(self, hidden_states, mapping_weight,
+                     alpha_pre, alpha_post, alpha_res,
+                     bias_pre, bias_post, bias_res):
         """Compute connection matrices and aggregate streams.
 
         Args:
@@ -495,6 +502,12 @@ class HyperConnectionModuleFused(nn.Cell):
             h_res:      [s, b, n, n]    doubly-stochastic residual matrix
             h_post:     [s, b, n, 1]    per-stream output scale
         """
+        hc_scale = self.concat((alpha_pre, alpha_post, alpha_res))
+        hc_scale = hc_scale.reshape((3,))
+
+        bias = self.concat((bias_pre, bias_post, bias_res))
+        bias = bias.reshape((-1,))
+
         s = hidden_states.shape[0]
         n, h_sz = self.rate, self.hidden_size
         orig_dtype = hidden_states.dtype  # bfloat16 (packed streams)
@@ -533,4 +546,6 @@ class HyperConnectionModuleFused(nn.Cell):
         return aggregated, h_res, h_post
 
     def construct(self, hidden_states):
-        return self.morphed_forward(hidden_states, self.mapping_weight, self.hc_scale, self.bias)
+        return self.morphed_forward(hidden_states, self.mapping_weight,
+                                    self.alpha_pre, self.alpha_post, self.alpha_res,
+                                    self.bias_pre, self.bias_post, self.bias_res)
