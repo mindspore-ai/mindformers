@@ -3,54 +3,34 @@ description: Create a new Request for Comments (RFC) proposal (English version)
 title: "[RFC] "
 labels: ["kind/rfc"]
 body:
-  - type: input
-    id: authors
-    attributes:
-      label: Authors
-      description: Please list authors' AtomGit/GitHub handles (e.g., @nickname)
-      placeholder: "@nickname"
-    validations:
-      required: true
-
-  - type: dropdown
-    id: status
-    attributes:
-      label: Status
-      options:
-        - Proposed
-        - Draft
-        - Reviewing
-        - Accepted
-        - Rejected
-    validations:
-      required: true
-
   - type: textarea
-    id: summary
+    id: background
     attributes:
-      label: Summary
-      description: A concise overview or "elevator pitch" of the proposal.
+      label: Background
+      description: Describe the background of the proposal, the problems it addresses, the core value, and the objectives it achieves.
       placeholder: |
         * This proposal aims to solve [problem] by [method] to achieve [goal].
     validations:
       required: true
-
+  
   - type: textarea
-    id: motivation
+    id: usecase
     attributes:
-      label: Motivation
-      description: Why are we doing this? What pain points does it solve?
+      label: Use Case
+      description: For each scenario use case of this proposal, describe the main functions which are included, key performance indicators to be achieved, security and privacy requirements, as well as DFX (compatibility, maintainability, testability, reliability...) requirements. If involved, additional information such as usage restrictions, constraints, and requirements can also be included.
       placeholder: |
-        * Problem Statement: What are the current limitations?
-        * Value & Impact: What specific benefits will this bring to MindFormers users?
+        * The main use case of this proposal, including who will use it, how they use it, etc.
     validations:
       required: true
 
   - type: textarea
-    id: proposed_implementation
+    id: design_details
     attributes:
-      label: Proposed Implementation
-      description: Detailed technical design, architecture, and API definitions.
+      label: Design Details
+      description:
+        Based on the use cases and functional features of this proposal, elaborate on the overall design concept, technical solution, core logic, which may include choosing what software/hardware platforms, operating systems, programming models, using what algorithms, how the system architecture is designed, how the UI is presented, etc.
+        Depending on the complexity of the implementation plan, natural language can be adopted, and suitable methods such as architecture diagrams, sequence diagrams, activity diagrams or state machines (algorithms) can be combined to assist in the design.
+        The impact of the security privacy and DFX (compatibility, maintainability, testability, reliability...) attributes involved in this proposal also need to be designed.
       placeholder: |
         ### Design Logic
         * Describe the core architecture and flow.
@@ -58,33 +38,62 @@ body:
         ### API Design
         * Provide code snippets (e.g., new Cell, Ops, or configs).
         * Explain how users will interact with this feature.
+
+        ### Impact Analysis
+        * Impact on existing system architecture, configurations, and backward compatibility.
+        * Impact on software complexity, performance, etc.
     validations:
       required: true
 
   - type: textarea
-    id: metrics
+    id: user_guide
     attributes:
-      label: Metrics & Verification
-      description: How will success be measured?
+      label: User Guide
+      description:
+        Introduce how to use this function, as well as the usage constraints or limitations.
+        If it requires new interfaces or interface changes, additional interface descriptions must be added;
+        For configuration parameters, parameter explanations need to be provided;
+        The relevant usage constraints and limitations should be described.
       placeholder: |
-        * Performance: Throughput, memory usage, TFLOPS.
-        * Accuracy: Alignment with PyTorch/Megatron baselines.
-        * Test Plan: Unit tests and integration scenarios.
+        * Describe how to use the feature and associated constraints or limitations.
+    validations:
+        required: true
+
+
+  - type: textarea
+    id: test_plan
+    attributes:
+      label: Test Plan
+      description: Introduce the testing methods and test case for this function, including unit tests, integration tests, and end-to-end tests, etc.
+      placeholder: |
+        * Describe the testing approach, including unit tests, integration tests, and end-to-end tests.
+        * Describe expected test objectives, including:
+          * Performance metrics: throughput, memory usage, TFLOPS, etc.
+          * Accuracy metrics: alignment with PyTorch/Megatron, etc.
+    validations:
+      required: true
 
   - type: textarea
     id: drawbacks
     attributes:
-      label: Drawbacks & Constraints
-      description: Potential risks, breaking changes, or dependencies.
+      label: Drawbacks
+      description: 
+        Explain potential risks (Breaking Change, performance regression, complexity increase, security issues), negative impacts (impact on existing functions/users), implementation costs (code volume/maintenance cost/ manpower investment), whether there is API or version compatibility issues, migration solutions for the old version, etc., and provide corresponding solution.
       placeholder: |
-        * Breaking Changes: Will existing models/configs be affected?
-        * Complexity & Dependencies: Any significant overhead or new libraries?
+        * Describe the drawbacks and potential risks associated with this function.
 
   - type: textarea
-    id: documentation
+    id: alternatives
     attributes:
-      label: Documentation & Usability
-      description: Plan for documentation updates and user experience.
+      label: Alternatives
+      description: There are alternative solutions for this function which should be compared, and explain the reasons for not choosing any of them.
       placeholder: |
-        * Config Changes: New yaml parameters and defaults.
-        * Docs Update: README or tutorial revisions.
+        * Describe other possible solutions or approaches that were considered.
+
+  - type: textarea
+    id: unresolved_questions
+    attributes:
+      label: Unresolved Questions
+      description: Open issues that need to be discussed and decided by the community, such as hardware compatibility scope, default values of parameters, etc. (These need to be resolved before the RFC is approved.)
+      placeholder: |
+        * Describe the issues that require further discussion or decision-making by the community.
