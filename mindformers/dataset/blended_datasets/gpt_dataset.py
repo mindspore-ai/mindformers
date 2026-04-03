@@ -75,13 +75,15 @@ class GPTDataset(MegatronDataset):
 
         indexed_indices (numpy.ndarray): The set of the documents indices to expose
 
-        num_samples (Optional[int]): The number of samples to draw from the indexed dataset. When None, build as many samples as correspond to one epoch.
+        num_samples (Optional[int]): The number of samples to draw from the indexed dataset.
+            When None, build as many samples as correspond to one epoch.
 
         index_split (Split): The indexed_indices Split
 
         config (GPTDatasetConfig): The config
     """
 
+    # pylint: disable=W0702
     def __init__(
         self,
         indexed_dataset: IndexedDataset,
@@ -170,6 +172,7 @@ class GPTDataset(MegatronDataset):
         Returns:
             Dict[str, numpy.ndarray]: The sample information wrapped in a dictionary
         """
+        actual_seq_len = None
         if idx is None:
             # Batch padding sequence so the index does not matter
             text, _ = self._query_document_sample_shuffle_indices(0)
@@ -199,8 +202,6 @@ class GPTDataset(MegatronDataset):
 
             if self.config.create_compressed_eod_mask:
                 actual_seq_len = _get_eod_attention_mask(tokens, self._eod_token_id, self.config.eod_pad_length)
-            else:
-                actual_seq_len = None
 
             if self.masks_and_position_ids_are_cacheable:
                 self.cached_attention_mask = attention_mask
@@ -225,12 +226,11 @@ class GPTDataset(MegatronDataset):
         if self.config.create_compressed_eod_mask:
             return (tokens.astype(numpy.int32), labels.astype(numpy.int32), loss_mask.astype(numpy.int32),
                     position_ids.astype(numpy.int32), actual_seq_len.astype(numpy.int32))
-        elif self.config.create_attention_mask:
+        if self.config.create_attention_mask:
             return (tokens.astype(numpy.int32), labels.astype(numpy.int32), loss_mask.astype(numpy.int32),
                     position_ids.astype(numpy.int32), attention_mask.astype(numpy.int32))
-        else:
-            return (tokens.astype(numpy.int32), labels.astype(numpy.int32),
-                    loss_mask.astype(numpy.int32), position_ids.astype(numpy.int32))
+        return (tokens.astype(numpy.int32), labels.astype(numpy.int32),
+                loss_mask.astype(numpy.int32), position_ids.astype(numpy.int32))
 
     def _query_document_sample_shuffle_indices(
         self, idx: int
@@ -298,7 +298,8 @@ class GPTDataset(MegatronDataset):
                 * (self.config.sequence_length + self.config.add_extra_token_to_sequence - length)
             )
 
-
+        # pylint: disable = E1123
+        # Pylint reported a false positive.
         return (
             numpy.concatenate(sample_parts, dtype=numpy.int64),
             numpy.array(document_ids, dtype=numpy.int64),
@@ -536,13 +537,13 @@ class GPTDataset(MegatronDataset):
         num_tokens = num_tokens_per_epoch
         if self.num_samples is None:
             return num_epochs
-        else:
-            num_tokens_requested = (
-                self.num_samples * self.config.sequence_length
-            ) + self.config.add_extra_token_to_sequence
-            while num_tokens < num_tokens_requested:
-                num_epochs += 1
-                num_tokens += num_tokens_per_epoch
+
+        num_tokens_requested = (
+            self.num_samples * self.config.sequence_length
+        ) + self.config.add_extra_token_to_sequence
+        while num_tokens < num_tokens_requested:
+            num_epochs += 1
+            num_tokens += num_tokens_per_epoch
         return num_epochs
 
 
@@ -587,7 +588,8 @@ def _build_shuffle_index(
     Args:
         num_samples (int): The size of the first shuffle range [0, num_samples)
 
-        total_size (int): The size of the entire index. If larger than 'num_samples', it defines the second shuffle range [num_samples, total_size)
+        total_size (int): The size of the entire index. If larger than 'num_samples',
+            it defines the second shuffle range [num_samples, total_size)
 
         numpy_random_state (numpy.random.RandomState): The NumPy random state
 
@@ -612,7 +614,7 @@ def _build_shuffle_index(
 def _get_eod_attention_mask(
     data: numpy.ndarray,
     eod_token: int,
-    eod_pad_length: int
+    compressed_eod_mask_length: int
 ):
     """
     Get the compressed EOD attention mask.
@@ -624,15 +626,23 @@ def _get_eod_attention_mask(
     Returns:
         attention_mask (numpy.ndarray): Attention mask needed to be used for Attention
     """
-    seq_length = numpy.size(data)
-    eod_positions = numpy.where(data == eod_token)[0] + 1
-    if data[-1] == eod_token:
-        eod_positions = eod_positions[:-1]
-    actual_seq_len = numpy.concatenate(
-        (eod_positions, [seq_length] * (max(seq_length, eod_pad_length) - len(eod_positions))),
-        dtype=numpy.int32
+    seq_length = data.size
+    eod_positions = numpy.where(data == eod_token)[0] + 1  # EOD after the token
+    if len(data) > 0 and data[-1] == eod_token:
+        eod_positions = eod_positions[:-1]  # Do not include final EOD
+
+    if len(eod_positions) > compressed_eod_mask_length:
+        raise ValueError(
+            f"Number of EOD tokens ({len(eod_positions)}) exceeds "
+            f"compressed_eod_mask_length ({compressed_eod_mask_length})."
+        )
+
+    actual_seq_len = numpy.pad(
+        eod_positions,
+        (0, compressed_eod_mask_length - len(eod_positions)),
+        mode='constant',
+        constant_values=seq_length
     )
-    actual_seq_len = actual_seq_len[:eod_pad_length]
     return actual_seq_len
 
 
@@ -657,7 +667,8 @@ def _get_ltor_masks_and_position_ids(
 
         eod_mask_loss (bool): Switch to enable the EOD mask loss
 
-        create_attention_mask (bool): Switch to enable the attention masks generation. Can be disabled if attention kernel generates masks by itself.
+        create_attention_mask (bool): Switch to enable the attention masks generation.
+            Can be disabled if attention kernel generates masks by itself.
 
     Returns:
         numpy.ndarray: Attention mask needed to be used for Attention
@@ -713,7 +724,7 @@ def _get_ltor_masks_and_position_ids(
 
 
 class MockGPTLowLevelDataset:
-
+    """Mock dataset for GPT low-level data simulation."""
     seed: int = 0
     size: int = 100000
     max_sequence_length: int = 4096
