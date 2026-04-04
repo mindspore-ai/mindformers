@@ -39,11 +39,10 @@ Key improvements over the three-separate-module design
      post : 0        → sigmoid ≈ 0.5
      res  : (I−1)×5  → strong diagonal prior, fewer Sinkhorn iterations
 
-6. **HyperConnectionOutputCell** is a standalone Cell so that its ops
-   (res_mm, mul_outer, add_output) are compiled into the MindSpore graph
-   with correct shard annotations.  Calling a plain Python method from
-   inside another Cell's construct() bypasses graph compilation and
-   silently drops all shard strategies.
+6. **HyperConnectionOutputCell** is Morph-wrapped so that the entire
+   post-sublayer update (including rank-changing reshapes) is treated as
+   a single logical op by the parallel compiler.  In/out shard strategies
+   are declared once on the Morph op rather than per internal primitive.
 """
 
 import numpy as np
@@ -130,11 +129,10 @@ class SinkhornKnopp(nn.Cell):
 class HyperConnectionOutputCell(nn.Cell):
     """Residual-stream update after a sublayer (attention or FFN).
 
-    Factored into its own Cell so that MindSpore's graph compiler picks up
-    the construct() method and applies all .shard() annotations correctly.
-    Calling a plain Python helper method from inside another Cell's
-    construct() is silently treated as Python-level execution — the graph
-    compiler does not compile it and all shard strategies are ignored.
+    Wrapped with Morph so the entire update is a single logical op to the
+    parallel compiler, with explicit in/out shard strategies.  The internal
+    reshapes (rank change: [s,b,n*H]↔[s,b,n,H]) would otherwise require
+    self_define_shard on every Reshape; Morph avoids that entirely.
 
     Computes:
         new_streams = H_res @ x_streams  +  H_post ⊗ sublayer_out
@@ -155,16 +153,36 @@ class HyperConnectionOutputCell(nn.Cell):
         self.mul_outer        = aclnn_ops.Mul()
         self.add_output       = aclnn_ops.AddExt()
 
+        self.morphed_output = Morph(
+            self.forward_func, self.func_infer_shape, self.func_infer_dtype)
+        self.morphed_output.add_prim_attr("self_define_shard", True)
+
         self.shard()
 
     def shard(self):
-        """Set shard strategies for output cell ops on [s, b, n, H] tensors."""
-        shard_4d = layout("cp_tp", "dp", "None", "None")
-        self.res_mm.shard((shard_4d, shard_4d))
-        self.mul_outer.shard((shard_4d, shard_4d))
-        self.add_output.shard((shard_4d, shard_4d))
+        """Set shard strategy for the Morph-wrapped output op."""
+        self.morphed_output.shard(
+            in_strategy=(
+                layout("cp_tp", "dp", "None", "None"),  # h_res   [s,b,n,n]
+                layout("cp_tp", "dp", "None", "None"),  # h_post  [s,b,n,1]
+                layout("cp_tp", "dp", "None"),           # original_streams [s,b,n*H]
+                layout("cp_tp", "dp", "None"),           # sublayer_out [s,b,H]
+            ),
+            out_strategy=(
+                layout("cp_tp", "dp", "None"),           # output [s,b,n*H]
+            ),
+        )
 
-    def construct(self, h_res, h_post, original_streams, sublayer_out):
+    def func_infer_shape(self, *args):
+        """Infer output shape: [s, b, n*H] from original_streams shape (args[2])."""
+        s, b, _ = args[2]
+        return (s, b, self.rate * self.hidden_size)
+
+    def func_infer_dtype(self, *args):
+        """Infer output dtype: matches original_streams dtype (args[2])."""
+        return args[2]
+
+    def forward_func(self, h_res, h_post, original_streams, sublayer_out):
         """
         Args:
             h_res:            [s, b, n, n]  doubly-stochastic matrix
@@ -174,8 +192,8 @@ class HyperConnectionOutputCell(nn.Cell):
         Returns:
             [s, b, n*H]  updated packed streams
         """
-        s          = original_streams.shape[0]
-        n, h_size  = self.rate, self.hidden_size
+        s         = original_streams.shape[0]
+        n, h_size = self.rate, self.hidden_size
 
         # H_res @ streams:  [s,b,n,n] @ [s,b,n,H] → [s,b,n,H]
         x_streams = self.reshape_streams(original_streams, (s, -1, n, h_size))
@@ -187,6 +205,10 @@ class HyperConnectionOutputCell(nn.Cell):
 
         output = self.add_output(res_part, post_part)
         return self.reshape_output(output, (s, -1, n * h_size))
+
+    def construct(self, h_res, h_post, original_streams, sublayer_out):
+        """Delegate to morphed_output (Morph-wrapped forward_func)."""
+        return self.morphed_output(h_res, h_post, original_streams, sublayer_out)
 
 
 class HyperConnectionModule(nn.Cell):
@@ -213,9 +235,9 @@ class HyperConnectionModule(nn.Cell):
         hidden_states = self.ffn_hc.output_cell(
             h_res, h_post, hidden_states, x)              # [s, b, n*H]
 
-    output_cell is a HyperConnectionOutputCell instance whose construct()
-    holds the post-sublayer update logic.  It must be a proper Cell (not a
-    plain method) so MindSpore compiles it and honours all .shard() calls.
+    output_cell is a Morph-wrapped HyperConnectionOutputCell; its construct()
+    delegates to a single morphed_output op so the parallel compiler sees
+    explicit in/out shard strategies across the rank-changing reshapes.
     """
 
     def __init__(self, rate, hidden_size, config,
@@ -294,88 +316,114 @@ class HyperConnectionModule(nn.Cell):
         self.add_bias_pre    = aclnn_ops.AddExt()
         self.add_bias_post   = aclnn_ops.AddExt()
         self.add_bias_res    = aclnn_ops.AddExt()
+        # Morph wrapper: treats the full forward as a single logical op so
+        # Python slicing inside forward_func is safe (no anonymous-op shard
+        # issue) and rank-changing reshapes are invisible to the compiler.
+        self.morphed_forward = Morph(
+            self.forward_func, self.func_infer_shape, self.func_infer_dtype)
+        self.morphed_forward.add_prim_attr("self_define_shard", True)
 
         self.shard()
 
     def shard(self):
-        """Set shard strategies for all HyperConnectionModule ops."""
-        shard_4d  = layout("cp_tp", "dp", "None", "None")
-        shard_nnn = layout("None", "None", "None", "None")
-        shard_3d  = layout("cp_tp", "dp", "None")
+        """Set shard strategy for the Morph-wrapped forward op."""
+        self.morphed_forward.shard(
+            in_strategy=(
+                layout("cp_tp", "dp", "None"),            # hidden_states [s,b,n*H]
+                layout("None", "None"),                    # mapping_weight [n*H,dim]
+                layout("None", "None", "None", "None"),   # alpha_pre  [1,1,1,1]
+                layout("None", "None", "None", "None"),   # alpha_post [1,1,1,1]
+                layout("None", "None", "None", "None"),   # alpha_res  [1,1,1,1]
+                layout("None", "None", "None", "None"),   # bias_pre  [1,1,1,n]
+                layout("None", "None", "None", "None"),   # bias_post [1,1,1,n]
+                layout("None", "None", "None", "None"),   # bias_res  [1,1,1,n²]
+            ),
+            out_strategy=(
+                layout("cp_tp", "dp", "None"),            # aggregated [s,b,H]
+                layout("cp_tp", "dp", "None", "None"),    # h_res  [s,b,n,n]
+                layout("cp_tp", "dp", "None", "None"),    # h_post [s,b,n,1]
+            ),
+        )
 
-        self.sigmoid.shard((shard_4d,))
-        self.mapping_mm.shard(in_strategy=(shard_4d, layout("None", "None")), out_strategy=(shard_4d,))
-        self.pre_mm.shard((shard_4d, shard_4d))
-        self.squeeze.shard((shard_4d,))
-        self.mul_alpha_pre.shard((shard_nnn, shard_4d))
-        self.mul_alpha_post.shard((shard_nnn, shard_4d))
-        self.mul_alpha_res.shard((shard_nnn, shard_4d))
-        self.mul_expand_post.shard((shard_nnn, shard_4d))
-        self.add_bias_pre.shard((shard_4d, shard_nnn))
-        self.add_bias_post.shard((shard_4d, shard_nnn))
-        self.add_bias_res.shard((shard_4d, shard_nnn))
-        # Fused RmsNorm: input [s,b,n*H], weight [n*H] (γ=1, non-learnable)
-        self.rms_norm.shard((shard_3d, layout("None",)))
+    def func_infer_shape(self, *args):
+        """Infer output shapes: aggregated [s,b,H], h_res [s,b,n,n], h_post [s,b,n,1]."""
+        s, b, _ = args[0]
+        return (s, b, self.hidden_size), (s, b, self.rate, self.rate), (s, b, self.rate, 1)
+
+    def func_infer_dtype(self, *args):
+        """Infer output dtypes: aggregated matches input, h_res/h_post are self.dtype."""
+        return args[0], self.dtype, self.dtype
 
     # ─────────────────────────────────────────────────────────────────────────
-    def construct(self, hidden_states):
+    def forward_func(self, hidden_states, mapping_weight,
+                     alpha_pre, alpha_post, alpha_res,
+                     bias_pre, bias_post, bias_res):
         """Compute connection matrices and aggregate streams.
+
+        Python slicing is safe here because Morph treats this as a black box —
+        the parallel compiler does not inspect individual ops inside, so no
+        anonymous StridedSlice triggers an AlltoAll after mapping_mm.
 
         Args:
             hidden_states: [s, b, n*H]  packed residual streams (bfloat16)
+            mapping_weight: [n*H, dim]  projection weight
+            alpha_pre/post/res: [1,1,1,1]  per-type gating scales
+            bias_pre/post/res:  [1,1,1,n/n/n²]  per-type biases
         Returns:
             aggregated: [s, b, H]       weighted input for the sublayer
             h_res:      [s, b, n, n]    doubly-stochastic residual matrix
             h_post:     [s, b, n, 1]    per-stream output scale
         """
-        s          = hidden_states.shape[0]
-        n, h_sz    = self.rate, self.hidden_size
+        s       = hidden_states.shape[0]
+        n, h_sz = self.rate, self.hidden_size
 
         # 1. Fused RmsNorm (γ=1, no learned params) — single kernel, fp32 output
-        #    matmul(x/rms, W) = matmul(x, W)/rms ≡ Megatron's r_inv * proj
         norm_x = self.rms_norm(
             self.cast(hidden_states, mstype.float32), self._rms_weight)[0]  # [s, b, n*H]
 
         # 2. Project normalised hidden_states  →  [s, b, 1, n+n+n²]
-        x4d = self.cast(self.reshape(norm_x, (s, -1, 1, n * h_sz)), self.dtype)  # [s, b, 1, n*H] bf16
-        h   = self.mapping_mm(x4d, self.cast(self.mapping_weight, self.dtype))
+        x4d = self.cast(self.reshape(norm_x, (s, -1, 1, n * h_sz)), self.dtype)
+        h   = self.mapping_mm(x4d, self.cast(mapping_weight, self.dtype))
         h   = self.cast(h, mstype.float32)                          # [s, b, 1, dim] fp32
 
-        # 3. Split raw projection (bias NOT yet added — must be added AFTER alpha mul)
+        # 3. Split raw projection — Python slicing is safe inside Morph
         h_pre  = h[:, :, :, :n]                                    # [s, b, 1, n]
         h_post = h[:, :, :, n:2 * n]                               # [s, b, 1, n]
         h_res  = h[:, :, :, 2 * n:]                                # [s, b, 1, n²]
 
         # 4. Activations: sigmoid(alpha * proj + bias)
         #    Correct order: mul alpha FIRST, add bias SECOND.
-        #    Reversed order sigmoid(alpha*(proj+bias)) would scale bias by alpha,
-        #    destroying the -log(3) pre-prior and the (I-1)*5 res diagonal prior.
         h_pre  = self.sigmoid(
-            self.add_bias_pre(self.mul_alpha_pre(self.alpha_pre, h_pre),
-                              self.bias_pre))                       # float32
+            self.add_bias_pre(self.mul_alpha_pre(alpha_pre, h_pre),
+                              bias_pre))                            # float32
         h_post = self.mul_expand_post(
             self.expand_post_val,
             self.sigmoid(
-                self.add_bias_post(self.mul_alpha_post(self.alpha_post, h_post),
-                                   self.bias_post)))                # float32
+                self.add_bias_post(self.mul_alpha_post(alpha_post, h_post),
+                                   bias_post)))                     # float32
         h_res  = self.reshape(
-            self.add_bias_res(self.mul_alpha_res(self.alpha_res, h_res),
-                              self.bias_res), (s, -1, n, n))
+            self.add_bias_res(self.mul_alpha_res(alpha_res, h_res),
+                              bias_res), (s, -1, n, n))
         h_res  = self.cast(self.sinkhorn(h_res), self.dtype)        # [s, b, n, n]  bfloat16
 
-        # Cast h_pre / h_post to self.dtype (computation dtype) so all three
-        # tensors that go into BatchMatMul / Mul share the same dtype as
-        # x_streams.  Using orig_dtype instead would mismatch when the caller
-        # passes float32 hidden_states (e.g. during fp32 warmup or inference).
         h_pre  = self.cast(h_pre, self.dtype)                      # [s, b, 1, n]  bfloat16
         h_post = self.cast(
             self.reshape(h_post, (s, -1, n, 1)), self.dtype)       # [s, b, n, 1]  bfloat16
 
         # 5. Aggregate streams:  [s,b,1,n] @ [s,b,n,H] → [s,b,1,H] → [s,b,H]
-        x_streams  = self.reshape(hidden_states, (s, -1, n, h_sz))  # [s, b, n, H]  bfloat16
+        x_streams  = self.reshape(hidden_states, (s, -1, n, h_sz))  # [s, b, n, H]
         aggregated = self.squeeze(self.pre_mm(h_pre, x_streams))     # [s, b, H]
 
         return aggregated, h_res, h_post
+
+    def construct(self, hidden_states):
+        """Forward pass: delegates to morphed_forward with all parameters explicit."""
+        return self.morphed_forward(
+            hidden_states,
+            self.mapping_weight,
+            self.alpha_pre, self.alpha_post, self.alpha_res,
+            self.bias_pre, self.bias_post, self.bias_res,
+        )
 
 
 class HyperConnectionModuleFused(nn.Cell):
@@ -402,9 +450,9 @@ class HyperConnectionModuleFused(nn.Cell):
         hidden_states = self.ffn_hc.output_cell(
             h_res, h_post, hidden_states, x)              # [s, b, n*H]
 
-    output_cell is a HyperConnectionOutputCell instance whose construct()
-    holds the post-sublayer update logic.  It must be a proper Cell (not a
-    plain method) so MindSpore compiles it and honours all .shard() calls.
+    output_cell is a Morph-wrapped HyperConnectionOutputCell; its construct()
+    delegates to a single morphed_output op so the parallel compiler sees
+    explicit in/out shard strategies across the rank-changing reshapes.
     """
 
     def __init__(self, rate, hidden_size, config,
@@ -421,7 +469,7 @@ class HyperConnectionModuleFused(nn.Cell):
         h_sz = hidden_size
         dim = n + n + n * n        # pre + post + res output dims
 
-        # ── Single projection  [1, 1, n*H, dim] ─────────────────────────────
+        # ── Single projection  [n*H, dim] ───────────────────────────────────
         fi = np.random.normal(0, 1e-4, (n * h_sz, dim)).astype(np.float32)
         self.mapping_weight = Parameter(
             Tensor(fi, mstype.float32), parallel_optimizer=False)
@@ -484,10 +532,12 @@ class HyperConnectionModuleFused(nn.Cell):
         )
 
     def func_infer_shape(self, *args):
+        """Infer output shapes: aggregated [s,b,H], h_res [s,b,n,n], h_post [s,b,n,1]."""
         s, b, _ = args[0]
         return (s, b, self.hidden_size), (s, b, self.rate, self.rate), (s, b, self.rate, 1)
 
     def func_infer_dtype(self, *args):
+        """Infer output dtypes: aggregated matches input dtype, h_res/h_post are self.dtype."""
         return args[0], self.dtype, self.dtype
 
     def forward_func(self, hidden_states, mapping_weight,
@@ -540,12 +590,13 @@ class HyperConnectionModuleFused(nn.Cell):
         aggregated = self.squeeze(self.pre_mm(h_pre, x_streams))  # [s, b, H]
         aggregated = self.cast(aggregated, orig_dtype)
 
-        h_post = self.cast(self.reshape(h_post, (s, -1, n, 1)), self.dtype)  # [s, b, n, 1]  bfloat16
+        h_post = self.cast(self.reshape(h_post, (s, -1, n, 1)), self.dtype)  # [s, b, n, 1]
         h_res = self.cast(h_res, self.dtype)
 
         return aggregated, h_res, h_post
 
     def construct(self, hidden_states):
+        """Delegate to morphed_forward (Morph-wrapped forward_func)."""
         return self.morphed_forward(hidden_states, self.mapping_weight,
                                     self.alpha_pre, self.alpha_post, self.alpha_res,
                                     self.bias_pre, self.bias_post, self.bias_res)
