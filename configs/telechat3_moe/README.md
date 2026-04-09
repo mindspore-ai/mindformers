@@ -19,9 +19,9 @@
 
 TeleChat3 当前支持的版本配套如下。
 
-|           | Mindspore Transformers | MindSpore | CANN | HDK |
-|:---------:|:----------------------:|:---------:|:----:|:---:|
-| 当前支持的版本 |           在研版本           |    在研版本     |  在研版本  | 在研版本  |
+|         | Mindspore Transformers | MindSpore | CANN  |   HDK    |
+|:-------:|:----------------------:|:---------:|:-----:|:--------:|
+| 最新推荐的版本 |         1.9.0          |   2.9.0   | 9.0.0 | 26.0.RC1 |
 
 ### 前期准备
 
@@ -33,9 +33,9 @@ TeleChat3 当前支持的版本配套如下。
 
 用户可以从Modelers、Hugging Face、ModelScope等开源社区下载所需的模型文件，包括模型权重、Tokenizer、配置等（重头预训练不需加载权重）。链接如下：
 
-|         模型名称         | 下载链接                                             | 说明 |
-|:--------------------:|:-------------------------------------------------|:---|
-|  TeleChat/TeleChat3-105B-A4.7B  | [ModelScope](https://modelscope.cn/models/TeleAI/TeleChat3-105B-A4.7B-Thinking/files)
+|             模型名称              | 下载链接                                                                                  | 说明 |
+|:-----------------------------:|:--------------------------------------------------------------------------------------|:---|
+| TeleChat/TeleChat3-105B-A4.7B | [ModelScope](https://modelscope.cn/models/TeleAI/TeleChat3-105B-A4.7B-Thinking/files) |
 
 #### 数据集下载
 
