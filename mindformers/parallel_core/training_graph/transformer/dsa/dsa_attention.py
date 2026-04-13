@@ -21,6 +21,7 @@ import mindspore.common.dtype as mstype
 from mindspore import nn, ops, Parameter, Tensor
 from mindspore.ops import operations as P
 from mindspore.ops import auto_generate as aclnn_ops
+from mindspore.ops.operations.nn_ops import FlashAttentionScore
 from mindspore.context import ParallelMode
 from mindspore.parallel._utils import _get_parallel_mode
 
@@ -29,6 +30,7 @@ from mindformers.parallel_core.transformer_config import MLATransformerConfig
 from mindformers.parallel_core.training_graph.transformer.dsa.dsa_indexer_loss import DSAIndexerLoss
 from mindformers.parallel_core.training_graph.device_matrix import layout
 from mindformers.parallel_core.training_graph.communication import get_dp_cp_id
+from mindformers.parallel_core.training_graph.transformer.dsa.utils import adjust_bsnd_input, adjust_tnd_input
 
 
 @dataclass
@@ -76,6 +78,9 @@ class DSAttention(nn.Cell):
         self.head_num = config.num_attention_heads
         self.layer_number = layer_number
         self.attention_mode = 2 # currently, attention mode only support 2
+        self.cp = config.context_parallel_size
+        self.sparse_loss = config.dsa_indexer_use_sparse_loss
+        self.mask_compression = config.use_attn_mask_compression
 
         _, cp_id = get_dp_cp_id(config)
         self.offset_id = cp_id
@@ -103,22 +108,25 @@ class DSAttention(nn.Cell):
 
         # common operators
         self.cast = aclnn_ops.Cast()
-        self.transpose_q = aclnn_ops.Transpose()
-        self.transpose_kv = aclnn_ops.Transpose()
+        self.reshape = aclnn_ops.Reshape()
         self.split_q = aclnn_ops.SplitWithSize()
         self.split_k = aclnn_ops.SplitWithSize()
-        self.transpose_attn = aclnn_ops.Transpose()
-        # morph operators
-        self.clamp = aclnn_ops.ClampScalar()
-        self.relu = aclnn_ops.ReLU()
-        self.roll = aclnn_ops.Roll(1)
-        self.cumsum = aclnn_ops.CumsumExt()
-        self.sparse_flash_attention = P.Morph(
-            self._sparse_flash_attention_forward,
-            self.sfa_infer_shape,
-            lambda *args: (args[0], mstype.float32, mstype.float32)
-        ).add_prim_attr("self_define_shard", True)
-
+        if self.sparse_loss:
+            # Sparse stage use SparseFlashAttention.
+            self.sparse_flash_attention = P.Morph(
+                self._sparse_flash_attention_forward,
+                self.sfa_infer_shape,
+                lambda *args: (args[0], mstype.float32, mstype.float32)
+            ).add_prim_attr("self_define_shard", True)
+        else:
+            # Dense stage use common FlashAttention.
+            self.dense_flash_attention = FlashAttentionScore(
+                head_num=self.head_num,
+                scale_value=self.softmax_scale,
+                inner_precise=0,
+                input_layout=self.input_layout,
+                sparse_mode=config.sparse_mode
+            )
         if _get_parallel_mode() in (ParallelMode.SEMI_AUTO_PARALLEL,):
             self.shard()
 
@@ -141,18 +149,12 @@ class DSAttention(nn.Cell):
     ):
         """get attention output with fused sfa operator"""
         if self.is_tnd:
-            slice_tq = q.shape[0]
-            slice_tk = k.shape[0]
-            offset_q = slice_tq * self.offset_id
-            # process actual_seq_len for fused operator to auto-generate mask in individual shard
-            new_actual_seq_qlen = self.cast(self.clamp(actual_seq_qlen - offset_q, 0, slice_tq), mstype.int32)
-            new_actual_seq_kvlen = actual_seq_kvlen - self.relu(actual_seq_qlen - offset_q) + new_actual_seq_qlen
-            prev_seq_klen = self.roll(new_actual_seq_kvlen)
-            prev_seq_klen[0] = 0
-            new_actual_seq_kvlen = self.cumsum(self.relu(new_actual_seq_kvlen - prev_seq_klen), 0)
-            new_actual_seq_kvlen[-1] = slice_tk
-            actual_seq_qlen = new_actual_seq_qlen
-            actual_seq_kvlen = new_actual_seq_kvlen
+            actual_seq_qlen, actual_seq_kvlen = adjust_tnd_input(self.offset_id, q, k,
+                                                                 actual_seq_qlen, actual_seq_kvlen)
+        elif self.cp > 1:
+            k = adjust_bsnd_input(self.offset_id, q, k)
+            v = adjust_bsnd_input(self.offset_id, q, v)
+            key_rope = adjust_bsnd_input(self.offset_id, q, key_rope)
 
         attention_out, softmax_max, softmax_sum = ops.sparse_flash_attention(
             q, k, v, topk_indices, self.softmax_scale,
@@ -167,60 +169,71 @@ class DSAttention(nn.Cell):
         return attention_out, softmax_max, softmax_sum
 
     def construct(
-            self, query, key, value, topk_indices,
+            self, query, key, value, topk_indices, attention_mask=None,
             actual_seq_qlen=None, actual_seq_kvlen=None
     ):
         """Forward pass for Sparse Attention."""
-        if not self.is_tnd:
-            query = self.transpose_q(query, (1, 0, 2, 3))
-            key = self.transpose_kv(key, (1, 0, 2, 3))
-            value = self.transpose_kv(value, (1, 0, 2, 3))
+        if self.sparse_loss:
+            q_nope, q_rope = self.split_q(query, [self.nope_dim, self.pe_dim], -1)
+            k_nope, k_rope = self.split_k(key, [self.nope_dim, self.pe_dim], -1)
+            attention_output, softmax_max, softmax_sum = self.sparse_flash_attention(
+                q_nope, k_nope, value, topk_indices,
+                q_rope, k_rope, actual_seq_qlen, actual_seq_kvlen
+            )
+            if self.track_max_attention_logit:
+                if self.is_tnd:
+                    max_logits = self.reduce_max(softmax_max, (0, 1))
+                else:
+                    max_logits = self.reduce_max(softmax_max, (0, 1, 2))
+                self.assign(self.max_logits_val, self.maximum(self.max_logits_val, max_logits))
+        else:
+            # During dense warmup stage, common FlashAttention will be applied instead of SparseFlashAttention
+            softmax_max, softmax_sum, _, attention_output = self.dense_flash_attention(
+                query, key, value,
+                None, None, None,
+                attn_mask=attention_mask,
+                actual_seq_qlen=actual_seq_qlen,
+                actual_seq_kvlen=actual_seq_kvlen
+            )
+            softmax_max = softmax_max[..., :1]
+            softmax_sum = softmax_sum[..., :1]
+            if self.track_max_attention_logit:
+                if self.is_tnd:
+                    max_logits = self.reduce_max(softmax_max, (0, 2))
+                else:
+                    max_logits = self.reduce_max(softmax_max, (0, 2, 3))
+                self.assign(self.max_logits_val, self.maximum(self.max_logits_val, max_logits))
 
-        q_nope, q_rope = self.split_q(query, [self.nope_dim, self.pe_dim], -1)
-        k_nope, k_rope = self.split_k(key, [self.nope_dim, self.pe_dim], -1)
-
-        # ===================================
-        # Run sparse attention kernel
-        # ===================================
-        attention_output, softmax_max, _ = self.sparse_flash_attention(
-            q_nope, k_nope, value, topk_indices,
-            q_rope, k_rope, actual_seq_qlen, actual_seq_kvlen
-        )
-        if self.track_max_attention_logit:
-            if self.is_tnd:
-                max_logits = self.reduce_max(softmax_max, (0, 1))
-            else:
-                max_logits = self.reduce_max(softmax_max, (0, 1, 2))
-            # Update local maximum; global sync happens in GPTModel.allreduce_max_attention_logit()
-            self.assign(self.max_logits_val, self.maximum(self.max_logits_val, max_logits))
-
-        if not self.is_tnd:
-            attention_output = self.transpose_attn(attention_output, (1, 0, 2, 3))
-
-        return attention_output
+        return attention_output, softmax_max, softmax_sum
 
     def shard(self):
         """Set parallel strategy."""
-        self.transpose_q.shard((layout("cp", "dp", "tp", "None"),))
-        self.transpose_kv.shard((layout("cp", "dp", "None", "None"),))
-        self.transpose_attn.shard((layout("dp", "cp", "tp", "None"),))
+        # in sparse stage, head_num of kv is 1 so tp shard is not applied.
+        kv_head_split_num = "None" if self.sparse_loss else "tp"
         if self.is_tnd:
             q_shard = layout("dp_cp", "tp", "None")
-            kv_shard = layout("dp", "None", "None")
+            kv_shard = layout("dp", kv_head_split_num, "None")
             idx_shard = layout("dp_cp", "None", "None")
-            sfa_shard = (q_shard, kv_shard, kv_shard, idx_shard, q_shard, kv_shard, layout("dp"), layout("dp"))
+            mask_shard = layout("None", "None")
             attn_shard = layout("dp_cp", "tp", "None")
-            softmax_shard = layout("None", "dp_cp", "tp")
+            softmax_shard = layout("None", "dp_cp", "tp") if self.sparse_loss else layout("dp_cp", "None", "tp")
+            sfa_shard = (q_shard, kv_shard, kv_shard, idx_shard, q_shard, kv_shard, layout("dp"), layout("dp"))
+            fa_shard = (q_shard, kv_shard, kv_shard, mask_shard, layout("dp"), layout("dp"))
         else:
-            q_shard = layout("dp", "None", "tp", "None")
-            kv_shard = layout("dp", "None", "None", "None")
-            idx_shard = layout("dp", "None", "None", "None")
-            attn_shard = layout("dp", "None", "tp", "None")
-            softmax_shard = layout("dp", "None", "None", "tp")
+            q_shard = layout("dp", "cp", "tp", "None")
+            kv_shard = layout("dp", "None", kv_head_split_num, "None")
+            idx_shard = layout("dp", "cp", "None", "None")
+            mask_shard = layout("None", "None") if self.mask_compression else layout("dp", "None", "cp", "None")
+            attn_shard = layout("dp", "cp", "tp", "None")
+            softmax_shard = layout("dp", "None", "cp", "tp") if self.sparse_loss else layout("dp", "tp", "cp", "None")
             sfa_shard = (q_shard, kv_shard, kv_shard, idx_shard, q_shard, kv_shard)
+            fa_shard = (q_shard, kv_shard, kv_shard, mask_shard)
         self.split_q.shard((q_shard,))
         self.split_k.shard((kv_shard,))
-        self.sparse_flash_attention.shard(sfa_shard, (attn_shard, softmax_shard, softmax_shard))
+        if self.sparse_loss:
+            self.sparse_flash_attention.shard(sfa_shard, (attn_shard, softmax_shard, softmax_shard))
+        else:
+            self.dense_flash_attention.shard(fa_shard, (softmax_shard, softmax_shard, layout("None"), attn_shard))
         if self.track_max_attention_logit:
             self.assign.shard((layout("tp"), layout("tp")), (layout("tp"),))
             self.maximum.shard((layout("tp"), layout("tp")), (layout("tp"),))
