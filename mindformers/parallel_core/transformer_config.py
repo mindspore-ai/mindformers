@@ -1377,7 +1377,7 @@ class TransformerConfig:
     dsa_indexer_n_heads: int = field(
         default=None,
         metadata={
-            "description": "Number of DSA indexer heads.",
+            "description": "Number of DSA indexer heads. Should be in [8, 16, 32, 64].",
             "usage": ParamUsage.TRAINING,
             "source": ParamSource.MEGATRON,
             "mode": ParamMode.GRAPH
@@ -1387,7 +1387,7 @@ class TransformerConfig:
     dsa_indexer_head_dim: int = field(
         default=None,
         metadata={
-            "description": "Dimension per DSA indexer head.",
+            "description": "Dimension per DSA indexer head. Should be 128.",
             "usage": ParamUsage.TRAINING,
             "source": ParamSource.MEGATRON,
             "mode": ParamMode.GRAPH
@@ -1397,7 +1397,7 @@ class TransformerConfig:
     dsa_indexer_topk: int = field(
         default=None,
         metadata={
-            "description": "Number of top-k tokens to select in DSA indexer.",
+            "description": "Number of top-k tokens to select in DSA indexer. Should be in closed interval [1, 2048]",
             "usage": ParamUsage.TRAINING,
             "source": ParamSource.MEGATRON,
             "mode": ParamMode.GRAPH
@@ -2074,9 +2074,6 @@ class TransformerConfig:
         if self.experimental_attention_variant == 'dsa':
             if not self.multi_latent_attention:
                 raise ValueError("When experimental_attention_variant == 'dsa', multi_latent_attention should be True.")
-            if not self.use_flash_attention:
-                raise ValueError("DeepSeek Sparse Attention is only available for flash attention for now, "
-                                 "please set use_flash_attention=True.")
             if ms.get_auto_parallel_context("pipeline_scheduler") == "zero_bubble_v":
                 raise ValueError("When experimental_attention_variant == 'dsa', zero_bubble_v is not supported.")
 
@@ -2587,10 +2584,22 @@ class MLATransformerConfig(TransformerConfig):
 
         if self.experimental_attention_variant == 'dsa':
             if self.kv_lora_rank != 512 or self.qk_pos_emb_head_dim != 64 or \
-                    self.dsa_indexer_head_dim != 128 or self.dsa_indexer_n_heads != 64:
-                raise ValueError("CurrentLy, when `experimental_attention_variant` == 'dsa', "
-                                 "`kv_lora_rank` only supports 512, `qk_pos_emb_head_dim` only supports 64, "
-                                 "`dsa_indexer_head_dim` only supports 128, `dsa_indexer_n_heads` only supports 64.")
+                    self.num_attention_heads not in [32, 64, 128]:
+                raise ValueError("When `experimental_attention_variant` == 'dsa', "
+                                 "`kv_lora_rank` only supports 512, "
+                                 "`qk_pos_emb_head_dim` only supports 64, "
+                                 "`num_attention_heads` only supports {32, 64, 128}, "
+                                 f"but get `kv_lora_rank`={self.kv_lora_rank}, "
+                                 f"`qk_pos_emb_head_dim`={self.qk_pos_emb_head_dim}, "
+                                 f"`num_attention_heads`={self.num_attention_heads}!")
+            if self.dsa_indexer_n_heads not in [8, 16, 32, 64] or self.dsa_indexer_head_dim != 128 or \
+                    not 1 <= self.dsa_indexer_topk <= 2048:
+                raise ValueError("`dsa_indexer_n_heads` only supports {8, 16, 32, 64}, "
+                                 "`dsa_indexer_head_dim` only supports 128, "
+                                 "`dsa_indexer_topk` only supports 1~2048, "
+                                 f"but get `dsa_indexer_n_heads`={self.dsa_indexer_n_heads}, "
+                                 f"`dsa_indexer_head_dim`={self.dsa_indexer_head_dim}, "
+                                 f"`dsa_indexer_topk`={self.dsa_indexer_topk}.")
 
 
 default_transformer_config = TransformerConfig(num_attention_heads=1, num_layers=1)

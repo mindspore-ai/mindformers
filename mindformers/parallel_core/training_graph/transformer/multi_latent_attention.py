@@ -120,6 +120,7 @@ class MultiLatentAttention(nn.Cell):
         self.input_layout = self.config.input_layout
         self.compute_dtype = self.config.compute_dtype
         self.use_dsa = self.config.experimental_attention_variant == "dsa"
+        self.sparse_loss = self.config.dsa_indexer_use_sparse_loss
         self.mla_qkv_concat = self.config.mla_qkv_concat
 
         # Define ulysses context parallel related parameters
@@ -173,7 +174,9 @@ class MultiLatentAttention(nn.Cell):
             ).add_prim_attr("self_define_shard", True)
             self.cat_q = Concat(axis=3).add_prim_attr("self_define_shard", True)
             self.cat_k = Concat(axis=3).add_prim_attr("self_define_shard", True)
-            self.bmm = BatchMatMul()
+            self.unsqueeze = ExpandDims()
+            self.q_bmm = BatchMatMul()
+            self.v_bmm = BatchMatMul()
 
         if _get_parallel_mode() in (ParallelMode.AUTO_PARALLEL,) and _is_sharding_propagation():
             self.sharding_propagation()
@@ -210,6 +213,7 @@ class MultiLatentAttention(nn.Cell):
         self.tnd_transpose.shard((layout("cp", "dp", "tp", "None"),))
         self.tnd_transpose_one_head.shard((layout("cp", "dp", "None", "None"),))
         if self.use_dsa:
+            self.bs_transpose.shard((layout("dp", "cp", "tp", "None"), ))
             self.split_weight.shard(
                 in_strategy=(layout("tp", "None"),),
                 out_strategy=(layout("tp", "None", "None"), layout("tp", "None", "None"))
@@ -222,7 +226,13 @@ class MultiLatentAttention(nn.Cell):
                 in_strategy=((layout("cp", "dp", "None", "None"), layout("cp", "dp", "None", "None")),),
                 out_strategy=(layout("cp", "dp", "None", "None"),)
             )
-            self.bmm.shard((layout("cp", "dp", "tp", "None", "None"), layout("tp", "None", "None")))
+            self.q_bmm.shard((layout("cp", "dp", "tp", "None", "None"), layout("tp", "None", "None")))
+            if self.input_layout == "TND":
+                self.unsqueeze.shard((layout("dp_cp", "tp", "None"),))
+                self.v_bmm.shard((layout("dp_cp", "tp", "None", "None"), layout("tp", "None", "None")))
+            else:
+                self.unsqueeze.shard((layout("dp", "cp", "tp", "None"),))
+                self.v_bmm.shard((layout("dp", "cp", "tp", "None", "None"), layout("tp", "None", "None")))
 
     def split_infer_shape(self, *_):
         q_absorb_shape = (self.num_attention_heads, self.qk_head_dim, self.kv_lora_rank)
@@ -239,6 +249,71 @@ class MultiLatentAttention(nn.Cell):
         v_absorb = self.transpose_weight(v_absorb, (0, 2, 1))
         return q_absorb, v_absorb
 
+    def dsa_forward(self, x: Tensor, attention_mask=None, rotary_pos_emb=None, actual_seq_len=None, attention_loss=0.):
+        """Forward DSA"""
+        ori_dtype = x.dtype
+        seq_len, bs, _ = self.shape(x)
+        query, key, value, q_compress = self.get_query_key_value_tensors(x, rotary_pos_emb=rotary_pos_emb)
+        x = F.stop_gradient(x)
+        q_compress = F.stop_gradient(q_compress)
+        q_index, k_index, weights = self.core_attention.indexer.get_qk_index(x, q_compress, rotary_pos_emb)
+        topk_indices, _, softmax_max_index, softmax_sum_index = self.core_attention.indexer(
+            q_index, k_index, weights,
+            actual_seq_len, actual_seq_len
+        )
+        # add depend() on attention_mask to avoid dataset broadcast is pruned
+        topk_indices = F.depend(topk_indices, attention_mask)
+        if self.sparse_loss:
+            # do MHA->MQA transform
+            q_nope, q_rope = query
+            k_nope, k_rope = key
+            w_kvb = self.linear_kvb.weight if self.mla_qkv_concat else self.linear_kv_up_proj.weight
+            q_absorb, v_absorb = self.split_weight(w_kvb)
+            q_nope = self.q_bmm(self.reshape(q_nope, (seq_len, bs, -1, 1, self.qk_head_dim)), q_absorb)
+            q_nope = self.reshape(q_nope, (seq_len, bs, -1, self.kv_lora_rank))
+            query = self.cat_q([q_nope, q_rope])
+            key = self.cat_k([k_nope, k_rope])
+
+        if self.input_layout == "TND":
+            query = self.sbh2tnd(query)
+            key = self.sbh2tnd(key, self.sparse_loss)
+            value = self.sbh2tnd(value, self.sparse_loss)
+        else:
+            transpose_kv = self.tnd_transpose_one_head if self.sparse_loss else self.tnd_transpose
+            query = self.tnd_transpose(query, (1, 0, 2, 3))
+            key = transpose_kv(key, (1, 0, 2, 3))
+            value = transpose_kv(value, (1, 0, 2, 3))
+
+        query = self.cast(query, self.compute_dtype)
+        key = self.cast(key, self.compute_dtype)
+        value = self.cast(value, self.compute_dtype)
+        attn_out, softmax_max, softmax_sum = self.core_attention(
+            query, key, value, topk_indices, attention_mask,
+            actual_seq_qlen=actual_seq_len,
+            actual_seq_kvlen=actual_seq_len
+        )
+        if self.sparse_loss:
+            # Do weight absorb of value
+            attn_out = self.unsqueeze(attn_out, -2)
+            attn_out = self.v_bmm(attn_out, v_absorb)
+            attn_out = self.reshape(attn_out, (bs, seq_len, self.num_attention_heads, -1))
+        attn_out = self.bs_transpose(attn_out, (1, 0, 2, 3))
+        attn_out = self.reshape(attn_out, (seq_len, bs, -1))
+
+        # output linear projection
+        output = self.linear_proj(attn_out)[0]  # dp, mp -> dp, 1 / dp * mp, 1
+        output = self.cast(output, ori_dtype)
+
+        # compute indexer loss
+        query = F.stop_gradient(query)
+        key = F.stop_gradient(key)
+        _, _, _, indexer_loss = self.core_attention.indexer_loss(
+            query, key, q_index, k_index, weights, topk_indices, softmax_max, softmax_sum,
+            softmax_max_index, softmax_sum_index, actual_seq_len, actual_seq_len
+        )
+        attention_loss = self.add_loss(attention_loss, indexer_loss)
+        return output, attention_loss
+
     def construct(self, x: Tensor, attention_mask=None, rotary_pos_emb=None, rotary_pos_cos=None, rotary_pos_sin=None,
                   prefix_keys_values=None, pad_zeros=None, actual_seq_len=None, attention_loss=0.):
         """Forward process."""
@@ -253,29 +328,12 @@ class MultiLatentAttention(nn.Cell):
         ori_dtype = x.dtype
         seq_len, bs, _ = self.shape(x)
         if self.use_dsa:
-            query, key, value, q_compress = self.get_query_key_value_tensors(x, rotary_pos_emb=rotary_pos_emb)
-            x = F.stop_gradient(x)
-            q_compress = F.stop_gradient(q_compress)
-            index_scores, topk_indices = self.core_attention.indexer(
-                x, q_compress,
-                attention_mask, rotary_pos_emb,
-                actual_seq_len, actual_seq_len
-            )
-            # do MHA->MQA transform
-            q_nope, q_rope = query
-            k_nope, k_rope = key
-            w_kvb = self.linear_kvb.weight if self.mla_qkv_concat else self.linear_kv_up_proj.weight
-            q_absorb, v_absorb = self.split_weight(w_kvb)
-            q_nope = self.bmm(self.reshape(q_nope, (seq_len, bs, -1, 1, self.qk_head_dim)), q_absorb)
-            q_nope = self.reshape(q_nope, (seq_len, bs, -1, self.kv_lora_rank))
-            query = self.cat_q([q_nope, q_rope])
-            key = self.cat_k([k_nope, k_rope])
-        else:
-            query, key, value = self.get_query_key_value_tensors(x, rotary_pos_emb=rotary_pos_emb)
+            return self.dsa_forward(x, attention_mask, rotary_pos_emb, actual_seq_len, attention_loss)
 
-        head_dim = query.shape[-1]
+        query, key, value = self.get_query_key_value_tensors(x, rotary_pos_emb=rotary_pos_emb)
+
         # with ulysses context parallel, insert all to all before FA
-        if self.cp > 1 and not self.use_dsa:
+        if self.cp > 1:
             if self.cp_ds > 1:
                 # For query & key & value, transpose from [S, B, N, D] back to [B, S, N, D]
                 query = self._ulysses_qkv_a2a(query)
@@ -289,16 +347,12 @@ class MultiLatentAttention(nn.Cell):
 
         if self.input_layout == "TND":
             query = self.sbh2tnd(query)
-            key = self.sbh2tnd(key, self.use_dsa)
-            value = self.sbh2tnd(value, self.use_dsa)
+            key = self.sbh2tnd(key)
+            value = self.sbh2tnd(value)
 
         query = self.cast(query, self.compute_dtype)
         key = self.cast(key, self.compute_dtype)
         value = self.cast(value, self.compute_dtype)
-        # For DSA, rename `topk_indices` to `attention_mask` for unified function calling format.
-        if self.use_dsa:
-            mask = attention_mask
-            attention_mask = topk_indices
         if self.use_flash_attention:
             if self.use_eod_attn_mask_compression:
                 context_layer = self.core_attention(
@@ -316,25 +370,8 @@ class MultiLatentAttention(nn.Cell):
                 attn_out = self.reshape(context_layer, (seq_len, bs, -1))
         else:
             attn_out = self.core_attention(query, key, value, attention_mask)
-        if self.use_dsa:
-            attn_out = self.reshape(attn_out, (seq_len, bs, self.num_attention_heads, -1))
-            attn_out = self.bmm(self.reshape(attn_out, (seq_len, bs, -1, 1, self.kv_lora_rank)), v_absorb)
-            attn_out = self.reshape(attn_out, (seq_len, bs, -1, self.v_head_dim))
-            attn_out = self.reshape(attn_out, (seq_len, bs, -1))
         output = self.linear_proj(attn_out)[0]  # dp, mp -> dp, 1 / dp * mp, 1
         output = self.cast(output, ori_dtype)
-        if self.use_dsa:
-            query = F.stop_gradient(query)
-            key = F.stop_gradient(key)
-            if self.use_eod_attn_mask_compression:
-                query = self.reshape(query, (bs, seq_len, -1, head_dim))
-                key = self.reshape(key, (bs, seq_len, -1, head_dim))
-            else:
-                query = self.reshape(query, (seq_len, bs, -1, head_dim))
-                key = self.reshape(key, (seq_len, bs, -1, head_dim))
-            indexer_loss = self.core_attention.indexer_loss(index_scores, topk_indices,
-                                                            query, key, mask, actual_seq_len)
-            attention_loss = self.add_loss(attention_loss, indexer_loss)
         return output, attention_loss
 
     def sbh2tnd(self, x, one_head=False):
@@ -590,7 +627,7 @@ class MLASelfAttentionConcatenated(MultiLatentAttention):
                 multi_latent_attention=self.config.multi_latent_attention
             )
 
-        if self.use_dsa:
+        if self.use_dsa and self.sparse_loss:
             k_nope = self.reshape(compressed_kv_norm, (seq_len, bs, 1, -1))
             value = self.reshape(compressed_kv_norm, (seq_len, bs, 1, -1))
             query = (q_nope, q_pe)
@@ -776,7 +813,7 @@ class MLASelfAttention(MultiLatentAttention):
                 multi_latent_attention=self.config.multi_latent_attention
             )
 
-        if self.use_dsa:
+        if self.use_dsa and self.sparse_loss:
             k_no_pe = self.reshape(kv_compressed, (q_len, bs, 1, -1))
             value = self.reshape(kv_compressed, (q_len, bs, 1, -1))
             query = (q_no_pe, q_pos_emb)
