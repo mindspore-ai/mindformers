@@ -177,6 +177,7 @@ class MultiLatentAttention(nn.Cell):
             self.unsqueeze = ExpandDims()
             self.q_bmm = BatchMatMul()
             self.v_bmm = BatchMatMul()
+            self.useless_add = AddExt().add_prim_attr("keep_alive", True)
 
         if _get_parallel_mode() in (ParallelMode.AUTO_PARALLEL,) and _is_sharding_propagation():
             self.sharding_propagation()
@@ -205,15 +206,10 @@ class MultiLatentAttention(nn.Cell):
 
     def shard(self):
         """Set parallel strategy."""
-        dp = self.dp
-        tp = self.tp
-        cp = self.cp
-
-        self.bs_transpose.shard(((dp, cp, tp),))
+        self.bs_transpose.shard((layout("dp", "cp", "tp"),))
         self.tnd_transpose.shard((layout("cp", "dp", "tp", "None"),))
         self.tnd_transpose_one_head.shard((layout("cp", "dp", "None", "None"),))
         if self.use_dsa:
-            self.bs_transpose.shard((layout("dp", "cp", "tp", "None"), ))
             self.split_weight.shard(
                 in_strategy=(layout("tp", "None"),),
                 out_strategy=(layout("tp", "None", "None"), layout("tp", "None", "None"))
@@ -230,9 +226,11 @@ class MultiLatentAttention(nn.Cell):
             if self.input_layout == "TND":
                 self.unsqueeze.shard((layout("dp_cp", "tp", "None"),))
                 self.v_bmm.shard((layout("dp_cp", "tp", "None", "None"), layout("tp", "None", "None")))
+                self.useless_add.shard((layout("dp_cp", "tp", "None"), layout()))
             else:
                 self.unsqueeze.shard((layout("dp", "cp", "tp", "None"),))
                 self.v_bmm.shard((layout("dp", "cp", "tp", "None", "None"), layout("tp", "None", "None")))
+                self.useless_add.shard((layout("dp", "cp", "tp", "None"), layout()))
 
     def split_infer_shape(self, *_):
         q_absorb_shape = (self.num_attention_heads, self.qk_head_dim, self.kv_lora_rank)
@@ -296,9 +294,10 @@ class MultiLatentAttention(nn.Cell):
             # Do weight absorb of value
             attn_out = self.unsqueeze(attn_out, -2)
             attn_out = self.v_bmm(attn_out, v_absorb)
-            attn_out = self.reshape(attn_out, (bs, seq_len, self.num_attention_heads, -1))
-        attn_out = self.bs_transpose(attn_out, (1, 0, 2, 3))
-        attn_out = self.reshape(attn_out, (seq_len, bs, -1))
+        else:
+            attn_out = self.useless_add(attn_out, 0) # avoid tensor redistribution error while crossing subgraph
+        attn_out = self.reshape(attn_out, (bs, seq_len, -1))
+        attn_out = self.bs_transpose(attn_out, (1, 0, 2))
 
         # output linear projection
         output = self.linear_proj(attn_out)[0]  # dp, mp -> dp, 1 / dp * mp, 1

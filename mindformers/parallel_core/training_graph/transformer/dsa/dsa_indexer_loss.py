@@ -57,20 +57,6 @@ class DSAIndexerLoss(nn.Cell):
     Args:
         config (TransformerConfig): The configuration for the transformer model.
         softmax_scale: Scale coefficient after q @ k^T.
-
-    Input:
-        index_scores: Scores predicted by indexer [batch, seqlen_q, seqlen_k].
-        topk_indices: Top-k indices [batch, seqlen_q, index_topk].
-        query: Query tensor [seqlen_q, batch, heads, dim].
-        key: Key tensor [seqlen_k, batch, heads, dim].
-        softmax_scale: Scale coefficient after q @ k^T.
-        loss_coeff: Coefficient for the indexer KL divergence loss.
-        sparse_loss: bool, whether to use sparse indexer loss. If True, only the topk
-            indices will be used to compute the loss.
-        pg_collection: Process group collection, must have TP process group.
-
-    Returns:
-        index_loss: KL divergence loss (scalar).
     """
     def __init__(self, config: MLATransformerConfig, softmax_scale=None):
         super().__init__()
@@ -91,13 +77,14 @@ class DSAIndexerLoss(nn.Cell):
 
         _, cp_id = get_dp_cp_id(config)
         self.offset_id = cp_id
-        self.cp_group = get_cp_group_name(
-            get_real_rank(),
-            config.data_parallel_size,
-            config.tensor_model_parallel_size,
-            config.context_parallel_size
-        )[0]
-        self.cp_allreduce = ops.AllReduce("sum", self.cp_group)
+        if self.cp > 1:
+            self.cp_group = get_cp_group_name(
+                get_real_rank(),
+                config.data_parallel_size,
+                config.tensor_model_parallel_size,
+                config.context_parallel_size
+            )[0]
+            self.cp_allreduce = ops.AllReduce("sum", self.cp_group)
 
         # common operators
         self.cast = aclnn_ops.Cast()

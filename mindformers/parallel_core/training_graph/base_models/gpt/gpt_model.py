@@ -737,21 +737,11 @@ class GPTModel(nn.Cell):
 
     def shard(self, config: TransformerConfig):
         """parallel shard."""
-        dp = config.data_parallel_size
-        tp = config.tensor_model_parallel_size
-        cp = 1 if config is None else config.context_parallel_size
-
-        slice_in_strategy = ((dp, 1),)
-        self.slice.shard(in_strategy=slice_in_strategy)
-        not_equal_in_strategy = ((dp, 1), ())
-        self.not_equal.shard(in_strategy=not_equal_in_strategy)
-        mul_in_strategy = ((dp, 1), (dp, 1))
-        self.mul.shard(in_strategy=mul_in_strategy)
-        self.concat_prefix.shard(((dp, 1, cp, 1), (dp, 1, cp, 1)))
-        self.transpose.shard(((cp, dp, tp),))
+        self.concat_prefix.shard((layout("dp", "None", "cp", "None"), layout("dp", "None", "cp", "None")))
+        self.transpose.shard((layout("cp", "dp", "tp"),))
 
         if config.moe_router_load_balancing_type == "gbs_aux_loss":
-            self.assign_aux.shard(((1,), (1,)))
+            self.assign_aux.shard((layout("None"), layout("None")))
 
         pipeline_stage = config.pipeline_model_parallel_size
         if pipeline_stage > 1:
