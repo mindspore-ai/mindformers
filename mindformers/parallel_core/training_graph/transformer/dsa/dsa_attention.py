@@ -30,6 +30,7 @@ from mindformers.parallel_core.transformer_config import MLATransformerConfig
 from mindformers.parallel_core.training_graph.transformer.dsa.dsa_indexer_loss import DSAIndexerLoss
 from mindformers.parallel_core.training_graph.device_matrix import layout
 from mindformers.parallel_core.training_graph.communication import get_dp_cp_id
+from mindformers.parallel_core.training_graph.transformer.mask_generate import CausalEODMaskGenerate
 from mindformers.parallel_core.training_graph.transformer.dsa.utils import adjust_bsnd_input, adjust_tnd_input
 
 
@@ -75,12 +76,13 @@ class DSAttention(nn.Cell):
         self.pe_dim = config.qk_pos_emb_head_dim
         self.input_layout = config.input_layout
         self.is_tnd = config.input_layout == "TND"
+        self.seq_length = config.seq_length
         self.head_num = config.num_attention_heads
         self.layer_number = layer_number
         self.attention_mode = 2 # currently, attention mode only support 2
         self.cp = config.context_parallel_size
         self.sparse_loss = config.dsa_indexer_use_sparse_loss
-        self.mask_compression = config.use_attn_mask_compression
+        self.mask_compression = config.use_attn_mask_compression and not self.is_tnd
 
         _, cp_id = get_dp_cp_id(config)
         self.offset_id = cp_id
@@ -120,13 +122,18 @@ class DSAttention(nn.Cell):
             ).add_prim_attr("self_define_shard", True)
         else:
             # Dense stage use common FlashAttention.
+            # the softmax_out of FA in TND layout is hard to convert to the correct layout
+            # and the convert process notably increase the compile time (about 10x),
+            # so fall to use BSND + full eod_mask
             self.dense_flash_attention = FlashAttentionScore(
                 head_num=self.head_num,
                 scale_value=self.softmax_scale,
                 inner_precise=0,
-                input_layout=self.input_layout,
-                sparse_mode=config.sparse_mode
+                input_layout="BSND",
+                sparse_mode=config.sparse_mode if not self.is_tnd else 0
             )
+            self.eod_mask_generator = CausalEODMaskGenerate(config)
+            self.softmax_transpose = aclnn_ops.Transpose()
             self.slice =  aclnn_ops.StridedSlice().add_prim_attr("self_define_shard", True)
         if _get_parallel_mode() in (ParallelMode.SEMI_AUTO_PARALLEL,):
             self.shard()
@@ -189,6 +196,16 @@ class DSAttention(nn.Cell):
                 self.assign(self.max_logits_val, self.maximum(self.max_logits_val, max_logits))
         else:
             # During dense warmup stage, common FlashAttention will be applied instead of SparseFlashAttention
+            if self.is_tnd:
+                t, n, _ = query.shape
+                b, s = t // self.seq_length, self.seq_length
+                attention_mask = self.eod_mask_generator(self.reshape(actual_seq_qlen, (b, -1)))
+                query = self.reshape(query, (b, s, n, -1))
+                key = self.reshape(key, (b, s, n, -1))
+                value = self.reshape(value, (b, s, n, -1))
+                actual_seq_qlen = None
+                actual_seq_kvlen = None
+
             softmax_max, softmax_sum, _, attention_output = self.dense_flash_attention(
                 query, key, value,
                 None, None, None,
@@ -202,11 +219,14 @@ class DSAttention(nn.Cell):
             softmax_max = self.slice(softmax_max, begin, (*softmax_shape, 1), step)
             softmax_sum = self.slice(softmax_sum, begin, (*softmax_shape, 1), step)
             if self.track_max_attention_logit:
-                if self.is_tnd:
-                    max_logits = self.reduce_max(softmax_max, (0, 2))
-                else:
-                    max_logits = self.reduce_max(softmax_max, (0, 2, 3))
+                max_logits = self.reduce_max(softmax_max, (0, 2, 3))
                 self.assign(self.max_logits_val, self.maximum(self.max_logits_val, max_logits))
+            if self.is_tnd:
+                # [b, s, n, d] -> [t, n, d]
+                attention_output = self.reshape(attention_output, (t, n, -1))
+                # [b, n, s, 1] -> [n, b, s, 1] -> [n, t, 1]
+                softmax_max = self.reshape(self.softmax_transpose(softmax_max, (1, 0, 2, 3)), (n, t, 1))
+                softmax_sum = self.reshape(self.softmax_transpose(softmax_sum, (1, 0, 2, 3)), (n, t, 1))
 
         return attention_output, softmax_max, softmax_sum
 
@@ -218,27 +238,32 @@ class DSAttention(nn.Cell):
             q_shard = layout("dp_cp", "tp", "None")
             kv_shard = layout("dp", kv_head_split_num, "None")
             idx_shard = layout("dp_cp", "None", "None")
-            mask_shard = layout("None", "None")
             attn_shard = layout("dp_cp", "tp", "None")
             softmax_shard = layout("None", "dp_cp", "tp") if self.sparse_loss else layout("dp_cp", "tp", "None")
             sfa_shard = (q_shard, kv_shard, kv_shard, idx_shard, q_shard, kv_shard, layout("dp"), layout("dp"))
-            fa_shard = (q_shard, kv_shard, kv_shard, mask_shard, layout("dp"), layout("dp"))
         else:
             q_shard = layout("dp", "cp", "tp", "None")
             kv_shard = layout("dp", "None", kv_head_split_num, "None")
             idx_shard = layout("dp", "cp", "None", "None")
-            mask_shard = layout("None", "None") if self.mask_compression else layout("dp", "None", "cp", "None")
             attn_shard = layout("dp", "cp", "tp", "None")
             softmax_shard = layout("dp", "None", "cp", "tp") if self.sparse_loss else layout("dp", "tp", "cp", "None")
             sfa_shard = (q_shard, kv_shard, kv_shard, idx_shard, q_shard, kv_shard)
-            fa_shard = (q_shard, kv_shard, kv_shard, mask_shard)
         self.split_q.shard((q_shard,))
         self.split_k.shard((kv_shard,))
         if self.sparse_loss:
             self.sparse_flash_attention.shard(sfa_shard, (attn_shard, softmax_shard, softmax_shard))
         else:
+            fa_shard = (
+                layout("dp", "cp", "tp", "None"),
+                layout("dp", "None", kv_head_split_num, "None"),
+                layout("dp", "None", kv_head_split_num, "None"),
+                layout("None", "None") if self.mask_compression else layout("dp", "None", "cp", "None"),
+            )
+            softmax_shard = layout("dp", "tp", "cp", "None")
+            attn_shard = layout("dp", "cp", "tp", "None")
             self.dense_flash_attention.shard(fa_shard, (softmax_shard, softmax_shard, layout("None"), attn_shard))
             self.slice.shard((softmax_shard,), (softmax_shard,))
+            self.softmax_transpose.shard((layout("dp", "tp", "cp", "None"),))
         if self.track_max_attention_logit:
             self.assign.shard((layout("tp"), layout("tp")), (layout("tp"),))
             self.maximum.shard((layout("tp"), layout("tp")), (layout("tp"),))

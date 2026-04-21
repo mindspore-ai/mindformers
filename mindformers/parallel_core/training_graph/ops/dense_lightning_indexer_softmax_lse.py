@@ -147,7 +147,7 @@ class DenseLightningIndexerSoftmaxLse(Cell):
             func_type="aot",
             bprop=None,
             reg_info=reg_info,
-        )
+        ).add_prim_attr("value_depend", [3, 4])
         self._custom_op._generate_get_worspace_size_func_by_types(
             _ACLNN_WORKSPACE_SIGNATURE)
 

@@ -304,6 +304,7 @@ class DSAIndexer(nn.Cell):
         )
         if not self.sparse_loss:
             if self.is_tnd:
+                # actual_seq_len should be cast to int64, otherwise overflow will occur during load int32 with int64.
                 actual_seq_qlen = self.cast(actual_seq_qlen, mstype.int64)
                 actual_seq_klen = self.cast(actual_seq_klen, mstype.int64)
             softmax_max_index, softmax_sum_index = self.dense_softmax_lse(
