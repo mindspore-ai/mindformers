@@ -897,6 +897,8 @@ class GPTModel(nn.Cell):
         no_tp_list = [
             "linear_q_down_proj",
             "linear_kv_down_proj",
+            "indexer.linear_wk",
+            "indexer.linear_weights_proj",
             "shared_experts",
             "mlp.router",
             "hnorm.weight", "enorm.weight", "eh_proj.weight",
@@ -945,6 +947,10 @@ class GPTModel(nn.Cell):
             "eh_proj",
             "max_logits_val",
             "shared_rms_norm.weight",
+            # DSA (DeepSeekSparseAttention) indexer parameters - no op group needed
+            "self_attention.indexer.linear_wq_b",
+            "self_attention.indexer.linear_wk",
+            "self_attention.indexer.linear_weights_proj",
             # mHC (HyperConnectionModule) parameters — not TP-sharded, no op group needed
             "attn_hc.mapping_weight",
             "attn_hc.alpha_pre",
