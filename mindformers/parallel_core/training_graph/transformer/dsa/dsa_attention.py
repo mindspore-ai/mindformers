@@ -127,6 +127,7 @@ class DSAttention(nn.Cell):
                 input_layout=self.input_layout,
                 sparse_mode=config.sparse_mode
             )
+            self.slice =  aclnn_ops.StridedSlice().add_prim_attr("self_define_shard", True)
         if _get_parallel_mode() in (ParallelMode.SEMI_AUTO_PARALLEL,):
             self.shard()
 
@@ -195,8 +196,11 @@ class DSAttention(nn.Cell):
                 actual_seq_qlen=actual_seq_qlen,
                 actual_seq_kvlen=actual_seq_kvlen
             )
-            softmax_max = softmax_max[..., :1]
-            softmax_sum = softmax_sum[..., :1]
+            softmax_shape = softmax_max.shape[:-1]
+            begin = (0,) * len(softmax_max.shape)
+            step = (1,) * len(softmax_max.shape)
+            softmax_max = self.slice(softmax_max, begin, (*softmax_shape, 1), step)
+            softmax_sum = self.slice(softmax_sum, begin, (*softmax_shape, 1), step)
             if self.track_max_attention_logit:
                 if self.is_tnd:
                     max_logits = self.reduce_max(softmax_max, (0, 2))
@@ -216,7 +220,7 @@ class DSAttention(nn.Cell):
             idx_shard = layout("dp_cp", "None", "None")
             mask_shard = layout("None", "None")
             attn_shard = layout("dp_cp", "tp", "None")
-            softmax_shard = layout("None", "dp_cp", "tp") if self.sparse_loss else layout("dp_cp", "None", "tp")
+            softmax_shard = layout("None", "dp_cp", "tp") if self.sparse_loss else layout("dp_cp", "tp", "None")
             sfa_shard = (q_shard, kv_shard, kv_shard, idx_shard, q_shard, kv_shard, layout("dp"), layout("dp"))
             fa_shard = (q_shard, kv_shard, kv_shard, mask_shard, layout("dp"), layout("dp"))
         else:
@@ -234,6 +238,7 @@ class DSAttention(nn.Cell):
             self.sparse_flash_attention.shard(sfa_shard, (attn_shard, softmax_shard, softmax_shard))
         else:
             self.dense_flash_attention.shard(fa_shard, (softmax_shard, softmax_shard, layout("None"), attn_shard))
+            self.slice.shard((softmax_shard,), (softmax_shard,))
         if self.track_max_attention_logit:
             self.assign.shard((layout("tp"), layout("tp")), (layout("tp"),))
             self.maximum.shard((layout("tp"), layout("tp")), (layout("tp"),))

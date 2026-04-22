@@ -183,21 +183,18 @@ class FusedLayerNorm(nn.Cell):
         output = self.cast(output, original_type)
         return output
 
+    # pylint: disable=W0613
     def shard(self, config: TransformerConfig, in_strategy=None):
         """shard method"""
         if in_strategy:
-            if isinstance(in_strategy[0], Layout):
-                strategy = layout.to_tuple_strategy(in_strategy[0])
-            else:
-                strategy = in_strategy
+            strategy = in_strategy[0]
         else:
-            dp, _, cp = get_strategy(config)
-            strategy = (cp, dp, 1)
+            strategy = layout("cp", "dp", "None")
 
-        if strategy[-1] != 1:
+        if layout.to_tuple_strategy(strategy)[-1] != 1:
             raise TypeError(f'The last dim in FusedLayerNorm can not equal to 1! Strategy {strategy} not supported!')
 
-        self.layer_norm.shard((strategy, (strategy[-1],), (strategy[-1],)))
+        self.layer_norm.shard((strategy, layout("None"), layout("None")))
 
     def sharding_propagation(self, config: TransformerConfig):
         pass
@@ -350,6 +347,7 @@ class FusedRMSNorm(nn.Cell):
         output = self.cast(output, original_type)
         return output
 
+    # pylint: disable=W0613
     def shard(self, config: TransformerConfig, in_strategy: tuple = None):
         """shard method"""
         if in_strategy:

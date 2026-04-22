@@ -124,6 +124,7 @@ class DSAIndexer(nn.Cell):
         self.index_topk = config.dsa_indexer_topk
         self.sparse_loss = config.dsa_indexer_use_sparse_loss
         self.softmax_scale: float = self.index_head_dim ** -0.5
+        self.weight_scale = Tensor([(self.index_n_heads ** -0.5) * self.softmax_scale], mstype.float32)
 
         self.apply_rotary_emb_q = ApplyRotaryPosEmb(config)
         self.apply_rotary_emb_k = ApplyRotaryPosEmb(config, for_k_pos_emb=True)
@@ -179,6 +180,7 @@ class DSAIndexer(nn.Cell):
         self.cat_k = aclnn_ops.Concat(-1).add_prim_attr("self_define_shard", True)
         self.cast = aclnn_ops.Cast()
         self.reshape = aclnn_ops.Reshape()
+        self.mul_scalar = aclnn_ops.Mul()
         self.transpose_q = aclnn_ops.Transpose()
         self.transpose_k = aclnn_ops.Transpose()
         self.transpose_w = aclnn_ops.Transpose()
@@ -247,7 +249,7 @@ class DSAIndexer(nn.Cell):
         k, _ = self.linear_wk(x)
         k = self.k_norm(k)
         # [seqlen, batch, index_head_dim] -> [seqlen, batch, 1, index_head_dim]
-        k = k.reshape(seqlen, bsz, 1, self.index_head_dim)
+        k = self.reshape(k, (seqlen, bsz, 1, self.index_head_dim))
         # [seqlen, batch, 1, index_head_dim] -> [seqlen, batch, index_head_dim]
         k_nope, k_pe = self.split_k(
             k, [self.index_head_dim - self.qk_pos_emb_head_dim, self.qk_pos_emb_head_dim], dim=-1
@@ -272,7 +274,7 @@ class DSAIndexer(nn.Cell):
         # =========================================
         # [seqlen, batch, hidden_size] -> [seqlen, batch, index_n_heads]
         weights, _ = self.linear_weights_proj(x)
-        weights = weights * (self.index_n_heads ** -0.5) * self.softmax_scale
+        weights = self.mul_scalar(weights, self.weight_scale)
 
         # convert q, k, weights from SB* layout to BS* or T* layout
         weights = self.transpose_w(weights, (1, 0, 2))
@@ -301,6 +303,9 @@ class DSAIndexer(nn.Cell):
             return_value=True
         )
         if not self.sparse_loss:
+            if self.is_tnd:
+                actual_seq_qlen = self.cast(actual_seq_qlen, mstype.int64)
+                actual_seq_klen = self.cast(actual_seq_klen, mstype.int64)
             softmax_max_index, softmax_sum_index = self.dense_softmax_lse(
                 q, k, weights,
                 actual_seq_qlen=actual_seq_qlen,
@@ -343,6 +348,7 @@ class DSAIndexer(nn.Cell):
         w_shard = layout("cp", "dp", "None")
         self.split_q.shard((q_shard,))
         self.split_k.shard((k_shard,))
+        self.mul_scalar.shard((w_shard, layout("None")))
         self.cat_q.shard(((q_shard, q_shard),), (q_shard,))
         self.cat_k.shard(((k_shard, k_shard),), (k_shard,))
         # merge tp in q-head and cp in k-seq

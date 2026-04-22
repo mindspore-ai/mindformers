@@ -28,7 +28,7 @@ def adjust_tnd_input(offset_id, q, k, actual_seq_qlen, actual_seq_klen):
     prev_seq_klen[0] = 0
     new_actual_seq_klen = F.cumsum(F.relu(new_actual_seq_klen - prev_seq_klen), 0)
     new_actual_seq_klen[-1] = slice_tk
-    return new_actual_seq_klen, new_actual_seq_klen
+    return new_actual_seq_qlen, new_actual_seq_klen
 
 
 def adjust_bsnd_input(offset_id, q, x):

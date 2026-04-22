@@ -1397,7 +1397,8 @@ class TransformerConfig:
     dsa_indexer_topk: int = field(
         default=None,
         metadata={
-            "description": "Number of top-k tokens to select in DSA indexer. Should be in closed interval [1, 2048]",
+            "description": "Number of top-k tokens to select in DSA indexer. "
+                           "Should be a integer multiple of 1024 and not greater than 8192",
             "usage": ParamUsage.TRAINING,
             "source": ParamSource.MEGATRON,
             "mode": ParamMode.GRAPH
@@ -2072,6 +2073,7 @@ class TransformerConfig:
                              "please set use_flash_attention=True.")
 
         if self.experimental_attention_variant == 'dsa':
+            self.use_flash_attention = True
             if not self.multi_latent_attention:
                 raise ValueError("When experimental_attention_variant == 'dsa', multi_latent_attention should be True.")
             if ms.get_auto_parallel_context("pipeline_scheduler") == "zero_bubble_v":
@@ -2584,19 +2586,21 @@ class MLATransformerConfig(TransformerConfig):
 
         if self.experimental_attention_variant == 'dsa':
             if self.kv_lora_rank != 512 or self.qk_pos_emb_head_dim != 64 or \
-                    self.num_attention_heads not in [32, 64, 128]:
+                    self.qk_head_dim != 128 or self.num_attention_heads not in [32, 64, 128]:
                 raise ValueError("When `experimental_attention_variant` == 'dsa', "
                                  "`kv_lora_rank` only supports 512, "
+                                 "`qk_head_dim` only supports 128, "
                                  "`qk_pos_emb_head_dim` only supports 64, "
                                  "`num_attention_heads` only supports {32, 64, 128}, "
                                  f"but get `kv_lora_rank`={self.kv_lora_rank}, "
+                                 f"`qk_head_dim`={self.qk_head_dim}, "
                                  f"`qk_pos_emb_head_dim`={self.qk_pos_emb_head_dim}, "
                                  f"`num_attention_heads`={self.num_attention_heads}!")
             if self.dsa_indexer_n_heads not in [8, 16, 32, 64] or self.dsa_indexer_head_dim != 128 or \
-                    not 1 <= self.dsa_indexer_topk <= 2048:
+                    self.dsa_indexer_topk // 1024 not in range(1, 9):
                 raise ValueError("`dsa_indexer_n_heads` only supports {8, 16, 32, 64}, "
                                  "`dsa_indexer_head_dim` only supports 128, "
-                                 "`dsa_indexer_topk` only supports 1~2048, "
+                                 "`dsa_indexer_topk` only supports {1024, 2048, 3072, ..., 8192}, "
                                  f"but get `dsa_indexer_n_heads`={self.dsa_indexer_n_heads}, "
                                  f"`dsa_indexer_head_dim`={self.dsa_indexer_head_dim}, "
                                  f"`dsa_indexer_topk`={self.dsa_indexer_topk}.")
