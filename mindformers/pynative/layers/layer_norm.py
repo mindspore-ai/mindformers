@@ -29,7 +29,7 @@ Currently supported normalization types:
 
 __all__ = ["get_norm_cls"]
 
-from mindspore import nn, dtype, Parameter
+from mindspore import nn, dtype, Parameter, mint
 from mindspore.ops import cast, rms_norm
 from mindspore.common.initializer import initializer
 from mindspore.mint.nn.functional import layer_norm
@@ -79,11 +79,11 @@ class FusedLayerNorm(nn.Cell):
 
         self.layer_norm = layer_norm
         self.gamma = Parameter(
-            initializer('ones', dim, self.params_dtype),
+            mint.empty(dim, dtype=self.params_dtype),
             name="gamma"
         )
         self.beta = Parameter(
-            initializer('zeros', dim, self.params_dtype),
+            mint.empty(dim, dtype=self.params_dtype),
             name="beta"
         )
         self.cast = cast
@@ -94,6 +94,11 @@ class FusedLayerNorm(nn.Cell):
         output = self.layer_norm(self.cast(x, self.compute_type), x.shape[-1], self.gamma, self.beta, self.eps)
         output = self.cast(output, original_type)
         return output
+
+    def reset_parameter(self):
+        """Reset LayerNorm parameters for delayed initialization."""
+        self.gamma.fill_(1.0)
+        self.beta.zero_()
 
 
 class FusedRMSNorm(nn.Cell):
@@ -137,7 +142,7 @@ class FusedRMSNorm(nn.Cell):
         self.compute_type = compute_dtype
 
         self.eps = eps
-        self.weight = Parameter(initializer('ones', dim, self.params_dtype))
+        self.weight = Parameter(mint.empty(dim, dtype=self.params_dtype))
 
         self.norm = rms_norm
         self.cast = cast
@@ -148,6 +153,10 @@ class FusedRMSNorm(nn.Cell):
         output = self.norm(self.cast(x, self.compute_type), self.weight, self.eps)[0]
         output = self.cast(output, original_type)
         return output
+
+    def reset_parameter(self):
+        """Reset RMSNorm parameters for delayed initialization."""
+        self.weight.fill_(1.0)
 
 
 def get_norm_cls(

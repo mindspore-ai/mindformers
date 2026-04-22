@@ -14,7 +14,7 @@
 # ============================================================================
 """AdamW"""
 
-from mindspore import _checkparam as validator, Parameter, Tensor
+from mindspore import _checkparam as validator, Parameter, Tensor, mint, ParameterTuple
 from mindspore.common import dtype as mstype
 from mindspore.ops import operations as P
 from mindspore.ops import auto_generate as gen
@@ -183,8 +183,8 @@ class AdamW(Optimizer):
         if self.enable_cpu_offload:
             raise ValueError("Not support enable_cpu_offload.")
 
-        self.exp_avg = self.parameters.clone(prefix="exp_avg", init='zeros')
-        self.exp_avg_sq = self.parameters.clone(prefix="exp_avg_sq", init='zeros')
+        self.exp_avg = self._init_state(prefix="exp_avg")
+        self.exp_avg_sq = self._init_state(prefix="exp_avg_sq")
 
         self.amsgrad = kwargs.get("amsgrad", False)
         self.maximize = kwargs.get("maximize", False)
@@ -203,6 +203,14 @@ class AdamW(Optimizer):
         else:
             self.global_step = Parameter(Tensor([0], mstype.int64), "global_step")
             self.global_step_increase_tensor = Tensor([1], mstype.int64)
+
+    def _init_state(self, prefix):
+        parameters = []
+        for param in self.parameters:
+            name = param.name
+            optim_param = Parameter(mint.zeros_like(param), name=f"{prefix}_{name}")
+            parameters.append(optim_param)
+        return ParameterTuple(parameters)
 
     def _increase_global_step(self):
         """Increase global step in PyNative mode without static-graph AssignAdd."""

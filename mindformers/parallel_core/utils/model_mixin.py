@@ -15,6 +15,7 @@
 """ModelMixin for train models"""
 
 from mindspore import Tensor
+import mindspore as ms
 import mindspore.common.dtype as mstype
 import numpy as np
 
@@ -147,9 +148,90 @@ class ModelMixin:
 
 
 class TrainModelMixin:
-    """General interfaces for train models."""
+    """General interfaces for train models with PyNative delay initialization support.
+    
+    This mixin provides the ``init_states`` method that is called after ``to_empty()``
+    has materialized meta-device parameters into real memory. The flow mirrors
+    torchtitan's three-step paradigm:
+
+    1. **Meta create**: Build model under ``init_empty_weights()`` (handled by Trainer)
+    2. **Materialize**: ``to_empty()`` allocates real memory (handled by Trainer)
+    3. **Initialize**: ``init_states()`` recursively resets parameters and buffers
+
+    In Graph mode, ``init_states`` is a no-op since parameters are initialized
+    directly during model construction.
+
+    Subclasses that need custom initialization ordering (e.g., weight tying before
+    parameter reset) should override ``_pre_init_states``.
+    """
 
     is_train_model = True
+
+    def init_states(self):
+        """
+        Reset parameters and initialize buffers for all sub-cells (PyNative only).
+        
+        This method is called by Trainer after ``to_empty()`` has materialized the
+        model. It traverses all cells in the model tree and calls ``reset_parameter``
+        on leaf parameter layers, then initializes device-aware buffers (RoPE cache,
+        MoE counters, etc.).
+
+        In Graph mode: No-op (parameters already initialized during construction)
+        """
+
+        if ms.get_context("mode") != ms.PYNATIVE_MODE:
+            logger.warning("[DelayInit] Graph mode: init_states is no-op.")
+            return
+
+        model = getattr(self, 'model', None)
+        if model is None:
+            logger.warning("[DelayInit] No model found, skipping initialization.")
+            return
+
+        self._reset_all_parameters(model)
+
+        logger.info("[DelayInit] Checkpoint initialization completed successfully.")
+
+    def _reset_all_parameters(self, model):
+        """
+        Traverse all sub-cells and call ``reset_parameter`` on each leaf layer.
+
+        Args:
+            model: The root model cell to traverse.
+
+        Returns:
+            tuple: (reset_count, skip_count, error_count)
+        """
+        reset_count = 0
+        skip_count = 0
+        error_count = 0
+
+        for name, cell in model.cells_and_names():
+            reset_fn = getattr(cell, "reset_parameter", None)
+            if callable(reset_fn):
+                try:
+                    reset_fn()
+                    reset_count += 1
+                    logger.debug(f"[DelayInit] Reset: {name} ({type(cell).__name__})")
+                except (RuntimeError, ValueError, TypeError) as e:
+                    error_count += 1
+                    logger.error(f"[DelayInit] Failed to reset {name}: {e}")
+                    raise RuntimeError(f"[DelayInit] Failed to reset {name}: {e}") from e
+                except Exception as e:
+                    # Catch-all for any unexpected exceptions to prevent task interruption
+                    error_count += 1
+                    logger.error(f"[DelayInit] Unexpected error while resetting {name}: {e}")
+                    raise RuntimeError(f"[DelayInit] Unexpected error while resetting {name}: {e}") from e
+            else:
+                logger.debug(f"[DelayInit] Skip to reset: {name} ({type(cell).__name__})")
+                skip_count += 1
+
+        logger.info(
+            f"[DelayInit] Parameter reset completed: "
+            f"{reset_count} reset, {skip_count} skipped, {error_count} errors."
+        )
+
+        return reset_count, skip_count, error_count
 
     def concat_qkv_contiguous(self, q_value, k_value, v_value, q_name):
         """

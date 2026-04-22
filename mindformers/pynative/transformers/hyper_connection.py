@@ -16,7 +16,6 @@
 import numpy as np
 import mindspore.common.dtype as mstype
 from mindspore import nn, Parameter, Tensor, mint, ops
-from mindspore.common.initializer import initializer
 from mindformers.parallel_core.transformer_config import TransformerConfig
 from mindformers.parallel_core.utils.init_method import init_method_zero
 from mindformers.pynative.layers.linear import Linear
@@ -144,30 +143,14 @@ class HyperConnectionModule(nn.Cell):
             init_method=init_method_zero(config.params_dtype),
             bias=False,
         )
-        fi = np.random.normal(0, 1e-4, self.mapping_proj.weight.shape).astype(np.float32)
-        self.mapping_proj.weight.set_data(Tensor(fi, mstype.float32))
+        self.alpha_pre = Parameter(mint.empty((1,), dtype=mstype.float32), name='alpha_pre')
+        self.alpha_post = Parameter(mint.empty((1,), dtype=mstype.float32), name='alpha_post')
+        self.alpha_res = Parameter(mint.empty((1,), dtype=mstype.float32), name='alpha_res')
 
-        init_alpha = config.mhc_init_gating_factor
-        self.alpha_pre = Parameter(
-            Tensor(np.full((1,), init_alpha, np.float32), mstype.float32)
-        )
-        self.alpha_post = Parameter(
-            Tensor(np.full((1,), init_alpha, np.float32), mstype.float32)
-        )
-        self.alpha_res = Parameter(
-            Tensor(np.full((1,), init_alpha, np.float32), mstype.float32)
-        )
+        self.bias = Parameter(mint.empty((dim,), dtype=mstype.float32), name='bias')
 
-        # Keep original priors while using Megatron-style packed bias name.
-        pre_b = np.full((n,), -np.log(3), np.float32)
-        post_b = np.zeros((n,), dtype=np.float32)
-        res_b = ((np.eye(n, dtype=np.float32) - 1) * 5).reshape(n * n)
-        bias = np.concatenate([pre_b, post_b, res_b], axis=0)
-        self.bias = Parameter(Tensor(bias, mstype.float32))
-
-        # Keep gamma as a non-trainable Parameter so hyper_parallel can infer distributed layout.
         self.rms_weight = Parameter(
-            initializer("ones", (n * hidden_size,), mstype.float32),
+            mint.empty((n * hidden_size,), dtype=mstype.float32),
             name="rms_weight",
             requires_grad=False,
         )
@@ -243,3 +226,27 @@ class HyperConnectionModule(nn.Cell):
         aggregated = self.squeeze(self.matmul(h_pre, x_streams), 2)
 
         return aggregated, h_res, h_post
+
+    def reset_parameter(self):
+        """Reset MHC parameters for delayed initialization."""
+        # Reset mapping projection weight with custom initialization (mean=0, std=1e-4)
+        self.mapping_proj.weight.normal_(mean=0.0, std=1e-4)
+        if self.mapping_proj.has_bias and self.mapping_proj.bias is not None:
+            self.mapping_proj.bias.zero_()
+
+        # Reset alpha parameters to init_gating_factor
+        init_alpha = self.config.mhc_init_gating_factor
+        self.alpha_pre.fill_(init_alpha)
+        self.alpha_post.fill_(init_alpha)
+        self.alpha_res.fill_(init_alpha)
+
+        # Reset bias with original initialization values
+        n = self.n
+        pre_b = np.full((n,), -np.log(3), np.float32)
+        post_b = np.zeros((n,), dtype=np.float32)
+        res_b = ((np.eye(n, dtype=np.float32) - 1) * 5).reshape(n * n)
+        bias = np.concatenate([pre_b, post_b, res_b], axis=0)
+        self.bias.set_data(Tensor(bias, mstype.float32))
+
+        # Reset rms_weight to ones
+        self.rms_weight.fill_(1.0)

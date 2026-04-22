@@ -70,6 +70,7 @@ __all__ = ["parallelize_gptmodel"]
 
 _DTYPE_MAP = {"float16": ms.float16, "float32": ms.float32, "bfloat16": ms.bfloat16}
 
+
 # ---------------------------------------------------------------------------
 # GPT-specific helpers
 # ---------------------------------------------------------------------------
@@ -99,9 +100,9 @@ def _unwrap_gptmodel(model: nn.Cell) -> nn.Cell:
 
 
 def _setup_gpt_prefetch(
-    embedding: nn.Cell,
-    transformer_layers: List[nn.Cell],
-    tail_modules: List[nn.Cell],
+        embedding: nn.Cell,
+        transformer_layers: List[nn.Cell],
+        tail_modules: List[nn.Cell],
 ) -> None:
     """Set up forward and backward prefetch chains for GPT FSDP modules.
 
@@ -188,11 +189,11 @@ def _distribute_param(module, param_name, device_mesh, placements):
 
 
 def _distribute_router(
-    module,
-    router_mesh,
-    input_layouts,
-    output_layouts,
-    use_local_output=True
+        module,
+        router_mesh,
+        input_layouts,
+        output_layouts,
+        use_local_output=True
 ):
     """
     Distribute a router module by defining custom input/output transformations
@@ -291,12 +292,12 @@ def _collect_layer_replicate_params(layer):
 
 
 def apply_non_moe_tp(
-    model: nn.Cell,
-    tp_mesh: DeviceMesh,
-    enable_loss_parallel: bool = False,
-    enable_float8_tensorwise_tp: bool = False,
-    enable_sp: bool = True,
-    enable_ep: bool = False,
+        model: nn.Cell,
+        tp_mesh: DeviceMesh,
+        enable_loss_parallel: bool = False,
+        enable_float8_tensorwise_tp: bool = False,
+        enable_sp: bool = True,
+        enable_ep: bool = False,
 ):
     """Apply tensor parallelism."""
     # 1. Parallelize the embedding and shard its outputs (which are the first
@@ -317,7 +318,7 @@ def apply_non_moe_tp(
         {
             "model.embedding.word_embeddings": embed_plan,
             "model.decoder.final_layernorm": SequenceParallel(sequence_dim=0,
-                use_local_output=False) if enable_sp else NoParallel(),
+                                                              use_local_output=False) if enable_sp else NoParallel(),
             "model.output_layer": ColwiseParallel(
                 input_layouts=sp_layout,
                 output_layouts=Shard(-1) if enable_loss_parallel else Replicate(),
@@ -427,7 +428,7 @@ def apply_non_moe_tp(
             layer_plan["mlp.shared_experts.linear_fc2"] = rowwise_output_plan
 
         core_attention = transformer_block.self_attention.core_attention
-        
+
         if hasattr(core_attention, "max_logits_val"):
             distribute_param_plan.append([core_attention, "max_logits_val", (Shard(0),)])
         if hasattr(transformer_block.mlp, "experts"):
@@ -571,9 +572,9 @@ def apply_moe_ep_tp(
 # ---------------------------------------------------------------------------
 
 def apply_fsdp(
-    model: nn.Cell,
-    parallel_dims: Any,
-    parallelism: Any,
+        model: nn.Cell,
+        parallel_dims: Any,
+        parallelism: Any,
 ) -> None:
     """Apply FSDP/HSDP to a GPT model.
 
@@ -653,29 +654,34 @@ def apply_fsdp(
 
     # --- 1. Wrap embedding ---
     if embedding is not None:
-        fully_shard(embedding, **fsdp_config, reshard_after_forward=reshard_after_forward)
+        with ms.DeviceCtx("meta"):
+            fully_shard(embedding, **fsdp_config, reshard_after_forward=reshard_after_forward)
 
     # --- 2. Wrap transformer layers ---
     for layer in layers:
         if hasattr(layer.mlp, "experts") and edp_mesh is not None:
-            fully_shard(layer.mlp.experts, **efsdp_config, reshard_after_forward=reshard_after_forward)
+            with ms.DeviceCtx("meta"):
+                fully_shard(layer.mlp.experts, **efsdp_config, reshard_after_forward=reshard_after_forward)
 
         replicate_params = _collect_layer_replicate_params(layer)
-        fully_shard(
-            layer,
-            **fsdp_config,
-            reshard_after_forward=reshard_after_forward,
-            replicate_params=replicate_params
-        )
+        with ms.DeviceCtx("meta"):
+            fully_shard(
+                layer,
+                **fsdp_config,
+                reshard_after_forward=reshard_after_forward,
+                replicate_params=replicate_params
+            )
 
     # --- 3. Wrap final_layernorm and output_layer together ---
     if tail_modules:
         # As an optimization, do not reshard_after_forward the last layers by default
         # since FSDP would prefetch them immediately after the forward pass.
-        fully_shard(tail_modules, **fsdp_config, reshard_after_forward=reshard_policy == "always")
+        with ms.DeviceCtx("meta"):
+            fully_shard(tail_modules, **fsdp_config, reshard_after_forward=reshard_policy == "always")
 
     # --- 4. Wrap root ---
-    fully_shard(model, **fsdp_config)
+    with ms.DeviceCtx("meta"):
+        fully_shard(model, **fsdp_config)
 
     # --- 5. Disable gradient division ---
     if getattr(parallelism, "disable_gradient_division", True):
@@ -695,12 +701,12 @@ def apply_fsdp(
 # ---------------------------------------------------------------------------
 
 def parallelize_gptmodel(
-    model: nn.Cell,
-    parallel_dims: Any,
-    parallelism: Any,
-    recompute: Any,
-    recompute_comm: Any,
-    swap: Any,
+        model: nn.Cell,
+        parallel_dims: Any,
+        parallelism: Any,
+        recompute: Any,
+        recompute_comm: Any,
+        swap: Any,
 ) -> nn.Cell:
     """Unified GPTModel parallelization entry point."""
     logger.info("Starting GPTModel parallelization for MCore architecture...")
@@ -709,19 +715,22 @@ def parallelize_gptmodel(
     tp_mesh = None
     if parallel_dims.tp_enabled:
         tp_mesh = parallel_dims.get_mesh("tp")
-        apply_non_moe_tp(
-            model,
-            tp_mesh=tp_mesh,
-            enable_ep=parallel_dims.ep_enabled,
-        )
+        with ms.DeviceCtx("meta"):
+            apply_non_moe_tp(
+                model,
+                tp_mesh=tp_mesh,
+                enable_ep=parallel_dims.ep_enabled,
+            )
 
     # Phase 2: EP
     if parallel_dims.ep_enabled:
-        apply_moe_ep_tp(
-            model,
-            tp_mesh=tp_mesh,
-            ep_mesh=parallel_dims.get_mesh("ep"),
-        )
+        ep_mesh = parallel_dims.get_mesh("ep")
+        with ms.DeviceCtx("meta"):
+            apply_moe_ep_tp(
+                model,
+                tp_mesh=tp_mesh,
+                ep_mesh=ep_mesh,
+            )
 
     # Phase 3: CP
     if parallel_dims.cp_enabled:

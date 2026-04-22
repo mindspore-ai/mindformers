@@ -50,7 +50,12 @@ class VocabEmbedding(nn.Cell):
         self.tile = mint.tile
         self.reshape = mint.reshape
 
-        self.weight = Parameter(init_method([self.num_embeddings, self.embedding_dim]), name="weight")
+        self.init_method = init_method
+        self.weight = Parameter(mint.empty([self.num_embeddings, self.embedding_dim]), name="weight")
+
+    def reset_parameter(self):
+        """Reset embedding weights for delayed initialization."""
+        self.weight.normal_(mean=0.0, std=0.01)
 
     def construct(self, input_):
         """

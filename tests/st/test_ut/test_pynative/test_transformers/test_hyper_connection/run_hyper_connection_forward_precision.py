@@ -127,6 +127,7 @@ def run_forward_precision(args):
 
     config = build_config(args)
     module = HyperConnectionModule(config=config, layer_number=1)
+    module.reset_parameter()
     module.set_train(False)
     weight, bias, alpha = set_deterministic_params(module, args.rate)
 
