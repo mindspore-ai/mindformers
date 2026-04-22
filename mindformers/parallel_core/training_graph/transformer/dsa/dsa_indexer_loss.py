@@ -69,6 +69,7 @@ class DSAIndexerLoss(nn.Cell):
         self.sparse_count = config.dsa_indexer_topk
         self.num_attention_heads = config.num_attention_heads
         self.is_tnd = config.input_layout == "TND"
+        self.mbs = config.micro_batch_num
         self.cp = config.context_parallel_size
         self.tp = config.tensor_model_parallel_size
         softmax_scale = softmax_scale or config.kv_channels ** -0.5
@@ -119,15 +120,16 @@ class DSAIndexerLoss(nn.Cell):
         """get dense indexer loss and gradient with fused operator"""
         if self.is_tnd:
             loss_scale = q.shape[0]
+            grad_scale = q.shape[0] * self.mbs * self.tp * self.cp
             actual_seq_qlen, actual_seq_klen = adjust_tnd_input(self.offset_id, q, k, actual_seq_qlen, actual_seq_klen)
-        elif self.cp > 1:
-            loss_scale = q.shape[0] * q.shape[1]
-            origin_seq_len = k.shape[1]
-            k = adjust_bsnd_input(self.offset_id, q, k)
-            k_index = adjust_bsnd_input(self.offset_id, q, k_index)
-            key_rope = adjust_bsnd_input(self.offset_id, q, key_rope)
         else:
             loss_scale = q.shape[0] * q.shape[1]
+            grad_scale = q.shape[0] * q.shape[1] * self.mbs * self.tp * self.cp
+            if self.cp > 1:
+                origin_seq_len = k.shape[1]
+                k = adjust_bsnd_input(self.offset_id, q, k)
+                k_index = adjust_bsnd_input(self.offset_id, q, k_index)
+                key_rope = adjust_bsnd_input(self.offset_id, q, key_rope)
 
         d_q, d_k, d_w, loss = self.loss_op(
             q, k, q_index, k_index, weights,
@@ -139,9 +141,9 @@ class DSAIndexerLoss(nn.Cell):
             actual_seq_klen=actual_seq_klen,
             layout=self.input_layout
         )
-        d_q = d_q / loss_scale / 8 / self.tp / self.cp
-        d_k = d_k / loss_scale / 8 / self.tp / self.cp
-        d_w = d_w / loss_scale / 8 / self.tp / self.cp
+        d_q = d_q / grad_scale
+        d_k = d_k / grad_scale
+        d_w = d_w / grad_scale
         loss = loss / loss_scale
         if self.cp > 1:
             loss = self.cp_allreduce(loss) / self.cp
@@ -156,15 +158,16 @@ class DSAIndexerLoss(nn.Cell):
         """get sparse indexer loss and gradient with fused operator"""
         if self.is_tnd:
             loss_scale = q.shape[0]
+            grad_scale = q.shape[0] * self.mbs * self.tp * self.cp
             actual_seq_qlen, actual_seq_klen = adjust_tnd_input(self.offset_id, q, k, actual_seq_qlen, actual_seq_klen)
-        elif self.cp > 1:
-            loss_scale = q.shape[0] * q.shape[1]
-            origin_seq_len = k.shape[1]
-            k = adjust_bsnd_input(self.offset_id, q, k)
-            k_index = adjust_bsnd_input(self.offset_id, q, k_index)
-            key_rope = adjust_bsnd_input(self.offset_id, q, key_rope)
         else:
             loss_scale = q.shape[0] * q.shape[1]
+            grad_scale = q.shape[0] * q.shape[1] * self.mbs * self.tp * self.cp
+            if self.cp > 1:
+                origin_seq_len = k.shape[1]
+                k = adjust_bsnd_input(self.offset_id, q, k)
+                k_index = adjust_bsnd_input(self.offset_id, q, k_index)
+                key_rope = adjust_bsnd_input(self.offset_id, q, key_rope)
 
         d_q, d_k, d_w, loss = self.loss_op(
             q, k, q_index, k_index, weights, topk_indices,
@@ -175,9 +178,9 @@ class DSAIndexerLoss(nn.Cell):
             actual_seq_klen=actual_seq_klen,
             layout=self.input_layout
         )
-        d_q = d_q / loss_scale / 8 / self.tp / self.cp
-        d_k = d_k / loss_scale / 8 / self.tp / self.cp
-        d_w = d_w / loss_scale / 8 / self.tp / self.cp
+        d_q = d_q / grad_scale
+        d_k = d_k / grad_scale
+        d_w = d_w / grad_scale
         loss = loss / loss_scale
         if self.cp > 1:
             loss = self.cp_allreduce(loss) / self.cp
