@@ -1398,7 +1398,8 @@ class TransformerConfig:
         default=None,
         metadata={
             "description": "Number of top-k tokens to select in DSA indexer. "
-                           "Should be a integer multiple of 1024 and not greater than 8192",
+                           "Should be a integer in [1~2048, 3072, 4096, 5120, 6144, 7168, 8092] during inference. "
+                           "Should be a integer multiple of 1024 and not greater than 8192 during sparse stage.",
             "usage": ParamUsage.TRAINING,
             "source": ParamSource.MEGATRON,
             "mode": ParamMode.GRAPH
@@ -2596,14 +2597,14 @@ class MLATransformerConfig(TransformerConfig):
                                  f"`qk_head_dim`={self.qk_head_dim}, "
                                  f"`qk_pos_emb_head_dim`={self.qk_pos_emb_head_dim}, "
                                  f"`num_attention_heads`={self.num_attention_heads}!")
-            if self.dsa_indexer_n_heads not in [8, 16, 32, 64] or self.dsa_indexer_head_dim != 128 or \
-                    self.dsa_indexer_topk // 1024 not in range(1, 9):
+            if self.dsa_indexer_n_heads not in [8, 16, 32, 64] or self.dsa_indexer_head_dim != 128:
                 raise ValueError("`dsa_indexer_n_heads` only supports {8, 16, 32, 64}, "
                                  "`dsa_indexer_head_dim` only supports 128, "
-                                 "`dsa_indexer_topk` only supports {1024, 2048, 3072, ..., 8192}, "
                                  f"but get `dsa_indexer_n_heads`={self.dsa_indexer_n_heads}, "
-                                 f"`dsa_indexer_head_dim`={self.dsa_indexer_head_dim}, "
-                                 f"`dsa_indexer_topk`={self.dsa_indexer_topk}.")
+                                 f"`dsa_indexer_head_dim`={self.dsa_indexer_head_dim}.")
+            if self.dsa_indexer_use_sparse_loss and self.dsa_indexer_topk // 1024 not in range(1, 9):
+                raise ValueError("`dsa_indexer_topk` only supports {1024, 2048, 3072, ..., 8192} during sparse stage, "
+                                 f"but get `dsa_indexer_topk`={self.dsa_indexer_topk}.")
 
 
 default_transformer_config = TransformerConfig(num_attention_heads=1, num_layers=1)

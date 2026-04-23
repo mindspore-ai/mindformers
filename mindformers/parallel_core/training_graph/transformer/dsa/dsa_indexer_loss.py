@@ -23,7 +23,7 @@ from mindspore.parallel._utils import _get_parallel_mode
 from mindformers.tools.utils import get_real_rank
 from mindformers.parallel_core.transformer_config import MLATransformerConfig
 from mindformers.parallel_core.training_graph.device_matrix import layout
-from mindformers.parallel_core.training_graph.communication import get_dp_cp_id, get_cp_group_name
+from mindformers.parallel_core.training_graph.communication import get_dp_cp_id, get_cp_group_name, get_dp_group_name
 from mindformers.parallel_core.training_graph.transformer.dsa.utils import adjust_bsnd_input, adjust_tnd_input
 from mindformers.parallel_core.training_graph.ops.dense_lightning_indexer_grad_kl_loss import (
     DenseLightningIndexerGradKLLoss
@@ -70,8 +70,10 @@ class DSAIndexerLoss(nn.Cell):
         self.num_attention_heads = config.num_attention_heads
         self.is_tnd = config.input_layout == "TND"
         self.mbs = config.micro_batch_num
+        self.dp = config.data_parallel_size
         self.cp = config.context_parallel_size
         self.tp = config.tensor_model_parallel_size
+        self.grad_scale_base = self.mbs * self.dp * self.cp * self.tp
         softmax_scale = softmax_scale or config.kv_channels ** -0.5
 
         self.softmax_scale = Tensor([softmax_scale], mstype.float32)
@@ -86,6 +88,14 @@ class DSAIndexerLoss(nn.Cell):
                 config.context_parallel_size
             )[0]
             self.cp_allreduce = ops.AllReduce("sum", self.cp_group)
+        if self.dp > 1:
+            self.dp_group = get_dp_group_name(
+                get_real_rank(),
+                config.data_parallel_size,
+                config.tensor_model_parallel_size,
+                config.context_parallel_size
+            )[0]
+            self.dp_allreduce = ops.AllReduce("sum", self.dp_group)
 
         # common operators
         self.cast = aclnn_ops.Cast()
@@ -120,11 +130,14 @@ class DSAIndexerLoss(nn.Cell):
         """get dense indexer loss and gradient with fused operator"""
         if self.is_tnd:
             loss_scale = q.shape[0]
-            grad_scale = q.shape[0] * self.mbs * self.tp * self.cp
+            grad_scale = q.shape[0] * self.grad_scale_base
             actual_seq_qlen, actual_seq_klen = adjust_tnd_input(self.offset_id, q, k, actual_seq_qlen, actual_seq_klen)
+            # actual_seq_len should be cast to int64, otherwise overflow will occur during load int32 with int64.
+            actual_seq_qlen = self.cast(actual_seq_qlen, mstype.int64)
+            actual_seq_klen = self.cast(actual_seq_klen, mstype.int64)
         else:
             loss_scale = q.shape[0] * q.shape[1]
-            grad_scale = q.shape[0] * q.shape[1] * self.mbs * self.tp * self.cp
+            grad_scale = q.shape[0] * q.shape[1] * self.grad_scale_base
             if self.cp > 1:
                 origin_seq_len = k.shape[1]
                 k = adjust_bsnd_input(self.offset_id, q, k)
@@ -145,6 +158,8 @@ class DSAIndexerLoss(nn.Cell):
         d_k = d_k / grad_scale
         d_w = d_w / grad_scale
         loss = loss / loss_scale
+        if self.dp > 1:
+            loss = self.dp_allreduce(loss) / self.dp
         if self.cp > 1:
             loss = self.cp_allreduce(loss) / self.cp
             if not self.is_tnd:
@@ -158,11 +173,13 @@ class DSAIndexerLoss(nn.Cell):
         """get sparse indexer loss and gradient with fused operator"""
         if self.is_tnd:
             loss_scale = q.shape[0]
-            grad_scale = q.shape[0] * self.mbs * self.tp * self.cp
+            grad_scale = q.shape[0] * self.grad_scale_base
             actual_seq_qlen, actual_seq_klen = adjust_tnd_input(self.offset_id, q, k, actual_seq_qlen, actual_seq_klen)
+            actual_seq_qlen = self.cast(actual_seq_qlen, mstype.int64)
+            actual_seq_klen = self.cast(actual_seq_klen, mstype.int64)
         else:
             loss_scale = q.shape[0] * q.shape[1]
-            grad_scale = q.shape[0] * q.shape[1] * self.mbs * self.tp * self.cp
+            grad_scale = q.shape[0] * q.shape[1] * self.grad_scale_base
             if self.cp > 1:
                 origin_seq_len = k.shape[1]
                 k = adjust_bsnd_input(self.offset_id, q, k)
@@ -182,6 +199,8 @@ class DSAIndexerLoss(nn.Cell):
         d_k = d_k / grad_scale
         d_w = d_w / grad_scale
         loss = loss / loss_scale
+        if self.dp > 1:
+            loss = self.dp_allreduce(loss) / self.dp
         if self.cp > 1:
             loss = self.cp_allreduce(loss) / self.cp
             if not self.is_tnd:
@@ -242,12 +261,11 @@ class DSAIndexerLoss(nn.Cell):
             k_shard = layout("dp", "None", "None")
             w_shard = layout("dp_cp", "None")
             topk_shard = layout("dp_cp", "None", "None")
+            softmax_shard = layout("None", "dp_cp", "None")
             if self.sparse_loss:
-                softmax_shard = layout("None", "dp_cp", "None")
                 loss_shard = (q_shard, k_shard, q_shard, k_shard, w_shard, topk_shard,
                               softmax_shard, softmax_shard, q_shard, k_shard, layout("dp"), layout("dp"))
             else:
-                softmax_shard = layout("dp_cp", "None", "None")
                 softmax_index_shard = layout("None", "dp_cp")
                 loss_shard = (q_shard, k_shard, q_shard, k_shard, w_shard, softmax_shard, softmax_shard,
                               softmax_index_shard, softmax_index_shard, q_shard, k_shard, layout("dp"), layout("dp"))

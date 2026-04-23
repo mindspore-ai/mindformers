@@ -117,7 +117,7 @@ class SparseLightningIndexerGradKLLoss(Cell):
             out_dtype=_infer_dtype,
             func_type="aot",
             bprop=None,
-        )
+        ).add_prim_attr("value_depend", [10, 11])
 
     def construct(self, query, key, query_index, key_index, weights,
                   sparse_indices, softmax_max, softmax_sum,
