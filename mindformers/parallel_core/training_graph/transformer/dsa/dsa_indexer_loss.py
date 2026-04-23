@@ -23,8 +23,10 @@ from mindspore.parallel._utils import _get_parallel_mode
 from mindformers.tools.utils import get_real_rank
 from mindformers.parallel_core.transformer_config import MLATransformerConfig
 from mindformers.parallel_core.training_graph.device_matrix import layout
-from mindformers.parallel_core.training_graph.communication import get_dp_cp_id, get_cp_group_name, get_dp_group_name
+from mindformers.parallel_core.training_graph.communication import get_dp_cp_tp_id, get_cp_group_name, get_dp_group_name
+from mindformers.parallel_core.training_graph.tensor_parallel.utils import get_tp_group_name
 from mindformers.parallel_core.training_graph.transformer.dsa.utils import adjust_bsnd_input, adjust_tnd_input
+from mindformers.parallel_core.training_graph.transformer.identity_op import IdentityOp
 from mindformers.parallel_core.training_graph.ops.dense_lightning_indexer_grad_kl_loss import (
     DenseLightningIndexerGradKLLoss
 )
@@ -73,13 +75,22 @@ class DSAIndexerLoss(nn.Cell):
         self.dp = config.data_parallel_size
         self.cp = config.context_parallel_size
         self.tp = config.tensor_model_parallel_size
+        self.slice_kv = self.cp > 1 or self.tp > 1
         self.grad_scale_base = self.mbs * self.dp * self.cp * self.tp
         softmax_scale = softmax_scale or config.kv_channels ** -0.5
 
         self.softmax_scale = Tensor([softmax_scale], mstype.float32)
 
-        _, cp_id = get_dp_cp_id(config)
-        self.offset_id = cp_id
+        _, cp_id, tp_id = get_dp_cp_tp_id(config)
+        self.offset_id = cp_id * self.tp + tp_id
+        if self.tp > 1:
+            self.tp_group = get_tp_group_name(
+                get_real_rank(),
+                config.tensor_model_parallel_size
+            )
+            self.tp_allreduce = ops.AllReduce("sum", self.tp_group)
+        else:
+            self.tp_allreduce = IdentityOp()
         if self.cp > 1:
             self.cp_group = get_cp_group_name(
                 get_real_rank(),
@@ -88,6 +99,8 @@ class DSAIndexerLoss(nn.Cell):
                 config.context_parallel_size
             )[0]
             self.cp_allreduce = ops.AllReduce("sum", self.cp_group)
+        else:
+            self.cp_allreduce = IdentityOp()
         if self.dp > 1:
             self.dp_group = get_dp_group_name(
                 get_real_rank(),
@@ -96,6 +109,8 @@ class DSAIndexerLoss(nn.Cell):
                 config.context_parallel_size
             )[0]
             self.dp_allreduce = ops.AllReduce("sum", self.dp_group)
+        else:
+            self.dp_allreduce = IdentityOp()
 
         # common operators
         self.cast = aclnn_ops.Cast()
@@ -138,7 +153,7 @@ class DSAIndexerLoss(nn.Cell):
         else:
             loss_scale = q.shape[0] * q.shape[1]
             grad_scale = q.shape[0] * q.shape[1] * self.grad_scale_base
-            if self.cp > 1:
+            if self.slice_kv:
                 origin_seq_len = k.shape[1]
                 k = adjust_bsnd_input(self.offset_id, q, k)
                 k_index = adjust_bsnd_input(self.offset_id, q, k_index)
@@ -158,12 +173,11 @@ class DSAIndexerLoss(nn.Cell):
         d_k = d_k / grad_scale
         d_w = d_w / grad_scale
         loss = loss / loss_scale
-        if self.dp > 1:
-            loss = self.dp_allreduce(loss) / self.dp
-        if self.cp > 1:
-            loss = self.cp_allreduce(loss) / self.cp
-            if not self.is_tnd:
-                d_k = self.pad(d_k, (0, 0, 0, 0, 0, origin_seq_len - d_k.shape[1], 0, 0))
+        loss = self.tp_allreduce(loss) / self.tp
+        loss = self.cp_allreduce(loss) / self.cp
+        loss = self.dp_allreduce(loss) / self.dp
+        if not self.is_tnd and self.slice_kv:
+            d_k = self.pad(d_k, (0, 0, 0, 0, 0, origin_seq_len - d_k.shape[1], 0, 0))
         return d_q, d_k, d_w, loss
 
     def _sparse_indexer_loss(
@@ -180,7 +194,7 @@ class DSAIndexerLoss(nn.Cell):
         else:
             loss_scale = q.shape[0] * q.shape[1]
             grad_scale = q.shape[0] * q.shape[1] * self.grad_scale_base
-            if self.cp > 1:
+            if self.slice_kv:
                 origin_seq_len = k.shape[1]
                 k = adjust_bsnd_input(self.offset_id, q, k)
                 k_index = adjust_bsnd_input(self.offset_id, q, k_index)
@@ -199,12 +213,11 @@ class DSAIndexerLoss(nn.Cell):
         d_k = d_k / grad_scale
         d_w = d_w / grad_scale
         loss = loss / loss_scale
-        if self.dp > 1:
-            loss = self.dp_allreduce(loss) / self.dp
-        if self.cp > 1:
-            loss = self.cp_allreduce(loss) / self.cp
-            if not self.is_tnd:
-                d_k = self.pad(d_k, (0, 0, 0, 0, 0, origin_seq_len - d_k.shape[1], 0, 0))
+        loss = self.tp_allreduce(loss) / self.tp
+        loss = self.cp_allreduce(loss) / self.cp
+        loss = self.dp_allreduce(loss) / self.dp
+        if not self.is_tnd and self.slice_kv:
+            d_k = self.pad(d_k, (0, 0, 0, 0, 0, origin_seq_len - d_k.shape[1], 0, 0))
         return d_q, d_k, d_w, loss
 
     def construct(
@@ -242,11 +255,12 @@ class DSAIndexerLoss(nn.Cell):
         d_qi = out[0]
         d_ki = out[1]
         d_w = out[2]
-        d_topk = self.zeros_like(topk_indices)
         d_softmax1, d_softmax2 = self.zeros_like(softmax_max), self.zeros_like(softmax_sum)
         if not self.sparse_loss:
+            d_topk = None
             d_softmax_i1, d_softmax_i2 = self.zeros_like(softmax_max_index), self.zeros_like(softmax_sum_index)
         else:
+            d_topk = self.zeros_like(topk_indices)
             d_softmax_i1, d_softmax_i2 = None, None
         if self.is_tnd:
             d_qlen, d_klen = self.zeros_like(actual_seq_qlen), self.zeros_like(actual_seq_klen)
@@ -257,29 +271,29 @@ class DSAIndexerLoss(nn.Cell):
     def shard(self):
         """Set parallel strategy."""
         if self.is_tnd:
-            q_shard = layout("dp_cp", "None", "None")
+            q_shard = layout("dp_cp_tp", "None", "None")
             k_shard = layout("dp", "None", "None")
-            w_shard = layout("dp_cp", "None")
-            topk_shard = layout("dp_cp", "None", "None")
-            softmax_shard = layout("None", "dp_cp", "None")
+            w_shard = layout("dp_cp_tp", "None")
+            topk_shard = layout("dp_cp_tp", "None", "None")
+            softmax_shard = layout("None", "dp_cp_tp", "None")
             if self.sparse_loss:
                 loss_shard = (q_shard, k_shard, q_shard, k_shard, w_shard, topk_shard,
                               softmax_shard, softmax_shard, q_shard, k_shard, layout("dp"), layout("dp"))
             else:
-                softmax_index_shard = layout("None", "dp_cp")
+                softmax_index_shard = layout("None", "dp_cp_tp")
                 loss_shard = (q_shard, k_shard, q_shard, k_shard, w_shard, softmax_shard, softmax_shard,
                               softmax_index_shard, softmax_index_shard, q_shard, k_shard, layout("dp"), layout("dp"))
         else:
-            q_shard = layout("dp", "cp", "None", "None")
+            q_shard = layout("dp", "cp_tp", "None", "None")
             k_shard = layout("dp", "None", "None", "None")
-            w_shard = layout("dp", "cp", "None")
-            topk_shard = layout("dp", "cp", "None", "None")
-            softmax_shard = layout("dp", "None", "cp", "None")
+            w_shard = layout("dp", "cp_tp", "None")
+            topk_shard = layout("dp", "cp_tp", "None", "None")
+            softmax_shard = layout("dp", "None", "cp_tp", "None")
             if self.sparse_loss:
                 loss_shard = (q_shard, k_shard, q_shard, k_shard, w_shard, topk_shard,
                               softmax_shard, softmax_shard, q_shard, k_shard)
             else:
-                softmax_index_shard = layout("dp", "None", "cp")
+                softmax_index_shard = layout("dp", "None", "cp_tp")
                 loss_shard = (q_shard, k_shard, q_shard, k_shard, w_shard, softmax_shard, softmax_shard,
                               softmax_index_shard, softmax_index_shard, q_shard, k_shard)
         self.split_q.shard((q_shard,))

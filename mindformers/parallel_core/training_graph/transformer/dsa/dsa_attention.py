@@ -25,11 +25,14 @@ from mindspore.ops.operations.nn_ops import FlashAttentionScore
 from mindspore.context import ParallelMode
 from mindspore.parallel._utils import _get_parallel_mode
 
+from mindformers.tools.utils import get_real_rank
 from mindformers.parallel_core.utils.spec_utils import ModuleSpec, build_module
 from mindformers.parallel_core.transformer_config import MLATransformerConfig
 from mindformers.parallel_core.training_graph.transformer.dsa.dsa_indexer_loss import DSAIndexerLoss
 from mindformers.parallel_core.training_graph.device_matrix import layout
-from mindformers.parallel_core.training_graph.communication import get_dp_cp_id
+from mindformers.parallel_core.training_graph.communication import get_dp_cp_tp_id
+from mindformers.parallel_core.training_graph.tensor_parallel.utils import get_tp_group_name
+from mindformers.parallel_core.training_graph.transformer.identity_op import IdentityOp
 from mindformers.parallel_core.training_graph.transformer.mask_generate import CausalEODMaskGenerate
 from mindformers.parallel_core.training_graph.transformer.dsa.utils import adjust_bsnd_input, adjust_tnd_input
 
@@ -80,12 +83,13 @@ class DSAttention(nn.Cell):
         self.head_num = config.num_attention_heads
         self.layer_number = layer_number
         self.attention_mode = 2 # currently, attention mode only support 2
+        self.tp = config.tensor_model_parallel_size
         self.cp = config.context_parallel_size
         self.sparse_loss = config.dsa_indexer_use_sparse_loss
         self.mask_compression = config.use_attn_mask_compression and not self.is_tnd
 
-        _, cp_id = get_dp_cp_id(config)
-        self.offset_id = cp_id
+        _, cp_id, tp_id = get_dp_cp_tp_id(config)
+        self.offset_id = cp_id * self.tp + tp_id
 
         self.indexer = build_module(
             submodules.indexer, config=config
@@ -159,7 +163,7 @@ class DSAttention(nn.Cell):
         if self.is_tnd:
             actual_seq_qlen, actual_seq_kvlen = adjust_tnd_input(self.offset_id, q, k,
                                                                  actual_seq_qlen, actual_seq_kvlen)
-        elif self.cp > 1:
+        elif self.cp > 1 or self.tp > 1:
             k = adjust_bsnd_input(self.offset_id, q, k)
             v = adjust_bsnd_input(self.offset_id, q, v)
             key_rope = adjust_bsnd_input(self.offset_id, q, key_rope)
@@ -233,20 +237,19 @@ class DSAttention(nn.Cell):
     def shard(self):
         """Set parallel strategy."""
         # in sparse stage, head_num of kv is 1 so tp shard is not applied.
-        kv_head_split_num = "None" if self.sparse_loss else "tp"
         if self.is_tnd:
-            q_shard = layout("dp_cp", "tp", "None")
-            kv_shard = layout("dp", kv_head_split_num, "None")
-            idx_shard = layout("dp_cp", "None", "None")
-            attn_shard = layout("dp_cp", "tp", "None")
-            softmax_shard = layout("None", "dp_cp", "tp") if self.sparse_loss else layout("dp_cp", "tp", "None")
+            q_shard = layout("dp_cp_tp", "None", "None")
+            kv_shard = layout("dp", "None", "None")
+            idx_shard = layout("dp_cp_tp", "None", "None")
+            attn_shard = layout("dp_cp_tp", "None", "None")
+            softmax_shard = layout("None", "dp_cp_tp", "None")
             sfa_shard = (q_shard, kv_shard, kv_shard, idx_shard, q_shard, kv_shard, layout("dp"), layout("dp"))
         else:
-            q_shard = layout("dp", "cp", "tp", "None")
-            kv_shard = layout("dp", "None", kv_head_split_num, "None")
-            idx_shard = layout("dp", "cp", "None", "None")
-            attn_shard = layout("dp", "cp", "tp", "None")
-            softmax_shard = layout("dp", "None", "cp", "tp") if self.sparse_loss else layout("dp", "tp", "cp", "None")
+            q_shard = layout("dp", "cp_tp", "None", "None")
+            kv_shard = layout("dp", "None", "None", "None")
+            idx_shard = layout("dp", "cp_tp", "None", "None")
+            attn_shard = layout("dp", "cp_tp", "None", "None")
+            softmax_shard = layout("dp", "None", "cp_tp", "None")
             sfa_shard = (q_shard, kv_shard, kv_shard, idx_shard, q_shard, kv_shard)
         self.split_q.shard((q_shard,))
         self.split_k.shard((kv_shard,))
@@ -255,8 +258,8 @@ class DSAttention(nn.Cell):
         else:
             fa_shard = (
                 layout("dp", "cp", "tp", "None"),
-                layout("dp", "None", kv_head_split_num, "None"),
-                layout("dp", "None", kv_head_split_num, "None"),
+                layout("dp", "None", "tp", "None"),
+                layout("dp", "None", "tp", "None"),
                 layout("None", "None") if self.mask_compression else layout("dp", "None", "cp", "None"),
             )
             softmax_shard = layout("dp", "tp", "cp", "None")
@@ -265,6 +268,8 @@ class DSAttention(nn.Cell):
             self.slice.shard((softmax_shard,), (softmax_shard,))
             self.softmax_transpose.shard((layout("dp", "tp", "cp", "None"),))
         if self.track_max_attention_logit:
+            if self.sparse_loss:
+                softmax_shard = layout("None", "dp_cp", "tp") if self.is_tnd else layout("dp", "None", "cp", "tp")
             self.assign.shard((layout("tp"), layout("tp")), (layout("tp"),))
             self.maximum.shard((layout("tp"), layout("tp")), (layout("tp"),))
             self.reduce_max.shard((softmax_shard,), (layout("tp"),))

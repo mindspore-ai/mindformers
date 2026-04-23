@@ -59,14 +59,15 @@ def create_communication_group(rank_list):
     return group_name
 
 
-def get_dp_cp_id(config):
+def get_dp_cp_tp_id(config):
     """Get the CP (Context Parallel) and DP (Data Parallel) offset id on current rank"""
     rank, group_size = get_rank_info()
     pp_domain_size = group_size // config.pipeline_model_parallel_size
     dp_domain_size = pp_domain_size // config.data_parallel_size
     dp_id = rank % pp_domain_size // dp_domain_size
     cp_id = rank % pp_domain_size % dp_domain_size // config.tensor_model_parallel_size % config.context_parallel_size
-    return dp_id, cp_id
+    tp_id = rank % config.tensor_model_parallel_size
+    return dp_id, cp_id, tp_id
 
 
 OP_GROUP_NAME = {}

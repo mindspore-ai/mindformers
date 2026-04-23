@@ -23,7 +23,7 @@ import mindspore.common.dtype as mstype
 from mindspore.parallel._utils import _get_parallel_mode, _is_sharding_propagation
 from mindformers.parallel_core.transformer_config import TransformerConfig
 from mindformers.parallel_core.training_graph.device_matrix import layout
-from mindformers.parallel_core.training_graph.communication import get_dp_cp_id
+from mindformers.parallel_core.training_graph.communication import get_dp_cp_tp_id
 
 
 class CausalMaskGenerate(nn.Cell):
@@ -151,7 +151,7 @@ class CausalEODMaskGenerate(nn.Cell):
         self.seq_length = config.seq_length
         self.dtype = config.compute_dtype
 
-        _, cp_id = get_dp_cp_id(config)
+        _, cp_id, _ = get_dp_cp_tp_id(config)
         self.cp = config.context_parallel_size
         self.cp_id = cp_id
 
