@@ -15,7 +15,7 @@
 """Test the classes of style.py."""
 import pytest
 
-from hyper_parallel.core.placement_types import Shard, Replicate
+from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
 from mindformers.pynative.distributed.style import (
     PrepareModuleInput,
     PrepareModuleOutput,

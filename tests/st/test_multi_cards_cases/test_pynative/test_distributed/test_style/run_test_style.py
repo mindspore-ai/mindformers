@@ -17,8 +17,8 @@ import argparse
 import numpy as np
 
 from hyper_parallel import init_device_mesh
-from hyper_parallel.core.dtensor import DTensor
-from hyper_parallel.core.placement_types import Shard, Replicate
+from hyper_parallel import DTensor
+from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
 
 import mindspore as ms
 from mindspore import nn, Tensor

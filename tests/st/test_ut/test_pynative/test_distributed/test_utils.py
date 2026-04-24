@@ -19,7 +19,7 @@ import pytest
 import mindspore as ms
 from mindspore import context, nn
 
-from hyper_parallel.core.placement_types import Replicate
+from hyper_parallel.core.dtensor.placement_types import Replicate
 
 from mindformers.pynative.distributed import utils as dist_utils
 

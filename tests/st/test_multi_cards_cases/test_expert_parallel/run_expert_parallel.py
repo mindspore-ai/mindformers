@@ -19,13 +19,12 @@ import numpy as np
 import mindspore as ms
 from mindspore import context, Parameter, Tensor
 from mindspore.communication import init
-
+from hyper_parallel import init_device_mesh
+from hyper_parallel import DTensor
 from data_gen_utils import get_init_params
 from mindformers.pynative.transformers.moe.experts import GroupedMLP
 from mindformers.pynative.distributed.expert_parallel import ExpertParallel
 from mindformers.parallel_core.transformer_config import TransformerConfig
-from hyper_parallel.core.device_mesh import init_device_mesh
-from hyper_parallel import DTensor
 
 
 class ExpertParallelRunner:

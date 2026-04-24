@@ -14,15 +14,10 @@
 # limitations under the License.
 # ============================================================================
 """Tests for expert parallel in pynative mode."""
-
 import pytest
-import mindspore as ms
 from mindspore import context, nn
 
-import mindspore as ms
-
-from hyper_parallel.core.device_mesh import init_device_mesh
-from hyper_parallel.core.placement_types import Shard
+from hyper_parallel.core.dtensor.placement_types import Shard
 
 from mindformers.pynative.distributed import utils
 from mindformers.parallel_core.transformer_config import TransformerConfig
@@ -30,7 +25,7 @@ from mindformers.pynative.layers.linear import Linear
 from mindformers.pynative.transformers.mlp import MLP, MLPSubmodules
 from mindformers.pynative.transformers.moe.experts import GroupedMLP
 from mindformers.pynative.distributed.expert_parallel import ExpertParallel
-import pytest
+
 HIDDEN_SIZE = 32
 EXPERT_NUM = 4
 
@@ -43,13 +38,9 @@ class TestExpertParallel:
     """Tests for ExpertParallel."""
 
     def setup_method(self):
+        """Set up test fixtures for expert parallel MoE tests."""
         context.set_context(mode=context.PYNATIVE_MODE)
 
-        # self.device_mesh = init_device_mesh(
-        #     device_type="npu",
-        #     mesh_shape=(2,),
-        #     mesh_dim_names=("ep",)
-        # )
         self.device_mesh = object()
         self.config = TransformerConfig(
             hidden_size=HIDDEN_SIZE,
@@ -93,6 +84,7 @@ class TestExpertParallel:
     @pytest.mark.platform_x86_cpu
     @pytest.mark.env_onecard
     def test_parameter_sharding_plan(self, monkeypatch):
+        """Test that expert parallel applies the expected parameter sharding plan."""
         captured = {}
         def _fake_shard_module(module, device_mesh, parameter_shard_plan):
             captured["module"] = module
@@ -103,7 +95,7 @@ class TestExpertParallel:
 
         monkeypatch.setattr(utils, "shard_module", _fake_shard_module)
 
-        module = self.expert_parallel._apply(GroupedMLP(self.config), self.device_mesh)
+        module = self.expert_parallel._apply(GroupedMLP(self.config), self.device_mesh)# pylint: disable=unused-variable
         sharding_plan = captured["sharding_plan"]
         plan = sharding_plan.plan
 
@@ -111,4 +103,3 @@ class TestExpertParallel:
         assert set(plan.keys()) == {"weight1", "weight2"}
         assert plan["weight1"][0] == Shard(0)
         assert plan["weight2"][0] == Shard(0)
-

@@ -17,7 +17,6 @@ from unittest.mock import Mock, patch
 
 import pytest
 
-from hyper_parallel.core.device_mesh import _group_map
 from mindformers.pynative.distributed.parallel_dims import ParallelDims
 
 
@@ -36,14 +35,6 @@ def fixture_mock_platform():
         platform_mock.create_group.return_value = mock_group
         platform_mock.tensor_to_numpy = tensor_to_numpy
         yield platform_mock
-
-
-@pytest.fixture(autouse=True)
-def fixture_clear_group_map():
-    """Auto clear global group cache to avoid test case pollution, effective for all test cases"""
-    _group_map.clear()
-    yield
-    _group_map.clear()
 
 
 @pytest.mark.level1
