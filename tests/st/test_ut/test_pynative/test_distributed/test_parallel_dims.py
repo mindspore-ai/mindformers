@@ -37,6 +37,8 @@ def fixture_mock_platform():
         yield platform_mock
 
 
+
+
 @pytest.mark.level1
 @pytest.mark.platform_x86_cpu
 @pytest.mark.env_onecard
@@ -54,13 +56,13 @@ class TestDeviceMesh:
         _ = mock_platform  # Ensure mock is active
         # Automatically generate rank_list from mesh_shape
         parallel_dims = ParallelDims(
-            dp=2, cp=2, tp=2, pp=2,
+            dp_replicate=1, dp_shard=2, cp=2, tp=2, pp=2,
             ep=1, etp=1,
             world_size=16
         )
         mesh = parallel_dims.world_mesh
-        assert mesh.mesh_shape == (2, 2, 2, 2, 1)
-        assert mesh.mesh_dim_names == ('pp', 'dp', 'cp', 'tp', 'ep')
+        assert mesh.mesh_shape == (2, 1, 2, 2, 2, 1)
+        assert mesh.mesh_dim_names == ('pp', 'dp_replicate', 'dp_shard', 'cp', 'tp', 'ep')
         assert mesh.rank_list == (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)
 
         assert mesh['pp'].mesh_shape == (2,)
@@ -98,13 +100,13 @@ class TestDeviceMesh:
         _ = mock_platform  # Ensure mock is active
         # Automatically generate rank_list from mesh_shape
         parallel_dims = ParallelDims(
-            dp=2, cp=2, tp=2, pp=2,
+            dp_replicate=1, dp_shard=2, cp=2, tp=2, pp=2,
             ep=2, etp=1,
             world_size=16
         )
         mesh = parallel_dims.world_mesh
-        assert mesh.mesh_shape == (2, 2, 2, 1, 2)
-        assert mesh.mesh_dim_names == ('pp', 'dp', 'cp', 'tp_shard_mod_ep', 'tp_shard_in_ep')
+        assert mesh.mesh_shape == (2, 1, 2, 2, 1, 2)
+        assert mesh.mesh_dim_names == ('pp', 'dp_replicate', 'dp_shard', 'cp', 'tp_shard_mod_ep', 'tp_shard_in_ep')
         assert mesh.rank_list == (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)
 
         assert mesh['pp'].mesh_shape == (2,)
@@ -142,13 +144,13 @@ class TestDeviceMesh:
         _ = mock_platform  # Ensure mock is active
         # Automatically generate rank_list from mesh_shape
         parallel_dims = ParallelDims(
-            dp=2, cp=2, tp=2, pp=2,
+            dp_replicate=1, dp_shard=2, cp=2, tp=2, pp=2,
             ep=4, etp=1,
             world_size=16
         )
         mesh = parallel_dims.world_mesh
-        assert mesh.mesh_shape == (2, 2, 1, 2, 2)
-        assert mesh.mesh_dim_names == ('pp', 'dp', 'cp_shard_mod_ep', 'cp_shard_in_ep', 'tp')
+        assert mesh.mesh_shape == (2, 1, 2, 1, 2, 2)
+        assert mesh.mesh_dim_names == ('pp', 'dp_replicate', 'dp_shard', 'cp_shard_mod_ep', 'cp_shard_in_ep', 'tp')
         assert mesh.rank_list == (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)
 
         assert mesh['pp'].mesh_shape == (2,)
@@ -186,13 +188,13 @@ class TestDeviceMesh:
         _ = mock_platform  # Ensure mock is active
         # Automatically generate rank_list from mesh_shape
         parallel_dims = ParallelDims(
-            dp=2, cp=2, tp=2, pp=2,
+            dp_replicate=1, dp_shard=2, cp=2, tp=2, pp=2,
             ep=8, etp=1,
             world_size=16
         )
         mesh = parallel_dims.world_mesh
-        assert mesh.mesh_shape == (2, 1, 2, 2, 2)
-        assert mesh.mesh_dim_names == ('pp', 'dp_shard_mod_ep', 'dp_shard_in_ep', 'cp', 'tp')
+        assert mesh.mesh_shape == (2, 1, 1, 2, 2, 2)
+        assert mesh.mesh_dim_names == ('pp', 'dp_replicate', 'dp_shard_mod_ep', 'dp_shard_in_ep', 'cp', 'tp')
         assert mesh.rank_list == (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)
 
         assert mesh['pp'].mesh_shape == (2,)

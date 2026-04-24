@@ -19,10 +19,26 @@ from mindformers.pynative.distributed.style import (
     PrepareModuleInputOutput,
     ParallelStyle,
 )
+from mindformers.pynative.distributed.fsdp import (
+    get_fsdp_reshard_after_forward_policy,
+    disable_fsdp_gradient_division,
+)
+from mindformers.pynative.distributed.parallelize import (
+    parallelize_module,
+    parallelize_model,
+    register_parallelize_fn,
+    register_parallelize,
+)
 
 __all__ = [
     "PrepareModuleInput",
     "PrepareModuleOutput",
     "PrepareModuleInputOutput",
     "ParallelStyle",
+    "get_fsdp_reshard_after_forward_policy",
+    "disable_fsdp_gradient_division",
+    "parallelize_module",
+    "parallelize_model",
+    "register_parallelize_fn",
+    "register_parallelize",
 ]

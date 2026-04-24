@@ -15,6 +15,8 @@
 """Qwen3 models' APIs."""
 from mindspore import Tensor
 
+from mindformers.pynative.distributed import register_parallelize
+from mindformers.pynative.base_models.gpt.parallelize import parallelize_gptmodel
 from mindformers.parallel_core.transformer_config import TransformerConfig
 from mindformers.pynative.base_models.gpt.gpt_model import GPTModel
 from mindformers.pynative.base_models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
@@ -23,6 +25,7 @@ from .utils import Qwen3PreTrainedModel
 from .configuration_qwen3 import Qwen3Config
 
 
+@register_parallelize(parallelize_gptmodel)
 class PyNativeQwen3ForCausalLM(Qwen3PreTrainedModel, TrainModelMixin):
     """
     Provide qwen3 model train through network.
