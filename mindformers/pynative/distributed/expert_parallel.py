@@ -13,16 +13,16 @@
 # ============================================================================
 # implementation of Expert Parallel for the GroupedMLP in MoE
 
-import numpy as np
 import hashlib
+import numpy as np
 
 from mindspore import mint, nn, ops, Tensor
 from mindspore.common import dtype as mstype
 from mindspore.communication import get_rank
 from mindspore.communication.management import create_group
 
-from hyper_parallel.core.placement_types import Shard
-from hyper_parallel.core.device_mesh import DeviceMesh
+from hyper_parallel.core.dtensor.placement_types import Shard
+from hyper_parallel import DeviceMesh
 
 from mindformers.pynative.distributed.style import ParallelStyle
 from mindformers.pynative.distributed.utils import distribute_module
@@ -65,6 +65,7 @@ class ExpertParallel(ParallelStyle):
 
     # performing all-to-all dispatch on the input
     def _token_dispatch(self, device_mesh, cell, args):
+        """Dispatch routed tokens across experts and expert-parallel ranks for MoE execution."""
         tokens, probs, topk_indices, num_tokens_per_expert = args
         tokens_shape = self.shape(tokens)
         tokens = self.reshape(tokens, (-1, tokens_shape[-1]))
@@ -152,7 +153,9 @@ class ExpertParallel(ParallelStyle):
         }
 
     # performing all-to-all combine on the output
+    # pylint: disable=unused-argument
     def _token_combine(self, device_mesh, cell, args, routed_output):
+        """Combine expert outputs and restore token order after expert-parallel dispatch."""
         probs, unsorted_map, unsort_token_indices_experts, \
             input_splits, output_splits, original_shape = self.ctx
         routed_output = self.reshape(routed_output, (1, -1, cell.hidden_size))

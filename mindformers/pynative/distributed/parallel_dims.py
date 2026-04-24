@@ -16,7 +16,7 @@ __all__ = [
 
 from dataclasses import dataclass
 
-from hyper_parallel.core.device_mesh import DeviceMesh, init_device_mesh
+from hyper_parallel import DeviceMesh, init_device_mesh
 
 
 @dataclass
