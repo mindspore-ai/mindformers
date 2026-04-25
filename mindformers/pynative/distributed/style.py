@@ -114,7 +114,7 @@ class ColwiseParallel(ParallelStyle):
         return outputs.to_local() if use_local_output else outputs
 
     def _create_weight_sharding_plan(self, module: nn.Cell) -> Dict:
-        """Create the parameter sharding plan for a column-wise parallel module."""
+        """Create weight sharding plan for column-wise parallelism."""
         sharding_plan = {}
         if isinstance(module, Linear):
             if getattr(module, "weight", None) is not None:
@@ -217,7 +217,7 @@ class RowwiseParallel(ParallelStyle):
         return outputs.to_local() if use_local_output else outputs
 
     def _create_weight_sharding_plan(self, module: nn.Cell) -> Dict:
-        """Create the parameter sharding plan for a row-wise parallel module."""
+        """Create weight sharding plan for row-wise parallelism."""
         sharding_plan = {}
         if isinstance(module, Linear):
             if getattr(module, "weight", None) is not None:
@@ -375,7 +375,7 @@ class PrepareModuleInput(ParallelStyle):
     Example::
         >>> from mindformers.pynative.distributed import PrepareModuleInput
         >>> from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
-        >>> from hyper_parallel.core.dtensor.device_mesh import init_device_mesh
+        >>> from hyper_parallel import init_device_mesh
         >>> ...
         >>> block = TransformerBlock(...)  # block is a nn.Cell that contains an "attn" Attention submodule
         >>> tp_mesh = init_device_mesh(mesh_shape=(8,), alias_name=("tp",))
@@ -536,7 +536,7 @@ class PrepareModuleOutput(ParallelStyle):
     Example::
         >>> from mindformers.pynative.distributed import PrepareModuleOutput
         >>> from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
-        >>> from hyper_parallel.core.dtensor.device_mesh import init_device_mesh
+        >>> from hyper_parallel import init_device_mesh
         >>> ...
         >>> block = TransformerBlock(...)  # block is a nn.Cell that contains an "attn" Attention submodule
         >>> tp_mesh = init_device_mesh(mesh_shape=(8,), alias_name=("tp",))
@@ -671,7 +671,7 @@ class PrepareModuleInputOutput(ParallelStyle):
     Example::
         >>> from mindformers.pynative.distributed import PrepareModuleInputOutput
         >>> from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
-        >>> from hyper_parallel.core.dtensor.device_mesh import init_device_mesh
+        >>> from hyper_parallel import init_device_mesh
         >>> ...
         >>> block = TransformerBlock(...)  # block is a nn.Cell that contains an "attn" Attention submodule
         >>> tp_mesh = init_device_mesh(mesh_shape=(8,), alias_name=("tp",))

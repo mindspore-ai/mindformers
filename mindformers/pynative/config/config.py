@@ -339,17 +339,40 @@ class TrainingConfig(BaseConfig):
 class ParallelismConfig(BaseConfig):
     """
     Parallelism configuration for distributed training.
+    Supports FSDP/HSDP, TP, CP, PP and other parallelism strategies.
     """
 
+    # ========== Data Parallelism & FSDP ==========
+    data_parallel: int = 1
+    """Data parallelism degree"""
+
+    param_dtype: str = "float32"
+    """Parameter data type for FSDP (float16/float32/bfloat16)"""
+
+    reduce_dtype: str = "float32"
+    """Gradient reduction data type for FSDP (float16/float32/bfloat16)"""
+
+    reshard_after_forward_policy: str = "default"
+    """FSDP reshard policy: always/never/default"""
+
+    cpu_offload: bool = False
+    """Enable CPU offloading for FSDP"""
+
+    disable_gradient_division: bool = True
+    """Disable FSDP automatic gradient division (use sum instead of mean)"""
+
+    # ========== Tensor Parallelism ==========
     tensor_parallel: int = 1
     """Tensor parallelism degree"""
 
+    # ========== Context Parallelism ==========
     context_parallel: int = 1
     """Context parallelism degree"""
 
     context_parallel_method: str = "colossal"
     """Implementation method for context parallelism"""
 
+    # ========== Pipeline Parallelism ==========
     pipeline_parallel: int = 1
     """Pipeline parallelism degree"""
 
@@ -365,6 +388,7 @@ class ParallelismConfig(BaseConfig):
     pipeline_parallel_interleave_num: int = 1
     """Number of interleaved model chunks"""
 
+    # ========== Legacy HSDP Config (will be deprecated) ==========
     hsdp_shard_size: int = 1
     """HSDP sharding group size"""
 
@@ -439,6 +463,8 @@ class TrainDatasetConfig(BaseConfig):
     Train dataset configuration.
     """
 
+    allow_extra = True
+
     dataloader: DataloaderConfig = field(default_factory=DataloaderConfig)
     """Dataloader configuration"""
 
@@ -463,7 +489,13 @@ class ModelConfig(BaseConfig):
 
     allow_extra = True
 
-    model_type: str = None
+    type: Optional[str] = None
+    """Model class type for registration (e.g., Qwen3ForCausalLM)"""
+
+    model_config: Optional[Any] = None
+    """Inner model-specific configuration (e.g., Qwen3Config)"""
+
+    model_type: Optional[str] = None
     """Model type"""
 
     architectures: str = None
@@ -550,6 +582,8 @@ class ContextConfig(BaseConfig):
     """
     MindSpore context configuration.
     """
+
+    allow_extra = True
 
     mode: int = 1
     """Pynative Mode"""
