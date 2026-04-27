@@ -84,12 +84,12 @@ class TrainingTeleChat3ForCausalLM(TrainModelMixin, TeleChat3PreTrainedModel):
     def can_generate(cls):
         return False
 
-    def update_topk_bias(self, gradient_accumulation_steps=1):
+    def update_topk_bias(self):
         """
         Will be called by mindformer.core.callback.TopkBiasBalanceCallback to
         update topk bias and reset expert_load of router in MoELayers.
         """
-        return self.model.update_topk_bias(gradient_accumulation_steps)
+        return self.model.update_topk_bias()
 
     def reset_max_attention_logit(self,):
         """

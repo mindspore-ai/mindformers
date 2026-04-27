@@ -332,6 +332,8 @@ class BaseTrainer:
                            "Current pipeline stage=1 but gradient_accumulation_steps=1, "
                            "the feature is disabled by default.")
             self.config.model.model_config.disable_lazy_inline = True
+        self.config.model.model_config.gradient_accumulation_steps = \
+            self.config.runner_config.gradient_accumulation_steps
 
     @staticmethod
     def _check_training_network_no_use_past(network):
@@ -1221,7 +1223,8 @@ class BaseTrainer:
         # set resume training for hf iterable dataset
         dataloader_config = config.train_dataset.get('data_loader', {})
         dataloader_type = dataloader_config.get('type')
-        if (config.resume_training or not config.checkpoint.no_load_optim) and dataloader_type in ['HFDataLoader', 'CommonDataLoader']:
+        if (config.resume_training or not config.checkpoint.no_load_optim) and \
+                dataloader_type in ['HFDataLoader', 'CommonDataLoader']:
             resume_step = config.runner_config.initial_step
             _resume_hf_iterable_dataset(dataset, resume_step)
 
