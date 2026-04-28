@@ -302,6 +302,9 @@ class CheckpointConfig(BaseConfig):
     load_worker_number: int = 1
     """Number of worker threads used for checkpoint loading"""
 
+    save_global_layout_cache: bool = True
+    """Enable global layout cache for checkpoint saving"""
+
 
 @dataclass
 class TrainingConfig(BaseConfig):

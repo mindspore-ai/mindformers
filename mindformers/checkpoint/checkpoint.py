@@ -31,6 +31,7 @@ from mindspore.nn.optim.optimizer import Optimizer
 from mindspore.communication import comm_func
 from mindspore import save_checkpoint as ms_save_checkpoint
 
+from mindformers.checkpoint.layout_adapter import LayoutAdapter
 from mindformers.tools.logger import logger
 from mindformers.checkpoint.reshard import ReshardLoader
 from mindformers.utils.file_utils import is_publicly_accessible_path
@@ -365,7 +366,7 @@ def save_checkpoint(iteration: int, network: Cell, optimizer: Optimizer = None,
             cur_iter_checkpoint_dir, user_prefix, get_real_rank(), get_real_group_size(), FileType.MODEL
         )
         ms_save_checkpoint(
-            network,
+            LayoutAdapter.preprocess_params(network),
             model_ckpt_filename,
             async_save=use_async_save,
             format="safetensors"
@@ -391,7 +392,7 @@ def save_checkpoint(iteration: int, network: Cell, optimizer: Optimizer = None,
                 cur_iter_checkpoint_dir, user_prefix, get_real_rank(), get_real_group_size(), FileType.OPTIMIZER
             )
             ms_save_checkpoint(
-                optimizer,
+                LayoutAdapter.preprocess_params(optimizer),
                 optimizer_ckpt_filename,
                 async_save=use_async_save,
                 format="safetensors",
@@ -500,6 +501,11 @@ def load_checkpoint(
     else:
         dst_sharded_tensor_metas = get_cur_sharded_tensor(network, filter_func) \
             if get_real_group_size() > 1 else get_sharded_tensor_from_cell(network, optimizer)
+        if LayoutAdapter.is_pynative_mode() and get_real_group_size() > 1:
+            dst_sharded_tensor_metas_opt = get_cur_sharded_tensor(optimizer, filter_func)
+            for key, value in dst_sharded_tensor_metas_opt.items():
+                if key not in dst_sharded_tensor_metas:
+                    dst_sharded_tensor_metas[key] = value
 
     # Load using ReshardLoader
     # Self-trained weights do not require a template;
@@ -746,8 +752,13 @@ def load_parameters(
 
     # Load parameters into optimizer if available
     if optimizer and state_dict_opt:
+        if LayoutAdapter.is_pynative_mode():
+            state_dict_opt.update(state_dict)
         logger.debug(f"Optimizer state_dict keys: {list(state_dict_opt.keys())}")
-        param_not_load_opt, ckpt_not_load_opt = load_param_into_net(optimizer, state_dict_opt, strict_load=True)
+        strict_load = True
+        if LayoutAdapter.is_pynative_mode():
+            strict_load = False
+        param_not_load_opt, ckpt_not_load_opt = load_param_into_net(optimizer, state_dict_opt, strict_load)
         if balanced_load:
             param_loaded_opt = {param_name for param_name in state_dict_opt if param_name not in ckpt_not_load_opt}
             single_parameter_broadcast(optimizer, param_redundancy, param_not_load_opt, param_loaded_opt)

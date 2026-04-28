@@ -411,6 +411,7 @@ class Trainer:
             async_save=checkpoint.async_save,
             prefix=checkpoint.prefix,
             remove_redundancy=checkpoint.remove_redundancy,
+            save_global_layout_cache=checkpoint.save_global_layout_cache,
         )
 
         return [
