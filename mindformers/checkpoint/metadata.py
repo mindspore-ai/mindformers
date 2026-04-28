@@ -138,7 +138,7 @@ def save_metadata(sharded_tensor_metas, param_file_mappings, meta_data_path):
                 },
                 "global_shape": sharded_tensor.global_shape,
                 "axis_fragmentations": sharded_tensor.axis_fragmentations,
-                "layout": _serialize_sharded_tensor_layout(sharded_tensor.layout),
+                "layout": _serialize_sharded_tensor_layout(sharded_tensor.layout) if sharded_tensor.layout else None,
                 "chunk": [new_chunk]
             }
         elif param_name in state_dict_metadata:
@@ -228,7 +228,9 @@ def load_metadata(metadata_file: str):
         properties = meta.get("properties")
         global_shape = meta.get("global_shape")
         axis_fragmentations = meta.get("axis_fragmentations")
-        layout = _deserialize_sharded_tensor_layout(meta.get("layout"))
+        layout = None
+        if meta.get("layout") is not None:
+            layout = _deserialize_sharded_tensor_layout(meta.get("layout"))
 
         # Convert dtype string to appropriate type
         dtype_str = properties.get("dtype")

@@ -20,8 +20,8 @@ from typing import List, Dict, Optional, Tuple, Union, Callable
 import mindspore as ms
 from mindspore.nn import Cell
 from mindspore.parallel.shard import _DistributedTensorInfo
-from mindspore.parallel.strategy import get_current_strategy_metadata, get_strategy_metadata
 
+from mindformers.checkpoint.layout_adapter import LayoutAdapter
 from mindformers.tools.utils import get_real_rank, get_real_group_size
 from mindformers.tools.logger import logger
 
@@ -302,26 +302,38 @@ def get_sharded_tensor_from_strategy_metadata(
             continue
 
         layout, dtype, global_shape = param_info
-        distributed_info = _DistributedTensorInfo(layout)
-        strategy = distributed_info.sharding_strategy
-        axis_fragmentations = tuple(int(x) for x in strategy)
-        local_shape = tuple(int(s // c) for s, c in zip(global_shape, axis_fragmentations))
-        global_offset, replica_id = _get_global_offset_and_replica_id_from_layout(layout)
-        npu_nums_per_pp = len(global_offset)
-        global_offset = (global_offset[cur_npu_rank % npu_nums_per_pp],)
+        if layout is None:
+            param_shape = tuple(global_shape)
+            cur_sharded_tensor = build_sharded_tensor(
+                param_name=param_name,
+                param_dtype=dtype,
+                local_shape=param_shape,
+                global_shape=param_shape,
+                global_offset=(0,),
+                axis_fragmentations=[1] * len(param_shape),
+                layout=None
+            )
+        else:
+            distributed_info = _DistributedTensorInfo(layout)
+            strategy = distributed_info.sharding_strategy
+            axis_fragmentations = tuple(int(x) for x in strategy)
+            local_shape = tuple(int(s // c) for s, c in zip(global_shape, axis_fragmentations))
+            global_offset, replica_id = _get_global_offset_and_replica_id_from_layout(layout)
+            npu_nums_per_pp = len(global_offset)
+            global_offset = (global_offset[cur_npu_rank % npu_nums_per_pp],)
 
-        cur_sharded_tensor = build_sharded_tensor(
-            param_name=param_name,
-            param_dtype=dtype,
-            local_shape=local_shape,
-            global_shape=global_shape,
-            global_offset=global_offset,
-            axis_fragmentations=axis_fragmentations,
-            replica_id=replica_id,
-            allow_shape_mismatch=False,
-            allow_to_save=True,
-            layout=layout
-        )
+            cur_sharded_tensor = build_sharded_tensor(
+                param_name=param_name,
+                param_dtype=dtype,
+                local_shape=local_shape,
+                global_shape=global_shape,
+                global_offset=global_offset,
+                axis_fragmentations=axis_fragmentations,
+                replica_id=replica_id,
+                allow_shape_mismatch=False,
+                allow_to_save=True,
+                layout=layout
+            )
         cur_rank_sharded_tensor_dict[param_name] = cur_sharded_tensor
 
     return cur_rank_sharded_tensor_dict
@@ -435,7 +447,7 @@ def get_all_sharded_tensor(
             associated with the network.
     """
     logger.info(".........Get All Ranks' Strategy Metadata.........")
-    global_strategy_info = get_strategy_metadata(network)
+    global_strategy_info = LayoutAdapter.get_all_layouts(network)
     if not global_strategy_info:
         raise RuntimeError('`get_strategy_metadata` returns `None`, which indicates there is no strategy info. '
                            'Please check whether this is a distributed job.')
@@ -477,7 +489,16 @@ def get_cur_sharded_tensor(
         instances.
     """
     logger.info(".........Get Current Strategy Metadata.........")
-    strategy_info = get_current_strategy_metadata(network)[0]
+    strategy_info = LayoutAdapter.get_current_layout(network)
+    if not strategy_info:
+        if not LayoutAdapter.is_pynative_mode():
+            raise RuntimeError('`get_current_strategy_metadata` returns `None`, '
+                               'which indicates there is no strategy info. '
+                               'Please check whether this is a distributed job.')
+        raise RuntimeError(
+            '`get_global_layout` returns `None`, which indicates there is no strategy info. '
+            'Please check whether this is a distributed job.')
+
     # Get sharded tensors from strategy metadata
     cur_rank_sharded_tensors = get_sharded_tensor_from_strategy_metadata(
         param_infos=strategy_info, cur_npu_rank=get_real_rank(), filter_func=filter_func

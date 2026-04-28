@@ -16,8 +16,10 @@
 import os
 from mindformers.pynative.callback.callback import TrainerCallback
 from mindformers.tools.logger import logger
+from mindformers.tools.utils import get_real_group_size
 from mindformers.checkpoint import save_checkpoint
 from mindformers.checkpoint.checkpoint import CommonInfo, AsyncSaveManager
+from mindformers.checkpoint.sharded_tensor import get_all_sharded_tensor
 
 
 class CheckpointCallback(TrainerCallback):
@@ -46,11 +48,13 @@ class CheckpointCallback(TrainerCallback):
         async_save: bool = False,
         prefix: str = "checkpoint",
         remove_redundancy: bool = False,
+        save_global_layout_cache: bool = True,
     ):
         """
         Initialize the CheckpointCallback.
         """
         super().__init__()
+        self._last_triggered_step = 0
         self.save_path = save_path
         self.save_max = save_max
         self.save_interleaved_steps = save_interleaved_steps
@@ -58,6 +62,13 @@ class CheckpointCallback(TrainerCallback):
         self.prefix = prefix
         self.async_save = async_save
         self.remove_redundancy = remove_redundancy
+        self.current_ckpt_step_list = []
+        self.sharded_tensor_metas = None
+        self.opt_sharded_tensor_metas = None
+        self.save_global_layout_cache = save_global_layout_cache
+
+        if self.remove_redundancy:
+            raise ValueError("remove_redundancy is not supported yet.")
 
         if not self.save_path:
             raise ValueError("save_path must be provided for CheckpointCallback.")
@@ -129,6 +140,9 @@ class CheckpointCallback(TrainerCallback):
         if not self.save_path:
             return
 
+        if self._last_triggered_step == state.global_step:
+            return
+
         # args is currently unused, keep for callback signature compatibility.
         _ = args
         model = kwargs.get("model", None)
@@ -140,6 +154,23 @@ class CheckpointCallback(TrainerCallback):
 
         # CommonInfo provides metadata required by save_checkpoint.
         common_info = self._create_common_info(state)
+
+        if self.sharded_tensor_metas is None and get_real_group_size() > 1:
+            self.sharded_tensor_metas = get_all_sharded_tensor(
+                network=model,
+                filter_func=(lambda x: x in list(
+                    model.parameters_dict().keys())) if self.no_save_optim else None
+            ) if get_real_group_size() > 1 else None
+        if self.opt_sharded_tensor_metas is None and get_real_group_size() > 1:
+            self.opt_sharded_tensor_metas = get_all_sharded_tensor(
+                network=optimizer,
+                filter_func=(lambda x: x in list(
+                    optimizer.parameters_dict().keys())) if self.no_save_optim else None
+            ) if get_real_group_size() > 1 else None
+
+        if self.sharded_tensor_metas is not None and self.opt_sharded_tensor_metas is not None:
+            for rank_id, _ in self.sharded_tensor_metas.items():
+                self.sharded_tensor_metas[rank_id].update(self.opt_sharded_tensor_metas[rank_id])
 
         try:
             # Prepare the async manager before any save operation.
@@ -157,7 +188,15 @@ class CheckpointCallback(TrainerCallback):
                 user_prefix=self.prefix,
                 save_checkpoint_path=self.save_path,
                 remove_redundancy=self.remove_redundancy,
+                sharded_tensor_metas=self.sharded_tensor_metas,
+                current_ckpt_step_list=self.current_ckpt_step_list
             )
+
+            self._last_triggered_step = state.global_step
+
+            if not self.save_global_layout_cache and get_real_group_size() > 1:
+                self.sharded_tensor_metas = None
+                self.opt_sharded_tensor_metas = None
 
             logger.info(
                 f"Checkpoint saved at step {common_info.global_step} to {self.save_path} "
