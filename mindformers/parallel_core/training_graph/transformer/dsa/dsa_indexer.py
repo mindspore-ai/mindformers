@@ -36,7 +36,7 @@ from mindformers.parallel_core.utils.spec_utils import ModuleSpec, build_module
 from mindformers.parallel_core.transformer_config import MLATransformerConfig, TransformerConfig
 from mindformers.parallel_core.training_graph.base_models.common.embeddings.rope_utils import ApplyRotaryPosEmb
 from mindformers.parallel_core.training_graph.device_matrix import layout
-from mindformers.parallel_core.training_graph.communication import get_dp_cp_id
+from mindformers.parallel_core.training_graph.communication import get_dp_cp_tp_id
 from mindformers.parallel_core.training_graph.ops.dense_lightning_indexer_softmax_lse import (
     DenseLightningIndexerSoftmaxLse
 )
@@ -109,6 +109,7 @@ class DSAIndexer(nn.Cell):
         """Initialize the indexer."""
         super().__init__()
         self.config = config
+        self.tp = config.tensor_model_parallel_size
         self.cp = config.context_parallel_size
         self.input_layout = config.input_layout
         self.is_tnd = self.input_layout == "TND"
@@ -116,8 +117,8 @@ class DSAIndexer(nn.Cell):
         self.qk_pos_emb_head_dim = config.qk_pos_emb_head_dim
         self.q_lora_rank =  config.q_lora_rank if config.q_lora_rank is not None else config.hidden_size
 
-        _, cp_id = get_dp_cp_id(config)
-        self.offset_id = cp_id
+        _, cp_id, tp_id = get_dp_cp_tp_id(config)
+        self.offset_id = cp_id * self.tp + tp_id
 
         self.index_n_heads = config.dsa_indexer_n_heads
         self.index_head_dim = config.dsa_indexer_head_dim
@@ -192,6 +193,11 @@ class DSAIndexer(nn.Cell):
         ).add_prim_attr("self_define_shard", True)
         # dense indexer operators
         self.dense_softmax_lse = DenseLightningIndexerSoftmaxLse()
+        self.compute_dense_lse = P.Morph(
+            self._compute_dense_lse_forward,
+            self.lse_infer_shape,
+            self.lse_infer_dtype
+        ).add_prim_attr("self_define_shard", True)
         # backward operators
         self.zeros_like = aclnn_ops.ZerosLikeExt()
 
@@ -203,18 +209,24 @@ class DSAIndexer(nn.Cell):
         q_shape = args[0]
         k_shape = args[1]
         infer_topk_shape = q_shape[:-2] + [k_shape[-2], self.index_topk]
-        if self.sparse_loss:
-            return infer_topk_shape, infer_topk_shape
+        return infer_topk_shape, infer_topk_shape
+
+    def lse_infer_shape(self, *args):
+        q_shape = args[0]
+        k_shape = args[1]
         if self.is_tnd:
             infer_softmax_shape = [k_shape[1], q_shape[0]]
         else:
             infer_softmax_shape = [q_shape[0], k_shape[2], q_shape[1]]
-        return infer_topk_shape, infer_topk_shape, infer_softmax_shape, infer_softmax_shape
+        return infer_softmax_shape, infer_softmax_shape
 
     def indexer_infer_dtype(self, *args):
         if self.sparse_loss:
             return mstype.int32, args[0]
         return mstype.int32, args[0], mstype.float32, mstype.float32
+
+    def lse_infer_dtype(self, *_):
+        return mstype.float32, mstype.float32
 
     def get_qk_index(self, x, qr, rotary_pos_emb):
         """Pre-forward pass for DSA Indexer that returns indexer_q, indexer_k and weights."""
@@ -286,11 +298,29 @@ class DSAIndexer(nn.Cell):
             weights = self.reshape(weights, (seqlen * bsz, self.index_n_heads))
         return q, k, weights
 
+    def _compute_dense_lse_forward(self, q, k, weights, actual_seq_qlen=None, actual_seq_klen=None):
+        """Compute topk index score and indices with fused operator in sparse training stage."""
+        if self.is_tnd:
+            actual_seq_qlen, actual_seq_klen = adjust_tnd_input(self.offset_id, q, k, actual_seq_qlen, actual_seq_klen)
+            # actual_seq_len should be cast to int64, otherwise overflow will occur during load int32 with int64.
+            actual_seq_qlen = self.cast(actual_seq_qlen, mstype.int64)
+            actual_seq_klen = self.cast(actual_seq_klen, mstype.int64)
+        elif self.cp > 1 or self.tp > 1:
+            k = adjust_bsnd_input(self.offset_id, q, k)
+
+        softmax_max_index, softmax_sum_index = self.dense_softmax_lse(
+            q, k, weights,
+            actual_seq_qlen=actual_seq_qlen,
+            actual_seq_klen=actual_seq_klen,
+            layout=self.input_layout,
+        )
+        return softmax_max_index, softmax_sum_index
+
     def _compute_sparse_indices_forward(self, q, k, weights, actual_seq_qlen=None, actual_seq_klen=None):
         """Compute topk index score and indices with fused operator in sparse training stage."""
         if self.is_tnd:
             actual_seq_qlen, actual_seq_klen = adjust_tnd_input(self.offset_id, q, k, actual_seq_qlen, actual_seq_klen)
-        elif self.cp > 1:
+        elif self.cp > 1 or self.tp > 1:
             k = adjust_bsnd_input(self.offset_id, q, k)
 
         topk_indices, index_scores = ops.lightning_indexer(
@@ -302,18 +332,6 @@ class DSAIndexer(nn.Cell):
             sparse_count=self.index_topk,
             return_value=True
         )
-        if not self.sparse_loss:
-            if self.is_tnd:
-                # actual_seq_len should be cast to int64, otherwise overflow will occur during load int32 with int64.
-                actual_seq_qlen = self.cast(actual_seq_qlen, mstype.int64)
-                actual_seq_klen = self.cast(actual_seq_klen, mstype.int64)
-            softmax_max_index, softmax_sum_index = self.dense_softmax_lse(
-                q, k, weights,
-                actual_seq_qlen=actual_seq_qlen,
-                actual_seq_klen=actual_seq_klen,
-                layout=self.input_layout,
-            )
-            return topk_indices, index_scores, softmax_max_index, softmax_sum_index
         return topk_indices, index_scores
 
     def construct(self, q, k, weights, actual_seq_qlen=None, actual_seq_klen=None):
@@ -324,12 +342,13 @@ class DSAIndexer(nn.Cell):
         q = ops.stop_gradient(q)
         k = ops.stop_gradient(k)
         weights = ops.stop_gradient(weights)
-        output = self.compute_sparse_indices(q, k, weights, actual_seq_qlen, actual_seq_klen)
         if self.sparse_loss:
-            topk_indices, index_scores = output
+            topk_indices, index_scores = self.compute_sparse_indices(q, k, weights, actual_seq_qlen, actual_seq_klen)
             softmax_max_index, softmax_sum_index = None, None
         else:
-            topk_indices, index_scores, softmax_max_index, softmax_sum_index = output
+            topk_indices, index_scores = None, None
+            softmax_max_index, softmax_sum_index = self.compute_dense_lse(q, k, weights,
+                                                                          actual_seq_qlen, actual_seq_klen)
         return topk_indices, index_scores, softmax_max_index, softmax_sum_index
 
     # pylint: disable=W0613
@@ -346,44 +365,38 @@ class DSAIndexer(nn.Cell):
         # before convert_layout
         q_shard = layout("cp", "dp", "tp", "None")
         k_shard = layout("cp", "dp", "None", "None")
-        w_shard = layout("cp", "dp", "None")
+        w_shard = layout("cp_tp", "dp", "None")
         self.split_q.shard((q_shard,))
         self.split_k.shard((k_shard,))
         self.mul_scalar.shard((w_shard, layout("None")))
         self.cat_q.shard(((q_shard, q_shard),), (q_shard,))
         self.cat_k.shard(((k_shard, k_shard),), (k_shard,))
         # merge tp in q-head and cp in k-seq
-        self.transpose_q.shard((layout("cp", "dp", "None", "None"),))
+        self.transpose_q.shard((layout("cp_tp", "dp", "None", "None"),))
         self.transpose_k.shard((layout("None", "dp", "None", "None"),))
         self.transpose_w.shard((w_shard,))
 
         # after convert_layout
         if self.is_tnd:
-            q_shard = layout("dp_cp", "None", "None")
+            q_shard = layout("dp_cp_tp", "None", "None")
             k_shard = layout("dp", "None", "None")
-            w_shard = layout("dp_cp", "None")
+            w_shard = layout("dp_cp_tp", "None")
             actual_seq_shard = layout("dp")
-            indexer_shard = layout("dp_cp", "None", "None")
-            if self.sparse_loss:
-                self.compute_sparse_indices.shard(
-                    (q_shard, k_shard, w_shard, actual_seq_shard, actual_seq_shard), (indexer_shard, indexer_shard)
-                )
-            else:
-                softmax_index_shard = layout("None", "dp_cp")
-                self.compute_sparse_indices.shard(
-                    (q_shard, k_shard, w_shard, actual_seq_shard, actual_seq_shard),
-                    (indexer_shard, indexer_shard, softmax_index_shard, softmax_index_shard)
-                )
+            indexer_shard = layout("dp_cp_tp", "None", "None")
+            softmax_index_shard = layout("None", "dp_cp_tp")
+            self.compute_sparse_indices.shard(
+                (q_shard, k_shard, w_shard, actual_seq_shard, actual_seq_shard),
+                (indexer_shard, indexer_shard)
+            )
+            self.compute_dense_lse.shard(
+                (q_shard, k_shard, w_shard, actual_seq_shard, actual_seq_shard),
+                (softmax_index_shard, softmax_index_shard)
+            )
         else:
-            q_shard = layout("dp", "cp", "None", "None")
+            q_shard = layout("dp", "cp_tp", "None", "None")
             k_shard = layout("dp", "None", "None", "None")
-            w_shard = layout("dp", "cp", "None")
-            indexer_shard = layout("dp", "cp", "None", "None")
-            if self.sparse_loss:
-                self.compute_sparse_indices.shard((q_shard, k_shard, w_shard), (indexer_shard, indexer_shard))
-            else:
-                softmax_index_shard = layout("dp", "None", "cp")
-                self.compute_sparse_indices.shard(
-                    (q_shard, k_shard, w_shard),
-                    (indexer_shard, indexer_shard, softmax_index_shard, softmax_index_shard)
-                )
+            w_shard = layout("dp", "cp_tp", "None")
+            indexer_shard = layout("dp", "cp_tp", "None", "None")
+            softmax_index_shard = layout("dp", "None", "cp_tp")
+            self.compute_sparse_indices.shard((q_shard, k_shard, w_shard), (indexer_shard, indexer_shard))
+            self.compute_dense_lse.shard((q_shard, k_shard, w_shard), (softmax_index_shard, softmax_index_shard))
