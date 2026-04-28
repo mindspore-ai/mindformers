@@ -1,4 +1,9 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates. All rights reserved.
 # Copyright 2026 Huawei Technologies Co., Ltd
+#
+# Modification points:
+# 1. Replace all interfaces with MindSpore Transformers'.
+# 2. Add some input parameters for MindSpore Transformers.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -24,12 +29,14 @@ Applies parallelism strategies in TorchTitan order:
 This module is the single source of truth for GPT-family model parallelization.
 """
 
-import os
 from typing import Any, List
 
 import mindspore as ms
-from mindspore import nn
+from mindspore import nn, Parameter
 
+from hyper_parallel import DeviceMesh
+from hyper_parallel.core.dtensor.dtensor import DTensor, distribute_tensor
+from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
 from hyper_parallel.core.fully_shard.api import (
     fully_shard,
     MixedPrecisionPolicy,
@@ -41,6 +48,18 @@ from mindformers.pynative.distributed.fsdp import (
     get_fsdp_reshard_after_forward_policy,
     disable_fsdp_gradient_division,
 )
+from mindformers.pynative.distributed.style import (
+    ColwiseParallel,
+    PrepareModuleInput,
+    PrepareModuleInputOutput,
+    PrepareModuleOutput,
+    RowwiseParallel,
+    SequenceParallel,
+)
+from mindformers.pynative.distributed.tensor_parallel import NoParallel
+from mindformers.pynative.distributed.expert_parallel import ExpertParallel
+from mindformers.pynative.distributed.parallelize import parallelize_module
+from mindformers.pynative.distributed.utils import distribute_module
 from mindformers.pynative.base_models.gpt.gpt_model import GPTModel
 from mindformers.tools.logger import logger
 
@@ -78,9 +97,8 @@ def _unwrap_gptmodel(model: nn.Cell) -> nn.Cell:
 
 def _setup_gpt_prefetch(
     embedding: nn.Cell,
-    final_layernorm: nn.Cell,
-    output_layer: nn.Cell,
     transformer_layers: List[nn.Cell],
+    tail_modules: List[nn.Cell],
 ) -> None:
     """Set up forward and backward prefetch chains for GPT FSDP modules.
 
@@ -93,7 +111,7 @@ def _setup_gpt_prefetch(
     if not transformer_layers:
         return
 
-    if final_layernorm is None and output_layer is None:
+    if tail_modules is None:
         logger.warning(
             "No final_layernorm or output_layer found for prefetch setup. "
             "Prefetch chain will be incomplete."
@@ -111,18 +129,15 @@ def _setup_gpt_prefetch(
             continue
         if next_layer is not None:
             layer.set_modules_to_forward_prefetch([next_layer])
-        elif final_layernorm is not None or output_layer is not None:
-            layer.set_modules_to_forward_prefetch(
-                [m for m in [final_layernorm, output_layer] if m is not None]
-            )
+        elif tail_modules is not None:
+            layer.set_modules_to_forward_prefetch(tail_modules)
 
     # --- Backward prefetch: output_layer -> layer[N-1] -> ... -> embedding ---
     reversed_layers = list(reversed(transformer_layers))
     prev_layers = reversed_layers[1:] + [None]
 
-    last_tail = output_layer if output_layer is not None else final_layernorm
-    if last_tail is not None and isinstance(last_tail, HSDPModule):
-        last_tail.set_modules_to_backward_prefetch([reversed_layers[0]])
+    if tail_modules and isinstance(tail_modules[-1], HSDPModule):
+        tail_modules[-1].set_modules_to_backward_prefetch([reversed_layers[0]])
 
     for layer, prev_layer in zip(reversed_layers, prev_layers):
         if not isinstance(layer, HSDPModule):
@@ -133,14 +148,361 @@ def _setup_gpt_prefetch(
             layer.set_modules_to_backward_prefetch([embedding])
 
 
+def _distribute_param(module, param_name, device_mesh, placements):
+    """
+    Distribute a parameter of a module across a device mesh.
+
+    Args:
+        module: The module containing the parameter.
+        param_name (str): Name of the parameter to distribute.
+        device_mesh: The target device mesh for distribution.
+        placements: Placement strategy for the distributed tensor.
+
+    Raises:
+        ValueError: If the module does not have the specified parameter.
+    """
+    # Ensure the parameter exists in the module
+    if not hasattr(module, param_name):
+        raise ValueError(f"Parameter '{param_name}' not found in module.")
+
+    # Retrieve the original parameter
+    param = getattr(module, param_name)
+
+    # Replace it with a distributed version wrapped as a Parameter
+    setattr(
+        module,
+        param_name,
+        Parameter(
+            distribute_tensor(
+                param,
+                device_mesh=device_mesh,
+                placements=placements
+            ),
+            name=param.name,
+            requires_grad=param.requires_grad
+        )
+    )
+
+
+def _distribute_router(
+    module,
+    router_mesh,
+    input_layouts,
+    output_layouts,
+    use_local_output=True
+):
+    """
+    Distribute a router module by defining custom input/output transformations
+    for DTensor-based parallel execution.
+
+    Args:
+        module: The router module to be distributed.
+        router_mesh: Device mesh used for distribution.
+        input_layouts (tuple): Expected placements for each input tensor.
+        output_layouts (tuple): Desired placements for each output tensor.
+        use_local_output (bool): Whether to convert DTensor outputs back to local tensors.
+
+    This function wraps the module with input/output hooks to ensure:
+    - Inputs are converted to DTensor with correct placements.
+    - Outputs are redistributed and optionally converted back to local tensors.
+    """
+
+    # pylint: disable=W0613
+    def input_fn(device_mesh, mod, args):
+        """
+        Transform inputs into DTensor with correct placements before forward pass.
+        """
+        hidden_state, expert_bias = args
+
+        # Handle hidden_state: convert or redistribute to expected layout
+        if not isinstance(hidden_state, DTensor):
+            hidden_state = DTensor.from_local(
+                hidden_state, device_mesh, (input_layouts[0],)
+            )
+        elif hidden_state.placements != input_layouts[0]:
+            hidden_state = hidden_state.redistribute(
+                placements=(input_layouts[0],), device_mesh=device_mesh
+            )
+
+        # Handle expert_bias if provided
+        if expert_bias is not None:
+            if not isinstance(expert_bias, DTensor):
+                expert_bias = DTensor.from_local(
+                    expert_bias, device_mesh, (input_layouts[1],)
+                )
+            elif expert_bias.placements != input_layouts[1]:
+                expert_bias = expert_bias.redistribute(
+                    placements=(input_layouts[1],), device_mesh=device_mesh
+                )
+
+        return hidden_state, expert_bias
+
+    def output_fn(device_mesh, mod, args, outputs):
+        """
+        Transform outputs to desired placements and optionally convert to local tensors.
+        """
+        prepared_outputs = []
+
+        # Ensure each output matches the expected layout
+        for out, out_layout in zip(outputs, output_layouts):
+            if out.placements != out_layout:
+                out = out.redistribute(
+                    placements=(out_layout,),
+                    device_mesh=device_mesh,
+                )
+
+            # Convert to local tensor if required
+            prepared_outputs.append(
+                out.to_local() if use_local_output else out
+            )
+
+        return tuple(prepared_outputs)
+
+    # Apply distribution to the module with custom input/output handlers
+    distribute_module(
+        module=module,
+        device_mesh=router_mesh,
+        parameter_shard_plan={},  # No parameter sharding defined here
+        input_fn=input_fn,
+        output_fn=output_fn
+    )
+
+
+def apply_non_moe_tp(
+    model: nn.Cell,
+    tp_mesh: DeviceMesh,
+    enable_loss_parallel: bool = False,
+    enable_float8_tensorwise_tp: bool = False,
+    enable_sp: bool = True,
+    enable_ep: bool = False,
+):
+    """Apply tensor parallelism."""
+    # 1. Parallelize the embedding and shard its outputs (which are the first
+    # transformer block's inputs)
+    # 2. Parallelize the root norm layer over the sequence dim
+    # 3. Parallelize the final linear output layer
+    sp_layout = Shard(0) if enable_sp else Replicate()
+
+    embed_plan = RowwiseParallel(
+        input_layouts=Replicate(),
+        output_layouts=Shard(1),
+        use_local_output=False,
+    )
+
+    parallelize_module(
+        model,
+        tp_mesh,
+        {
+            "model.embedding.word_embeddings": embed_plan,
+            "model.decoder.final_layernorm": SequenceParallel(sequence_dim=0,
+                use_local_output=False) if enable_sp else NoParallel(),
+            "model.output_layer": ColwiseParallel(
+                input_layouts=sp_layout,
+                output_layouts=Shard(-1) if enable_loss_parallel else Replicate(),
+                use_local_output=False,
+            ),
+        },
+    )
+
+    rowwise_parallel, colwise_parallel, prepare_module_input, prepare_module_output, prepare_module_input_output = (
+        RowwiseParallel,
+        ColwiseParallel,
+        PrepareModuleInput,
+        PrepareModuleOutput,
+        PrepareModuleInputOutput,
+    )
+
+    attention_kernel_plan = prepare_module_input(
+        input_layouts=(Replicate(), Replicate(), Replicate(), None),
+        desired_input_layouts=(Shard(2), Shard(2), Shard(2), None),
+        use_local_output=False,
+    )
+    # Apply tensor + sequence parallelism to every transformer block
+    # NOTE: At the cost of model code change, we can accelerate Sequence Parallel
+    #       by folding (and unfolding) the batch dimension and the sequence dimension.
+    norm_plan = SequenceParallel(sequence_dim=0, use_local_output=False) if enable_sp else NoParallel()
+    rowwise_output_plan = rowwise_parallel(
+        output_layouts=sp_layout, use_local_output=False,  # use_local_output=enable_sp
+    )
+    rotary_emb_plan = prepare_module_input_output(
+        input_layouts=(Replicate(), None),
+        desired_input_layouts=(Replicate(), None),
+        output_layouts=(Replicate(),),
+        desired_output_layouts=(Replicate(),),
+        use_local_output=False,
+    )
+
+    for transformer_block in model.model.decoder.layers:
+        layer_plan = {
+            "input_layernorm": norm_plan,
+            "self_attention": prepare_module_input(
+                input_layouts=(sp_layout),
+                desired_input_layouts=(
+                    Replicate()
+                ),
+                use_local_output=False,
+            ),
+            # NOTE: NoParallel() without local_output_grad_placements keeps the output as a
+            # DTensor so that the intermediate results k is generated as a DTensor and its
+            # gradient is correctly handled by the autograd engine.
+            "self_attention.linear_qkv": colwise_parallel(output_layouts=Replicate(), use_local_output=False),
+            "self_attention.linear_kvb": colwise_parallel(output_layouts=Replicate(), use_local_output=False),
+            "self_attention.k_layernorm": NoParallel(use_local_output=False),
+            # NOTE: use_local_output=True so that the inputs to FlexAttention are plain Tensors
+            "self_attention.core_attention": attention_kernel_plan,
+            "self_attention.linear_proj": rowwise_output_plan,
+            "pre_mlp_layernorm": norm_plan,
+            "self_attention.apply_rotary_emb": rotary_emb_plan,
+            "self_attention.apply_rotary_emb2": rotary_emb_plan,
+        }
+
+        if transformer_block.self_attention.q_rank == 0:
+            raise ValueError(
+                "q_rank should be greater than 0, but got 0!"
+            )
+
+        layer_plan.update(
+            {
+                "self_attention.linear_qb": colwise_parallel(output_layouts=Replicate(), use_local_output=False),
+                "self_attention.q_layernorm": NoParallel(use_local_output=False),
+            }
+        )
+
+        if hasattr(transformer_block.mlp, "linear_fc1"):
+            layer_plan.update(
+                {
+                    "mlp": prepare_module_input(
+                        input_layouts=(sp_layout,),
+                        desired_input_layouts=(Replicate(),),
+                        use_local_output=False,
+                    ),
+                    "mlp.linear_fc1": colwise_parallel(use_local_output=False),
+                    "mlp.linear_fc2": rowwise_output_plan,
+                }
+            )
+
+        if hasattr(transformer_block.mlp, "shared_experts"):
+            layer_plan.update(
+                {
+                    "mlp.shared_experts": prepare_module_output(
+                        output_layouts=(sp_layout,),
+                        desired_output_layouts=(Replicate(),),
+                        use_local_output=False
+                    ),
+                }
+            )
+            layer_plan["mlp.shared_experts.linear_fc1"] = colwise_parallel(use_local_output=False)
+            layer_plan["mlp.shared_experts.linear_fc2"] = rowwise_output_plan
+
+        if hasattr(transformer_block.mlp, "experts"):
+            layer_plan["mlp"] = prepare_module_input_output(
+                input_layouts=(sp_layout,),
+                desired_input_layouts=(Replicate(),),
+                output_layouts=(Replicate(),),
+                desired_output_layouts=(sp_layout,),
+                use_local_input=False,
+                use_local_output=False
+            )
+
+            # distribute parameters for MoE layer
+            distribute_param_plan = [
+                [transformer_block.mlp, "tokens_per_expert", (Replicate(),)],
+            ]
+            if not enable_ep:
+                # shard expert weight if not enable_ep
+                distribute_param_plan.extend(
+                    [[transformer_block.mlp.experts, "weight1", (Replicate(),)],
+                    [transformer_block.mlp.experts, "weight2", (Replicate(),)],]
+                )
+            for sub_module, param_name, sub_plan in distribute_param_plan:
+                _distribute_param(
+                    sub_module,
+                    param_name=param_name,
+                    device_mesh=tp_mesh,
+                    placements=sub_plan
+                )
+
+            # special parallel for router
+            _distribute_router(
+                transformer_block.mlp.router,
+                router_mesh=tp_mesh,
+                input_layouts=(Replicate(), Replicate()),
+                output_layouts=(Replicate(), Replicate(), Replicate()),
+            )
+
+        parallelize_module(
+            module=transformer_block,
+            device_mesh=tp_mesh,
+            parallelize_plan=layer_plan,
+        )
+
+    logger.info(
+        f"Applied {'Float8 tensorwise ' if enable_float8_tensorwise_tp else ''}"
+        "Tensor Parallelism to the model"
+    )
+
+
+def apply_moe_ep_tp(
+        model: nn.Cell,
+        tp_mesh: DeviceMesh = None,
+        ep_mesh: DeviceMesh = None,
+):
+    """
+    Apply Expert Parallelism (EP) and Tensor Parallelism (TP) to MoE layers in model.
+
+ 	Args:
+        model (nn.Cell): The model to be parallelized.
+        tp_mesh (DeviceMesh): The device mesh for tensor parallelism.
+        ep_mesh (DeviceMesh): The device mesh for expert parallelism.
+
+ 	MoE layer structure:
+        - mlp.experts.weight1: Expert FFN first layer weights
+        - mlp.experts.weight2: Expert FFN second layer weights
+        - mlp.router.weight: Router/gate weights
+        - mlp.shared_experts.linear_fc1.weight: Shared expert FFN first layer
+        - mlp.shared_experts.linear_fc2.weight: Shared expert FFN second layer
+        - mlp.tokens_per_expert: Token distribution tracking
+
+    Returns:
+        nn.Cell: The parallelized model.
+    """
+
+    if tp_mesh is None and ep_mesh is None:
+        raise ValueError("At least one of ep_mesh or tp_mesh must be provided.")
+
+    for transformer_block in model.model.decoder.layers:
+        # Check if this layer has MoE (has experts attribute)
+        if not hasattr(transformer_block.mlp, 'experts'):
+            continue
+
+        # ============ Apply EP to Experts ============
+        # Determine which mesh and plan to use for experts
+        experts_mesh = ep_mesh
+        if ep_mesh is None:
+            # No EP, use TP for experts (TensorParallel on expert weights)
+            experts_mesh = tp_mesh
+        # Apply TP to experts: shard along the hidden dimension
+        experts_plan = ExpertParallel()
+
+        # Apply parallelism to experts module
+        if experts_mesh is not None:
+            parallelize_module(
+                module=transformer_block.mlp.experts,
+                device_mesh=experts_mesh,
+                parallelize_plan=experts_plan,
+            )
+
+    return model
+
+
 # ---------------------------------------------------------------------------
 # GPT FSDP implementation
 # ---------------------------------------------------------------------------
 
-def apply_fsdp_to_gptmodel(
+def apply_fsdp(
     model: nn.Cell,
     parallel_dims: Any,
-    parallelism_config: Any,
+    parallelism: Any,
 ) -> None:
     """Apply FSDP/HSDP to a GPT model.
 
@@ -150,29 +512,33 @@ def apply_fsdp_to_gptmodel(
     Args:
         model: The GPTModel instance.
         parallel_dims: ParallelDims instance.
-        parallelism_config: Parallelism configuration.
+        parallelism: Parallelism configuration.
     """
     logger.info("Applying FSDP/HSDP to GPT model...")
 
+    # Unwrap to GPTModel
+    gpt_model = _unwrap_gptmodel(model)
+
     # --- Resolve dp_mesh ---
     if parallel_dims.dp_replicate_enabled:
-        dp_mesh = parallel_dims.get_mesh(["dp_replicate", "fsdp"])
+        # change `dp_shard` to `fsdp` if hyper-parallel support flatten
+        dp_mesh = parallel_dims.get_mesh(["dp_replicate", "dp_shard"])
         logger.info("Using HSDP mesh [dp_replicate, fsdp] (2D)")
     else:
-        dp_mesh = parallel_dims.get_mesh("fsdp")
+        dp_mesh = parallel_dims.get_mesh("dp_shard")
         logger.info("Using FSDP mesh [fsdp] (1D)")
 
     # --- Resolve dtypes ---
-    param_dtype_str = getattr(parallelism_config, "param_dtype", None)
-    reduce_dtype_str = getattr(parallelism_config, "reduce_dtype", None)
+    param_dtype_str = getattr(parallelism, "param_dtype", None)
+    reduce_dtype_str = getattr(parallelism, "reduce_dtype", None)
 
     # --- Build FSDP config ---
-    reshard_policy = getattr(parallelism_config, "reshard_after_forward_policy", "default")
+    reshard_policy = getattr(parallelism, "reshard_after_forward_policy", "default")
     reshard_after_forward = get_fsdp_reshard_after_forward_policy(
         reshard_policy, parallel_dims.pp_enabled
     )
 
-    cpu_offload = getattr(parallelism_config, "cpu_offload", False)
+    cpu_offload = getattr(parallelism, "cpu_offload", False)
     fsdp_config = {
         "mesh": dp_mesh,
         "offload_policy": CPUOffloadPolicy() if cpu_offload else OffloadPolicy(),
@@ -183,15 +549,22 @@ def apply_fsdp_to_gptmodel(
         reduce_dtype = _DTYPE_MAP.get(reduce_dtype_str, ms.float32) if reduce_dtype_str is not None else ms.float32
         fsdp_config["mp_policy"] = MixedPrecisionPolicy(param_dtype=param_dtype, reduce_dtype=reduce_dtype)
 
-    unwrapped_model = _unwrap_gptmodel(model)
-
-    embedding = getattr(unwrapped_model, "embedding", None)
-    layers = list(unwrapped_model.decoder.layers)
-    final_layernorm = getattr(unwrapped_model.decoder, "final_layernorm", None)
-    output_layer = getattr(unwrapped_model, "output_layer", None)
+    modules = {
+        "embedding": getattr(gpt_model, "embedding", None),
+        "layers": list(gpt_model.decoder.layers),
+        "tail_modules": [
+            m for m in [
+                getattr(gpt_model.decoder, "final_layernorm", None),
+                getattr(gpt_model, "output_layer", None),
+            ] if m is not None
+        ],
+    }
+    embedding = modules["embedding"]
+    layers = modules["layers"]
+    tail_modules = modules["tail_modules"]
 
     if not layers:
-        raise ValueError(f"{type(unwrapped_model).__name__} has no decoder layers")
+        raise ValueError(f"{type(model).__name__} has no decoder layers")
 
     # --- 1. Wrap embedding ---
     if embedding is not None:
@@ -202,24 +575,20 @@ def apply_fsdp_to_gptmodel(
         fully_shard(layer, **fsdp_config, reshard_after_forward=reshard_after_forward)
 
     # --- 3. Wrap final_layernorm and output_layer together ---
-    if final_layernorm is not None or output_layer is not None:
+    if tail_modules:
         # As an optimization, do not reshard_after_forward the last layers by default
         # since FSDP would prefetch them immediately after the forward pass.
-        fully_shard(
-            [m for m in [final_layernorm, output_layer] if m is not None],
-            **fsdp_config,
-            reshard_after_forward=(reshard_policy == "always"),
-        )
+        fully_shard(tail_modules, **fsdp_config, reshard_after_forward=reshard_policy == "always")
 
     # --- 4. Wrap root ---
     fully_shard(model, **fsdp_config)
 
     # --- 5. Disable gradient division ---
-    if getattr(parallelism_config, "disable_gradient_division", True):
+    if getattr(parallelism, "disable_gradient_division", True):
         disable_fsdp_gradient_division(model)
 
     # --- 6. Prefetch chains ---
-    _setup_gpt_prefetch(embedding, final_layernorm, output_layer, layers)
+    _setup_gpt_prefetch(embedding, layers, tail_modules)
 
     if parallel_dims.dp_replicate_enabled:
         logger.info("Successfully applied HSDP (Hybrid Sharded Data Parallel)")
@@ -234,36 +603,51 @@ def apply_fsdp_to_gptmodel(
 def parallelize_gptmodel(
     model: nn.Cell,
     parallel_dims: Any,
-    training_config: Any,
-    parallelism_config: Any,
+    training: Any,
+    parallelism: Any,
 ) -> nn.Cell:
     """Unified GPTModel parallelization entry point."""
     logger.info("Starting GPTModel parallelization for MCore architecture...")
 
     # Phase 1: TP
     if parallel_dims.tp_enabled:
-        raise NotImplementedError(
-            "Tensor Parallelism (TP) is not yet implemented for GPTModel. "
-            "Please set tensor_parallel=1 in your config."
+        apply_non_moe_tp(
+            model,
+            tp_mesh=parallel_dims.get_mesh('tp'),
+            enable_ep=parallel_dims.ep_enabled,
         )
 
-    # Phase 2: CP
+    # Phase 2: EP
+    if parallel_dims.ep_enabled:
+        apply_moe_ep_tp(
+            model,
+            tp_mesh=parallel_dims.get_mesh("tp"),
+            ep_mesh=parallel_dims.get_mesh("ep"),
+        )
+
+    # Phase 3: CP
     if parallel_dims.cp_enabled:
         raise NotImplementedError(
             "Context Parallelism (CP) is not yet implemented for GPTModel. "
             "Please set context_parallel=1 in your config."
         )
 
-    # Phase 3: AC
-    if getattr(training_config, "activation_checkpointing", False):
+    # Phase 4: AC
+    if getattr(training, "activation_checkpointing", False):
         raise NotImplementedError(
             "Activation Checkpointing (AC) is not yet implemented for GPTModel. "
             "Please set activation_checkpointing=false in your config."
         )
 
-    # Phase 4: FSDP/HSDP
+    # Phase 5: FSDP/HSDP
     if parallel_dims.fsdp_enabled:
-        apply_fsdp_to_gptmodel(model, parallel_dims, parallelism_config)
+        apply_fsdp(model, parallel_dims, parallelism)
+
+    for param_name, param in model.parameters_and_names():
+        if isinstance(param, DTensor):
+            logger.debug(param_name, param.layout, param.placements)
+        else:
+            logger.debug(f"{param_name} is not DTensor, shape is {param.shape}")
 
     logger.info("GPTModel parallelization completed.")
     return model
