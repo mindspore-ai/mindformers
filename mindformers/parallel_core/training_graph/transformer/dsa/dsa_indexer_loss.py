@@ -76,7 +76,8 @@ class DSAIndexerLoss(nn.Cell):
         self.cp = config.context_parallel_size
         self.tp = config.tensor_model_parallel_size
         self.slice_kv = self.cp > 1 or self.tp > 1
-        self.grad_scale_base = self.mbs * self.dp * self.cp * self.tp
+        self.gas = config.gradient_accumulation_steps
+        self.grad_scale_base = self.mbs * self.dp * self.cp * self.tp * self.gas
         softmax_scale = softmax_scale or config.kv_channels ** -0.5
 
         self.softmax_scale = Tensor([softmax_scale], mstype.float32)

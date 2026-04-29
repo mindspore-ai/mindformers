@@ -255,6 +255,7 @@ class GPTModel(nn.Cell):
         self.pad_token_id = config.pad_token_id
         self.ignore_token_id = config.ignore_token_id
         self.calculate_per_token_loss = config.calculate_per_token_loss
+        self.gradient_accumulation_steps = config.gradient_accumulation_steps
 
         # init parallel state groups
         self.tp = config.tensor_model_parallel_size if config.tensor_model_parallel_size is not None else 1
@@ -614,7 +615,7 @@ class GPTModel(nn.Cell):
         """
         return self.preprocess_labels_and_masks(input_ids, labels, attention_mask, loss_mask)
 
-    def update_topk_bias(self, gradient_accumulation_steps: int = 1):
+    def update_topk_bias(self):
         """
         Will be called by mindformer.core.callback.TopkBiasBalanceCallback to
         update topk bias and reset expert_load of router in MoELayers.
@@ -623,10 +624,10 @@ class GPTModel(nn.Cell):
         if not config.moe_router_enable_expert_bias:
             return []
 
-        def _update_expert_load(router, gradient_accumulation_steps):
+        def _update_expert_load(router):
             expert_load_data = router.expert_load.value()
             if expert_load_data.sum() > 0:
-                err = F.sub(self.step_over_expert_num * gradient_accumulation_steps, expert_load_data)
+                err = F.sub(self.step_over_expert_num * self.gradient_accumulation_steps, expert_load_data)
                 expert_bias_new = F.add(
                     router.expert_bias.value(),
                     F.mul(F.sign(err), self.moe_router_bias_update_rate)
@@ -654,11 +655,11 @@ class GPTModel(nn.Cell):
                 continue
             if i < num_layers:
                 router = self.decoder.layers[i].mlp.router
-                expert_load_data = _update_expert_load(router, gradient_accumulation_steps)
+                expert_load_data = _update_expert_load(router)
                 expert_loads.append((f"decoder.layers.{i}.mlp.router", expert_load_data))
             else:
                 router = self.mtp.layers[i - num_layers].transformer_layer.mlp.router
-                expert_load_data = _update_expert_load(router, gradient_accumulation_steps)
+                expert_load_data = _update_expert_load(router)
                 expert_loads.append((f"mtp.layers.{i - num_layers}.transformer_layer.mlp.router", expert_load_data))
         return expert_loads
 

@@ -1039,6 +1039,16 @@ class TransformerConfig:
         }
     )
 
+    gradient_accumulation_steps: int = field(
+        default=1,
+        metadata={
+            "description": "Gradient accumulation steps for training.",
+            "usage": ParamUsage.TRAINING,
+            "source": ParamSource.MF,
+            "mode": ParamMode.COMMON
+        }
+    )
+
     ###################
     # Training
     ###################

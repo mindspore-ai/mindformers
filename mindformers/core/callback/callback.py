@@ -2921,7 +2921,7 @@ class TopkBiasBalanceCallback(Callback):
         while hasattr(network, "network"):
             network = network.network
         if hasattr(network, "update_topk_bias"):
-            expert_loads = network.update_topk_bias(self.gradient_accumulation_steps)
+            expert_loads = network.update_topk_bias()
             if self.tensor_writer is not None and self.write_expert_load_to_tensorboard:
                 for layer, expert_load in expert_loads:
                     if expert_load.sum() > 0:
