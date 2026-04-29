@@ -665,6 +665,28 @@ class RecomputeCommConfig(BaseConfig):
 
 
 @dataclass
+class SwapConfig(BaseConfig):
+    """
+    Swap configuration for activation offload.
+    """
+
+    swap: bool = False
+    """Enable offload of the transformer block or not. Default: False."""
+
+    default_prefetch: int = 1
+    """Number of operators to prefetch activations before the backward FlashAttention (FA)
+    operator. In the context of static graph execution, since the activation values that have
+    been offloaded need to be retrieved again during the backward pass, and retrieving data
+    from CPU back to NPU incurs latency."""
+
+    layer_swap: Optional[Union[list, dict]] = None
+    """Layer swap entries. May be a list or a single dict (normalized to a list)."""
+
+    op_swap: Optional[Union[list, dict]] = None
+    """Operator swap entries. May be a list or a single dict (normalized to a list)."""
+
+
+@dataclass
 class TrainConfig(BaseConfig):
     """
     Top-level Pynative training configuration.
@@ -700,4 +722,5 @@ class TrainConfig(BaseConfig):
     profiler: ProfilerConfig = field(default_factory=ProfilerConfig)
     recompute: RecomputeConfig = field(default_factory=RecomputeConfig)
     recompute_comm: RecomputeCommConfig = field(default_factory=RecomputeCommConfig)
+    swap_config: SwapConfig = field(default_factory=SwapConfig)
     callbacks: List[CallbackConfig] = field(default_factory=list)

@@ -19,11 +19,12 @@ from typing import Sequence, Tuple, Set
 
 import regex
 from mindspore import nn
-from hyper_parallel.core.activation_checkpoint import CheckpointPolicy, checkpoint_wrapper
+from hyper_parallel.core.activation_checkpoint import CheckpointPolicy, checkpoint_wrapper, swap_wrapper, SwapManager
 
 from mindformers.pynative.config.config import (
     RecomputeConfig,
     RecomputeCommConfig,
+    SwapConfig,
     TrainConfig,
 )
 from mindformers.pynative.base_models.gpt.parallelize import _unwrap_gptmodel
@@ -32,10 +33,11 @@ from mindformers.tools.logger import logger
 __all__ = [
     "apply_recompute_and_swap",
     "apply_recompute",
+    "apply_swap",
 ]
 
 _LAYER_ID_SPEC_PATTERN = re.compile(r"^(\d+)(?:-(\d+))?$")
-
+_config_list = []
 
 def _validate_recompute_config(config: TrainConfig, num_layers: int) -> None:
     """Validate recompute configuration."""
@@ -191,7 +193,7 @@ def _validate_select_module_size_for_pp(
             )
 
 
-def _validate_layer_id_range(label: str, value: object, num_layers: int) -> str:
+def _validate_layer_id_range(label: str, value: object, num_layers: int, prefetch=None) -> str:
     """Validate one layer spec."""
     normalized = str(value).strip()
     m = _LAYER_ID_SPEC_PATTERN.match(normalized)
@@ -213,7 +215,121 @@ def _validate_layer_id_range(label: str, value: object, num_layers: int) -> str:
         raise ValueError(
             f"{label}: layer id {hi} out of range [0, {num_layers - 1}], got {value!r}"
         )
+    if prefetch and hi + prefetch >= num_layers:
+        logger.error(f"[Swap Config] {label}: layer id {hi} out of range "
+                     f"[0, {num_layers - prefetch - 1}], got {value!r}")
+        raise ValueError(
+            f"{label}: layer id {hi} out of range [0, {num_layers - prefetch - 1}], got {value!r}"
+        )
     return normalized
+
+
+# Swap validators
+def _validate_swap_config(config: TrainConfig, num_layers: int) -> None:
+    """Validate swap configuration."""
+
+    pipeline_parallel = config.parallelism.pipeline_parallel
+    sc = config.swap_config
+
+    if sc.swap and pipeline_parallel != 1:
+        logger.error("[Swap Config] swap requires pipeline_parallel=1 "
+                     f"(pipeline parallelism is not supported); got pipeline_parallel={pipeline_parallel}")
+        raise ValueError(
+            "TrainConfig: swap requires pipeline_parallel=1 "
+            f"(pipeline parallelism is not supported); got pipeline_parallel={pipeline_parallel}"
+        )
+    _validate_swap_structure(sc, pipeline_parallel, num_layers)
+    _validate_swap_layers_no_pp(sc, num_layers)
+
+
+@staticmethod
+def _validate_swap_entry_shared_fields(item: dict, label: str, pp: int) -> None:
+    """Validate shared swap entry fields: `layers``."""
+    layers = item["layers"]
+    if not isinstance(layers, (list, tuple)):
+        raise TypeError(
+            f"{label}.layers: expected list/tuple of layer ids or ranges like ['5'], ['0-19'], "
+            f"got {type(layers).__name__}: {layers!r}"
+        )
+    if len(layers) != pp:
+        raise ValueError(
+            f"{label}.layers: expected {pp} layer spec entries for pipeline_parallel={pp}, "
+            f"got {len(layers)}"
+        )
+
+
+def _validate_swap_structure(swap_cfg: SwapConfig, pp: int, num_layers: int) -> None:
+    """Validate swap configuration structure."""
+    pfx = "TrainConfig.swap_config"
+
+    prefetch = swap_cfg.default_prefetch
+    if prefetch >= num_layers or prefetch < 1:
+        logger.error(f"[Swap Config] {pfx}.default_prefetch: value {prefetch} "
+                     f"out of range [1, {num_layers - 1}]")
+        raise ValueError(
+            f"{pfx}.default_prefetch: value {prefetch} "
+            f"out of range [1, {num_layers - 1}]"
+        )
+    # Validate layer_swap structure.
+    if swap_cfg.layer_swap is not None:
+        if not isinstance(swap_cfg.layer_swap, list):
+            logger.error(f"[Swap Config] {pfx}.layer_swap must be a list, "
+                         f"got {type(swap_cfg.layer_swap).__name__}")
+            raise TypeError(f"{pfx}.layer_swap must be a list, got {type(swap_cfg.layer_swap).__name__}")
+        for idx, item in enumerate(swap_cfg.layer_swap):
+            label = f"{pfx}.layer_swap[{idx}]"
+            if not isinstance(item, dict):
+                raise TypeError(f"{label} must be a dict, got {type(item).__name__}")
+            if "layers" not in item:
+                raise ValueError(
+                    f"{label}: each entry must include 'layers', got {item!r}"
+                )
+            _validate_swap_entry_shared_fields(item, label, pp)
+
+    # Validate op_swap structure.
+    if swap_cfg.op_swap is not None:
+        if not isinstance(swap_cfg.op_swap, list):
+            logger.error(f"[Swap Config] {pfx}.op_swap must be a list, "
+                         f"got {type(swap_cfg.op_swap).__name__}")
+            raise TypeError(f"{pfx}.op_swap must be a list, got {type(swap_cfg.op_swap).__name__}")
+        for idx, item in enumerate(swap_cfg.op_swap):
+            label = f"{pfx}.op_swap[{idx}]"
+            if not isinstance(item, dict):
+                raise TypeError(f"{label} must be a dict, got {type(item).__name__}")
+            for k in ("op_name", "layers"):
+                if k not in item:
+                    raise ValueError(
+                        f"{label}: each entry must include 'op_name' and 'layers', got {item!r}"
+                    )
+            opn = item["op_name"]
+            if not isinstance(opn, str) or not opn.strip():
+                raise ValueError(f"{label}.op_name must be a non-empty str, got {opn!r}")
+            _validate_swap_entry_shared_fields(item, label, pp)
+
+
+def _validate_swap_layers_no_pp(swap_cfg: SwapConfig, num_layers: int) -> None:
+    """Validate swap layer specs when pipeline_parallel is 1."""
+    pfx = "TrainConfig.swap_config"
+    prefetch = swap_cfg.default_prefetch
+    # Validate no-pp layer_swap.layers specs.
+    layer_items = (
+        []
+        if swap_cfg.layer_swap is None
+        else ([swap_cfg.layer_swap] if isinstance(swap_cfg.layer_swap, dict) else swap_cfg.layer_swap)
+    )
+    for idx, item in enumerate(layer_items):
+        label = f"{pfx}.layer_swap[{idx}]"
+        _validate_layer_id_range(f"{label}.layers[0]", item["layers"][0], num_layers, prefetch)
+
+    # Validate no-pp op_swap.layers specs.
+    op_items = (
+        []
+        if swap_cfg.op_swap is None
+        else ([swap_cfg.op_swap] if isinstance(swap_cfg.op_swap, dict) else swap_cfg.op_swap)
+    )
+    for idx, item in enumerate(op_items):
+        label = f"{pfx}.op_swap[{idx}]"
+        _validate_layer_id_range(f"{label}.layers[0]", item["layers"][0], num_layers, prefetch)
 
 
 def regex_match(pattern, string, timeout=1):
@@ -225,7 +341,7 @@ def regex_match(pattern, string, timeout=1):
     return None
 
 
-def _parse_recompute_spec_lo_hi(item: str) -> Tuple[int, int]:
+def _parse_spec_lo_hi(item: str) -> Tuple[int, int]:
     """Parse a single layer spec string into (lo, hi) tuple."""
     text = str(item).strip()
     if "-" in text:
@@ -243,7 +359,7 @@ def _parse_layer_ids(specs: Sequence[str]) -> set:
         return set()
     out = set()
     for item in specs:
-        lo, hi = _parse_recompute_spec_lo_hi(item)
+        lo, hi = _parse_spec_lo_hi(item)
         out.update(range(lo, hi + 1))
     return out
 
@@ -327,7 +443,7 @@ def _add_modules_dedup(module_names, layer_id, layer_to_modules, parent_modules=
         layer_to_modules[layer_id].append(module_name)
 
 
-def _clean_and_parse_config(full_target_ids, select_module):
+def _clean_and_parse_config(full_target_ids, select_module, label=None):
     """
     Deduplicate the expanded select_module into a Layer ID -> [Module Names] map.
     Parents are processed before children. Children are skipped if their parent is configured.
@@ -339,15 +455,15 @@ def _clean_and_parse_config(full_target_ids, select_module):
         if layer_id in full_target_ids:
             continue
 
-        # Sort by hierarchy depth so parents are processed before children
         sorted_names = sorted(module_names, key=lambda name: (name.count('.'), name))
         _add_modules_dedup(sorted_names, layer_id, layer_to_modules)
 
-    logger.info("--- Final Select Recompute Configuration Map---")
-    for layer_id in sorted(layer_to_modules.keys()):
-        modules = layer_to_modules[layer_id]
-        logger.info(f"layer{layer_id}: {', '.join(modules) if modules else '(No Module)'}")
-    logger.info("---------------------------------------------------------------------")
+    if label:
+        logger.info(f"--- Final Select {label} Configuration Map---")
+        for layer_id in sorted(layer_to_modules.keys()):
+            modules = layer_to_modules[layer_id]
+            logger.info(f"layer{layer_id}: {', '.join(modules) if modules else '(No Module)'}")
+        logger.info("---------------------------------------------------------------------")
 
     return layer_to_modules
 
@@ -443,16 +559,17 @@ def apply_recompute(
     full_target_ids = set()
     layer_to_modules = {}
     comm_layer_to_modules = {}
-    config_list = []
 
-    if need_recompute or need_comm:
+    if _config_list:
+        config_list = _config_list
+    else:
         config_list = _get_modules_and_ops_list(model, model.config.num_layers)
 
     if need_recompute:
         full_target_ids = _parse_layer_ids(rc.full_recompute_layer)
         if rc.mode == "select":
             select_module_list = _expand_select_module(config_list, rc.select_module)
-            layer_to_modules = _clean_and_parse_config(full_target_ids, select_module_list)
+            layer_to_modules = _clean_and_parse_config(full_target_ids, select_module_list, label="Recompute")
 
     if need_comm:
         comm_select_module_list = _expand_select_module(config_list, rc_comm.select_module)
@@ -470,9 +587,201 @@ def apply_recompute(
             _set_select_recompute(model.layers[layer_id], layer_id, comm_layer_to_modules, add_prim_attr=True)
 
 
+def _policy_fn_swap(x):
+    if x.shape == (1, 1, 4096, 4096):
+        return CheckpointPolicy.MUST_SAVE
+    return CheckpointPolicy.MUST_SWAP
+
+
+def _expand_op_swap(config_list, op_swap):
+    """Expand wildcard patterns in select_module against the model whitelist."""
+    layer_to_modules = {}
+
+    for item in op_swap:
+        module_name, raw_ranges_str = list(item.items())[0]
+        raw_layer_ids = _parse_layer_ids(raw_ranges_str)
+        matched = False
+
+        for layer_id in raw_layer_ids:
+            # Match user pattern against each item in the layer whitelist
+            for item in config_list[layer_id]:
+                if regex_match(module_name, item):
+                    matched = True
+                    if layer_id not in layer_to_modules:
+                        layer_to_modules[layer_id] = []
+                    if item not in layer_to_modules[layer_id]:
+                        layer_to_modules[layer_id].append(item)
+
+        if not matched:
+            logger.warning(f"op swap pattern '{module_name}' did not match any module in the model, "
+                           "please check your swap config.")
+
+    return layer_to_modules
+
+
+def parse_op_swap(op_swap) -> list:
+    """Parse swap config."""
+    op_swap_list = []
+    if op_swap:
+        for item in op_swap:
+            op_name = item["op_name"]
+            layers = item["layers"]
+            op_swap_list.append({op_name: layers})
+
+    return op_swap_list
+
+
+def _set_pattern_swap(layer, p_list, info=''):
+    """Recursively traverse layer cells along p_list path and apply swap_wrapper."""
+    log_list = []
+    log = ''
+    # Pop the next path segment to match
+    if p_list:
+        p = p_list.pop(0)
+    else:
+        return info
+    if p_list:
+        # Still have path segments left: recurse into matching child cells
+        # pylint: disable=W0212
+        for name, cell in layer._cells.items():
+            if p == name:
+                log = _set_pattern_swap(cell, p_list, info + f'.{name}')
+                if log:
+                    log_list.append(log[1:])
+    else:
+        # Last path segment: apply swap_wrapper to the target
+        for name, cell in layer._cells.items():
+            if p == name:
+                setattr(layer, name, swap_wrapper(cell))
+                log = f"{info}.{name}"
+        for attr in dir(layer):
+            if p == attr:
+                operator = getattr(layer, attr)
+                setattr(layer, attr, swap_wrapper(operator, policy_fn=_policy_fn_swap))
+                log = f"{info}.{attr}"
+
+    # Restore p_list so the caller's list is unchanged after recursion
+    p_list.insert(0, p)
+    if log_list:
+        return " " + ", ".join(log_list)
+    return log
+
+
+def _set_op_swap(layer, layer_id, layer_to_modules):
+    """Set op swap for a layer."""
+    log_ops = []
+    for pattern in layer_to_modules[layer_id]:
+        log = _set_pattern_swap(layer, pattern.split(r'.'))
+        if log:
+            log_ops.append(log[1:])
+    log_ops_str = ', '.join(log_ops)
+    if log_ops_str:
+        logger.info(f"Set select swap at layer {layer_id}: {log_ops_str}")
+
+
+def apply_swap(model: nn.Cell, swap_config: SwapConfig) -> None:
+    """Apply ``checkpoint_wrapper`` using ``swap_config``."""
+    sc = swap_config
+    prefetch = sc.default_prefetch
+    full_target_ids = _parse_layer_ids(sc.layer_swap[0].get("layers", [])) if sc.layer_swap else set()
+    layer_to_modules = {}
+    if _config_list:
+        config_list = _config_list
+    else:
+        config_list = _get_modules_and_ops_list(model, model.config.num_layers)
+    if sc.op_swap:
+        op_swap_list = _expand_op_swap(config_list, parse_op_swap(sc.op_swap))
+        layer_to_modules = _clean_and_parse_config(full_target_ids, op_swap_list, label="Swap")
+
+    for layer_id in range(model.config.num_layers):
+        if layer_id in full_target_ids:
+            model.layers[layer_id] = swap_wrapper(model.layers[layer_id], policy_fn=_policy_fn_swap)
+            SwapManager().set_forward_prefetch_layer(model.layers[layer_id], model.layers[layer_id + prefetch])
+            logger.info(f"Set layer swap at layer {layer_id}")
+
+        if sc.op_swap and layer_id in layer_to_modules:
+            _set_op_swap(model.layers[layer_id], layer_id, layer_to_modules)
+            SwapManager().set_forward_prefetch_layer(model.layers[layer_id], model.layers[layer_id + prefetch])
+
+
+def _check_recompute_swap_overlap(recompute, recompute_comm, swap_config):
+    """Check if recompute and swap configs overlap on the same modules."""
+    rc = recompute
+    rc_comm = recompute_comm
+    sc = swap_config
+
+    recompute_layers = set()
+    if rc.mode != "None":
+        recompute_layers = _parse_layer_ids(rc.full_recompute_layer)
+    swap_layers = set()
+    if sc.swap and sc.layer_swap:
+        swap_layers = _parse_layer_ids(sc.layer_swap[0].get("layers", []))
+
+    recompute_select = {}
+    if rc.mode == "select" and rc.select_module:
+        recompute_select = _expand_select_module(_config_list, rc.select_module)
+    if rc_comm.enable and rc_comm.select_module:
+        comm_select = _expand_select_module(_config_list, rc_comm.select_module)
+        for layer_id, mods in comm_select.items():
+            if layer_id in recompute_select:
+                recompute_select[layer_id] = list(set(recompute_select[layer_id]) | set(mods))
+            else:
+                recompute_select[layer_id] = list(mods)
+    if recompute_select:
+        recompute_select = _clean_and_parse_config(recompute_layers, recompute_select)
+    swap_select = {}
+    if sc.op_swap:
+        swap_select = _expand_op_swap(_config_list, parse_op_swap(sc.op_swap))
+
+    overlap = swap_layers & (recompute_layers | set(recompute_select.keys()))
+    if overlap:
+        logger.error(f"[Recompute/Swap Config] layers {sorted(overlap)} are configured for "
+                     "both recompute and layer swap, which is not allowed")
+        raise ValueError(
+            f"layers {sorted(overlap)} are configured for both recompute "
+            "and layer swap, which is not allowed"
+        )
+
+    layer_overlap_errors = []
+    for layer_id, sw_mods in swap_select.items():
+        if layer_id in recompute_layers:
+            layer_overlap_errors.append(
+                f"layer {layer_id}: layer is configured for full recompute, op swap is not allowed"
+            )
+            continue
+        if layer_id not in recompute_select:
+            continue
+        overlap_pairs = []
+        for sw_mod in sw_mods:
+            for rc_mod in recompute_select[layer_id]:
+                if sw_mod == rc_mod or sw_mod.startswith(rc_mod + ".") or rc_mod.startswith(sw_mod + "."):
+                    overlap_pairs.append((sw_mod, rc_mod))
+        if overlap_pairs:
+            pairs_str = ", ".join(f"'{sw}'/'{rc}'" for sw, rc in overlap_pairs)
+            layer_overlap_errors.append(
+                f"layer {layer_id}: modules {pairs_str} have parent-child overlap"
+            )
+    if layer_overlap_errors:
+        error_detail = "; ".join(layer_overlap_errors)
+        logger.error(f"[Recompute/Swap Config] {error_detail}, which is not allowed")
+        raise ValueError(f"{error_detail}, which is not allowed")
+
+
 def apply_recompute_and_swap(model: nn.Cell, config: TrainConfig) -> None:
-    if config.recompute.mode != "None" or config.recompute_comm.enable:
+    """Apply recompute and swap configuration to the model."""
+    global _config_list
+    need_recompute = config.recompute.mode != "None" or config.recompute_comm.enable
+    need_swap = config.swap_config.swap
+    if need_recompute or need_swap:
         gpt_model = _unwrap_gptmodel(model)
         decoder = gpt_model.decoder
-        _validate_recompute_config(config, decoder.config.num_layers)
-        apply_recompute(decoder, config.recompute, config.recompute_comm)
+        _config_list = _get_modules_and_ops_list(decoder, decoder.config.num_layers)
+        if need_recompute and need_swap:
+            _check_recompute_swap_overlap(config.recompute, config.recompute_comm, config.swap_config)
+        if need_recompute:
+            _validate_recompute_config(config, decoder.config.num_layers)
+            apply_recompute(decoder, config.recompute, config.recompute_comm)
+        if need_swap:
+            _validate_swap_config(config, decoder.config.num_layers)
+            apply_swap(decoder, config.swap_config)
+        _config_list = []
