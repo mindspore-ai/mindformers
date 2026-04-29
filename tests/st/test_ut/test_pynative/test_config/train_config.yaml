@@ -110,8 +110,3 @@ profiler:                     # reserved for future use
   profiler_level: Level0      # profiling detail level
   profile_memory: False       # enable memory profiling
 
-recompute:                    # reserved for future use
-  # activation recomputation configuration
-  full_recompute: False             # enable activation recomputation
-  select_recompute: False     # enable selective recomputation
-

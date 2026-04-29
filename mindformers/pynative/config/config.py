@@ -626,14 +626,42 @@ class ProfilerConfig(BaseConfig):
 @dataclass
 class RecomputeConfig(BaseConfig):
     """
-    Recompute configuration for memory optimization.
+    Recompute configuration.
+
+    Validation is performed only on the enclosing :class:`TrainConfig` (this dataclass has no
+    ``__post_init__`` checks).
     """
 
-    full_recompute: bool = False
-    """Enable fully recomputation"""
+    mode: str = "None"
+    """Recompute mode: ``'None'`` , ``'full'``, or ``'select'``."""
 
-    select_recompute: bool = False
-    """Enable selective recomputation"""
+    full_recompute_layer: Optional[Union[list, tuple]] = None
+    """Layer ranges for full recomputation."""
+
+    select_module: Optional[Union[dict, list]] = None
+    """Module paths and their layer ranges for selective recomputation. Only effective when ``mode`` is ``'select'``."""
+
+    def post_init(self):
+        """Post-initialization validation."""
+        if self.mode not in ["None", "full", "select"]:
+            raise ValueError(
+                f"RecomputeConfig.mode must be 'None', 'full', or 'select', got {self.mode}"
+            )
+
+
+@dataclass
+class RecomputeCommConfig(BaseConfig):
+    """
+    Communication recompute configuration.
+
+    Validation is performed only on the enclosing :class:`TrainConfig`.
+    """
+
+    enable: bool = False
+    """Whether to enable communication recomputation. Independent of ``RecomputeConfig.mode``."""
+
+    select_module: Optional[Union[dict, list]] = None
+    """Communication module paths and their layer ranges for selective recomputation. Only effective when ``enable`` is ``True``."""
 
 
 @dataclass
@@ -652,7 +680,8 @@ class TrainConfig(BaseConfig):
     - Monitoring and logging
     - MindSpore context
     - Profiling
-    - Gradient recomputation
+    - Gradient recomputation (``recompute``: standard gradient recomputation;
+      ``recompute_comm``: communication gradient recomputation)
     - Training callbacks
 
     This configuration allows extra fields to support extensibility.
@@ -670,4 +699,5 @@ class TrainConfig(BaseConfig):
     context: ContextConfig = field(default_factory=ContextConfig)
     profiler: ProfilerConfig = field(default_factory=ProfilerConfig)
     recompute: RecomputeConfig = field(default_factory=RecomputeConfig)
+    recompute_comm: RecomputeCommConfig = field(default_factory=RecomputeCommConfig)
     callbacks: List[CallbackConfig] = field(default_factory=list)
