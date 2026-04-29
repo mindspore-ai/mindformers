@@ -99,9 +99,8 @@ class RouterRunner:
         net.set_train(True)
 
         # Flatten inputs to (bs*slen, dim) as expected by TokenChoiceTopKRouter
-        inputs_flat = self.inputs.reshape(-1, self.hidden_size)
 
-        top_scores, selected_experts_indices, num_tokens_per_expert = net(inputs_flat, self.expert_bias)
+        top_scores, selected_experts_indices, num_tokens_per_expert = net(self.inputs, self.expert_bias)
 
         output_ms = {
             "top_scores": top_scores,

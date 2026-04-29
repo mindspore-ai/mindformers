@@ -59,10 +59,11 @@ class MLP(nn.Cell):
             config: TransformerConfig,
             submodules: MLPSubmodules,
             input_size: int = None,
+            layer_number: int = 0,
     ):
         super().__init__()
         self.config = config
-
+        self.layer_number = layer_number
         self.input_size = input_size if input_size is not None else config.hidden_size
 
         # Normal MLPs read ffn_hidden_size from config.ffn_hidden_size

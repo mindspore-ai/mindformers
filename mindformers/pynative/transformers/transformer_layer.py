@@ -80,7 +80,7 @@ class TransformerLayer(nn.Cell, BaseTransformerLayer):
     def __init__(self,
                  config: TransformerConfig,
                  submodules: TransformerLayerSubmodules,
-                 layer_number: int = 1,
+                 layer_number: int = 0,
                  hidden_dropout: float = None,
                  ):
         super().__init__()
@@ -129,7 +129,7 @@ class TransformerLayer(nn.Cell, BaseTransformerLayer):
             compute_dtype=config.layernorm_compute_dtype
         )
 
-        self.mlp = build_module(submodules.mlp, config=self.config)
+        self.mlp = build_module(submodules.mlp, config=self.config, layer_number=layer_number)
 
         # mlp_bda(BiasDropoutFusion) is not supported.
 

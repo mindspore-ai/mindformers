@@ -69,6 +69,7 @@ class GroupedMLP(nn.Cell):
             self.mul = mint.mul
         self.moe_token_dispatcher_type = config.moe_token_dispatcher_type
         self.init_method = config.init_method
+        self.compute_dtype = config.compute_dtype
 
         # parameters
         self.weight1 = Parameter(
@@ -137,8 +138,8 @@ class GroupedMLP(nn.Cell):
         need_dispatch = not isinstance(self.weight1, DTensor) or "ep" not in self.weight1.device_mesh.mesh_dim_names
 
         if need_dispatch:
-            tokens_per_expert, token_indices_experts_sorted, permuted_probs, permuted_local_hidden_states = self.permute(
-                tokens, probs, topk_indices, num_tokens_per_expert)
+            tokens_per_expert, token_indices_experts_sorted, permuted_probs, permuted_local_hidden_states = (
+                self.permute(tokens, probs, topk_indices, num_tokens_per_expert))
         else:
             tokens_per_expert, permuted_probs, permuted_local_hidden_states = num_tokens_per_expert, probs, tokens
             token_indices_experts_sorted = None
@@ -157,15 +158,17 @@ class GroupedMLP(nn.Cell):
     def experts_forward(self, permuted_local_hidden_states, tokens_per_expert):
         """Forward step of GroupedMLP."""
         original_dtype = permuted_local_hidden_states.dtype
-        w1 = self.cast(self.weight1, original_dtype)
-        w2 = self.cast(self.weight2, original_dtype)
+        permuted_local_hidden_states = self.cast(permuted_local_hidden_states, self.compute_dtype)
+        w1 = self.cast(self.weight1, self.compute_dtype)
+        w2 = self.cast(self.weight2, self.compute_dtype)
         w1 = w1.to_local() if isinstance(w1, DTensor) else w1
         w2 = w2.to_local() if isinstance(w2, DTensor) else w2
         w1 = self.reshape(w1, (-1, self.hidden_size, self.moe_ffn_hidden_size))
         w2 = self.reshape(w2, (-1, self.config.moe_ffn_hidden_size, self.hidden_size))
 
         fc1_output = GroupedMatmul(split_item=3, group_type=0)(
-            [permuted_local_hidden_states], [w1], None, None, None, None, None, tokens_per_expert)[0]
+            [permuted_local_hidden_states], [w1], None, None, None, None,
+            None, tokens_per_expert)[0]
 
         if self.gated_linear_unit:
             if self.activation_type == 'fusedswiglu':
@@ -178,5 +181,7 @@ class GroupedMLP(nn.Cell):
             intermediate_parallel = self.activation_func(fc1_output)
 
         fc2_output = GroupedMatmul(split_item=3, group_type=0)(
-            [intermediate_parallel], [w2], None, None, None, None, None, tokens_per_expert)[0]
+            [intermediate_parallel], [w2], None, None, None, None,
+            None, tokens_per_expert)[0]
+        fc2_output = self.cast(fc2_output, original_dtype)
         return fc2_output

@@ -83,7 +83,7 @@ class TransformerLayer(nn.Cell, BaseTransformerLayer):
     def __init__(self,
                  config: TransformerConfig,
                  submodules: TransformerLayerSubmodules,
-                 layer_number: int = 1,
+                 layer_number: int = 0,
                  hidden_dropout: float = None,
                  ):
         super().__init__()
