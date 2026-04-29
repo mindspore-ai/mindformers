@@ -3,10 +3,11 @@
 # Modified to adapt to MindSpore pynative mode.
 # Main changes: PyTorch->MindSpore, removed parallel/checkpointing/CUDA graph/CPU offloading features,
 # removed pre_process/post_process parameters, simplified forward pass.
+# Main changes: keeps pre_process/post_process stage flags for PP boundary semantics.
 """Transformer Block"""
 from dataclasses import dataclass
 from typing import Union, List, Optional
-from mindspore import nn, Tensor
+from mindspore import nn, Tensor, mint
 from mindformers.pynative.layers.layer_norm import get_norm_cls
 from mindformers.parallel_core.transformer_config import TransformerConfig
 from mindformers.parallel_core.utils.spec_utils import ModuleSpec, build_module
@@ -75,6 +76,8 @@ class TransformerBlock(nn.Cell):
             transformer block submodules. Can be either a TransformerBlockSubmodules
             instance or a ModuleSpec.
         post_layer_norm (bool): Insert normalization layer at the end of transformer block. Default: True.
+        pre_process (bool): Whether this block is in PP pre-process stage. Default: True.
+        post_process (bool): Whether this block is in PP post-process stage. Default: True.
 
     Inputs:
         - **hidden_states** (Tensor) - Tensor of shape :math:`(S, B, H)` where S is sequence length,
@@ -96,13 +99,25 @@ class TransformerBlock(nn.Cell):
             config: TransformerConfig,
             spec: Union[TransformerBlockSubmodules, ModuleSpec],
             post_layer_norm: bool = True,
+            pre_process: bool = True,
+            post_process: bool = True,
     ):
         super().__init__()
 
         self.config = config
         self.submodules = _get_block_submodules(config, spec)
         self.post_layer_norm = post_layer_norm
+        self.pre_process = pre_process
+        self.post_process = post_process
         self.num_layers = config.num_layers
+        self.hc = config.enable_hyper_connections
+        if config.enable_hyper_connections:
+            self.n = config.num_residual_streams
+            self.hidden_size = config.hidden_size
+            self.unsqueeze = mint.unsqueeze
+            self.tile = mint.tile
+            self.reshape = mint.reshape
+            self.mean = mint.mean
         cp = config.context_parallel_size if config.context_parallel_size is not None else 1
         if config.sequence_parallel and cp > 1:
             logger.warning("The context parallel way conflicts with sequence parallel way. "
@@ -114,6 +129,15 @@ class TransformerBlock(nn.Cell):
     def _build_layers(self, config: TransformerConfig):
         """build transformer layers."""
         # Transformer layers.
+        if self.hc:
+            logger.info(
+                "PyNative mHC is enabled: num_residual_streams=%s, mhc_sinkhorn_iterations=%s, "
+                "mhc_init_gating_factor=%s",
+                self.n,
+                config.mhc_sinkhorn_iterations,
+                config.mhc_init_gating_factor,
+            )
+
         self.layers = nn.CellList()
         for layer_id in range(config.num_layers):
             layer = build_module(self.submodules.layer_specs[layer_id], config=config, layer_number=layer_id)
@@ -130,6 +154,10 @@ class TransformerBlock(nn.Cell):
 
     def _get_layer(self, layer_number):
         return self.layers[layer_number]
+
+    def has_final_layernorm_in_this_stage(self):
+        """Whether this PP stage contains the final layernorm."""
+        return self.post_layer_norm and self.post_process
 
     def construct(self,
                   hidden_states: Tensor,
@@ -153,6 +181,12 @@ class TransformerBlock(nn.Cell):
             Tuple[Tensor, Tensor]: A tuple containing:
                 - hidden_states (Tensor): Output tensor of shape (S, B, H).
         """
+        if self.hc and self.pre_process:
+            s = hidden_states.shape[0]
+            hidden_states = self.unsqueeze(hidden_states, 2)
+            hidden_states = self.tile(hidden_states, (1, 1, self.n, 1))
+            hidden_states = self.reshape(hidden_states, (s, -1, self.n * self.hidden_size))
+
         for index in range(self.num_layers):
             layer = self._get_layer(index)
             prefix_kv = prefix_keys_values[index] if prefix_keys_values is not None else None
@@ -163,6 +197,11 @@ class TransformerBlock(nn.Cell):
                 prefix_keys_values=prefix_kv,
                 actual_seq_len=actual_seq_len
             )
+
+        if self.hc and self.has_final_layernorm_in_this_stage():
+            s = hidden_states.shape[0]
+            hidden_states = self.reshape(hidden_states, (s, -1, self.n, self.hidden_size))
+            hidden_states = self.mean(hidden_states, dim=2)
 
         # final layernorm.
         if self.post_layer_norm:
