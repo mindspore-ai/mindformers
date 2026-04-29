@@ -1992,6 +1992,71 @@ class TransformerConfig:
         }
     )
 
+    ####################
+    # Manifold-Constrained Hyper-Connections (mHC)
+    ####################
+
+    enable_hyper_connections: bool = field(
+        default=False,
+        metadata={
+            "description": "If True, enable Manifold-Constrained Hyper-Connections (mHC) between Attention and "
+                           "FFN layers.",
+            "usage": ParamUsage.TRAINING,
+            "source": ParamSource.MEGATRON,
+            "mode": ParamMode.COMMON
+        }
+    )
+
+    num_residual_streams: int = field(
+        default=4,
+        metadata={
+            "description": "Number of residual streams (tile factor n) used by mHC.",
+            "usage": ParamUsage.TRAINING,
+            "source": ParamSource.MEGATRON,
+            "mode": ParamMode.COMMON
+        }
+    )
+
+    mhc_sinkhorn_iterations: int = field(
+        default=20,
+        metadata={
+            "description": "Number of Sinkhorn-Knopp iterations for mHC residual matrix normalisation.",
+            "usage": ParamUsage.TRAINING,
+            "source": ParamSource.MEGATRON,
+            "mode": ParamMode.COMMON
+        }
+    )
+
+    mhc_init_gating_factor: float = field(
+        default=0.01,
+        metadata={
+            "description": "Initial value of alpha gating factors for mHC projection.",
+            "usage": ParamUsage.TRAINING,
+            "source": ParamSource.MEGATRON,
+            "mode": ParamMode.COMMON
+        }
+    )
+
+    mhc_layernorm_epsilon: float = field(
+        default=1e-6,
+        metadata={
+            "description": "Epsilon used by mHC RMSNorm.",
+            "usage": ParamUsage.TRAINING,
+            "source": ParamSource.MF,
+            "mode": ParamMode.COMMON
+        }
+    )
+
+    use_fused_mhc: bool = field(
+        default=False,
+        metadata={
+            "description": "If True, use fused mHC kernels.",
+            "usage": ParamUsage.TRAINING,
+            "source": ParamSource.MF,
+            "mode": ParamMode.COMMON
+        }
+    )
+
     def __post_init__(self):
         """
         Python dataclass method that is used to modify attributes after initialization.
@@ -2012,6 +2077,27 @@ class TransformerConfig:
             raise ValueError(f"hidden_dropout should be a float within [0, 1), but get {self.hidden_dropout}.")
         if not isinstance(self.attention_dropout, float) or not 0 <= self.attention_dropout < 1:
             raise ValueError(f"attention_dropout should be a float within [0, 1), but get {self.attention_dropout}.")
+        if self.enable_hyper_connections:
+            if not isinstance(self.num_residual_streams, int) or self.num_residual_streams <= 0:
+                raise ValueError(
+                    f"num_residual_streams should be a positive integer, but get {self.num_residual_streams}."
+                )
+            if not isinstance(self.mhc_sinkhorn_iterations, int) or self.mhc_sinkhorn_iterations <= 0:
+                raise ValueError(
+                    f"mhc_sinkhorn_iterations should be a positive integer, but get {self.mhc_sinkhorn_iterations}."
+                )
+            if not isinstance(self.mhc_init_gating_factor, (int, float)):
+                raise ValueError(
+                    "mhc_init_gating_factor should be a number, "
+                    f"but get {type(self.mhc_init_gating_factor).__name__}."
+                )
+            self.mhc_init_gating_factor = float(self.mhc_init_gating_factor)
+            if not isinstance(self.mhc_layernorm_epsilon, (int, float)) or self.mhc_layernorm_epsilon <= 0:
+                raise ValueError(
+                    "mhc_layernorm_epsilon should be a positive number, "
+                    f"but get {self.mhc_layernorm_epsilon}."
+                )
+            self.mhc_layernorm_epsilon = float(self.mhc_layernorm_epsilon)
 
         if self.vocab_emb_dp:
             logger.warning("vocab_emb_dp is not supported in MCore, it will be converted to False automatically.")

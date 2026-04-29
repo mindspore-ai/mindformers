@@ -27,7 +27,11 @@ from mindformers.pynative.layers.identity_op import IdentityOp
 from mindformers.pynative.transformers.mlp import MLP, MLPSubmodules
 from mindformers.pynative.layers.layer_norm import get_norm_cls
 from mindformers.pynative.transformers.transformer_block import TransformerBlockSubmodules
-from mindformers.pynative.transformers.transformer_layer import TransformerLayer, TransformerLayerSubmodules
+from mindformers.pynative.transformers.transformer_layer import (
+    HyperConnectionTransformerLayer,
+    TransformerLayer,
+    TransformerLayerSubmodules,
+)
 from mindformers.parallel_core.transformer_config import TransformerConfig
 from mindformers.parallel_core.utils.spec_utils import ModuleSpec
 from mindformers.pynative.base_models.gpt.moe_module_specs import get_moe_module_spec
@@ -59,6 +63,7 @@ def get_gpt_layer_local_spec(
         moe_grouped_gemm: Optional[bool] = False,
         qk_layernorm: Optional[bool] = False,
         multi_latent_attention: Optional[bool] = False,
+        enable_hyper_connections: Optional[bool] = False,
         fused_norm: Optional[bool] = True,
         normalization: Optional[str] = "RMSNorm",
 ) -> ModuleSpec:
@@ -70,6 +75,8 @@ def get_gpt_layer_local_spec(
         moe_grouped_gemm (bool, optional): To use Grouped GEMM. Defaults to False.
         qk_layernorm (bool, optional): To use layernorm for queries/keys. Defaults to False.
         multi_latent_attention (bool, optional): To use MultiLatentAttention. Defaults to False.
+        enable_hyper_connections (bool, optional): Whether to build HyperConnectionTransformerLayer.
+            Defaults to False.
         fused_norm (bool): Whether to use fused-normalization. Defaults to True.
         normalization (str): The type of the norm. Defaults to RMSNorm.
     Returns:
@@ -80,6 +87,7 @@ def get_gpt_layer_local_spec(
         num_experts=num_experts,
         moe_grouped_gemm=moe_grouped_gemm,
     )
+    layer_cls = HyperConnectionTransformerLayer if enable_hyper_connections else TransformerLayer
 
     if multi_latent_attention:
         self_attention = ModuleSpec(
@@ -95,7 +103,7 @@ def get_gpt_layer_local_spec(
             ),
         )
         return ModuleSpec(
-            module=TransformerLayer,
+            module=layer_cls,
             submodules=TransformerLayerSubmodules(
                 input_layernorm=get_norm_cls(normalization, fused_norm),
                 self_attention=self_attention,
@@ -105,7 +113,7 @@ def get_gpt_layer_local_spec(
         )
 
     return ModuleSpec(
-        module=TransformerLayer,
+        module=layer_cls,
         submodules=TransformerLayerSubmodules(
             input_layernorm=get_norm_cls(normalization, fused_norm),
             self_attention=ModuleSpec(
@@ -135,6 +143,7 @@ def get_gpt_decoder_block_spec(
         moe_grouped_gemm=False,
         qk_layernorm=config.qk_layernorm,
         multi_latent_attention=config.multi_latent_attention,
+        enable_hyper_connections=config.enable_hyper_connections,
         fused_norm=config.fused_norm,
     )
 
@@ -143,6 +152,7 @@ def get_gpt_decoder_block_spec(
         moe_grouped_gemm=config.moe_grouped_gemm,
         qk_layernorm=config.qk_layernorm,
         multi_latent_attention=config.multi_latent_attention,
+        enable_hyper_connections=config.enable_hyper_connections,
         fused_norm=config.fused_norm,
     )
     # Parse config.moe_layer_freq to determine the pattern of expert/dense layers.

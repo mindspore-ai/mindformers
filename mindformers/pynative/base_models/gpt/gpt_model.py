@@ -192,6 +192,8 @@ class GPTModel(nn.Cell):
             spec=transformer_layer_spec,
             # The corresponding Megatron v0.12.0 module's forward pass has this logic disabled by default,
             # so it won't cause significant impact.
+            pre_process=self.pre_process,
+            post_process=self.post_process,
         )
 
         # Output

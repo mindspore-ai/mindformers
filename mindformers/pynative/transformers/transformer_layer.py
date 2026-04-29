@@ -10,6 +10,7 @@ from mindformers.parallel_core.utils.spec_utils import ModuleSpec, build_module
 from mindformers.parallel_core.transformer_config import TransformerConfig
 from mindformers.pynative.layers.dropout import Dropout
 from mindformers.pynative.layers.identity_op import IdentityOp
+from mindformers.pynative.transformers.hyper_connection import HyperConnectionModule
 
 
 @dataclass
@@ -101,6 +102,7 @@ class TransformerLayer(nn.Cell, BaseTransformerLayer):
             config=self.config,
             layer_number=layer_number,
         )
+
         # self_attn_bda(BiasDropoutFusion) is not supported.
 
         self.pre_cross_attn_layernorm = build_module(
@@ -209,4 +211,69 @@ class TransformerLayer(nn.Cell, BaseTransformerLayer):
         output = self.add(residual, dropout_output)
         # Note: context parameter is returned for API compatibility but currently unused.
         # It may be deprecated in future versions.
+        return output, context
+
+
+class HyperConnectionTransformerLayer(TransformerLayer):
+    """Transformer layer with mHC path."""
+
+    def __init__(self,
+                 config: TransformerConfig,
+                 submodules: TransformerLayerSubmodules,
+                 layer_number: int = 1,
+                 hidden_dropout: float = None,
+                 ):
+        super().__init__(
+            config=config,
+            submodules=submodules,
+            layer_number=layer_number,
+            hidden_dropout=hidden_dropout,
+        )
+        self.n = config.num_residual_streams
+        self.attn_hc = HyperConnectionModule(
+            config=config,
+            layer_number=layer_number,
+        )
+        self.ffn_hc = HyperConnectionModule(
+            config=config,
+            layer_number=layer_number,
+        )
+
+    def construct(
+            self,
+            hidden_states,
+            attention_mask=None,
+            context=None,
+            rotary_pos_emb=None,
+            prefix_keys_values=None,
+            actual_seq_len=None
+    ):
+        """mHC forward path."""
+
+        streams_before_attn = hidden_states
+        aggregated_attn, h_res_attn, h_post_attn = self.attn_hc(hidden_states)
+
+        input_layernorm_output = self.input_layernorm(aggregated_attn)
+        attention_output = self.self_attention(
+            input_layernorm_output,
+            attention_mask=attention_mask,
+            rotary_pos_emb=rotary_pos_emb,
+            prefix_keys_values=prefix_keys_values,
+            actual_seq_len=actual_seq_len
+        )
+
+        dropout_output = self.hidden_states_dropout(attention_output)
+        hidden_states = self.attn_hc.output_cell(
+            h_res_attn, h_post_attn, streams_before_attn, dropout_output)
+
+        streams_before_ffn = hidden_states
+        aggregated_ffn, h_res_ffn, h_post_ffn = self.ffn_hc(hidden_states)
+
+        pre_mlp_layernorm_output = self.pre_mlp_layernorm(aggregated_ffn)
+        mlp_output = self.mlp(pre_mlp_layernorm_output)
+
+        dropout_output = self.hidden_states_dropout(mlp_output)
+        output = self.ffn_hc.output_cell(
+            h_res_ffn, h_post_ffn, streams_before_ffn, dropout_output)
+
         return output, context
