@@ -20,21 +20,22 @@ from typing import Optional, Callable, List, Dict, Any, Union
 import json
 import numpy as np
 
-from mindspore import mint, manual_seed, value_and_grad, set_deterministic
+# mindspore modules
+from mindspore import ops, manual_seed, set_deterministic, nn
 from mindspore.dataset import Dataset
 from mindspore.common import set_seed
 from mindspore.mint.distributed import (
     init_process_group,
     destroy_process_group,
     get_world_size,
+    all_reduce,
 )
-from mindspore.nn.utils import no_init_parameters
-from mindspore.ops import clip_by_global_norm
+from mindspore.graph.api import _no_grad
 
-try:
-    from hyper_parallel import parallelize_value_and_grad
-except ImportError:
-    parallelize_value_and_grad = None
+# hyper_parallel modules
+from hyper_parallel import SkipDTensorDispatch
+from hyper_parallel.core.dtensor.dtensor import DTensor
+from hyper_parallel.platform.mindspore.autograd_compat import enable_mindspore_backward_compat
 
 from mindformers.tools.logger import logger
 from mindformers.pynative.config import TrainConfig
@@ -48,6 +49,8 @@ from mindformers.pynative.callback import (
 )
 import mindformers.tools.register.register as register_module
 import mindformers.dataset.handler.base_handler as handler_module
+from mindformers.pynative.distributed.parallel_dims import ParallelDims
+from mindformers.pynative.distributed.parallelize import parallelize_model
 
 from mindformers.checkpoint.checkpoint import CommonInfo, get_checkpoint_path
 
@@ -59,6 +62,8 @@ from .utils import (
     _build_lr_scheduler,
     _build_callback,
     _build_lora_model,
+    _calculate_global_grad_norm,
+    _get_loss_sense,
     compute_parameters,
 )
 
@@ -126,14 +131,19 @@ class Trainer:
         # patch legacy model inference for pynative mode
         patch_pynative_modules()
 
+        # apply backward compat for `loss.backward()`
+        enable_mindspore_backward_compat()
+
         # Initialize config
         self.config = self._init_config(config, run_mode)
 
         self.world_size = get_world_size()
         logger.info(f"Current world size: {self.world_size}.")
-        self.use_parallel = self.world_size > 1
-        if self.use_parallel:
-            raise ValueError("Parallel training is not supported yet.")
+        self.enable_parallel = self.world_size > 1
+        if self.enable_parallel:
+            init_process_group()
+            self.communication_init = True
+            logger.info("Distributed communication is initialized.")
 
         self._setup_seed_and_determinism()
 
@@ -143,6 +153,9 @@ class Trainer:
 
         # Create model
         self.model = self._create_model(model, self.config.model)
+        if self.enable_parallel:
+            # Apply parallelism to model
+            self._apply_parallelism(self.model, self.config.parallelism)
 
         # Create train dataset
         self.train_dataset = self._create_dataset(
@@ -234,6 +247,41 @@ class Trainer:
         manual_seed(seed)
         np.random.seed(seed)
 
+    def _apply_parallelism(self, model, parallelism):
+        """
+        Apply parallelism strategies (FSDP/TP/CP/AC) to the model.
+        This follows TorchTitan's parallelization order.
+        """
+        logger.info("Applying parallelism to model...")
+
+        # Build ParallelDims
+        if parallelism.data_parallel_shard > 0:
+            dp_replicate = max(
+                parallelism.data_parallel // parallelism.data_parallel_shard, 1)
+        else:
+            dp_replicate = 1
+
+        parallel_dims = ParallelDims(
+            dp_replicate=dp_replicate,
+            dp_shard=parallelism.data_parallel,
+            cp=parallelism.context_parallel,
+            tp=parallelism.tensor_parallel,
+            pp=parallelism.pipeline_parallel,
+            ep=parallelism.expert_parallel,
+            etp=parallelism.expert_tensor_parallel,
+            world_size=self.world_size,
+        )
+
+        # Apply unified parallelization
+        parallelize_model(
+            model=model,
+            parallel_dims=parallel_dims,
+            parallelism=parallelism,
+            recompute=self.config.recompute,
+            recompute_comm=self.config.recompute_comm,
+            swap=self.config.swap
+        )
+
     def _create_model(self, model, model_config: Optional[Dict]) -> Any:
         """
         Create or validate model instance.
@@ -258,8 +306,8 @@ class Trainer:
             raise ValueError("Either model instance or config.model must be provided.")
 
         logger.info("Building model from config...")
-        with no_init_parameters():
-            model = _build_model(model_config)
+        # support delay init params in future
+        model = _build_model(model_config)
 
         # Apply LoRA if provided (after base model is built)
         lora_config = getattr(self.config, "lora_config", None)
@@ -484,18 +532,10 @@ class Trainer:
         if mode not in ["pretrain", "finetune"]:
             raise ValueError(f"mode must be 'pretrain' or 'finetune', got: {mode}")
 
-        # MindSpore communication setting
-        if self.use_parallel:
-            init_process_group()
-            self.communication_init = True
-            logger.info("Distributed communication is initialized.")
-
         # Initialize training state
         self.state = self._init_train_state()
 
-        # Initialize parallel config and wrappers
-        if self.use_parallel:
-            self._init_parallel_config(self.model, self.config.parallelism)
+        
 
         # Load checkpoint
         checkpoint_path = checkpoint_path or self.config.checkpoint.load_path
@@ -513,11 +553,6 @@ class Trainer:
 
         if self.communication_init:
             destroy_process_group()
-
-    def _init_parallel_config(self, model, parallelism):
-        """Initialize parallel configuration."""
-        _, _ = model, parallelism
-        raise ValueError("Parallel training is not supported yet.")
 
     def _load_checkpoint(
         self,
@@ -583,16 +618,6 @@ class Trainer:
         # Create dataset iterator
         dataset_iter = self._create_dataset_iterator(self.train_dataset)
 
-        if self.use_parallel:
-            grad_fn = parallelize_value_and_grad(
-                self.compute_loss, self.optimizer.parameters
-            )
-
-        else:
-            grad_fn = value_and_grad(
-                self.compute_loss, None, self.optimizer.parameters, has_aux=False
-            )
-
         if hasattr(self.model, "set_train"):
             self.model.set_train(True)
 
@@ -618,7 +643,7 @@ class Trainer:
 
             # Training step
             try:
-                loss, grad_norm = self.training_step(self.model, inputs, grad_fn)
+                loss, grad_norm = self.training_step(self.model, inputs)
             except Exception as e:
                 raise RuntimeError(f"Error in training step {step}.") from e
 
@@ -733,38 +758,36 @@ class Trainer:
         # return value must be Tensor or DTensor
         return loss
 
-    def training_step(self, model, inputs: Dict[str, Any], grad_fn: Callable):
+    def training_step(self, model, inputs: Dict[str, Any]):
         """
         Perform a single training step.
 
         Args:
             model (PreTrainedModel): Model instance.
             inputs (Dict[str, Any]): Input data dictionary.
-            grad_fn (Callable): Gradient computation function.
 
         Returns:
             tuple: Tuple containing loss value and gradient norm (loss, grad_norm).
         """
-        # Forward and compute loss
-        loss, grads = grad_fn(model, inputs)
+        loss = self.compute_loss(model, inputs)
 
-        # Gradient norm calculation
-        overflow = False
-        grad_norm = 0.0
-        for grad in grads:
-            if grad.isinf().any() or grad.isnan().any():
-                overflow = True
-                break
-            grad_norm += mint.sum(mint.square(grad))
+        sense = _get_loss_sense(loss, data_parallel=self.config.parallelism.data_parallel)
+        loss.backward(sense)
+        global_norm, grads = _calculate_global_grad_norm(self.optimizer.parameters)
 
-        if overflow:
-            return loss, None
-        grad_norm = mint.sqrt(grad_norm)
+        with SkipDTensorDispatch(), _no_grad():
+            self.optimizer(grads)
 
-        # Clip gradients
-        grads = clip_by_global_norm(grads)
+        # zero grad
+        if isinstance(model, nn.Cell):
+            model.zero_grad()
+        else:
+            for param in model.trainable_params():
+                param.grad = None
 
-        # Optimizer step
-        self.optimizer(grads)
-
-        return loss, grad_norm
+        if self.enable_parallel:
+            if isinstance(loss, DTensor):
+                loss = loss.to_local()
+            all_reduce(loss, op=ops.ReduceOp.SUM)
+            loss /= self.world_size
+        return loss, global_norm

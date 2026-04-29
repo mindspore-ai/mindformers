@@ -18,11 +18,14 @@ from mindspore import Tensor
 from mindformers.models.deepseek3.utils import DeepseekV3PreTrainedModel
 from mindformers.pynative.base_models.gpt.gpt_model import GPTModel
 from mindformers.pynative.base_models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
+from mindformers.pynative.base_models.gpt.parallelize import parallelize_gptmodel
+from mindformers.pynative.distributed.parallelize import register_parallelize
 from mindformers.parallel_core.utils.model_mixin import TrainModelMixin
 
 from .configuration_deepseek_v3 import DeepseekV3Config
 
 
+@register_parallelize(parallelize_gptmodel)
 class PyNativeDeepseekV3ForCausalLM(TrainModelMixin, DeepseekV3PreTrainedModel):
     """DeepseekV3 model for training"""
 

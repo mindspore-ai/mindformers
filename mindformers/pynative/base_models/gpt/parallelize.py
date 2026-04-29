@@ -59,6 +59,7 @@ from mindformers.pynative.distributed.style import (
 from mindformers.pynative.distributed.tensor_parallel import NoParallel
 from mindformers.pynative.distributed.expert_parallel import ExpertParallel
 from mindformers.pynative.distributed.parallelize import parallelize_module
+from mindformers.pynative.distributed.activation_checkpoint import apply_ac
 from mindformers.pynative.distributed.utils import distribute_module
 from mindformers.pynative.base_models.gpt.gpt_model import GPTModel
 from mindformers.tools.logger import logger
@@ -528,6 +529,15 @@ def apply_fsdp(
         dp_mesh = parallel_dims.get_mesh("dp_shard")
         logger.info("Using FSDP mesh [fsdp] (1D)")
 
+    edp_mesh = None
+    if parallel_dims.ep_enabled:
+        edp_mesh_names = (
+            ["dp_replicate", "efsdp"]
+            if parallel_dims.dp_replicate_enabled
+            else ["efsdp"]
+        )
+        edp_mesh = parallel_dims.get_mesh(edp_mesh_names)
+
     # --- Resolve dtypes ---
     param_dtype_str = getattr(parallelism, "param_dtype", None)
     reduce_dtype_str = getattr(parallelism, "reduce_dtype", None)
@@ -543,11 +553,16 @@ def apply_fsdp(
         "mesh": dp_mesh,
         "offload_policy": CPUOffloadPolicy() if cpu_offload else OffloadPolicy(),
     }
+    efsdp_config = {
+        "mesh": edp_mesh,
+        "offload_policy": CPUOffloadPolicy() if cpu_offload else OffloadPolicy(),
+    }
 
     if param_dtype_str is not None:
         param_dtype = _DTYPE_MAP.get(param_dtype_str, ms.bfloat16)
         reduce_dtype = _DTYPE_MAP.get(reduce_dtype_str, ms.float32) if reduce_dtype_str is not None else ms.float32
         fsdp_config["mp_policy"] = MixedPrecisionPolicy(param_dtype=param_dtype, reduce_dtype=reduce_dtype)
+        efsdp_config["mp_policy"] = MixedPrecisionPolicy(param_dtype=param_dtype, reduce_dtype=reduce_dtype)
 
     modules = {
         "embedding": getattr(gpt_model, "embedding", None),
@@ -572,6 +587,8 @@ def apply_fsdp(
 
     # --- 2. Wrap transformer layers ---
     for layer in layers:
+        if hasattr(layer.mlp, "experts") and edp_mesh is not None:
+            fully_shard(layer.mlp.experts, **efsdp_config, reshard_after_forward=reshard_after_forward)
         fully_shard(layer, **fsdp_config, reshard_after_forward=reshard_after_forward)
 
     # --- 3. Wrap final_layernorm and output_layer together ---
@@ -581,6 +598,33 @@ def apply_fsdp(
         fully_shard(tail_modules, **fsdp_config, reshard_after_forward=reshard_policy == "always")
 
     # --- 4. Wrap root ---
+    if hasattr(gpt_model.loss, "log_softmax") and hasattr(gpt_model.loss, "nll_loss"):
+        # apply parallelism to loss custom backend functions
+        # NOTE: should support loss parallel in future
+        layer_plan = {
+            "log_softmax": PrepareModuleInputOutput(
+                input_layouts=(Replicate(),),
+                desired_input_layouts=(Replicate(),),
+                output_layouts=(Replicate(),),
+                desired_output_layouts=(Replicate(),),
+                use_local_input=True,
+                use_local_output=False,
+            ),
+            "nll_loss": PrepareModuleInputOutput(
+                input_layouts=(Replicate(), None),
+                desired_input_layouts=(Replicate(), None),
+                output_layouts=(Replicate(),),
+                desired_output_layouts=(Replicate(),),
+                use_local_input=True,
+                use_local_output=False,
+            ),
+        }
+        parallelize_module(
+            module=gpt_model.loss,
+            device_mesh=dp_mesh,
+            parallelize_plan=layer_plan,
+        )
+        
     fully_shard(model, **fsdp_config)
 
     # --- 5. Disable gradient division ---
@@ -603,40 +647,47 @@ def apply_fsdp(
 def parallelize_gptmodel(
     model: nn.Cell,
     parallel_dims: Any,
-    training: Any,
     parallelism: Any,
+    recompute: Any,
+    recompute_comm: Any,
+    swap: Any,
 ) -> nn.Cell:
     """Unified GPTModel parallelization entry point."""
     logger.info("Starting GPTModel parallelization for MCore architecture...")
 
-    # Phase 1: TP
+    # Phase 1: AC
+    if recompute.mode != "None" or recompute_comm.enable or swap.enable:
+        apply_ac(
+            _unwrap_gptmodel(model).decoder,
+            recompute,
+            recompute_comm,
+            swap,
+            parallel_dims.pp
+        )
+
+    # Phase 2: TP
+    tp_mesh = None
     if parallel_dims.tp_enabled:
+        tp_mesh = parallel_dims.get_mesh("tp")
         apply_non_moe_tp(
             model,
-            tp_mesh=parallel_dims.get_mesh('tp'),
+            tp_mesh=tp_mesh,
             enable_ep=parallel_dims.ep_enabled,
         )
 
-    # Phase 2: EP
+    # Phase 3: EP
     if parallel_dims.ep_enabled:
         apply_moe_ep_tp(
             model,
-            tp_mesh=parallel_dims.get_mesh("tp"),
+            tp_mesh=tp_mesh,
             ep_mesh=parallel_dims.get_mesh("ep"),
         )
 
-    # Phase 3: CP
+    # Phase 4: CP
     if parallel_dims.cp_enabled:
         raise NotImplementedError(
             "Context Parallelism (CP) is not yet implemented for GPTModel. "
             "Please set context_parallel=1 in your config."
-        )
-
-    # Phase 4: AC
-    if getattr(training, "activation_checkpointing", False):
-        raise NotImplementedError(
-            "Activation Checkpointing (AC) is not yet implemented for GPTModel. "
-            "Please set activation_checkpointing=false in your config."
         )
 
     # Phase 5: FSDP/HSDP

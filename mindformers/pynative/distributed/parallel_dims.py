@@ -96,10 +96,73 @@ class ParallelDims:
         """
         Build a DeviceMesh based on whether expert parallelism (ep) is enabled.
         """
-        if self.ep > 1:
-            mesh = self._build_mesh_with_ep()
+        if self.ep == 1 and self.etp == 1:
+            dims = [self.pp, self.dp_replicate, self.dp_shard, self.cp, self.tp]
+            names = ["pp", "dp_replicate", "dp_shard", "cp", "tp"]
+            mesh = init_device_mesh(
+                device_type="npu",
+                mesh_shape=tuple(dims),
+                mesh_dim_names=tuple(names)
+            )
+
+            mesh[("dp_replicate", "dp_shard")].flatten(mesh_dim_name="batch")
+            mesh[("dp_replicate", "dp_shard", "cp")].flatten(mesh_dim_name="loss_mesh")
+            mesh[("dp_shard", "cp")].flatten(mesh_dim_name="fsdp")
+
+        elif self.ep <= self.tp:
+            tp_mod_ep = self.tp // self.ep
+            dims = [self.pp, self.dp_replicate, self.dp_shard, self.cp, tp_mod_ep, self.ep]
+            names = ["pp", "dp_replicate", "dp_shard", "cp", "tp_mod_ep", "ep"]
+
+            mesh = init_device_mesh(
+                device_type="npu",
+                mesh_shape=tuple(dims),
+                mesh_dim_names=tuple(names)
+            )
+
+            mesh[("dp_replicate", "dp_shard")].flatten(mesh_dim_name="batch")
+            mesh[("dp_replicate", "dp_shard", "cp")].flatten(mesh_dim_name="loss_mesh")
+            mesh[("dp_shard", "cp")].flatten(mesh_dim_name="fsdp")
+            mesh[("dp_shard", "cp", "tp_mod_ep")].flatten(mesh_dim_name="efsdp")
+            mesh[("tp_mod_ep", "ep")].flatten(mesh_dim_name="tp")
+        
+        elif self.tp < self.ep <= (self.cp * self.tp):
+            cp_tp_mod_ep = (self.cp * self.tp) // self.ep
+            ep_mod_tp = self.ep // self.tp
+            dims = [self.pp, self.dp_replicate, self.dp_shard, cp_tp_mod_ep, ep_mod_tp, self.tp]
+            names = ["pp", "dp_replicate", "dp_shard", "cp_tp_mod_ep", "ep_mod_tp", "tp"]
+
+            mesh = init_device_mesh(
+                device_type="npu",
+                mesh_shape=tuple(dims),
+                mesh_dim_names=tuple(names)
+            )
+
+            mesh[("dp_replicate", "dp_shard")].flatten(mesh_dim_name="batch")
+            mesh[("dp_replicate", "dp_shard", "cp_tp_mod_ep", "ep_mod_tp")].flatten(mesh_dim_name="loss_mesh")
+            mesh[("dp_shard", "cp_tp_mod_ep", "ep_mod_tp")].flatten(mesh_dim_name="fsdp")
+            mesh[("dp_shard", "cp_tp_mod_ep")].flatten(mesh_dim_name="efsdp")
+            mesh[("cp_tp_mod_ep", "ep_mod_tp")].flatten(mesh_dim_name="cp")
+            mesh[("ep_mod_tp", "tp")].flatten(mesh_dim_name="ep")
+        
         else:
-            mesh = self._build_mesh_without_ep()
+            efsdp = (self.dp_shard  * self.cp * self.tp) // self.ep
+            ep_mod_cp_tp = self.ep // (self.cp * self.tp)
+            dims = [self.pp, self.dp_replicate, efsdp, ep_mod_cp_tp, self.cp, self.tp]
+            names = ["pp", "dp_replicate", "efsdp", "ep_mod_cp_tp", "cp", "tp"]
+
+            mesh = init_device_mesh(
+                device_type="npu",
+                mesh_shape=tuple(dims),
+                mesh_dim_names=tuple(names)
+            )
+
+            mesh[("dp_replicate", "efsdp", "ep_mod_cp_tp")].flatten(mesh_dim_name="batch")
+            mesh[("dp_replicate", "efsdp", "ep_mod_cp_tp", "cp")].flatten(mesh_dim_name="loss_mesh")
+            mesh[("efsdp", "ep_mod_cp_tp", "cp")].flatten(mesh_dim_name="fsdp")
+            mesh[("efsdp", "ep_mod_cp_tp")].flatten(mesh_dim_name="dp_shard")
+            mesh[("ep_mod_cp_tp", "cp", "tp")].flatten(mesh_dim_name="ep")
+
         self._world_mesh = mesh
         self._validate_meshes()
         return mesh
@@ -111,15 +174,13 @@ class ParallelDims:
         previously require complex pre-validation logic (e.g., EP divisibility).
         """
         expected_sizes = {
+            "pp": self.pp,
+            "batch": self.dp_replicate * self.dp_shard,
             "dp_replicate": self.dp_replicate,
-            "dp": self.dp_replicate * self.dp_shard,
             "fsdp": self.dp_shard * self.cp,
-            "dp_cp": self.dp_replicate * self.dp_shard * self.cp,
             "cp": self.cp,
             "tp": self.tp,
         }
-        if self.ep > 1:
-            expected_sizes["ep"] = self.ep
 
         for mesh_name, expected_size in expected_sizes.items():
             try:
@@ -136,128 +197,6 @@ class ParallelDims:
                     f"This indicates a bug in _build_mesh_with_ep() or _build_mesh_without_ep(). "
                     f"Check that all expected flatten() calls use correct dimension names."
                 ) from None
-
-    def _build_mesh_with_ep(self) -> DeviceMesh:
-        """
-        Construct a DeviceMesh when expert parallelism (ep > 1) is enabled.
-
-        The mesh is constructed differently depending on the relative size of ep compared to tp and cp*tp:
-        1. If ep <= tp: split tp into two sub-dimensions — one for non-expert computation and one for ep.
-        2. If tp < ep <= cp * tp: split cp dimension to accommodate ep, while keeping tp intact.
-        3. If ep > cp * tp: split dp dimension to accommodate ep.
-
-        After constructing the base mesh, it flattens logical dimensions to expose commonly used submeshes:
-        - "dp", "cp", "tp": individual parallelism axes
-        - "dp_cp": combined data and context parallelism group (used for loss reduction)
-        - "ep": expert parallelism group
-        """
-        # Dimension names to be flattened into logical sub-meshes.
-        cp_mesh_dim_names: List[str] = []
-        tp_mesh_dim_names: List[str] = []
-        dp_cp_mesh_dim_names: List[str] = []
-        ep_mesh_dim_names: List[str] = []
-
-        if self.ep <= self.tp:
-            tp_shard_mod_ep = self.tp // self.ep
-            tp_shard_in_ep = self.ep
-            dims = [self.pp, self.dp_replicate, self.dp_shard, self.cp, tp_shard_mod_ep, tp_shard_in_ep]
-            names = ["pp", "dp_replicate", "dp_shard", "cp", "tp_shard_mod_ep", "tp_shard_in_ep"]
-
-            mesh = init_device_mesh(
-                device_type="npu",
-                mesh_shape=tuple(dims),
-                mesh_dim_names=tuple(names)
-            )
-
-            tp_mesh_dim_names.append("tp_shard_mod_ep")
-            tp_mesh_dim_names.append("tp_shard_in_ep")
-            dp_cp_mesh_dim_names.append("dp_replicate")
-            dp_cp_mesh_dim_names.append("dp_shard")
-            dp_cp_mesh_dim_names.append("cp")
-            ep_mesh_dim_names.append("tp_shard_in_ep")
-
-            mesh[("dp_replicate", "dp_shard")].flatten(mesh_dim_name="dp")
-            mesh[("dp_shard", "cp")].flatten(mesh_dim_name="fsdp")
-            mesh[tuple(tp_mesh_dim_names)].flatten(mesh_dim_name="tp")
-            mesh[tuple(dp_cp_mesh_dim_names)].flatten(mesh_dim_name="dp_cp")
-            mesh[tuple(ep_mesh_dim_names)].flatten(mesh_dim_name="ep")
-
-        elif self.tp < self.ep <= (self.cp * self.tp):
-            cp_shard_mod_ep = (self.cp * self.tp) // self.ep
-            cp_shard_in_ep = self.ep // self.tp
-            dims = [self.pp, self.dp_replicate, self.dp_shard, cp_shard_mod_ep, cp_shard_in_ep, self.tp]
-            names = ["pp", "dp_replicate", "dp_shard", "cp_shard_mod_ep", "cp_shard_in_ep", "tp"]
-
-            mesh = init_device_mesh(
-                device_type="npu",
-                mesh_shape=tuple(dims),
-                mesh_dim_names=tuple(names)
-            )
-
-            cp_mesh_dim_names.append("cp_shard_mod_ep")
-            cp_mesh_dim_names.append("cp_shard_in_ep")
-            dp_cp_mesh_dim_names.append("dp_replicate")
-            dp_cp_mesh_dim_names.append("dp_shard")
-            dp_cp_mesh_dim_names.append("cp_shard_mod_ep")
-            dp_cp_mesh_dim_names.append("cp_shard_in_ep")
-            ep_mesh_dim_names.append("cp_shard_in_ep")
-            ep_mesh_dim_names.append("tp")
-
-            mesh[("dp_replicate", "dp_shard")].flatten(mesh_dim_name="dp")
-            mesh[("dp_shard", "cp_shard_mod_ep", "cp_shard_in_ep")].flatten(mesh_dim_name="fsdp")
-            mesh[tuple(cp_mesh_dim_names)].flatten(mesh_dim_name="cp")
-            mesh[tuple(dp_cp_mesh_dim_names)].flatten(mesh_dim_name="dp_cp")
-            mesh[tuple(ep_mesh_dim_names)].flatten(mesh_dim_name="ep")
-
-        else:
-            dp_shard_mod_ep = (self.dp_replicate * self.dp_shard * self.cp * self.tp) // self.ep
-            dp_shard_in_ep = self.ep // (self.cp * self.tp)
-            dims = [self.pp, self.dp_replicate, dp_shard_mod_ep, dp_shard_in_ep, self.cp, self.tp]
-            names = ["pp", "dp_replicate", "dp_shard_mod_ep", "dp_shard_in_ep", "cp", "tp"]
-
-            mesh = init_device_mesh(
-                device_type="npu",
-                mesh_shape=tuple(dims),
-                mesh_dim_names=tuple(names)
-            )
-
-            dp_cp_mesh_dim_names.append("dp_replicate")
-            dp_cp_mesh_dim_names.append("dp_shard_mod_ep")
-            dp_cp_mesh_dim_names.append("dp_shard_in_ep")
-            dp_cp_mesh_dim_names.append("cp")
-            ep_mesh_dim_names.append("dp_shard_in_ep")
-            ep_mesh_dim_names.append("cp")
-            ep_mesh_dim_names.append("tp")
-
-            mesh[("dp_replicate", "dp_shard_mod_ep", "dp_shard_in_ep")].flatten(mesh_dim_name="dp")
-            mesh[("dp_shard_mod_ep", "dp_shard_in_ep", "cp")].flatten(mesh_dim_name="fsdp")
-            mesh[tuple(dp_cp_mesh_dim_names)].flatten(mesh_dim_name="dp_cp")
-            mesh[tuple(ep_mesh_dim_names)].flatten(mesh_dim_name="ep")
-
-        return mesh
-
-    def _build_mesh_without_ep(self) -> DeviceMesh:
-        """
-        Construct a DeviceMesh when expert parallelism is disabled (ep = 1).
-
-        Builds a mesh with dimensions: [pp, dp_replicate, dp_shard, cp, tp, ep].
-        Flattens dp_replicate + dp_shard -> dp and dp + cp -> dp_cp.
-        """
-        dims = [self.pp, self.dp_replicate, self.dp_shard, self.cp, self.tp, self.ep]
-        names = ["pp", "dp_replicate", "dp_shard", "cp", "tp", "ep"]
-
-        mesh = init_device_mesh(
-            device_type="npu",
-            mesh_shape=tuple(dims),
-            mesh_dim_names=tuple(names)
-        )
-
-        mesh[("dp_replicate", "dp_shard")].flatten(mesh_dim_name="dp")
-        mesh[("dp_shard", "cp")].flatten(mesh_dim_name="fsdp")
-        if self.cp > 1:
-            mesh[("dp", "cp")].flatten(mesh_dim_name="dp_cp")
-
-        return mesh
 
     @property
     def world_mesh(self) -> DeviceMesh:
@@ -280,14 +219,6 @@ class ParallelDims:
 
         if isinstance(dims, str):
             dims = [dims]
-
-        for dim in dims:
-            try:
-                sub = self._world_mesh[dim]
-                if sub.size() <= 1:
-                    return None
-            except KeyError:
-                return None
 
         if len(dims) == 1:
             return self._world_mesh[dims[0]]

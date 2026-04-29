@@ -35,9 +35,6 @@ parallelism: # name refers to torchtitan
   # number of layers assigned to each pipeline stage
   # supports uneven or interleaved layer placement
   pipeline_parallel_layers_per_stage: null
-  hsdp_shard_size: 1                 # HSDP sharding group size
-  hsdp_optimizer_level: level1       # optimizer state sharding level for HSDP
-  hsdp_threshold: 64                 # parameter size threshold (in MB) for enabling HSDP sharding
   sequence_parallel: false           # enable sequence parallelism
 
 optimizer: # name refers to torchtitan
