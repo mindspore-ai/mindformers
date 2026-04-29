@@ -15,13 +15,14 @@
 """Test recompute functional scenarios."""
 import pytest
 from mindspore import nn
-from hyper_parallel.platform.mindspore.activation_checkpoint import CheckpointWrapper
+from hyper_parallel.platform.mindspore.activation_checkpoint import CheckpointWrapper, SwapWrapper
 
 from mindformers.pynative.config.config import (
     RecomputeCommConfig,
     RecomputeConfig,
+    SwapConfig,
 )
-from mindformers.pynative.distributed.activation_checkpoint import apply_recompute
+from mindformers.pynative.distributed.activation_checkpoint import apply_recompute, apply_swap
 
 
 class MockAttention(nn.Cell):
@@ -73,7 +74,7 @@ def _make_config(mode="None", full_recompute_layer=None,
     return rc, rc_comm
 
 
-# ======================== Full Recompute ========================
+# ======================== Recompute ========================
 
 @pytest.mark.level0
 @pytest.mark.platform_x86_cpu
@@ -95,8 +96,6 @@ class TestFullRecompute:
         assert isinstance(model.layers[0], CheckpointWrapper)
         assert isinstance(model.layers[1], CheckpointWrapper)
 
-
-# ======================== Select Recompute ========================
 
 @pytest.mark.level0
 @pytest.mark.platform_x86_cpu
@@ -124,3 +123,58 @@ class TestSelectRecompute:
         apply_recompute(model, rc, rc_comm)
         assert isinstance(model.layers[0].attention, CheckpointWrapper)
         assert isinstance(model.layers[1].mlp, CheckpointWrapper)
+
+
+# ======================== Swap ========================
+
+def _make_swap_config(swap=True, default_prefetch=1, layer_swap=None, op_swap=None):
+    """Build a SwapConfig."""
+    return SwapConfig(swap=swap, default_prefetch=default_prefetch,
+                     layer_swap=layer_swap, op_swap=op_swap)
+
+
+@pytest.mark.level0
+@pytest.mark.platform_x86_cpu
+@pytest.mark.env_onecard
+class TestLayerSwap:
+    """Test layer swap: entire layers are wrapped with swap_wrapper."""
+
+    def test_layer_swap_single_layer(self):
+        model = MockModel(num_layers=3)
+        sc = _make_swap_config(layer_swap=[{"layers": ["0"]}])
+        apply_swap(model, sc)
+        assert isinstance(model.layers[0], SwapWrapper)
+        assert not isinstance(model.layers[1], SwapWrapper)
+        assert not isinstance(model.layers[2], SwapWrapper)
+
+    def test_layer_swap_range(self):
+        model = MockModel(num_layers=3)
+        sc = _make_swap_config(layer_swap=[{"layers": ["0-1"]}])
+        apply_swap(model, sc)
+        assert isinstance(model.layers[0], SwapWrapper)     
+        assert isinstance(model.layers[1], SwapWrapper)
+        assert not isinstance(model.layers[2], SwapWrapper)
+
+
+@pytest.mark.level0
+@pytest.mark.platform_x86_cpu
+@pytest.mark.env_onecard
+class TestOpSwap:
+    """Test op swap: specific modules within layers are wrapped."""
+
+    def test_op_swap_by_name(self):
+        model = MockModel(num_layers=3)
+        sc = _make_swap_config(op_swap=[{"op_name": "attention", "layers": ["0"]}])
+        apply_swap(model, sc)
+        assert isinstance(model.layers[0].attention, SwapWrapper)
+        assert not isinstance(model.layers[0].mlp, SwapWrapper)
+
+    def test_op_swap_multiple_modules(self):
+        model = MockModel(num_layers=3)
+        sc = _make_swap_config(op_swap=[
+            {"op_name": "attention", "layers": ["0"]},
+            {"op_name": "mlp", "layers": ["1"]},
+        ])
+        apply_swap(model, sc)
+        assert isinstance(model.layers[0].attention, SwapWrapper)
+        assert isinstance(model.layers[1].mlp, SwapWrapper)
