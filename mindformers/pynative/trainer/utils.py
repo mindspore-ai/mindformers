@@ -14,8 +14,9 @@
 # ============================================================================
 """Pynative Trainer Utils."""
 
+from fnmatch import fnmatch
 from functools import partial
-from typing import List, Tuple, Union
+from typing import List, Optional, Set, Tuple, Union
 import numpy as np
 
 from hyper_parallel.core.dtensor.dtensor import DTensor
@@ -64,9 +65,9 @@ def compute_parameters(model: nn.Cell) -> None:
     )
 
 
-def _get_no_wd_params(model: nn.Cell) -> Tuple[Union[dict, list], dict]:
+def _get_no_wd_params(model: nn.Cell) -> Tuple[Set[str], Set[str]]:
     """
-    Get parameters or parameter name keywords that should NOT apply weight decay.
+    Get parameter names and name keywords that should NOT apply weight decay.
 
     This function queries optional model interfaces:
         - model.no_weight_decay()
@@ -76,57 +77,120 @@ def _get_no_wd_params(model: nn.Cell) -> Tuple[Union[dict, list], dict]:
         model: MindSpore model instance.
 
     Returns:
-        Tuple[Union[dict, list], dict]:
-        - no_wd_params: Explicit parameter names without weight decay, can be a dict or a list.
+        Tuple[Set[str], Set[str]]:
+        - no_wd_params: Explicit parameter names without weight decay.
         - no_wd_keywords: Keywords used to match parameter names.
     """
-    no_wd_params = {}
-    no_wd_keywords = {}
+    no_wd_params: Set[str] = set()
+    no_wd_keywords: Set[str] = set()
 
     if hasattr(model, "no_weight_decay"):
-        no_wd_params = model.no_weight_decay()
+        no_wd_params = set(model.no_weight_decay())
         logger.info(f"Get no weight decay params: {no_wd_params}")
 
     if hasattr(model, "no_weight_decay_keywords"):
-        no_wd_keywords = model.no_weight_decay_keywords()
+        no_wd_keywords = set(model.no_weight_decay_keywords())
         logger.info(f"Get no weight decay keywords: {no_wd_keywords}")
 
     return no_wd_params, no_wd_keywords
 
 
-def get_param_groups(model: nn.Cell, weight_decay: float = 0.0) -> List[dict]:
+def _normalize_weight_decay_rules(rules, field_name: str) -> List[str]:
+    """Normalize custom weight-decay rules to a list of strings."""
+    if rules is None:
+        return []
+    if not isinstance(rules, (list, tuple)):
+        raise TypeError(
+            f"{field_name} should be a list of strings, but got {type(rules)}."
+        )
+    for rule in rules:
+        if not isinstance(rule, str):
+            raise TypeError(
+                f"All items in {field_name} should be strings, but got {type(rule)}."
+            )
+    return list(rules)
+
+
+def _match_weight_decay_rule(param_name: str, rules: List[str]) -> Optional[str]:
+    """
+    Match a parameter name against custom rules.
+
+    Rules support exact names, substring matches, and shell-style wildcards.
+    """
+    for rule in rules:
+        if rule == param_name or rule in param_name or fnmatch(param_name, rule):
+            return rule
+    return None
+
+
+def get_param_groups(
+    model: nn.Cell,
+    weight_decay: float = 0.0,
+    weight_decay_include: Optional[List[str]] = None,
+    weight_decay_exclude: Optional[List[str]] = None,
+) -> List[dict]:
     """
     Create optimizer parameter groups.
 
     Weight decay will be disabled for:
+        - Parameters matched by weight_decay_exclude
         - 1D parameters (e.g., LayerNorm / bias)
         - Bias parameters
         - Parameters explicitly specified by model
         - Parameters matched by no-weight-decay keywords
 
+    Parameters matched by weight_decay_include always use weight decay, even if
+    they match the default no-weight-decay rules. The priority is:
+    weight_decay_include > weight_decay_exclude > default no-weight-decay rules.
+
     Args:
         model: MindSpore model instance.
         weight_decay (float): Base weight decay value.
+        weight_decay_include (Optional[List[str]]): Parameter name rules that
+            force weight decay on. Rules support exact names, substring matches,
+            and shell-style wildcards.
+        weight_decay_exclude (Optional[List[str]]): Parameter name rules that
+            force weight decay off. Rules support exact names, substring matches,
+            and shell-style wildcards.
 
     Returns:
         List[dict]: Parameter groups compatible with MindSpore optimizers.
     """
     # Get no weight decay params and keywords from model interface
     no_wd_params, no_wd_keywords = _get_no_wd_params(model)
+    weight_decay_include = _normalize_weight_decay_rules(
+        weight_decay_include, "weight_decay_include"
+    )
+    weight_decay_exclude = _normalize_weight_decay_rules(
+        weight_decay_exclude, "weight_decay_exclude"
+    )
+    if weight_decay_include:
+        logger.info(f"Get weight decay include rules: {weight_decay_include}")
+    if weight_decay_exclude:
+        logger.info(f"Get weight decay exclude rules: {weight_decay_exclude}")
 
-    def _is_keywords_in_name(p_name):
-        """Check whether parameter name matches any no-wd keyword."""
-        for keyword in no_wd_keywords:
-            if keyword in p_name:
-                return True
-        return False
+    def _matches_keyword(p_name):
+        return any(keyword in p_name for keyword in no_wd_keywords)
 
-    def _init_param_group(wd_value, wd_factor, lr=None):
-        """Initialize a parameter group."""
-        init_group = {"weight_decay": wd_value * wd_factor, "params": []}
-        if lr is not None:
-            init_group["lr"] = lr
-        return init_group
+    def _classify(param, p_name):
+        """Return (no_wd, reason) for a parameter."""
+        rule = _match_weight_decay_rule(p_name, weight_decay_include)
+        if rule is not None:
+            return False, f"custom_include:{rule}"
+        rule = _match_weight_decay_rule(p_name, weight_decay_exclude)
+        if rule is not None:
+            return True, f"custom_exclude:{rule}"
+
+        default_no_wd_rules = (
+            ("1d_param", len(param.shape) == 1),
+            ("bias", p_name.endswith(".bias")),
+            ("model_no_weight_decay", p_name in no_wd_params),
+            ("model_no_weight_decay_keywords", _matches_keyword(p_name)),
+        )
+        for reason, hit in default_no_wd_rules:
+            if hit:
+                return True, reason
+        return False, "default"
 
     # Iterate over trainable parameters and assign them to groups
     logger.info("Assigning parameters to groups...")
@@ -134,29 +198,17 @@ def get_param_groups(model: nn.Cell, weight_decay: float = 0.0) -> List[dict]:
 
     for param in model.trainable_params():
         param_name = param.name
+        no_wd, wd_reason = _classify(param, param_name)
+        wd_value = 0.0 if no_wd else weight_decay
+        group_name = "no_weight_decay" if no_wd else "weight_decay"
 
-        no_wd = (
-            len(param.shape) == 1
-            or param_name.endswith(".bias")
-            or param_name in no_wd_params
-            or _is_keywords_in_name(param_name)
-        )
-        if no_wd:
-            wd_mul = 0.0
-            group_name = "no_weight_decay"
-        else:
-            wd_mul = 1.0
-            group_name = "weight_decay"
-
-        # Initialize group if not exists
         if group_name not in parameter_groups:
-            parameter_groups[group_name] = _init_param_group(weight_decay, wd_mul)
-
-        # Append parameter to its group
+            parameter_groups[group_name] = {"weight_decay": wd_value, "params": []}
         parameter_groups[group_name]["params"].append(param)
+
         logger.info(
             f"param_name: {param_name:<60} | weight_decay: "
-            f"{parameter_groups[group_name]['weight_decay']:>8.4f}"
+            f"{wd_value:>8.4f} | reason: {wd_reason}"
         )
     return list(parameter_groups.values())
 
@@ -331,13 +383,14 @@ def _build_optimizer(
     Returns:
         Optimizer instance.
     """
-    grouped_params = get_param_groups(
-        model=model,
-        weight_decay=config.weight_decay,
-    )
-
     config = config.to_dict()
     optim_type = config.pop("type", None)
+    grouped_params = get_param_groups(
+        model=model,
+        weight_decay=config["weight_decay"],
+        weight_decay_include=config.pop("weight_decay_include", None),
+        weight_decay_exclude=config.pop("weight_decay_exclude", None),
+    )
 
     if optim_type == "AdamW":
         optimizer = AdamW(
