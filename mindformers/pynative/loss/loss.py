@@ -13,87 +13,101 @@
 # limitations under the License.
 # ============================================================================
 """loss function"""
+
 from mindspore import nn, mint, ops
 from mindspore.common import dtype as mstype
+from mindspore.common._grad_function import _Function
 from mindspore import log as logger
 
 from mindformers.tools.logger import _LogActionOnce
 
 
-class _LogSoftmax(nn.Cell):
+class _LogSoftmax(_Function):
     """
-    Calculate the log softmax results with given logits. The bprop of the cell is rewritten,
-    just returns the accepted dout as returns. This cell should be used together with _NLLLoss,
-    to optimize the bprop of the cross entropy loss.
-
-    Inputs:
-        - **logits** (Tensor) - Tensor of shape (N, C). Data type must be float16 or float32. The output logits of
-          the backbone.
-
-    Returns:
-        The corresponding log softmax results.
+    Custom LogSoftmax function with manual backward implementation.
+    Computes log(softmax(logits)) in a numerically stable way.
     """
-    def __init__(self):
-        super().__init__()
-        self.sub = mint.sub
-        self.max = mint.max
-        self.sum = mint.sum
-        self.exp = mint.exp
-        self.log = mint.log
-        self.cast = ops.cast
 
-    def construct(self, logits):
-        """Forward process"""
-        logits = self.cast(logits, mstype.float32)
-        logit_max, _ = self.max(logits, 1, True)
-        logit_sub = self.sub(logits, logit_max)
-        logit_exp = self.exp(logit_sub)
-        exp_sum = self.sum(logit_exp, -1, True)
-        log_exp_sum = self.log(exp_sum)
-        logit_neg_logsoftmax = self.sub(log_exp_sum, logit_sub)
-        return logit_neg_logsoftmax
+    @staticmethod
+    def forward(ctx, logits):
+        """
+        Forward pass for LogSoftmax.
+        """
+        ctx.logits = logits
+        logits = ops.cast(logits, mstype.float32)
+        max_val, _ = mint.max(logits, 1, True)
+        shifted = mint.sub(logits, max_val)
+        exp_vals = mint.exp(shifted)
+        sum_exp = mint.sum(exp_vals, -1, True)
+        log_sum = mint.log(sum_exp)
+        log_softmax = mint.sub(log_sum, shifted)
+        return log_softmax
 
-    def bprop(self, logits, _, dout):
-        """just return the loss of the dout. Note this should be used together with _NLLLoss"""
-        return self.cast(dout, logits.dtype)
+    @staticmethod
+    def backward(ctx, grads):
+        """
+        Backward pass for LogSoftmax.
+        """
+        logits = ctx.logits
+        return ops.cast(grads, logits.dtype)
 
 
-class _NLLLoss(nn.Cell):
+class _NLLLoss(_Function):
     """
-    Calculate the NLLLoss results with given log softmax results and the label. The bprop of the cell is rewritten.
-    This cell should be used together with _LogSoftmax, to optimize the bprop of the cross entropy loss.
-
-    Inputs:
-        - **logit_neg_logsoftmax** (Tensor) - Tensor of shape (N, C). Data type is float32.
-        - **label** (Tensor) - Tensor of shape (N, C). The ground truth label.
-
-    Returns:
-        The corresponding loss results.
+    Custom Negative Log Likelihood Loss function with manual backward implementation.
+    Computes the negative log likelihood loss for classification tasks.
     """
-    def __init__(self):
-        super().__init__()
-        self.gather = mint.gather
-        self.unsqueeze = mint.unsqueeze
-        self.exp = mint.exp
-        self.neg = mint.neg
-        self.zeros_like = mint.zeros_like
-        self.reshape = mint.reshape
-        self.scatter_add = mint.scatter_add
 
-    def construct(self, logit_neg_logsoftmax, label):
-        """Forward process"""
-        vocab_indices = self.reshape(label, (-1, 1))
-        loss = self.reshape(self.gather(logit_neg_logsoftmax, 1, vocab_indices), (-1,))
+    @staticmethod
+    def forward(ctx, log_softmax, labels):
+        """
+        Forward pass for NLLLoss.
+        """
+        ctx.log_softmax = log_softmax
+        ctx.labels = labels
+        indices = mint.reshape(labels, (-1, 1))
+        loss = mint.reshape(mint.gather(log_softmax, 1, indices), (-1,))
         return loss
 
-    def bprop(self, logit_neg_logsoftmax, label, _, dout):
-        """A simplified function. Note this should be used together with _LogSoftmax"""
-        vocab_indices = self.reshape(label, (-1, 1))
-        logits_softmax = self.exp(self.neg(logit_neg_logsoftmax))
-        neg_ones = self.zeros_like(vocab_indices, dtype=logits_softmax.dtype) - 1
-        grad = self.scatter_add(logits_softmax, 1, vocab_indices, neg_ones)
-        grad = grad * self.unsqueeze(dout, -1)
-        return grad, self.zeros_like(label)
+    @staticmethod
+    def backward(ctx, grads):
+        """
+        Backward pass for NLLLoss.
+        """
+        log_softmax = ctx.log_softmax
+        labels = ctx.labels
+        indices = mint.reshape(labels, (-1, 1))
+        probs = mint.exp(mint.neg(log_softmax))
+        vals = mint.zeros_like(indices, dtype=probs.dtype) - 1
+        grad = mint.scatter_add(probs, 1, indices, vals)
+        grad = grad * mint.unsqueeze(grads, -1)
+        return grad, mint.zeros_like(labels)
+
+
+class _LogSoftmaxModule(nn.Cell):
+    """
+    Module wrapper for the custom LogSoftmax function.
+    """
+
+    @staticmethod
+    def construct(logits):
+        """
+        Forward pass for LogSoftmax.
+        """
+        return _LogSoftmax.apply(logits)
+
+
+class _NLLLossModule(nn.Cell):
+    """
+    Module wrapper for the custom NLLLoss function.
+    """
+
+    @staticmethod
+    def construct(log_softmax, label):
+        """
+        Forward pass for _NLLLoss.
+        """
+        return _NLLLoss.apply(log_softmax, label)
 
 
 class CrossEntropyLoss(nn.Cell):
@@ -190,14 +204,15 @@ class CrossEntropyLoss(nn.Cell):
         self.cast = ops.cast
         self.tuple_to_array = ops.tuple_to_array
 
-        self._log_softmax = _LogSoftmax()
-        self._nllloss = _NLLLoss()
+        self.log_softmax = _LogSoftmaxModule()
+        self.nll_loss = _NLLLossModule()
+
         self.calculate_per_token_loss = calculate_per_token_loss
 
     def construct(self, logits, label, input_mask):
         """Forward process"""
-        log_softmax = self._log_softmax(logits)
-        loss_reduce = self._nllloss(log_softmax, label)
+        log_softmax = self.log_softmax(logits)
+        loss_reduce = self.nll_loss(log_softmax, label)
 
         # Using input_mask to mask the loss
         input_mask = self.reshape(input_mask, (-1,))

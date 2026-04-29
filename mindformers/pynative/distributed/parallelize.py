@@ -66,7 +66,7 @@ def parallelize_module(
         # pylint: disable=W0212
         return parallelize_plan._apply(module, device_mesh)
     if isinstance(parallelize_plan, dict):
-        module_map = dict(module.name_cells().items())
+        module_map = dict(module.cells_and_names())
         for module_path, parallelize_style in parallelize_plan.items():
             if not module_path:
                 raise ValueError(
@@ -134,8 +134,10 @@ def register_parallelize(fn: Callable) -> Callable:
 def parallelize_model(
     model: nn.Cell,
     parallel_dims: Any,
-    training_config: Any,
-    parallelism_config: Any,
+    parallelism: Any,
+    recompute: Any,
+    recompute_comm: Any,
+    swap: Any,
 ) -> nn.Cell:
     """Route to the correct model-specific parallelization function.
 
@@ -152,7 +154,7 @@ def parallelize_model(
     if model_cls in _PARALLELIZE_FN:
         logger.info("Parallelizing %s", model_cls.__name__)
         return _PARALLELIZE_FN[model_cls](
-            model, parallel_dims, training_config, parallelism_config
+            model, parallel_dims, parallelism, recompute, recompute_comm, swap
         )
     registered = [c.__name__ for c in _PARALLELIZE_FN]
     raise ValueError(

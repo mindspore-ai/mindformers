@@ -18,7 +18,10 @@ from functools import partial
 from typing import List, Tuple, Union
 import numpy as np
 
-from mindspore import nn
+from hyper_parallel.core.dtensor.dtensor import DTensor
+
+from mindspore import nn, Tensor, mint
+from mindspore.common import dtype as mstype
 import mindspore.dataset as ms_dataset
 from mindspore.nn.learning_rate_schedule import LearningRateSchedule
 from mindspore.mint.distributed import (
@@ -28,12 +31,12 @@ from mindspore.mint.distributed import (
 
 from mindformers.tools.logger import logger
 from mindformers.tools.register.register import MindFormerModuleType, MindFormerRegister
-from mindformers.core.optim.adamw import AdamW
 from mindformers.dataset.dataloader.blended_megatron_dataloader import (
     BlendedMegatronDatasetDataLoader,
 )
 from mindformers.dataset.dataloader.hf_dataloader import HFDataLoader
 from mindformers.dataset.dataloader.utils import _get_mindrecord_files
+from mindformers.pynative.optimizer.adamw import AdamW
 
 
 def compute_parameters(model: nn.Cell) -> None:
@@ -228,6 +231,9 @@ def _build_dataset(
         """
         Compute dataset shard number and shard id for data parallel training.
         """
+        if dataset_parallel == 1:
+            return None, None
+
         world_size = get_world_size()
         if world_size % dataset_parallel != 0:
             raise ValueError(
@@ -237,7 +243,7 @@ def _build_dataset(
 
         dp_world_size = world_size // dataset_parallel
         dp_rank = get_rank() // dp_world_size
-        return dp_world_size, dp_rank
+        return dataset_parallel, dp_rank
 
     def _actual_seq_len_batch_map(*cols, micro_batch_size):
         """
@@ -379,3 +385,56 @@ def _build_callback(config):
         config.to_dict(),
         MindFormerModuleType.CALLBACK,
     )
+
+
+def _calculate_global_grad_norm(parameters):
+    """Calculate the global gradient norm across all parameters and clip gradients in-place.
+
+    Computes the global L2 norm of gradients, synchronizes it across distributed
+    processes, and clips gradients in-place if the norm exceeds max_norm.
+
+    Args:
+        parameters: Iterable of parameters whose gradients will be clipped.
+        max_norm: Maximum allowed gradient norm. Default: 1.0.
+        eps: Epsilon for numerical stability in the clipping coefficient
+            computation. Default: 1e-6.
+
+    Returns:
+        Tuple of (global_norm, grads) where global_norm is the computed global
+        gradient norm and grads is a tuple of gradient tensors.
+    """
+    global_norm = Tensor(0.0)
+    grads = ()
+    for param in parameters:
+        if param.grad is not None:
+            grad = param.grad
+            grads += (grad,)
+            # For DTensor, use the local shard to compute the norm contribution
+            # will replace full_tensor() with redistribute
+            if isinstance(grad, DTensor):
+                grad = grad.full_tensor()
+            global_norm += grad.pow(2).sum()
+    global_norm = mint.sqrt(global_norm)
+    return global_norm, grads
+
+
+def _get_loss_sense(loss, data_parallel: int):
+    """
+    Calculate the loss scaling factor for distributed training.
+
+    Args:
+        loss: The loss tensor, either a regular Tensor or a DTensor.
+        data_parallel: The number of data parallel workers.
+
+    Returns:
+        A scalar Tensor containing the loss scaling factor.
+            - Returns [1.0] if loss is not a DTensor (non-distributed case).
+            - Returns [1.0 / (data_parallel * repeat_num)] if loss is a DTensor.
+    """
+    if not isinstance(loss, DTensor):
+        return Tensor([1.0,], dtype=mstype.float32)
+
+    repeat_num = loss.layout.repeat_num()
+    sense = 1. / (data_parallel * repeat_num)
+    logger.debug(f"Got loss sense({sense}) = data_parallel({data_parallel}) * repeat_num({repeat_num})")
+    return Tensor([sense,], dtype=mstype.float32)

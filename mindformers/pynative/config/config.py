@@ -345,9 +345,11 @@ class ParallelismConfig(BaseConfig):
     Supports FSDP/HSDP, TP, CP, PP and other parallelism strategies.
     """
 
-    # ========== Data Parallelism & FSDP ==========
-    data_parallel: int = 1
-    """Data parallelism degree"""
+    data_parallel_shard: int = -1
+    """Data parallel sharding degree"""
+
+    data_parallel_shard_strategy: str = "optim_grads_params"
+    """Data parallel sharding strategy"""
 
     param_dtype: str = "float32"
     """Parameter data type for FSDP (float16/float32/bfloat16)"""
@@ -364,18 +366,15 @@ class ParallelismConfig(BaseConfig):
     disable_gradient_division: bool = True
     """Disable FSDP automatic gradient division (use sum instead of mean)"""
 
-    # ========== Tensor Parallelism ==========
     tensor_parallel: int = 1
     """Tensor parallelism degree"""
 
-    # ========== Context Parallelism ==========
     context_parallel: int = 1
     """Context parallelism degree"""
 
     context_parallel_method: str = "colossal"
     """Implementation method for context parallelism"""
 
-    # ========== Pipeline Parallelism ==========
     pipeline_parallel: int = 1
     """Pipeline parallelism degree"""
 
@@ -391,18 +390,14 @@ class ParallelismConfig(BaseConfig):
     pipeline_parallel_interleave_num: int = 1
     """Number of interleaved model chunks"""
 
-    # ========== Legacy HSDP Config (will be deprecated) ==========
-    hsdp_shard_size: int = 1
-    """HSDP sharding group size"""
-
-    hsdp_optimizer_level: str = "Level1"
-    """Optimizer state sharding level for HSDP"""
-
-    hsdp_threshold: int = 64
-    """Parameter size threshold for enabling HSDP sharding"""
-
     sequence_parallel: bool = False
     """Enable sequence parallelism"""
+
+    expert_parallel: int = 1
+    """Expert parallelism degree"""
+
+    expert_tensor_parallel: int = 1
+    """Expert tensor parallelism degree"""
 
 
 @dataclass
@@ -466,8 +461,6 @@ class TrainDatasetConfig(BaseConfig):
     Train dataset configuration.
     """
 
-    allow_extra = True
-
     dataloader: DataloaderConfig = field(default_factory=DataloaderConfig)
     """Dataloader configuration"""
 
@@ -492,13 +485,7 @@ class ModelConfig(BaseConfig):
 
     allow_extra = True
 
-    type: Optional[str] = None
-    """Model class type for registration (e.g., Qwen3ForCausalLM)"""
-
-    model_config: Optional[Any] = None
-    """Inner model-specific configuration (e.g., Qwen3Config)"""
-
-    model_type: Optional[str] = None
+    model_type: str = None
     """Model type"""
 
     architectures: str = None
@@ -586,8 +573,6 @@ class ContextConfig(BaseConfig):
     MindSpore context configuration.
     """
 
-    allow_extra = True
-
     mode: int = 1
     """Pynative Mode"""
 
@@ -670,7 +655,7 @@ class SwapConfig(BaseConfig):
     Swap configuration for activation offload.
     """
 
-    swap: bool = False
+    enable: bool = False
     """Enable offload of the transformer block or not. Default: False."""
 
     default_prefetch: int = 1
@@ -722,5 +707,5 @@ class TrainConfig(BaseConfig):
     profiler: ProfilerConfig = field(default_factory=ProfilerConfig)
     recompute: RecomputeConfig = field(default_factory=RecomputeConfig)
     recompute_comm: RecomputeCommConfig = field(default_factory=RecomputeCommConfig)
-    swap_config: SwapConfig = field(default_factory=SwapConfig)
+    swap: SwapConfig = field(default_factory=SwapConfig)
     callbacks: List[CallbackConfig] = field(default_factory=list)

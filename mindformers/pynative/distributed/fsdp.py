@@ -79,6 +79,6 @@ def disable_fsdp_gradient_division(model: nn.Cell) -> None:
 
     Call this after fully_shard wrapping is complete if gradient scaling is handled externally.
     """
-    for _, submodule in model.name_cells().items():
+    for _, submodule in model.cells_and_names():
         if isinstance(submodule, HSDPModule):
             submodule.set_reduce_op_type("sum")

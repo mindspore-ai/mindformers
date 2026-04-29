@@ -13,25 +13,29 @@
 # limitations under the License.
 # ============================================================================
 """Pynative transformer helpers (recompute)."""
+
 import inspect
 import re
-from typing import Sequence, Tuple, Set
+from typing import Sequence, Tuple
 
 import regex
 from mindspore import nn
-from hyper_parallel.core.activation_checkpoint import CheckpointPolicy, checkpoint_wrapper, swap_wrapper, SwapManager
+from hyper_parallel.core.activation_checkpoint import(
+    CheckpointPolicy,
+    checkpoint_wrapper,
+    swap_wrapper,
+    SwapManager,
+)
 
 from mindformers.pynative.config.config import (
     RecomputeConfig,
     RecomputeCommConfig,
     SwapConfig,
-    TrainConfig,
 )
-from mindformers.pynative.base_models.gpt.parallelize import _unwrap_gptmodel
 from mindformers.tools.logger import logger
 
 __all__ = [
-    "apply_recompute_and_swap",
+    "apply_ac",
     "apply_recompute",
     "apply_swap",
 ]
@@ -39,12 +43,15 @@ __all__ = [
 _LAYER_ID_SPEC_PATTERN = re.compile(r"^(\d+)(?:-(\d+))?$")
 _config_list = []
 
-def _validate_recompute_config(config: TrainConfig, num_layers: int) -> None:
+def _validate_recompute_config(
+    recompute,
+    recompute_comm,
+    num_layers: int,
+    pipeline_parallel: int = 1
+) -> None:
     """Validate recompute configuration."""
-
-    pipeline_parallel = config.parallelism.pipeline_parallel
-    rc = config.recompute
-    rc_comm = config.recompute_comm
+    rc = recompute
+    rc_comm = recompute_comm
 
     need_recompute = rc.mode != "None"
     need_comm = rc_comm.enable
@@ -224,14 +231,11 @@ def _validate_layer_id_range(label: str, value: object, num_layers: int, prefetc
     return normalized
 
 
-# Swap validators
-def _validate_swap_config(config: TrainConfig, num_layers: int) -> None:
+def _validate_swap_config(swap, num_layers: int, pipeline_parallel: int = 1) -> None:
     """Validate swap configuration."""
+    sc = swap
 
-    pipeline_parallel = config.parallelism.pipeline_parallel
-    sc = config.swap_config
-
-    if sc.swap and pipeline_parallel != 1:
+    if sc.enable and pipeline_parallel != 1:
         logger.error("[Swap Config] swap requires pipeline_parallel=1 "
                      f"(pipeline parallelism is not supported); got pipeline_parallel={pipeline_parallel}")
         raise ValueError(
@@ -242,7 +246,6 @@ def _validate_swap_config(config: TrainConfig, num_layers: int) -> None:
     _validate_swap_layers_no_pp(sc, num_layers)
 
 
-@staticmethod
 def _validate_swap_entry_shared_fields(item: dict, label: str, pp: int) -> None:
     """Validate shared swap entry fields: `layers``."""
     layers = item["layers"]
@@ -549,6 +552,7 @@ def apply_recompute(
     model: nn.Cell,
     recompute_config: RecomputeConfig,
     recompute_comm_config: RecomputeCommConfig,
+    num_layers: int,
 ) -> None:
     """Apply ``checkpoint_wrapper`` using recompute and recompute_comm configs."""
     rc = recompute_config
@@ -563,7 +567,7 @@ def apply_recompute(
     if _config_list:
         config_list = _config_list
     else:
-        config_list = _get_modules_and_ops_list(model, model.config.num_layers)
+        config_list = _get_modules_and_ops_list(model, num_layers)
 
     if need_recompute:
         full_target_ids = _parse_layer_ids(rc.full_recompute_layer)
@@ -575,7 +579,10 @@ def apply_recompute(
         comm_select_module_list = _expand_select_module(config_list, rc_comm.select_module)
         comm_layer_to_modules = _clean_and_parse_comm_config(full_target_ids, layer_to_modules, comm_select_module_list)
 
-    for layer_id in range(model.config.num_layers):
+    if not hasattr(model, "layers"):
+        raise ValueError(f"{type(model)} must have 'layers' attribute.")
+
+    for layer_id in range(num_layers):
         if need_recompute and layer_id in full_target_ids:
             model.layers[layer_id] = checkpoint_wrapper(model.layers[layer_id])
             logger.info(f"Set full recompute at layer {layer_id}")
@@ -679,21 +686,28 @@ def _set_op_swap(layer, layer_id, layer_to_modules):
         logger.info(f"Set select swap at layer {layer_id}: {log_ops_str}")
 
 
-def apply_swap(model: nn.Cell, swap_config: SwapConfig) -> None:
+def apply_swap(
+    model: nn.Cell,
+    swap: SwapConfig,
+    num_layers: int,
+) -> None:
     """Apply ``checkpoint_wrapper`` using ``swap_config``."""
-    sc = swap_config
+    sc = swap
     prefetch = sc.default_prefetch
     full_target_ids = _parse_layer_ids(sc.layer_swap[0].get("layers", [])) if sc.layer_swap else set()
     layer_to_modules = {}
     if _config_list:
         config_list = _config_list
     else:
-        config_list = _get_modules_and_ops_list(model, model.config.num_layers)
+        config_list = _get_modules_and_ops_list(model, num_layers)
     if sc.op_swap:
         op_swap_list = _expand_op_swap(config_list, parse_op_swap(sc.op_swap))
         layer_to_modules = _clean_and_parse_config(full_target_ids, op_swap_list, label="Swap")
 
-    for layer_id in range(model.config.num_layers):
+    if not hasattr(model, "layers"):
+        raise ValueError(f"{type(model)} must have 'layers' attribute.")
+
+    for layer_id in range(num_layers):
         if layer_id in full_target_ids:
             model.layers[layer_id] = swap_wrapper(model.layers[layer_id], policy_fn=_policy_fn_swap)
             SwapManager().set_forward_prefetch_layer(model.layers[layer_id], model.layers[layer_id + prefetch])
@@ -704,17 +718,17 @@ def apply_swap(model: nn.Cell, swap_config: SwapConfig) -> None:
             SwapManager().set_forward_prefetch_layer(model.layers[layer_id], model.layers[layer_id + prefetch])
 
 
-def _check_recompute_swap_overlap(recompute, recompute_comm, swap_config):
+def _check_recompute_swap_overlap(recompute, recompute_comm, swap):
     """Check if recompute and swap configs overlap on the same modules."""
     rc = recompute
     rc_comm = recompute_comm
-    sc = swap_config
+    sc = swap
 
     recompute_layers = set()
     if rc.mode != "None":
         recompute_layers = _parse_layer_ids(rc.full_recompute_layer)
     swap_layers = set()
-    if sc.swap and sc.layer_swap:
+    if sc.enable and sc.layer_swap:
         swap_layers = _parse_layer_ids(sc.layer_swap[0].get("layers", []))
 
     recompute_select = {}
@@ -767,21 +781,35 @@ def _check_recompute_swap_overlap(recompute, recompute_comm, swap_config):
         raise ValueError(f"{error_detail}, which is not allowed")
 
 
-def apply_recompute_and_swap(model: nn.Cell, config: TrainConfig) -> None:
-    """Apply recompute and swap configuration to the model."""
+def apply_ac(
+    model,
+    recompute,
+    recompute_comm,
+    swap,
+    pipeline_parallel: int = 1
+):
+    """Apply activation checkpointing to the model."""
     global _config_list
-    need_recompute = config.recompute.mode != "None" or config.recompute_comm.enable
-    need_swap = config.swap_config.swap
-    if need_recompute or need_swap:
-        gpt_model = _unwrap_gptmodel(model)
-        decoder = gpt_model.decoder
-        _config_list = _get_modules_and_ops_list(decoder, decoder.config.num_layers)
-        if need_recompute and need_swap:
-            _check_recompute_swap_overlap(config.recompute, config.recompute_comm, config.swap_config)
-        if need_recompute:
-            _validate_recompute_config(config, decoder.config.num_layers)
-            apply_recompute(decoder, config.recompute, config.recompute_comm)
-        if need_swap:
-            _validate_swap_config(config, decoder.config.num_layers)
-            apply_swap(decoder, config.swap_config)
-        _config_list = []
+    enable_recompute = (recompute.mode != "None" or recompute_comm.enable)
+    enable_swap = swap.enable
+    if not (enable_recompute or enable_swap):
+        return
+
+    num_layers = None
+    if hasattr(model, "config"):
+        num_layers = model.config.num_layers
+    if not num_layers:
+        raise ValueError(f"{type(model)} must have 'config.num_layers' attribute.")
+
+    _config_list = _get_modules_and_ops_list(model, num_layers)
+
+    if enable_recompute and enable_swap:
+        _check_recompute_swap_overlap(recompute, recompute_comm, swap)
+
+    if enable_recompute:
+        _validate_recompute_config(recompute, recompute_comm, num_layers, pipeline_parallel)
+        apply_recompute(model, recompute, recompute_comm, num_layers)
+
+    if enable_swap:
+        _validate_swap_config(swap, num_layers, pipeline_parallel)
+        apply_swap(model, swap, num_layers)

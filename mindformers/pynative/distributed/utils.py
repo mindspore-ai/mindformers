@@ -20,10 +20,12 @@ import inspect
 from functools import partial
 from typing import Any, Callable, Dict, Optional
 
+from mindspore import nn
+
 from hyper_parallel import DeviceMesh, shard_module
 from hyper_parallel.core.dtensor.placement_types import Replicate
 from hyper_parallel.core.shard.sharding_plan import ShardingPlan
-from mindspore import nn
+
 from mindformers.tools import logger
 
 

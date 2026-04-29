@@ -21,8 +21,9 @@ from mindspore.common import dtype as mstype
 from mindspore.communication import get_rank
 from mindspore.communication.management import create_group
 
-from hyper_parallel.core.dtensor.placement_types import Shard
 from hyper_parallel import DeviceMesh
+from hyper_parallel.core.dtensor.placement_types import Shard
+from hyper_parallel.core.dtensor.dtensor import DTensor
 
 from mindformers.pynative.distributed.style import ParallelStyle
 from mindformers.pynative.distributed.utils import distribute_module
@@ -48,9 +49,9 @@ class ExpertParallel(ParallelStyle):
     def __init__(self):
         super().__init__()
         self.ctx = None
+        self.input_layout = None
 
         self.cast = ops.cast
-        self.shape = ops.shape
         self.reshape = mint.reshape
         self.concat = mint.cat
         self.transpose = mint.transpose
@@ -67,30 +68,40 @@ class ExpertParallel(ParallelStyle):
     def _token_dispatch(self, device_mesh, cell, args):
         """Dispatch routed tokens across experts and expert-parallel ranks for MoE execution."""
         tokens, probs, topk_indices, num_tokens_per_expert = args
-        tokens_shape = self.shape(tokens)
+        if isinstance(tokens, DTensor):
+            self.input_layout = tokens.layout
+            tokens = tokens.to_local()
+
+        tokens_shape = tokens.shape
         tokens = self.reshape(tokens, (-1, tokens_shape[-1]))
 
         ep_degree = device_mesh.mesh_shape[0]
         num_experts = num_tokens_per_expert.shape[-1]
         moe_router_topk = topk_indices.shape[-1]
-        self.pad_tokens = Tensor(np.zeros((num_experts, tokens.shape[-1])), dtype=tokens.dtype)
-        self.pad_probs = Tensor(np.zeros((num_experts, moe_router_topk)), dtype=probs.dtype)
-        self.pad_topk_indices = Tensor(
-            np.arange(num_experts * moe_router_topk).reshape(num_experts, moe_router_topk) % num_experts,
-            dtype=topk_indices.dtype)
-        tokens = self.concat((self.pad_tokens, tokens), dim=0)
-        probs = self.concat((self.pad_probs, probs), dim=0)
+
+        # NOTE: if enable pad tokens, results will be different with Megatron.
+        pad_tokens = mint.zeros((num_experts, tokens.shape[-1]), dtype=tokens.dtype)
+        pad_probs = mint.zeros((num_experts, moe_router_topk), dtype=probs.dtype)
+        self.pad_topk_indices = mint.arange(num_experts * moe_router_topk, dtype=topk_indices.dtype) % num_experts
+        self.pad_topk_indices = self.pad_topk_indices.reshape((num_experts, moe_router_topk))
+
+        tokens = self.concat((pad_tokens, tokens), dim=0)
+        probs = self.concat((pad_probs, probs), dim=0)
         topk_indices = self.concat((self.pad_topk_indices, topk_indices), dim=0)
 
-        topk_indices_shape = self.shape(topk_indices)
+        tokens_shape = tokens.shape
+
+        topk_indices_shape = topk_indices.shape
         topk_indices = self.transpose(topk_indices, 1, 0)  # (B*S, k) --> (k, B*S)
         topk_indices = self.reshape(topk_indices, (-1,))  # (k, B*S) --> (k*T,)
 
         sorted_topk_indices, token_indices_experts_sorted = self.sort(self.cast(topk_indices, mstype.float32), dim=-1)
 
         _, unsort_token_indices_experts = self.sort(self.cast(token_indices_experts_sorted, mstype.float32), dim=-1)
-        unsort_token_indices_experts = self.reshape(unsort_token_indices_experts,
-                                                    (topk_indices_shape[1], topk_indices_shape[0]))
+        unsort_token_indices_experts = self.reshape(
+            unsort_token_indices_experts,
+            (topk_indices_shape[1], topk_indices_shape[0])
+        )
         unsort_token_indices_experts = self.transpose(unsort_token_indices_experts, 1, 0)  # (k, B*S) --> (B*S, k)
 
         inter_map = self.fmod(token_indices_experts_sorted, topk_indices_shape[0])
@@ -132,12 +143,14 @@ class ExpertParallel(ParallelStyle):
         # sort tokens by local expert
         _, sorted_map = self.sort(routing_map)
         _, unsorted_map = self.sort(self.cast(sorted_map, mstype.float32))
-        index = self.reshape(sorted_map, (self.shape(sorted_map)[0] * self.shape(sorted_map)[1],))
-        global_input_tokens_shape = self.shape(global_input_tokens)
+        index = self.reshape(sorted_map, (sorted_map.shape[0] * sorted_map.shape[1],))
+        global_input_tokens_shape = global_input_tokens.shape
         global_input_tokens = self.reshape(global_input_tokens, (-1, global_input_tokens_shape[-1]))
         global_input_tokens = self.index_select(global_input_tokens, 0, index)
-        global_input_tokens = self.reshape(global_input_tokens,
-                                           (-1, global_input_tokens_shape[-1]))
+        global_input_tokens = self.reshape(
+            global_input_tokens,
+            (-1, global_input_tokens_shape[-1])
+        )
         self.ctx = (
             probs, unsorted_map, unsort_token_indices_experts,
             input_splits, output_splits, original_shape
@@ -156,6 +169,10 @@ class ExpertParallel(ParallelStyle):
     # pylint: disable=unused-argument
     def _token_combine(self, device_mesh, cell, args, routed_output):
         """Combine expert outputs and restore token order after expert-parallel dispatch."""
+        (
+            probs, unsorted_map, unsort_token_indices_experts,
+            input_splits, output_splits, original_shape
+        ) = self.ctx
         probs, unsorted_map, unsort_token_indices_experts, \
             input_splits, output_splits, original_shape = self.ctx
         routed_output = self.reshape(routed_output, (1, -1, cell.hidden_size))
@@ -174,18 +191,30 @@ class ExpertParallel(ParallelStyle):
 
         # AlltoAll output to output
         index = self.reshape(unsort_token_indices_experts, (-1,))
-        permutated_local_input_tokens = self.reshape(permutated_local_input_tokens,
-                                                     (-1, self.shape(permutated_local_input_tokens)[-1]))
+        permutated_local_input_tokens = self.reshape(
+            permutated_local_input_tokens,
+            (-1, permutated_local_input_tokens.shape[-1])
+        )
         routed_output = self.index_select(permutated_local_input_tokens, 0, index)
-        unsort_token_indices_experts_shape = self.shape(unsort_token_indices_experts)
-        routed_output = self.reshape(routed_output,
-                                     (unsort_token_indices_experts_shape[0], unsort_token_indices_experts_shape[1], -1))
-        probs = self.reshape(probs, (self.shape(probs)[0], self.shape(probs)[1], 1))
+        unsort_token_indices_experts_shape = unsort_token_indices_experts.shape
+        routed_output = self.reshape(
+            routed_output,
+            (unsort_token_indices_experts_shape[0], unsort_token_indices_experts_shape[1], -1)
+        )
+        probs = self.reshape(probs, (probs.shape[0], probs.shape[1], 1))
         routed_output = self.mul(routed_output, self.cast(probs, routed_output.dtype))
         routed_output = self.sum(routed_output, dim=1, keepdim=False)
 
-        routed_output = self.strided_slice(routed_output, (self.pad_topk_indices.shape[0], 0),
-                                          (routed_output.shape[0], routed_output.shape[-1]), (1, 1))
+        routed_output = self.strided_slice(
+            routed_output, (self.pad_topk_indices.shape[0], 0),
+            (routed_output.shape[0], routed_output.shape[-1]), (1, 1)
+        )
+        if self.input_layout is not None:
+            return DTensor.from_local(
+                routed_output,
+                self.input_layout.mesh,
+                self.input_layout.alias_placements
+            )
         return routed_output
 
     def _apply(self, module: nn.Cell, device_mesh: DeviceMesh) -> nn.Cell:
@@ -231,9 +260,9 @@ class DeredundancyExpertParallel(ExpertParallel):
     def _token_dispatch(self, device_mesh, cell, args):
         tokens, probs, topk_indices, num_tokens_per_expert = args
         ep_degree = device_mesh.mesh_shape[0]
-        num_experts = self.shape(num_tokens_per_expert)[0]
+        num_experts = num_tokens_per_expert.shape[0]
 
-        tokens_shape = self.shape(tokens)
+        tokens_shape = tokens.shape
         tokens = self.reshape(tokens, (-1, tokens_shape[-1]))
         tokens = self.squeeze(tokens, 0)
         probs = self.cast(self.squeeze(probs, 0), mstype.bfloat16)
@@ -249,7 +278,7 @@ class DeredundancyExpertParallel(ExpertParallel):
         self.oep_group = get_oep_group_name(self.rank_id, ep_degree, inter_ep)
         self.iep_group = get_iep_group_name(self.rank_id, inter_ep)
 
-        top_k = self.shape(topk_indices)[-1]
+        top_k = topk_indices.shape[-1]
         node_expert_num = self.local_expert_end_index - self.local_expert_start_index
         safe_tokens = self.zeros((node_expert_num, tokens_shape[-1]), dtype=mstype.bfloat16)
         tokens = self.cat((safe_tokens, tokens), dim=0)
