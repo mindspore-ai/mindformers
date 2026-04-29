@@ -124,9 +124,9 @@ Currently supported hardware includes Atlas 800T A2, Atlas 800I A2, and Atlas 90
 
 Python 3.11.4 is recommended for the current suite.
 
-| MindSpore Transformers |       MindSpore        |          CANN          |    Driver/Firmware     |
-|:----------------------:|:----------------------:|:----------------------:|:----------------------:|
-| In-development version | In-development version | In-development version | In-development version |
+| MindSpore Transformers | MindSpore | CANN  | Driver/Firmware |
+|:----------------------:|:---------:|:-----:|:---------------:|
+|         1.9.0          |   2.9.0   | 9.0.0 |    26.0.RC1     |
 
 Historical Version Supporting Relationships:
 
