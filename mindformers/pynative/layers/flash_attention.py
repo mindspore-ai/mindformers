@@ -16,13 +16,15 @@
 __all__ = ['FlashAttention']
 
 import math
-from typing import Union
+from typing import Optional, Union
 
 import mindspore.common.dtype as mstype
 import mindspore as ms
-from mindspore import ops, mint
+from hyper_parallel import SkipDTensorDispatch
+from mindspore import ops, mint, Parameter
 from mindspore.common.tensor import Tensor
 from mindspore.nn.cell import Cell
+from mindspore.ops.operations.nn_ops import FlashAttentionScore
 
 from mindformers.parallel_core.transformer_config import TransformerConfig, MLATransformerConfig
 
@@ -70,7 +72,7 @@ class FlashAttention(Cell):
     def __init__(self,
                  config: Union[TransformerConfig, MLATransformerConfig],
                  layer_number,
-                 softmax_scale: float = None,
+                 softmax_scale: Optional[float] = None,
                  ):
         super().__init__()
 
@@ -96,7 +98,15 @@ class FlashAttention(Cell):
         self.scalar_value = 1. / math.sqrt(hidden_size_per_attention_head) if softmax_scale is None else softmax_scale
         self.inner_precise = 0
 
-        self.flash_attention = ops.flash_attention_score
+        self.flash_attention = FlashAttentionScore(
+            head_num=self.head_num,
+            scale_value=self.scalar_value,
+            pre_tokens=self.pre_tokens,
+            next_tokens=self.next_tokens,
+            inner_precise=self.inner_precise,
+            input_layout=self.input_layout,
+            sparse_mode=self.sparse_mode,
+        )
 
         # Note: only support config.apply_query_key_layer_scaling be set False
         # FusedScaleMaskSoftmax does not require implementation.
@@ -114,6 +124,15 @@ class FlashAttention(Cell):
         self.fa_out_transpose = mint.permute
         self.cast = ops.cast
 
+        self.track_max_attention_logit = getattr(config, "track_max_attention_logit", False)
+        if self.track_max_attention_logit:
+            self.max_logits_val = Parameter(
+                mint.zeros((self.head_num,), dtype=mstype.float32),
+                requires_grad=False
+            )
+            self.amax = mint.amax
+            self.maximum = mint.maximum
+
     def construct(self,
                   query: Tensor,
                   key: Tensor,
@@ -129,22 +148,19 @@ class FlashAttention(Cell):
             attention_mask = self.cast(attention_mask, ms.uint8)
 
         if self.input_layout == "TND":
-            output = self.flash_attention(query=query,
-                                          key=key,
-                                          value=value,
-                                          head_num=self.head_num,
-                                          real_shift=alibi_mask,
-                                          padding_mask=padding_mask,
-                                          attn_mask=attention_mask,
-                                          prefix=prefix,
-                                          actual_seq_qlen=actual_seq_qlen,
-                                          actual_seq_kvlen=actual_seq_kvlen,
-                                          scalar_value=self.scalar_value,
-                                          pre_tokens=self.pre_tokens,
-                                          next_tokens=self.next_tokens,
-                                          inner_precise=self.inner_precise,
-                                          input_layout=self.input_layout,
-                                          sparse_mode=self.sparse_mode)
+            softmax_val, _, _, output = self.flash_attention(query=query,
+                                                             key=key,
+                                                             value=value,
+                                                             real_shift=alibi_mask,
+                                                             padding_mask=padding_mask,
+                                                             attn_mask=attention_mask,
+                                                             prefix=prefix,
+                                                             actual_seq_qlen=actual_seq_qlen,
+                                                             actual_seq_kvlen=actual_seq_kvlen)
+            if self.track_max_attention_logit:
+                max_logits = self.amax(softmax_val, dim=(0, 2), keepdim=False)
+                with SkipDTensorDispatch():
+                    self.max_logits_val.copy_(max_logits.detach())
             return output
 
         q_seq_len, bsz = query.shape[:2]
@@ -164,20 +180,21 @@ class FlashAttention(Cell):
         if self.use_alibi_mask:
             alibi_mask = self.alibi_rescale_mul(alibi_mask, self.cast(self.alibi_rescale_factor, alibi_mask.dtype))
 
-        output = self.flash_attention(query=query,
-                                      key=key,
-                                      value=value,
-                                      head_num=self.head_num,
-                                      real_shift=alibi_mask,
-                                      padding_mask=padding_mask,
-                                      attn_mask=attention_mask,
-                                      prefix=prefix,
-                                      scalar_value=self.scalar_value,
-                                      pre_tokens=self.pre_tokens,
-                                      next_tokens=self.next_tokens,
-                                      inner_precise=self.inner_precise,
-                                      input_layout=self.input_layout,
-                                      sparse_mode=self.sparse_mode)
+        softmax_val, _, _, output = self.flash_attention(query=query,
+                                                         key=key,
+                                                         value=value,
+                                                         real_shift=alibi_mask,
+                                                         padding_mask=padding_mask,
+                                                         attn_mask=attention_mask,
+                                                         prefix=prefix,
+                                                         actual_seq_qlen=actual_seq_qlen,
+                                                         actual_seq_kvlen=actual_seq_kvlen)
+        if self.track_max_attention_logit:
+            max_logits = self.amax(softmax_val, dim=(0, 2, 3), keepdim=False)
+            max_logits = self.maximum(self.max_logits_val, max_logits)
+            with SkipDTensorDispatch():
+                self.max_logits_val.copy_(max_logits.detach())
+
         if self.input_layout == "BNSD":
             output = self._merge_heads(output)
         elif self.input_layout == "BSH":

@@ -32,8 +32,6 @@ from mindspore.mint.distributed import (
 )
 from mindspore.graph.api import _no_grad
 
-# hyper_parallel modules
-from hyper_parallel import SkipDTensorDispatch
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.platform.mindspore.autograd_compat import enable_mindspore_backward_compat
 
@@ -46,6 +44,8 @@ from mindformers.pynative.callback import (
     TrainerCallback,
     LossCallback,
     CheckpointCallback,
+    configure_max_logits_tracking,
+    ensure_max_logits_reset_callback,
 )
 import mindformers.tools.register.register as register_module
 import mindformers.dataset.handler.base_handler as handler_module
@@ -77,6 +77,8 @@ def patch_pynative_modules():
     """Patch is_legacy_model for pynative trainer."""
     register_module.is_legacy_model = patch_legacy_model_inference
     handler_module.is_legacy_model = patch_legacy_model_inference
+    from mindformers.core import context as core_context
+    core_context.is_legacy_model = patch_legacy_model_inference
 
 
 class TrainMode(enum.Enum):
@@ -93,7 +95,7 @@ class Trainer:
 
     def __init__(
         self,
-        config: Union[str, dict] = None,
+        config: Optional[Union[str, dict]] = None,
         model: PreTrainedModel = None,
         run_mode: Optional[str] = "train",
         train_dataset: Optional[Dataset] = None,
@@ -136,6 +138,7 @@ class Trainer:
 
         # Initialize config
         self.config = self._init_config(config, run_mode)
+        configure_max_logits_tracking(self.config, callbacks, optimizer)
 
         self.world_size = get_world_size()
         logger.info(f"Current world size: {self.world_size}.")
@@ -490,6 +493,11 @@ class Trainer:
         for callback in callback_config:
             callback_list.append(_build_callback(callback))
 
+        callback_list = ensure_max_logits_reset_callback(
+            callback_list,
+            getattr(self.config.model, "track_max_attention_logit", False),
+        )
+
         # Create handler with complete list
         cb_handler = CallbackHandler(
             callbacks=callback_list,
@@ -775,7 +783,7 @@ class Trainer:
         loss.backward(sense)
         global_norm, grads = _calculate_global_grad_norm(self.optimizer.parameters)
 
-        with SkipDTensorDispatch(), _no_grad():
+        with _no_grad():
             self.optimizer(grads)
 
         # zero grad

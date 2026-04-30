@@ -563,10 +563,10 @@ class TrainModelMixin:
         model = self.check_and_get_model()
         return model.get_max_attention_logit()
 
-    def make_model_muon_fns(self):
+    def make_model_muon_fns(self, *args, **kwargs):
         """Make model muon functions."""
         model = self.check_and_get_model()
-        return model.make_model_muon_fns()
+        return model.make_model_muon_fns(*args, **kwargs)
 
     def get_muon_filter(self):
         """Get muon filter."""
@@ -593,14 +593,16 @@ class TrainModelMixin:
         model = self.check_and_get_model()
         return model.get_param_layer_indices(parameters)
 
-    def apply_qk_clip_scaling(self, parameters, param_names, param_layers,
-                              logit_threshold, split_fn, merge_fn):
+    def allreduce_max_attention_logit(self):
         """Apply QK clip scaling to parameters."""
         model = self.check_and_get_model()
-        return model.apply_qk_clip_scaling(
-            parameters, param_names, param_layers,
-            logit_threshold, split_fn, merge_fn
-        )
+        return model.allreduce_max_attention_logit()
+
+    def apply_qk_clip_scaling(self, *args, **kwargs):
+        """Apply QK clip scaling to parameters."""
+        model = self.check_and_get_model()
+        return model.apply_qk_clip_scaling(*args, **kwargs)
 
     def prepare_inputs_for_predict_layout(self, input_ids, **kwargs):
+        _ = kwargs
         return Tensor(input_ids, mstype.int32), None, None, None, None, None, None, None, None

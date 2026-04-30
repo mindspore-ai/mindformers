@@ -405,6 +405,7 @@ class OptimizerConfig(BaseConfig):
     """
     Optimizer configuration.
     """
+    allow_extra = True
 
     type: str = "AdamW"
     """Optimizer type"""

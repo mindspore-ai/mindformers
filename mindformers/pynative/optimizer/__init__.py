@@ -13,3 +13,6 @@
 # limitations under the License.
 # ============================================================================
 """optimizer modules"""
+from .muon import Muon
+
+__all__ = ['Muon']
