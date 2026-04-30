@@ -41,6 +41,7 @@ from mindformers.parallel_core.training_graph.base_models.common.embeddings.rope
 from mindformers.parallel_core.training_graph.base_models.common.embeddings.yarn_rotary_pos_embedding import (
     _yarn_get_mscale)
 from mindformers.parallel_core.training_graph.device_matrix import layout
+from mindformers.parallel_core.training_graph.transformer.dsa.utils import WeightAbsorb
 
 
 @dataclass
@@ -174,9 +175,7 @@ class MultiLatentAttention(nn.Cell):
             ).add_prim_attr("self_define_shard", True)
             self.cat_q = Concat(axis=3).add_prim_attr("self_define_shard", True)
             self.cat_k = Concat(axis=3).add_prim_attr("self_define_shard", True)
-            self.unsqueeze = ExpandDims()
-            self.q_bmm = BatchMatMul()
-            self.v_bmm = BatchMatMul()
+            self.absorb = WeightAbsorb()
             self.useless_add = AddExt().add_prim_attr("keep_alive", True)
 
         if _get_parallel_mode() in (ParallelMode.AUTO_PARALLEL,) and _is_sharding_propagation():
@@ -222,14 +221,9 @@ class MultiLatentAttention(nn.Cell):
                 in_strategy=((layout("cp", "dp", "None", "None"), layout("cp", "dp", "None", "None")),),
                 out_strategy=(layout("cp", "dp", "None", "None"),)
             )
-            self.q_bmm.shard((layout("cp", "dp", "tp", "None", "None"), layout("tp", "None", "None")))
             if self.input_layout == "TND":
-                self.unsqueeze.shard((layout("dp_cp", "tp", "None"),))
-                self.v_bmm.shard((layout("dp_cp", "tp", "None", "None"), layout("tp", "None", "None")))
                 self.useless_add.shard((layout("dp_cp", "tp", "None"), layout()))
             else:
-                self.unsqueeze.shard((layout("dp", "cp", "tp", "None"),))
-                self.v_bmm.shard((layout("dp", "cp", "tp", "None", "None"), layout("tp", "None", "None")))
                 self.useless_add.shard((layout("dp", "cp", "tp", "None"), layout()))
 
     def split_infer_shape(self, *_):
@@ -267,8 +261,7 @@ class MultiLatentAttention(nn.Cell):
             k_nope, k_rope = key
             w_kvb = self.linear_kvb.weight if self.mla_qkv_concat else self.linear_kv_up_proj.weight
             q_absorb, v_absorb = self.split_weight(w_kvb)
-            q_nope = self.q_bmm(self.reshape(q_nope, (seq_len, bs, -1, 1, self.qk_head_dim)), q_absorb)
-            q_nope = self.reshape(q_nope, (seq_len, bs, -1, self.kv_lora_rank))
+            q_nope = self.absorb(q_nope, q_absorb)
             query = self.cat_q([q_nope, q_rope])
             key = self.cat_k([k_nope, k_rope])
 
@@ -292,12 +285,13 @@ class MultiLatentAttention(nn.Cell):
         )
         if self.sparse_loss:
             # Do weight absorb of value
-            attn_out = self.unsqueeze(attn_out, -2)
-            attn_out = self.v_bmm(attn_out, v_absorb)
+            attn_out = self.reshape(attn_out, (bs, seq_len, self.num_attention_heads, -1))
+            attn_out = self.absorb(attn_out, v_absorb, True)
+            attn_out = self.reshape(attn_out, (seq_len, bs, -1))
         else:
             attn_out = self.useless_add(attn_out, 0) # avoid tensor redistribution error while crossing subgraph
-        attn_out = self.reshape(attn_out, (bs, seq_len, -1))
-        attn_out = self.bs_transpose(attn_out, (1, 0, 2))
+            attn_out = self.reshape(attn_out, (bs, seq_len, -1))
+            attn_out = self.bs_transpose(attn_out, (1, 0, 2))
 
         # output linear projection
         output = self.linear_proj(attn_out)[0]  # dp, mp -> dp, 1 / dp * mp, 1
