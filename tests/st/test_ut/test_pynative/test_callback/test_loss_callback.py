@@ -39,6 +39,26 @@ class TestLossCallback:
         self.state.global_batch_size = 2
         self.state.total_flops = 0
 
+    @staticmethod
+    def _make_model_mock(
+        moe_aux_loss_coeff=0.0,
+        moe_router_load_balancing_type="aux_loss",
+        moe_router_enable_expert_bias=False,
+        num_layers=12,
+        first_k_dense_replace=0,
+    ):
+        """Create a mock model with a properly configured TransformerConfig mock."""
+        model = MagicMock()
+        model_config = MagicMock()
+        model_config.moe_aux_loss_coeff = moe_aux_loss_coeff
+        model_config.moe_router_load_balancing_type = moe_router_load_balancing_type
+        model_config.moe_router_enable_expert_bias = moe_router_enable_expert_bias
+        model_config.num_layers = num_layers
+        model_config.first_k_dense_replace = first_k_dense_replace
+        model.get_gpt_transformer_config.return_value = model_config
+        model.cells_and_names.return_value = []
+        return model
+
     def test_init(self):
         """Test initialization"""
         callback = LossCallback(log_interval=5)
@@ -68,11 +88,7 @@ class TestLossCallback:
 
     def test_on_epoch_end(self):
         """Test on_epoch_end"""
-        # on_epoch_end is currently empty, just ensuring it runs without error
-        try:
-            self.callback.on_epoch_end(self.args, self.state)
-        except Exception as e:
-            pytest.fail(f"on_epoch_end raised exception: {e}")
+        self.callback.on_epoch_end(self.args, self.state)
 
     @patch("mindformers.pynative.callback.loss_callback.logger")
     @patch("mindformers.pynative.callback.loss_callback.get_world_size")
@@ -88,8 +104,7 @@ class TestLossCallback:
         mock_flops.return_value = 1000
         mock_convert.return_value = MagicMock()
 
-        model = MagicMock()
-        model.get_gpt_transformer_config.return_value = MagicMock()
+        model = self._make_model_mock()
 
         # Case 1: loss is None
         self.callback.on_step_end(self.args, self.state, loss=None)
@@ -98,13 +113,12 @@ class TestLossCallback:
         # Case 2: step not in log interval
         self.callback.log_interval = 2
         self.state.global_step = 1
-        self.callback.on_step_end(self.args, self.state, loss=1.0)
+        self.callback.on_step_end(self.args, self.state, loss=1.0, model=model)
         mock_logger.info.assert_not_called()
 
         # Case 3: Normal logging
         self.callback.log_interval = 1
         self.state.global_step = 1
-        # Set step_time to be slightly in the past to avoid division by zero if implementation changes
         self.callback.step_time = time.time() - 0.1
 
         lr_scheduler = MagicMock(spec=LearningRateSchedule)
@@ -139,7 +153,7 @@ class TestLossCallback:
         mock_get_world_size.return_value = 1
         mock_flops.return_value = 1000
         mock_convert.return_value = MagicMock()
-        model = MagicMock()
+        model = self._make_model_mock()
 
         # Case: grad_norm is None, lr_scheduler is None
         self.callback.step_time = time.time() - 0.1
@@ -153,11 +167,6 @@ class TestLossCallback:
         )
         call_args = mock_logger.info.call_args[0][0]
         assert "grad_norm: NaN" in call_args
-        # lr should not be in logs if None (based on implementation reading)
-        # Wait, let's check implementation:
-        # lr = log_info.get("learning_rate")
-        # if lr is not None: log_parts.append(...)
-        # So check it's NOT present
         assert "lr:" not in call_args
 
     def test_parse_lr_info(self):
@@ -184,7 +193,7 @@ class TestLossCallback:
 
         # Case 3: Object with item (but no asnumpy)
         mock_tensor_item = MagicMock()
-        del mock_tensor_item.asnumpy  # Ensure no asnumpy
+        del mock_tensor_item.asnumpy
         mock_tensor_item.item.return_value = 2.5
         assert self.callback._to_float(mock_tensor_item) == 2.5
 

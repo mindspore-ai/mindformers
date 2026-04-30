@@ -1,3 +1,4 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates
 # Copyright 2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -25,6 +26,10 @@ from mindformers.tools.logger import logger
 from mindformers.models.utils import (
     convert_transformer_config_to_args_for_tflops,
     num_floating_point_operations,
+)
+from mindformers.pynative.transformers.moe.moe_utils import (
+    get_moe_layer_wise_logging_tracker,
+    clear_aux_losses_tracker,
 )
 
 
@@ -119,20 +124,32 @@ class LossCallback(TrainerCallback):
         cur_time = time.time()
         step_time_cost = int((cur_time - self.step_time) * 1000)
 
-        # Calculate total FLOPs for the model
         model = kwargs.get("model")
         model_config = deepcopy(model.get_gpt_transformer_config())
+        reset_model_temporary_tensors(model_config, model)
+
+        moe_aux_loss_coeff = model_config.moe_aux_loss_coeff
+        load_balancing_loss = None
+        if moe_aux_loss_coeff and moe_aux_loss_coeff > 0.0:
+            load_balancing_loss = get_moe_layer_wise_logging_tracker()["values"].sum()
+            load_balancing_loss /= (model_config.num_layers - model_config.first_k_dense_replace)
+            clear_aux_losses_tracker()
+        if model_config.moe_router_enable_expert_bias:
+            _update_expert_bias(model)
+
+        # Calculate total FLOPs for the model
         model_config = convert_transformer_config_to_args_for_tflops(model_config)
         state.total_flops = num_floating_point_operations(
             model_config, state.global_batch_size
         )
 
         # Calculate the throughput for the current step
-        throughput = state.total_flops / (step_time_cost * 10**12 * get_world_size())
+        throughput = state.total_flops / (step_time_cost * 1e9 * get_world_size())
 
         # Prepare log information dictionary
         log_info = {
             "loss": self._to_float(loss),
+            "load_balancing_loss": self._to_float(load_balancing_loss),
             "grad_norm": self._to_float(grad_norm),
             "cur_step": state.global_step,
             "max_steps": state.max_steps,
@@ -171,6 +188,10 @@ class LossCallback(TrainerCallback):
             f"loss: {log_info.get('loss'):10.6f}",
             f"per_step_time: {log_info.get('step_time'):6d}ms",
         ]
+
+        load_balancing_loss = log_info.get("load_balancing_loss")
+        if load_balancing_loss is not None:
+            log_parts.append(f"load_balancing_loss: {load_balancing_loss:10.6f}")
 
         lr = log_info.get("learning_rate")
         if lr is not None:
@@ -223,3 +244,55 @@ class LossCallback(TrainerCallback):
         if hasattr(data, "item"):
             return data.item()
         return float(data)
+
+
+def reset_model_temporary_tensors(config, model):
+    """
+    Reset the temporary tensors of the model.
+    """
+    for _, module in model.cells_and_names():
+        if (
+                config.moe_router_load_balancing_type == "global_aux_loss"
+                and hasattr(module, 'reset_global_aux_loss_tracker')
+        ):
+            module.reset_global_aux_loss_tracker()
+
+
+def _update_expert_bias(model):
+    """
+    Update expert bias for load-balanced routing and reset per-step token counters.
+    """
+    from mindspore import ops, mint
+    from mindspore.graph.api import _no_grad
+    # NOTE: Currently this sync is blocking (thus exposed) and happens on the
+    # default compute stream. Need to assess if this is OK performance-wise.
+    tokens_per_expert_list = []
+    for _, module in model.cells_and_names():
+        if not getattr(module, 'enable_expert_bias', False):
+            continue
+        tokens_per_expert = module.tokens_per_expert
+        tokens_per_expert_list.append(tokens_per_expert)
+    tokens_per_expert_by_layer = ops.vstack(tokens_per_expert_list)
+
+    moe_layer_idx = 0
+    with _no_grad():
+        for _, module in model.cells_and_names():
+            if not getattr(module, 'enable_expert_bias', False):
+                continue
+
+            tokens_per_expert = tokens_per_expert_by_layer[
+                moe_layer_idx
+            ].float()
+            moe_layer_idx += 1
+
+            # update the expert bias
+            # this is not exactly the same as https://arxiv.org/pdf/2408.15664 proposed
+            # pyrefly: ignore [missing-attribute]
+            expert_bias_delta = module.load_balance_coeff * mint.sign(
+                tokens_per_expert.mean() - tokens_per_expert
+            )
+            expert_bias_delta = expert_bias_delta - expert_bias_delta.mean()
+            # pyrefly: ignore [missing-attribute]
+            module.expert_bias.add_(expert_bias_delta)
+            # pyrefly: ignore [missing-attribute]
+            module.tokens_per_expert.zero_()

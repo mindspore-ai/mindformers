@@ -28,16 +28,22 @@ from .shared_experts import SharedExpertMLP
 class MoELayer(nn.Cell):
     """
     MoE Layer that combines Router, Grouped Experts, and Shared Experts.
+
+    Args:
+        config (TransformerConfig): Configuration for the transformer model.
+        layer_number (int): The layer index in the transformer stack. Used to
+            track per-layer aux loss in MoETracker. Default: 0.
     """
 
-    def __init__(self, config: TransformerConfig):
+    def __init__(self, config: TransformerConfig, layer_number: int = 0):
         super().__init__()
         self.config = config
         self.num_experts = config.num_moe_experts
         self.top_k = config.moe_router_topk
+        self.layer_number = layer_number
 
         # Router
-        self.router = TopKRouter(config)
+        self.router = TopKRouter(config, layer_number=layer_number)
 
         # Experts
         self.experts = GroupedMLP(config)
@@ -55,7 +61,21 @@ class MoELayer(nn.Cell):
         # Determine when to apply scores: before or after experts
         self.score_before_experts = config.moe_apply_probs_on_input
 
-        self.load_balance_coeff = config.moe_aux_loss_coeff
+        # define fields for auxiliary-loss-free load balancing (https://arxiv.org/abs/2408.15664)
+        # NOTE: tokens_per_expert is accumulated in the model forward pass.
+        #       expert_bias is updated outside the model in an optimizer step pre hook
+        #       to work with gradient accumulation.
+        self.enable_expert_bias = config.moe_router_enable_expert_bias
+        if self.enable_expert_bias is not None:
+            self.expert_bias = Parameter(
+                mint.zeros(self.num_experts, dtype=ms.float32),
+                name="expert_bias",
+                requires_grad=False,
+            )
+            self.load_balance_coeff = config.moe_router_bias_update_rate
+        else:
+            self.expert_bias = None
+            self.load_balance_coeff = 0.0
 
         # Buffers for load balancing
         self.tokens_per_expert = Parameter(
@@ -63,8 +83,6 @@ class MoELayer(nn.Cell):
             name="tokens_per_expert",
             requires_grad=False
         )
-
-        self.expert_bias = None
 
         # Mint operators
         self.reshape = mint.reshape
@@ -77,6 +95,7 @@ class MoELayer(nn.Cell):
         self.cast = ops.cast
         self.ones_like = mint.ones_like
 
+
     def construct(self, hidden_states: Tensor):
         """
         Forward pass for MoELayer.
@@ -84,13 +103,15 @@ class MoELayer(nn.Cell):
             hidden_states (Tensor): Input tensor of shape (bs, seq_length, dim)
         """
         bs, seq_length, dim = hidden_states.shape
-        x_flat = self.reshape(hidden_states, (-1, dim))
-
-        top_scores, selected_experts_indices, num_tokens_per_expert = self.router(x_flat, self.expert_bias)
+        top_scores, selected_experts_indices, num_tokens_per_expert = self.router(
+            hidden_states, self.expert_bias
+        )
 
         self.tokens_per_expert.add_(num_tokens_per_expert)
 
-        routed_output = self.experts(hidden_states, top_scores, selected_experts_indices, num_tokens_per_expert)
+        routed_output = self.experts(
+            hidden_states, top_scores, selected_experts_indices, num_tokens_per_expert
+        )
 
         shared_output = None
         if self.shared_experts is not None:

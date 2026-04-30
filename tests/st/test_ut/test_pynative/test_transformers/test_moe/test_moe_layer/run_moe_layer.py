@@ -93,7 +93,8 @@ class MoELayerRunner:
             moe_apply_probs_on_input=self.apply_probs_on_input,
             gated_linear_unit=True,
             # For testing, we can set aux loss coeff to enable expert_bias buffer creation
-            moe_aux_loss_coeff=0.01
+            moe_aux_loss_coeff=0.01,
+            moe_router_load_balancing_type="seq_aux_loss",
         )
 
         net = MoELayer(config)
