@@ -369,6 +369,14 @@ def apply_non_moe_tp(
             }
         )
 
+        if hasattr(transformer_block, "attn_hc"):
+            layer_plan.update(
+                {
+                    "attn_hc": SequenceParallel(sequence_dim=0, use_local_output=False),
+                    "ffn_hc": SequenceParallel(sequence_dim=0, use_local_output=False),
+                }
+            )
+
         if hasattr(transformer_block.mlp, "linear_fc1"):
             layer_plan.update(
                 {
@@ -409,10 +417,18 @@ def apply_non_moe_tp(
                 use_local_output=False
             )
 
+            layer_plan["mlp.router.moe_aux_loss_auto_scaler"] = prepare_module_output(
+                output_layouts=(Replicate(),),
+                desired_output_layouts=(sp_layout,),
+                use_local_output=False
+            )
+
             # distribute parameters for MoE layer
             distribute_param_plan = [
                 [transformer_block.mlp, "tokens_per_expert", (Replicate(),)],
             ]
+            if hasattr(transformer_block.mlp, "expert_bias"):
+                distribute_param_plan.append([transformer_block.mlp, "expert_bias", (Replicate(),)])
             if not enable_ep:
                 # shard expert weight if not enable_ep
                 distribute_param_plan.extend(
@@ -596,10 +612,19 @@ def apply_fsdp(
         fully_shard(embedding, **fsdp_config, reshard_after_forward=reshard_after_forward)
 
     # --- 2. Wrap transformer layers ---
+    replicate_params = max_logits
     for layer in layers:
         if hasattr(layer.mlp, "experts") and edp_mesh is not None:
             fully_shard(layer.mlp.experts, **efsdp_config, reshard_after_forward=reshard_after_forward)
-        fully_shard(layer, **fsdp_config, reshard_after_forward=reshard_after_forward, replicate_params=max_logits)
+
+        if hasattr(layer, "attn_hc"):
+            replicate_params.extend([
+                layer.attn_hc.alpha_pre, layer.attn_hc.alpha_post, layer.attn_hc.alpha_res,
+                layer.ffn_hc.alpha_pre, layer.ffn_hc.alpha_post, layer.ffn_hc.alpha_res,
+            ])
+
+        fully_shard(layer, **fsdp_config, reshard_after_forward=reshard_after_forward,
+                    replicate_params=replicate_params)
 
     # --- 3. Wrap final_layernorm and output_layer together ---
     if tail_modules:
@@ -608,7 +633,8 @@ def apply_fsdp(
         fully_shard(tail_modules, **fsdp_config, reshard_after_forward=reshard_policy == "always")
 
     # --- 4. Wrap root ---
-    if hasattr(gpt_model.loss, "log_softmax") and hasattr(gpt_model.loss, "nll_loss"):
+    if hasattr(gpt_model.loss, "log_softmax") and hasattr(gpt_model.loss, "nll_loss") \
+            and not parallel_dims.only_fsdp_enabled:
         # apply parallelism to loss custom backend functions
         # NOTE: should support loss parallel in future
         layer_plan = {

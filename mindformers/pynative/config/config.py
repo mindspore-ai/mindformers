@@ -363,7 +363,7 @@ class ParallelismConfig(BaseConfig):
     cpu_offload: bool = False
     """Enable CPU offloading for FSDP"""
 
-    disable_gradient_division: bool = True
+    disable_gradient_division: bool = False
     """Disable FSDP automatic gradient division (use sum instead of mean)"""
 
     tensor_parallel: int = 1

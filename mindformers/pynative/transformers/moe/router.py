@@ -82,6 +82,7 @@ class TopKRouter(nn.Cell):
         self._debug_force_load_balance = config.moe_router_force_expert_balance
         # NOTE: add config for per token loss
         self.calculate_per_token_loss = False
+        self.moe_aux_loss_auto_scaler = MoEAuxLossAutoScaler()
 
         # Auxiliary loss components
         self.moe_aux_loss_coeff = 0.0
@@ -121,9 +122,6 @@ class TopKRouter(nn.Cell):
         self.histc = mint.histc
         self.stop_gradient = ops.stop_gradient
 
-    def set_layer_number(self, layer_number: int):
-        """Set the layer number for the router."""
-        self.layer_number = layer_number
 
     def _debug_force_load_balance_routing(
             self, scores: Tensor
@@ -344,8 +342,8 @@ class TopKRouter(nn.Cell):
             Tensor: top_scores with aux loss gradient injected.
         """
         # NOTE: AllReduce tokens_per_expert over tp_cp_group for multi-card
-        scores_for_aux_loss = scores_for_aux_loss.reshape(seq_length, -1)
-        tokens_per_expert = routing_map.reshape(seq_length, -1).sum(dim=0)
+        scores_for_aux_loss = scores_for_aux_loss.reshape((seq_length, -1),)
+        tokens_per_expert = routing_map.reshape((seq_length, -1),).sum(dim=0)
         total_num_tokens = seq_length
 
         aux_loss = (
@@ -442,14 +440,14 @@ class TopKRouter(nn.Cell):
             # which scales both the main_loss gradient and aux_loss gradient by
             # 1/(num_local_tokens * dp_size * num_micro_batches) in finalize_model_grads function.
             # To correct this scaling, we need to scale the aux_loss by num_local_tokens here.
-            top_scores = MoEAuxLossAutoScaler.apply(top_scores, aux_loss * top_scores.shape[0])
+            top_scores = self.moe_aux_loss_auto_scaler(top_scores, aux_loss * top_scores.shape[0])
         else:
-            top_scores = MoEAuxLossAutoScaler.apply(top_scores, aux_loss)
+            top_scores = self.moe_aux_loss_auto_scaler(top_scores, aux_loss)
 
         return top_scores
 
     def reset_global_aux_loss_tracker(self):
         """Reset the global aux loss tracker."""
         if self.global_tokens_per_expert is not None:
-            self.global_tokens_per_expert.zero_()
-            self.ga_steps.zero_()
+            self.global_tokens_per_expert = mint.zeros_like(self.global_tokens_per_expert)
+            self.ga_steps = mint.zeros_like(self.ga_steps)

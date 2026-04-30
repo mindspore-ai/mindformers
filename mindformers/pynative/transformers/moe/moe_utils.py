@@ -19,7 +19,8 @@ MoE Auxiliary Loss computation and gradient injection.
 
 from typing import Optional,Tuple
 
-from mindspore import Tensor, mint
+from hyper_parallel.core.dtensor.dtensor import DTensor
+from mindspore import Tensor, mint, nn
 from mindspore.common import dtype as mstype
 from mindspore.common._grad_function import _Function
 
@@ -100,7 +101,7 @@ def switch_load_balancing_loss_func(
     return aux_loss
 
 
-class MoEAuxLossAutoScaler(_Function):
+class _MoEAuxLossAutoScaler(_Function):
     """An AutoScaler that triggers the backward pass and scales the grad for auxiliary loss."""
 
     main_loss_backward_scale: Optional[Tensor] = None
@@ -130,13 +131,13 @@ class MoEAuxLossAutoScaler(_Function):
             Tuple[Tensor, Tensor]: The gradient of the output, scaled auxiliary loss gradient.
         """
         aux_loss = ctx.aux_loss
-        if MoEAuxLossAutoScaler.main_loss_backward_scale is None:
+        if _MoEAuxLossAutoScaler.main_loss_backward_scale is None:
             # Prefer mint operator to create Tensor
-            MoEAuxLossAutoScaler.main_loss_backward_scale = Tensor(
+            _MoEAuxLossAutoScaler.main_loss_backward_scale = Tensor(
                 1.0, dtype=aux_loss.dtype
             )
 
-        aux_loss_backward_scale = MoEAuxLossAutoScaler.main_loss_backward_scale
+        aux_loss_backward_scale = _MoEAuxLossAutoScaler.main_loss_backward_scale
         scaled_aux_loss_grad = mint.ones_like(aux_loss) * aux_loss_backward_scale
         return grad_output, scaled_aux_loss_grad
 
@@ -148,11 +149,22 @@ class MoEAuxLossAutoScaler(_Function):
             scale (Tensor): The scale value to set. Please ensure that the scale passed in
                             matches the scale of the main_loss.
         """
-        if MoEAuxLossAutoScaler.main_loss_backward_scale is None:
-            MoEAuxLossAutoScaler.main_loss_backward_scale = scale
+        if _MoEAuxLossAutoScaler.main_loss_backward_scale is None:
+            _MoEAuxLossAutoScaler.main_loss_backward_scale = scale
         else:
-            MoEAuxLossAutoScaler.main_loss_backward_scale.copy_(scale)
+            _MoEAuxLossAutoScaler.main_loss_backward_scale.copy_(scale)
 
+class MoEAuxLossAutoScaler(nn.Cell):
+    """
+    Module wrapper for the custom LogSoftmax function.
+    """
+
+    @staticmethod
+    def construct(output: Tensor, aux_loss: Tensor):
+        """
+        Forward pass for LogSoftmax.
+        """
+        return _MoEAuxLossAutoScaler.apply(output, aux_loss)
 
 def compute_routing_scores_for_aux_loss(
     logits: Tensor,
@@ -182,7 +194,8 @@ def compute_routing_scores_for_aux_loss(
         raise ValueError(f"Invalid score_function: {score_function}")
 
     _, top_indices = mint.topk(scores, k=topk, dim=1)
-    routing_map = mint.zeros_like(logits).int().scatter(1, top_indices, 1).bool()
+    routing_map = mint.zeros_like(logits).int()
+    routing_map.scatter_(1, top_indices, 1).bool()
     return routing_map, scores
 
 
@@ -212,7 +225,9 @@ def save_to_aux_losses_tracker(
     tracker = get_moe_layer_wise_logging_tracker()
     if not tracker:
         tracker["values"] = mint.zeros(num_layers)
-    tracker["values"][layer_number] += loss  # Aggregate the loss for the layer.
+    if isinstance(loss, DTensor):
+        loss = loss.to_local()
+    tracker["values"][layer_number] = tracker["values"][layer_number] + loss  # Aggregate the loss for the layer.
 
 
 def clear_aux_losses_tracker() -> None:
