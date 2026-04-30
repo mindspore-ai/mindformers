@@ -590,24 +590,49 @@ class ProfilerConfig(BaseConfig):
     Profiler configuration.
     """
 
-    enable_profiler: bool = False
-    """Enable profiler"""
+    enable_profiling: bool = False
+    """Whether to enable mindspore profiler."""
 
-    start_step: int = 10
-    """Profiling start step"""
+    save_traces_folder: str = "profile_traces"
+    """Trace files location."""
 
-    stop_step: int = 20
-    """Profiling stop step"""
+    profiler_repeat: int = 0
+    """
+    The number of times to repeat the profiling cycle
 
-    output_path: str = ""
-    """Profiler output directory"""
+    This is used to configure mindspore.profiler.schedule.
+    """
 
-    profiler_level: str = "Level0"
-    """Profiling detail level"""
+    profiler_skip_first: int = 0
+    """
+    The number of initial profiling cycles to skip
 
-    profile_memory: bool = False
-    """Enable memory profiling"""
+    This is used to configure mindspore.profiler.schedule.
+    """
 
+    profiler_skip_first_wait: int = 0
+    """
+    The number of wait steps before the warmup step in each profiling cycle.
+
+    This is used to configure mindspore.profiler.schedule.
+    """
+
+    profiler_active: int = 1
+    """
+    The number of the active step in each profiling cycle.
+
+    This is used to configure mindspore.profiler.schedule.
+    """
+
+    profiler_warmup: int = 0
+    """
+    The number of warmup steps before the active step in each profiling cycle.
+
+    This is used to configure mindspore.profiler.schedule.
+    """
+
+    enable_memory: bool = False
+    """Whether to dump memory."""
 
 @dataclass
 class RecomputeConfig(BaseConfig):

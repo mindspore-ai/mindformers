@@ -100,10 +100,12 @@ context:
 
 profiler:                     # reserved for future use
   # MindSpore profiler configuration
-  enable_profiler: False
-  start_step: 10              # profiling start step
-  stop_step: 20               # profiling stop step
-  output_path: ''             # profiler output directory
-  profiler_level: Level0      # profiling detail level
-  profile_memory: False       # enable memory profiling
+  enable_profiling: False
+  save_traces_folder: "./data"
+  profiler_repeat: 1            # profiling loops
+  profiler_skip_first: 5        # profiling steps before loop
+  profiler_skip_first_wait: 0   # profiling steps in loop for waiting
+  profiler_active: 1            # profiling steps in loop for profiling
+  profiler_warmup: 0            # profiling steps in loop for warming up
+  enable_memory: False          # enable memory profiling
 

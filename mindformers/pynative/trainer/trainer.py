@@ -47,6 +47,7 @@ from mindformers.pynative.callback import (
     configure_max_logits_tracking,
     ensure_max_logits_reset_callback,
 )
+from mindformers.pynative.tools.profiler import Profiler
 import mindformers.tools.register.register as register_module
 import mindformers.dataset.handler.base_handler as handler_module
 from mindformers.pynative.distributed.parallel_dims import ParallelDims
@@ -543,7 +544,7 @@ class Trainer:
         # Initialize training state
         self.state = self._init_train_state()
 
-        
+
 
         # Load checkpoint
         checkpoint_path = checkpoint_path or self.config.checkpoint.load_path
@@ -632,41 +633,46 @@ class Trainer:
         # Training loop
         logger.info("Start training loop...")
         step = self.state.global_step
-        while step < self.state.max_steps:
-            # Epoch begin callback
-            if step % self.state.epoch_step == 0 and step > 0:
-                self.callback_handler.on_epoch_begin(self.config, self.state)
-                self.state.update_epoch()
 
-            # Get batch data
-            try:
-                inputs = self.get_batch(dataset_iter)
-            except StopIteration:
-                # Recreate iterator if dataset exhausted
-                dataset_iter = self._create_dataset_iterator(self.train_dataset)
-                inputs = self.get_batch(dataset_iter)
+        with Profiler(self.config.profiler) as prof:
+            while step < self.state.max_steps:
+                # Epoch begin callback
+                if step % self.state.epoch_step == 0 and step > 0:
+                    self.callback_handler.on_epoch_begin(self.config, self.state)
+                    self.state.update_epoch()
 
-            # Step begin callback
-            self.callback_handler.on_step_begin(self.config, self.state)
+                # Get batch data
+                try:
+                    inputs = self.get_batch(dataset_iter)
+                except StopIteration:
+                    # Recreate iterator if dataset exhausted
+                    dataset_iter = self._create_dataset_iterator(self.train_dataset)
+                    inputs = self.get_batch(dataset_iter)
 
-            # Training step
-            try:
-                loss, grad_norm = self.training_step(self.model, inputs)
-            except Exception as e:
-                raise RuntimeError(f"Error in training step {step}.") from e
+                # Step begin callback
+                self.callback_handler.on_step_begin(self.config, self.state)
 
-            # Update state
-            self.state.global_step += 1
-            step = self.state.global_step
+                # Training step
+                try:
+                    loss, grad_norm = self.training_step(self.model, inputs)
+                except Exception as e:
+                    raise RuntimeError(f"Error in training step {step}.") from e
 
-            # Step end callback (pass loss)
-            self.callback_handler.on_step_end(
-                self.config, self.state, loss=loss, grad_norm=grad_norm
-            )
+                # Update state
+                self.state.global_step += 1
+                step = self.state.global_step
 
-            # Epoch end callback (pass loss)
-            if step % self.state.epoch_step == 0:
-                self.callback_handler.on_epoch_end(self.config, self.state)
+                # Step end callback (pass loss)
+                self.callback_handler.on_step_end(
+                    self.config, self.state, loss=loss, grad_norm=grad_norm
+                )
+
+                # Epoch end callback (pass loss)
+                if step % self.state.epoch_step == 0:
+                    self.callback_handler.on_epoch_end(self.config, self.state)
+
+                # Profiler step notification
+                prof.step()
 
     def _create_dataset_iterator(self, dataset):
         """

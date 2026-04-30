@@ -13,7 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """Utility functions for config module."""
-
+import types
 from typing import Any, List, Union, Type, get_origin, get_args
 from dataclasses import is_dataclass
 
@@ -25,7 +25,7 @@ def check_type(value: Any, expected_type: Type, field_name: str):
 
     origin = get_origin(expected_type)
 
-    if origin is Union:
+    if origin is Union or origin is types.UnionType:
         _check_union(value, expected_type, field_name)
         return
 
