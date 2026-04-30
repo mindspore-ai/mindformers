@@ -20,6 +20,7 @@ from mindspore.ops import operations as P
 from mindspore.ops import auto_generate as gen
 from mindspore.nn.optim.optimizer import Optimizer
 
+from hyper_parallel import SkipDTensorDispatch
 
 op_cast = P.Cast()
 
@@ -215,11 +216,11 @@ class AdamW(Optimizer):
 
         lr = [float(x) for x in lr] if (self.is_group and self.is_group_lr) else float(lr)
         weight_decay = [float(x) for x in weight_decay] if self.is_group else float(weight_decay)
-
-        if self.enable_fused_opt:
-            result = self.forward_fused_opt(gradients, lr, weight_decay)
-        else:
-            result = self.forward_opt(gradients, lr, weight_decay)
+        with SkipDTensorDispatch():
+            if self.enable_fused_opt:
+                result = self.forward_fused_opt(gradients, lr, weight_decay)
+            else:
+                result = self.forward_opt(gradients, lr, weight_decay)
         return result
 
     def forward_fused_opt(self, gradients, lr, weight_decay):

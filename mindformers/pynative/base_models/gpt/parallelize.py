@@ -395,6 +395,10 @@ def apply_non_moe_tp(
             layer_plan["mlp.shared_experts.linear_fc1"] = colwise_parallel(use_local_output=False)
             layer_plan["mlp.shared_experts.linear_fc2"] = rowwise_output_plan
 
+        core_attention = transformer_block.self_attention.core_attention
+        
+        if hasattr(core_attention, "max_logits_val"):
+            _distribute_param(core_attention, "max_logits_val", device_mesh=tp_mesh, placements=(Shard(0),))
         if hasattr(transformer_block.mlp, "experts"):
             layer_plan["mlp"] = prepare_module_input_output(
                 input_layouts=(sp_layout,),
@@ -573,10 +577,16 @@ def apply_fsdp(
                 getattr(gpt_model, "output_layer", None),
             ] if m is not None
         ],
+        "max_logits": [
+            core_attn.max_logits_val
+            for _, core_attn in gpt_model._iter_core_attentions()
+            if hasattr(core_attn, "max_logits_val")
+        ]
     }
     embedding = modules["embedding"]
     layers = modules["layers"]
     tail_modules = modules["tail_modules"]
+    max_logits = modules["max_logits"]
 
     if not layers:
         raise ValueError(f"{type(model).__name__} has no decoder layers")
@@ -589,7 +599,7 @@ def apply_fsdp(
     for layer in layers:
         if hasattr(layer.mlp, "experts") and edp_mesh is not None:
             fully_shard(layer.mlp.experts, **efsdp_config, reshard_after_forward=reshard_after_forward)
-        fully_shard(layer, **fsdp_config, reshard_after_forward=reshard_after_forward)
+        fully_shard(layer, **fsdp_config, reshard_after_forward=reshard_after_forward, replicate_params=max_logits)
 
     # --- 3. Wrap final_layernorm and output_layer together ---
     if tail_modules:

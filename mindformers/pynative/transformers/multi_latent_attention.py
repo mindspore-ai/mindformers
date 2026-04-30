@@ -19,6 +19,9 @@ import math
 
 from mindspore import nn, Tensor, mint, ops
 
+from hyper_parallel import DTensor, SkipDTensorDispatch
+from hyper_parallel.core.dtensor.dtensor import distribute_tensor
+
 from mindformers.parallel_core.utils.spec_utils import ModuleSpec, build_module
 from mindformers.parallel_core.transformer_config import MLATransformerConfig
 from mindformers.pynative.base_models.common.embeddings.rope_utils import ApplyRotaryPosEmb
@@ -31,7 +34,7 @@ class MLASelfAttentionSubmodules:
     Dataclass for MLA self-attention layer submodules.
 
     This dataclass defines the submodules required for building the MLA self-attention layer.
-    
+
     Attributes:
         linear_qkv: Linear layer for combined query, key, and value projections.
             If q_lora_rank is not None, it concatenates linear_q_down_proj and linear_kv_down_proj;
@@ -55,11 +58,11 @@ class MLASelfAttentionSubmodules:
 class MultiLatentAttention(nn.Cell):
     """
     Multi-head Latent Attention (MLA) with KV compression and rotary position encoding.
-    
+
     Base class for Multi-head Latent Attention mechanism that implements KV compression
     and supports rotary position encoding. This class provides the core functionality
     for both self-attention and cross-attention variants.
-    
+
     Args:
         config: Configuration object with MLA parameters.
         submodules: Submodules configuration for building the attention layer.
@@ -125,21 +128,96 @@ class MultiLatentAttention(nn.Cell):
         self.transpose = mint.transpose
         self.cast = ops.cast
 
+    @staticmethod
+    def _to_full_tensor_with_layout(tensor):
+        """Return full tensor and original DTensor layout metadata when needed."""
+        if not isinstance(tensor, DTensor):
+            return tensor, None
+        return tensor.full_tensor(), (tensor.device_mesh, tensor.placements)
+
+    @staticmethod
+    def _restore_tensor_layout(tensor, layout):
+        """Restore a tensor back to the original DTensor local layout."""
+        if layout is None:
+            return tensor
+        device_mesh, placements = layout
+        return distribute_tensor(tensor, device_mesh, placements).to_local()
+
+    @staticmethod
+    def _get_scale_broadcast(scales, head_dim):
+        """Broadcast per-head QK-clip scales to projection weight rows."""
+        scale_broadcast = mint.tile(
+            mint.unsqueeze(scales, 1), (1, head_dim)
+        ).reshape(-1)
+        return mint.unsqueeze(scale_broadcast, 1)
+
+    def _get_qk_clip_weight(self, param_name):
+        """Return the MLA projection weight addressed by an optimizer parameter name."""
+        for attr in ("linear_qb", "linear_kvb", "linear_qkv"):
+            if f"self_attention.{attr}.weight" in param_name:
+                return getattr(getattr(self, attr, None), "weight", None)
+        return None
+
+    def apply_qk_clip_to_weights(self, param_prefix, scales, split_fn, merge_fn):
+        """Apply QK-clip scaling to all MLA projection weights owned by this layer."""
+        for weight_name in ("linear_qb.weight", "linear_kvb.weight", "linear_qkv.weight"):
+            self.apply_qk_clip_to_weight(f"{param_prefix}.{weight_name}", scales, split_fn, merge_fn)
+
+    def apply_qk_clip_to_weight(self, param_name, scales, split_fn, merge_fn):
+        """Apply QK-clip scaling to an MLA projection weight in-place."""
+        param = self._get_qk_clip_weight(param_name)
+        if param is None:
+            return
+
+        full_param, param_layout = self._to_full_tensor_with_layout(param)
+
+        if "self_attention.linear_qb.weight" in param_name:
+            with SkipDTensorDispatch():
+                nope, pe = split_fn(param_name, full_param)
+                nope = nope * self._get_scale_broadcast(mint.sqrt(scales), self.qk_head_dim)
+                pe = pe * self._get_scale_broadcast(scales, self.qk_pos_emb_head_dim)
+                weights = merge_fn(param_name, [nope, pe])
+        elif "self_attention.linear_kvb.weight" in param_name:
+            with SkipDTensorDispatch():
+                k_nope, v = split_fn(param_name, full_param)
+                k_nope = k_nope * self._get_scale_broadcast(mint.sqrt(scales), self.qk_head_dim)
+                weights = merge_fn(param_name, [k_nope, v])
+        elif "self_attention.linear_qkv.weight" in param_name:
+            # Concat MLA. With LoRA: [q_down, kv_lora, k_pe] has no per-head structure to scale.
+            parts = split_fn(param_name, full_param)
+            if len(parts) != 4:
+                return
+            q_nope, q_pe, kv_lora, k_pe = parts
+            with SkipDTensorDispatch():
+                q_nope = q_nope * self._get_scale_broadcast(mint.sqrt(scales), self.qk_head_dim)
+                q_pe = q_pe * self._get_scale_broadcast(scales, self.qk_pos_emb_head_dim)
+                weights = merge_fn(param_name, [q_nope, q_pe, kv_lora, k_pe])
+        else:
+            return
+
+        weights = self._restore_tensor_layout(weights, param_layout)
+        with SkipDTensorDispatch():
+            param.copy_(weights)
+
     def construct(self, x: Tensor, attention_mask=None, rotary_pos_emb=None,
                   prefix_keys_values=None, pad_zeros=None, actual_seq_len=None):
         """
         Forward pass of the Multi-head Latent Attention mechanism.
-        
+
         Args:
             x: Input tensor with shape (seq_length, batch_size, hidden_size).
             attention_mask: Attention mask tensor (optional).
             rotary_pos_emb: Rotary position embedding tensor (optional).
             pad_zeros: Padding zeros tensor (not used).
             actual_seq_len: Actual sequence length for EOD mask compression (optional).
-        
+
         Returns:
             Tensor: Output tensor with shape (seq_length, batch_size, hidden_size).
         """
+        if prefix_keys_values:
+            raise NotImplementedError("prefix_keys_values is not supported for now.")
+        if pad_zeros:
+            raise NotImplementedError("pad_zeros is not supported for now.")
         ori_dtype = x.dtype
         seq_len, bs, _ = self.shape(x)
 
@@ -176,10 +254,10 @@ class MultiLatentAttention(nn.Cell):
     def sbh2tnd(self, x):
         """
         Convert a tensor from SBH/SBND layout to TND layout.
-        
+
         Args:
             x: Input tensor with SBH/SBND layout.
-        
+
         Returns:
             Tensor: Output tensor with TND layout.
         """
@@ -193,10 +271,10 @@ class MultiLatentAttention(nn.Cell):
 class MLASelfAttention(MultiLatentAttention):
     """
     MLA Self-attention layer implementation.
-    
+
     This class implements the MLA self-attention layer following the same structure as Mindspeed A2.
     It inherits from MultiLatentAttention and provides self-attention specific functionality.
-    
+
     Args:
         config: Configuration object with MLA parameters.
         submodules: Submodules configuration for building the self-attention layer.
@@ -204,7 +282,7 @@ class MLASelfAttention(MultiLatentAttention):
 
     Inputs:
         x: Input tensor with shape [seq_length, batch_size, hidden_size].
-    
+
     Outputs:
         Tensor: Output tensor with shape [seq_length, batch_size, hidden_size].
     """
@@ -303,14 +381,14 @@ class MLASelfAttention(MultiLatentAttention):
                                     ):
         """
         Derive query, key, and value tensors from hidden states.
-        
+
         This method generates query, key, and value tensors from the input hidden states
         using the configured projection layers and applies rotary position embeddings.
-        
+
         Args:
             hidden_states: Input hidden states tensor with shape [seq_length, batch_size, hidden_size].
             rotary_pos_emb: Rotary position embedding tensor (optional).
-        
+
         Returns:
             tuple: A tuple containing query, key, and value tensors.
                 - query: Query tensor with shape [seq_length, batch_size, num_heads, head_dim].

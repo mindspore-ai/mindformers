@@ -22,8 +22,12 @@ __all__ = ['GPTModel']
 
 from typing import Literal, Optional, Union
 
+from hyper_parallel import SkipDTensorDispatch
+from hyper_parallel.core.dtensor.dtensor import DTensor
+from hyper_parallel.core.dtensor.placement_types import Partial, Replicate
 from mindspore import Tensor, dtype, nn, mint, ops
 
+from mindformers.tools.logger import logger
 from mindformers.pynative.loss.loss import CrossEntropyLoss
 from mindformers.parallel_core.utils.spec_utils import ModuleSpec
 from mindformers.pynative.layers.mask_generate import CausalMaskGenerate
@@ -33,6 +37,7 @@ from mindformers.pynative.base_models.common.embeddings.rotary_pos_embedding imp
 from mindformers.pynative.base_models.common.embeddings.yarn_rotary_pos_embedding import YarnRotaryEmbedding
 from mindformers.pynative.transformers.transformer_block import TransformerBlock, TransformerBlockSubmodules
 from mindformers.pynative.layers.linear import Linear
+from mindformers.pynative.optimizer.muon_utils import make_muon_fns
 
 
 class GPTModel(nn.Cell):
@@ -241,7 +246,7 @@ class GPTModel(nn.Cell):
             attention_mask (Tensor, optional): Attention mask tensor, used to mask padding
             tokens. Default is None.
             decoder_input (Tensor, optional): Decoder input tensor. Default is None.
-            labels (Tensor, optional): The label tensor, used for calculating the loss. 
+            labels (Tensor, optional): The label tensor, used for calculating the loss.
             Default is None.
             loss_mask (Tensor, optional): Loss mask tensor, used to specify which positions
             are included in the loss calculation. Default is None.
@@ -388,6 +393,86 @@ class GPTModel(nn.Cell):
         """
         return self.loss(logits, labels, loss_mask)
 
+    def _iter_self_attentions(self):
+        """Yield (layer_idx, param_name_prefix, self_attention_module) for every transformer / MTP layer."""
+        num_layers = self.config.num_layers
+        for i in range(num_layers):
+            self_attn = self.decoder.layers[i].self_attention
+            yield i, f"decoder.layers.{i}.self_attention", self_attn
+
+        mtp_num_layers = getattr(self.config, "mtp_num_layers", 0) or 0
+        if mtp_num_layers and getattr(self, "mtp", None) is not None:
+            for i in range(mtp_num_layers):
+                self_attn = self.mtp.layers[i].transformer_layer.self_attention
+                yield -i - 1, f"mtp.layers.{i}.transformer_layer.self_attention", self_attn
+
+    def _iter_core_attentions(self):
+        """Yield (param_name_prefix, core_attention_module) for every transformer / MTP layer."""
+        for _, prefix, self_attn in self._iter_self_attentions():
+            yield f"{prefix}.core_attention", self_attn.core_attention
+
+    def allreduce_max_attention_logit(self):
+        """
+        Perform AllReduce-Max operation across DP and CP dimensions for max attention logits.
+
+        This method aggregates the maximum attention logit values from all data parallel
+        and context parallel ranks to ensure consistent max logit values across the model.
+        """
+        def _allreduce_max_param(param):
+            if not isinstance(param, DTensor):
+                return
+
+            mesh = param.device_mesh
+            placements = list(param.placements)
+            mesh_dim_names = getattr(mesh, "mesh_dim_names", ())
+            if "dp_shard" not in mesh_dim_names:
+                return
+
+            dp_dim = mesh_dim_names.index("dp_shard")
+
+            partial_placements = placements.copy()
+            partial_placements[dp_dim] = Partial("max")
+
+            target_placements = placements.copy()
+            target_placements[dp_dim] = Replicate()
+
+            synced: DTensor = DTensor.from_local(
+                param.data,
+                device_mesh=mesh,
+                placements=tuple(partial_placements),
+            ).redistribute(
+                device_mesh=mesh,
+                placements=tuple(target_placements),
+            )
+            with SkipDTensorDispatch():
+                # inplace update the original param with the synced max values
+                param.copy_(synced)
+
+        for _, core_attn in self._iter_core_attentions():
+            if hasattr(core_attn, "max_logits_val"):
+                _allreduce_max_param(core_attn.max_logits_val)
+
+    def get_max_attention_logit(self):
+        """Return {full_param_name: Tensor} for layers whose running max is non-zero."""
+        max_logits = {}
+        for prefix, core_attn in self._iter_core_attentions():
+            if not hasattr(core_attn, "max_logits_val"):
+                continue
+            param = core_attn.max_logits_val
+            if float(param.sum().asnumpy()) <= 0:
+                continue
+            max_logits[f"{prefix}.max_logits_val"] = param
+        return max_logits
+
+    def reset_max_attention_logit(self):
+        """Reset every per-layer max_logits_val to zeros."""
+        for _, core_attn in self._iter_core_attentions():
+            if not hasattr(core_attn, "max_logits_val"):
+                continue
+            param = core_attn.max_logits_val
+            with SkipDTensorDispatch():
+                param.copy_(mint.zeros_like(param))
+
     def _preprocess_input_labels_and_masks(self,
                                            input_ids: Tensor,
                                            labels: Tensor = None,
@@ -405,3 +490,146 @@ class GPTModel(nn.Cell):
         elif attention_mask is None:
             attention_mask = self.casual_mask(input_ids)
         return labels, attention_mask, loss_mask
+
+    def get_gpt_transformer_config(self):
+        """Get the transformer config for GPT model.
+
+        Returns:
+            TransformerConfig: The transformer configuration.
+        """
+        return self.config
+
+    def make_model_muon_fns(self):
+        """Read values from TransformersConfig and generate schema."""
+        num_moe_experts = self.config.num_moe_experts
+        hidden_size = self.config.hidden_size
+        moe_ffn_hidden_size = self.config.moe_ffn_hidden_size
+        qk_head_dim = self.config.qk_head_dim
+        qk_pos_emb_head_dim = self.config.qk_pos_emb_head_dim
+        num_attention_heads = self.config.num_attention_heads
+        kv_lora_rank = self.config.kv_lora_rank
+        value_head_dim = self.config.v_head_dim
+
+        q_lora_rank = self.config.q_lora_rank
+
+        # linear_qkv (concat MLA) is [q_rank | kv_lora_rank | qk_pos_emb_head_dim] along dim=0.
+        # With LoRA    : q_rank = q_lora_rank → 3 plain slabs.
+        # Without LoRA : q_rank = n_heads * (qk_head_dim + qk_pos_emb_head_dim) → 1 periodic + 2 slabs.
+        if q_lora_rank is not None:
+            qkv_blocks = (q_lora_rank, kv_lora_rank, qk_pos_emb_head_dim)
+        else:
+            qkv_blocks = (
+                (qk_head_dim, qk_pos_emb_head_dim, num_attention_heads),
+                kv_lora_rank,
+                qk_pos_emb_head_dim,
+            )
+
+        schema = [
+            # experts.weight1: reshape → split into two [num_moe_experts, hidden_size, moe_ffn_hidden_size]
+            {
+                "patterns": ["*mlp.experts.weight1*"],
+                "kind": "reshape_concat",
+                "reshape": (num_moe_experts, hidden_size, 2 * moe_ffn_hidden_size),
+            },
+            # experts.weight2: reshape → [num_moe_experts, moe_ffn_hidden_size, hidden_size]
+            {
+                "patterns": ["*mlp.experts.weight2*"],
+                "kind": "reshape_only",
+                "reshape": (num_moe_experts, moe_ffn_hidden_size, hidden_size),
+            },
+            # linear_qb (concat MLA = q_up_proj): periodic split across heads
+            {
+                "patterns": ["*self_attention.linear_qb.weight*"],
+                "kind": "periodic",
+                "parts": (qk_head_dim, qk_pos_emb_head_dim, num_attention_heads),
+            },
+            # linear_kvb (concat MLA = kv_up_proj): periodic split across heads
+            {
+                "patterns": ["*self_attention.linear_kvb.weight*"],
+                "kind": "periodic",
+                "parts": (qk_head_dim, value_head_dim, num_attention_heads),
+            },
+            # linear_qkv (concat MLA): hybrid slabs along dim=0.
+            # LoRA case    : 3 plain slabs  → [q_down, kv_lora, k_pe]
+            # no-LoRA case : 1 periodic + 2 slabs → [q_nope, q_pe, kv_lora, k_pe]
+            {
+                "patterns": ["*self_attention.linear_qkv.weight*"],
+                "kind": "block_split",
+                "blocks": qkv_blocks,
+            },
+            # fc1 and shared_fc1: alternating 1,1 split along rows
+            {
+                "patterns": [
+                    "*mlp.shared_experts.linear_fc1.weight*",
+                    "*mlp.linear_fc1.weight*",
+                ],
+                "kind": "periodic",
+                "parts": (1, 1),
+            },
+        ]
+
+        return make_muon_fns(schema)
+
+    def get_muon_filter(self):
+        """Return a filter function to determine if a parameter should use Muon optimization.
+
+        Returns:
+            A function that takes a parameter and returns True if it should use Muon.
+        """
+        def muon_filter(param):
+            return (
+                (len(param.shape) == 2 or len(param.shape) == 3)
+                and "word_embeddings" not in param.name
+                and "output_layer" not in param.name
+            )
+        return muon_filter
+
+    def get_param_layer_indices(self, params):
+        """Return layer indices for each parameter (used for QK-clip).
+
+        Args:
+            params: List of parameters from the optimizer.
+
+        Returns:
+            Tuple of layer indices for each parameter, where:
+                - layer_idx >= 0 stands for the layer_idx-th decoder layer
+                - layer_idx < 0 stands for the -(layer_idx+1)-th MTP layer
+        """
+        param_layer = []
+        for param in params:
+            name = param.name
+            try:
+                layer_idx = int(name.split(".")[2])
+            except (ValueError, IndexError):
+                layer_idx = 0
+            if name.startswith('mtp'):
+                layer_idx = -layer_idx - 1
+            param_layer.append(layer_idx)
+        return tuple(param_layer)
+
+    def apply_qk_clip_scaling(self, logit_threshold, muon_split_fn, muon_merge_fn):
+        """Apply QK-clip scaling to attention weight parameters."""
+        if not self.config.multi_latent_attention:
+            return
+
+        ones = mint.ones((1,), dtype=dtype.float32)
+        threshold_val = float(logit_threshold.asnumpy())
+
+        for layer_idx, param_prefix, self_attention in self._iter_self_attentions():
+            logits_row = self_attention.core_attention.max_logits_val.value()
+            logits_row = logits_row.reshape((-1,))
+            logits_row = logits_row.full_tensor() if isinstance(logits_row, DTensor) else logits_row
+            mask = mint.greater_equal(logits_row, logit_threshold)
+            num_clipped = int(mint.sum(mask.astype(dtype.int32)).asnumpy())
+            if num_clipped == 0:
+                continue
+            with SkipDTensorDispatch():
+                safe_den = mint.where(mask, logits_row, ones)
+                scales = mint.where(mask, logit_threshold / safe_den, ones)
+                max_logit = float(mint.max(logits_row).asnumpy())
+            logger.debug(
+                f"[QK-Clip] layer_idx={layer_idx} {param_prefix}: "
+                f"clipping {num_clipped}/{logits_row.shape[0]} heads, "
+                f"max_logit={max_logit:.4f}, threshold={threshold_val:.4f}"
+            )
+            self_attention.apply_qk_clip_to_weights(param_prefix, scales, muon_split_fn, muon_merge_fn)

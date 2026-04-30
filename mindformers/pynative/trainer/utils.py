@@ -37,6 +37,7 @@ from mindformers.dataset.dataloader.blended_megatron_dataloader import (
 from mindformers.dataset.dataloader.hf_dataloader import HFDataLoader
 from mindformers.dataset.dataloader.utils import _get_mindrecord_files
 from mindformers.pynative.optimizer.adamw import AdamW
+from mindformers.pynative.optimizer import Muon
 
 
 def compute_parameters(model: nn.Cell) -> None:
@@ -343,6 +344,13 @@ def _build_optimizer(
         optimizer = AdamW(
             params=grouped_params,
             learning_rate=learning_rate,
+            **config,
+        )
+    elif optim_type == "Muon":
+        optimizer = Muon(
+            params=grouped_params,
+            learning_rate=learning_rate,
+            model=model,
             **config,
         )
     else:
