@@ -793,7 +793,7 @@ class Trainer:
             self.optimizer(grads)
 
         # zero grad
-        if isinstance(model, nn.Cell):
+        if hasattr(model, "zero_grad"):
             model.zero_grad()
         else:
             for param in model.trainable_params():

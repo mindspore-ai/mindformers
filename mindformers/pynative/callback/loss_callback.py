@@ -130,9 +130,10 @@ class LossCallback(TrainerCallback):
 
         moe_aux_loss_coeff = model_config.moe_aux_loss_coeff
         load_balancing_loss = None
-        if moe_aux_loss_coeff and moe_aux_loss_coeff > 0.0:
+        moe_layer = model_config.num_layers - model_config.first_k_dense_replace
+        if moe_aux_loss_coeff and moe_aux_loss_coeff > 0.0 and moe_layer > 0:
             load_balancing_loss = get_moe_layer_wise_logging_tracker()["values"].sum()
-            load_balancing_loss /= (model_config.num_layers - model_config.first_k_dense_replace)
+            load_balancing_loss /= moe_layer
             clear_aux_losses_tracker()
         if model_config.moe_router_enable_expert_bias:
             _update_expert_bias(model)
@@ -295,4 +296,4 @@ def _update_expert_bias(model):
             # pyrefly: ignore [missing-attribute]
             module.expert_bias.add_(expert_bias_delta)
             # pyrefly: ignore [missing-attribute]
-            module.tokens_per_expert.zero_()
+            module.tokens_per_expert = mint.zeros_like(module.tokens_per_expert)
