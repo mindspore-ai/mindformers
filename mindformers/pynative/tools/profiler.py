@@ -94,9 +94,10 @@ class Profiler:
 
         self.profiler = mindspore.profiler.profile(
             activities=activities,
+            with_stack=self.config.with_stack,
+            profile_memory=profile_memory,
             schedule=schedule,
             on_trace_ready=on_trace_ready,
-            profile_memory=profile_memory,
             experimental_config=experimental_config
         )
 

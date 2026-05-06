@@ -634,6 +634,9 @@ class ProfilerConfig(BaseConfig):
     enable_memory: bool = False
     """Whether to dump memory."""
 
+    with_stack: bool = True
+    """Whether to collect frame host call stack data on the Python side."""
+
 @dataclass
 class RecomputeConfig(BaseConfig):
     """
