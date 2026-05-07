@@ -18,6 +18,8 @@ import mindspore as ms
 from mindspore import nn, Tensor
 
 from hyper_parallel import DTensor, DeviceMesh
+from hyper_parallel.core.context_parallel.context_parallel import ContextParallel as HPContextParallel
+from hyper_parallel.core.context_parallel.async_context_parallel import AsyncContextParallel as HPAsyncContextParallel
 from hyper_parallel.core.dtensor.placement_types import Placement, Shard, Replicate
 
 from mindformers.pynative.layers.linear import Linear
@@ -27,12 +29,16 @@ from mindformers.pynative.distributed.utils import distribute_module
 
 __all__ = [
     "ParallelStyle",
+    "HPContextParallelAdapter",
+    "HPAsyncContextParallelAdapter",
     "ColwiseParallel",
     "RowwiseParallel",
     "SequenceParallel",
     "PrepareModuleInput",
     "PrepareModuleOutput",
     "PrepareModuleInputOutput",
+    "build_hp_cp_style",
+    "build_hp_async_cp_style",
 ]
 
 
@@ -50,6 +56,201 @@ class ParallelStyle(ABC):
     def _apply(self, module: nn.Cell, device_mesh: DeviceMesh) -> nn.Cell:
         """Apply parallel style to the module."""
         raise NotImplementedError("Subclasses must implement the _apply method.")
+
+
+class HPContextParallelAdapter(ParallelStyle):
+    """
+    Adapter that bridges Hyper-Parallel CP styles into MindFormers' style API.
+
+    The CP runtime logic remains in Hyper-Parallel. This wrapper only lets
+    ``parallelize_module`` treat it like a local ``ParallelStyle``.
+    """
+
+    def __init__(self, hp_style: HPContextParallel):
+        super().__init__()
+        self.hp_style = hp_style
+
+    def _apply(self, module: nn.Cell, device_mesh: DeviceMesh) -> nn.Cell:
+        return self.hp_style.apply(module, device_mesh)
+
+    def __repr__(self) -> str:
+        return f"{self.__class__.__name__}(hp_style={self.hp_style})"
+
+
+class HPAsyncContextParallelAdapter(ParallelStyle):
+    """
+    Adapter for Hyper-Parallel async CP styles.
+
+    ``parallelize_module`` can still apply the style synchronously when no
+    handoff modules are provided, while ``apply_with_qkv`` is used by the MLA
+    async path to pass the final Q/K/V handoff cells explicitly.
+    """
+
+    def __init__(self, hp_style: HPAsyncContextParallel):
+        super().__init__()
+        self.hp_style = hp_style
+
+    def _apply(self, module: nn.Cell, device_mesh: DeviceMesh) -> nn.Cell:
+        return self.hp_style.apply(module, device_mesh)
+
+    def apply_with_qkv(
+            self,
+            module: nn.Cell,
+            device_mesh: DeviceMesh,
+            q_proj: nn.Cell,
+            k_proj: nn.Cell,
+            v_proj: nn.Cell,
+    ) -> nn.Cell:
+        """Apply async CP with explicit final Q/K/V handoff modules."""
+        return self.hp_style.apply(
+            module,
+            device_mesh,
+            q_proj=q_proj,
+            k_proj=k_proj,
+            v_proj=v_proj,
+        )
+
+    def apply_to_attention(self, attention_module: nn.Cell, device_mesh: DeviceMesh) -> nn.Cell:
+        """Apply async CP to an attention module that exposes handoff boundaries."""
+        required_cells = ("core_attention", "q_handoff", "k_handoff", "v_handoff")
+        missing = [name for name in required_cells if not hasattr(attention_module, name)]
+        if missing:
+            raise ValueError(f"Async context parallel requires attention cells {missing}.")
+        config = getattr(attention_module, "config", None)
+        if config is not None:
+            if not getattr(config, "use_flash_attention", False):
+                raise NotImplementedError("Async context parallel requires flash attention.")
+            if getattr(config, "use_ring_attention", False):
+                raise NotImplementedError("Async context parallel does not support ring attention.")
+            input_layout = getattr(config, "input_layout", None)
+            use_eod_mask = getattr(config, "use_eod_attn_mask_compression", False)
+            if input_layout == "TND" and not use_eod_mask:
+                raise NotImplementedError("Async TND context parallel requires compressed EOD masks.")
+            if input_layout != "TND" and use_eod_mask:
+                raise NotImplementedError(
+                    "Async context parallel with compressed EOD masks requires input_layout='TND'."
+                )
+            if input_layout not in ("BNSD", "TND"):
+                raise NotImplementedError(
+                    f"Async context parallel expects input_layout='BNSD' or 'TND', got {input_layout!r}."
+                )
+        return self.apply_with_qkv(
+            module=attention_module.core_attention,
+            device_mesh=device_mesh,
+            q_proj=attention_module.q_handoff,
+            k_proj=attention_module.k_handoff,
+            v_proj=attention_module.v_handoff,
+        )
+
+    def __repr__(self) -> str:
+        return f"{self.__class__.__name__}(hp_style={self.hp_style})"
+
+
+def build_hp_cp_style(
+        method: str,
+        cp_size: int,
+        ulysses_degree_in_cp: Optional[int] = None,
+        input_layout: Optional[str] = None,
+) -> HPContextParallelAdapter:
+    """
+    Build a thin MindFormers wrapper for Hyper-Parallel CP styles.
+
+    Args:
+        method: Context parallel method from trainer config.
+        cp_size: Context parallel degree.
+
+    Returns:
+        HPContextParallelAdapter instance ready for ``parallelize_module``.
+    """
+    method = method.lower()
+    input_layout = input_layout.upper() if isinstance(input_layout, str) else input_layout
+    if input_layout == "TND":
+        if method == "colossal":
+            ulysses_degree = 1
+        elif method == "ulysses":
+            ulysses_degree = cp_size if ulysses_degree_in_cp is None else ulysses_degree_in_cp
+            if ulysses_degree != cp_size:
+                raise ValueError("TND Ulysses CP requires ulysses_degree_in_cp == context_parallel.")
+        elif method == "hybrid":
+            if ulysses_degree_in_cp is None:
+                raise ValueError("TND Hybrid CP requires ulysses_degree_in_cp to be set.")
+            ulysses_degree = ulysses_degree_in_cp
+        else:
+            raise NotImplementedError(f"unsupported context parallel method: {method}")
+        hp_style = HPContextParallel(
+            seq_dim=0,
+            head_dim=1,
+            ulysses_degree=ulysses_degree,
+            qkv_indices=(0, 1, 2),
+        )
+        return HPContextParallelAdapter(hp_style)
+
+    if method == "colossal":
+        hp_style = HPContextParallel(
+            # Colossal CP feeds FlashAttention with BSH QKV, so sequence is dim 1.
+            seq_dim=1,
+            head_dim=2,
+            ulysses_degree=1,
+            qkv_indices=(0, 1, 2),
+        )
+        return HPContextParallelAdapter(hp_style)
+
+    if method == "ulysses":
+        ulysses_degree = cp_size if ulysses_degree_in_cp is None else ulysses_degree_in_cp
+        hp_style = HPContextParallel(
+            # Synchronous Ulysses/Hybrid feeds FlashAttention with FA-native
+            # BNSD tensors, so sequence/head are dims 2/1 respectively.
+            seq_dim=2,
+            head_dim=1,
+            ulysses_degree=ulysses_degree,
+            qkv_indices=(0, 1, 2),
+        )
+        return HPContextParallelAdapter(hp_style)
+
+    if method == "hybrid":
+        hp_style = HPContextParallel(
+            # Synchronous Ulysses/Hybrid feeds FlashAttention with FA-native
+            # BNSD tensors, so sequence/head are dims 2/1 respectively.
+            seq_dim=2,
+            head_dim=1,
+            ulysses_degree=ulysses_degree_in_cp,
+            qkv_indices=(0, 1, 2),
+        )
+        return HPContextParallelAdapter(hp_style)
+
+    raise NotImplementedError(f"unsupported context parallel method: {method}")
+
+
+def build_hp_async_cp_style(
+        method: str,
+        cp_size: int,
+        ulysses_degree_in_cp: Optional[int] = None,
+        input_layout: Optional[str] = None,
+) -> HPAsyncContextParallelAdapter:
+    """Build a MindFormers wrapper for Hyper-Parallel async CP styles."""
+    method = method.lower()
+    input_layout = input_layout.upper() if isinstance(input_layout, str) else input_layout
+    if method == "colossal":
+        raise NotImplementedError(
+            "Async context parallel currently supports 'ulysses' and 'hybrid' only."
+        )
+
+    if method == "ulysses":
+        ulysses_degree = cp_size if ulysses_degree_in_cp is None else ulysses_degree_in_cp
+    elif method == "hybrid":
+        if ulysses_degree_in_cp is None:
+            raise ValueError("Hybrid async CP requires ulysses_degree_in_cp to be set.")
+        ulysses_degree = ulysses_degree_in_cp
+    else:
+        raise NotImplementedError(f"unsupported context parallel method: {method}")
+
+    hp_style = HPAsyncContextParallel(
+        seq_dim=0,
+        head_dim=1 if input_layout == "TND" else 2,
+        ulysses_degree=ulysses_degree,
+        qkv_indices=(0, 1, 2),
+    )
+    return HPAsyncContextParallelAdapter(hp_style)
 
 
 class ColwiseParallel(ParallelStyle):
@@ -541,7 +742,8 @@ class PrepareModuleOutput(ParallelStyle):
         >>> block = TransformerBlock(...)  # block is a nn.Cell that contains an "attn" Attention submodule
         >>> tp_mesh = init_device_mesh(mesh_shape=(8,), alias_name=("tp",))
         >>> 
-        >>> # According to the style specified below, the output of the TransformerBlock will be converted to Replicated DTensor
+        >>> # According to the style specified below, the output of the TransformerBlock
+        >>> # will be converted to Replicated DTensor
         >>> # and then redistributed to Sharded DTensor.
         >>> prepare_output = PrepareModuleOutput(
         >>>     output_layouts=Replicate(),

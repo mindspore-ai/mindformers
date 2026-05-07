@@ -945,10 +945,10 @@ class TransformerConfig:
         default=1,
         metadata={
             "description": "Reserved interface. Degrees of the hierarchical context parallelism. Users should provide "
-                           "a list to specify the sizes for different levels. Taking the a2a+p2p cp comm type as "
+                           "a list to specify the sizes for different levels. Taking the a2a+allgather cp comm type as "
                            "example, it contains groups of two levels, so the first value of the list indicates the "
                            "group size of the a2a communication type, and the second value indicates the group size "
-                           "of the p2p communication type.",
+                           "of the allgather communication type.",
             "usage": ParamUsage.COMMON,
             "source": ParamSource.MEGATRON,
             "mode": ParamMode.COMMON
@@ -1928,8 +1928,9 @@ class TransformerConfig:
         metadata={
             "description": "Reserved interface. Inter-NPU communication type for context parallelism. str: all layers "
                            "share same type. List[str]: each layer has its separate type. Each layer can be \"p2p\" "
-                           "or \"all_gather\" or \"a2a\" or \"a2a+p2p\". It uses A2A communications in low-level CP "
-                           "groups, and P2P communications in high-level CP groups.",
+                           "or \"all_gather\" or \"a2a\" or \"a2a+allgather\". "
+                           "It uses A2A communications in low-level CP "
+                           "groups, and AllGather communications in high-level CP groups.",
             "usage": ParamUsage.TRAINING,
             "source": ParamSource.MEGATRON,
             "mode": ParamMode.COMMON

@@ -50,6 +50,8 @@ class YarnRotaryEmbedding(RotaryEmbedding):
         mscale_all_dim (float, optional): Mscale all dim value for Yarn RoPE. Defaults to 0.
         use_eod_reset (bool, optional): Whether to reset the positional offset at eod tokens.
             Defaults to False.
+        use_position_ids (bool, optional): Whether to honor explicit position_ids when provided.
+            Defaults to the value of use_eod_reset.
     """
 
     def __init__(self,
@@ -64,7 +66,8 @@ class YarnRotaryEmbedding(RotaryEmbedding):
                  beta_slow: float = 1.0,
                  mscale: float = 1.0,
                  mscale_all_dim: float = 0.0,
-                 use_eod_reset: bool = False
+                 use_eod_reset: bool = False,
+                 use_position_ids: bool = None
                  ):
         super().__init__(
             kv_channels=kv_channels,
@@ -72,7 +75,8 @@ class YarnRotaryEmbedding(RotaryEmbedding):
             rotary_interleaved=rotary_interleaved,
             seq_len_interpolation_factor=seq_len_interpolation_factor,
             rotary_base=rotary_base,
-            use_eod_reset=use_eod_reset
+            use_eod_reset=use_eod_reset,
+            use_position_ids=use_position_ids
         )
         internal_freq_base = np.arange(0, kv_channels, 2)[: (kv_channels // 2)].astype(np.float32)
         internal_freq = 1.0 / (scaling_factor * rotary_base ** (internal_freq_base / kv_channels))
@@ -100,13 +104,14 @@ class YarnRotaryEmbedding(RotaryEmbedding):
         Args:
             max_seq_len (int): The maximum sequence length.
             offset (int): The offset for the sequence.
-            position_ids: user self-defined position_ids for eod_reset.
+            position_ids: user self-defined position_ids for eod_reset or context parallel.
 
         Returns:
             Tensor: Embeddings after applying RoPE.
             Tensor: mscale.
         """
-        if position_ids is None or not self.use_eod_reset:
+        explicit_position_ids = position_ids is not None and self.use_position_ids
+        if not explicit_position_ids:
             bs = 1
             seq = self.arange(max_seq_len, dtype=self.inv_freq.dtype) + offset
         else:
@@ -117,7 +122,7 @@ class YarnRotaryEmbedding(RotaryEmbedding):
 
         emb = self.cat((freqs, freqs), dim=-1)
 
-        if position_ids is None or not self.use_eod_reset:
+        if not explicit_position_ids:
             out = self.reshape(emb, (-1, bs, 1, emb.shape[1]))
         else:
             out = self.reshape(emb, (bs, -1, 1, emb.shape[1]))

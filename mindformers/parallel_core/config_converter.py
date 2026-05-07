@@ -55,6 +55,7 @@ class ConfigConverter(ABC):
         ("swap", "cpu_offloading"): "cpu_offloading",
         ("layer_swap", "cpu_offloading_num_layers"): "cpu_offloading_num_layers",
     }
+    _RUNTIME_HINT_PREFIX = "_mf_runtime_"
 
     @classmethod
     def convert(cls, model_config: Dict[str, Any],
@@ -95,6 +96,7 @@ class ConfigConverter(ABC):
             else:
                 missing_keys.add(src_key)
         # check HF config unmapping keys
+        missing_keys = cls._filter_internal_runtime_hints(missing_keys)
         if missing_keys - DEFAULT_WHITE_KEY:
             log_handler.add_warning("Unmapped Keys",
                                     f"following keys:{missing_keys - DEFAULT_WHITE_KEY} not in mapping."
@@ -107,6 +109,7 @@ class ConfigConverter(ABC):
         try:
             config_cls = MLATransformerConfig if is_mla_model else TransformerConfig
             converted_config = config_cls(**result)
+            cls._attach_internal_runtime_hints(converted_config, model_config)
             config_repr = "{\n" + ",\n".join(f"  {repr(k)}: {repr(v)}" for k, v in
                                              asdict(converted_config).items()) + "\n}"
             logger.info(f"The final converted {config_cls.__name__} is: {config_repr}")
@@ -117,15 +120,29 @@ class ConfigConverter(ABC):
             ) from e
 
     @classmethod
+    def _filter_internal_runtime_hints(cls, keys):
+        """Exclude internal runtime hints from user-facing unmapped-key warnings."""
+        return {key for key in keys if not key.startswith(cls._RUNTIME_HINT_PREFIX)}
+
+    @classmethod
+    def _attach_internal_runtime_hints(cls, converted_config, model_config):
+        """Carry internal runtime hints to the converted config without exposing them as config keys."""
+        for key, value in model_config.items():
+            if key.startswith(cls._RUNTIME_HINT_PREFIX) and not hasattr(converted_config, key):
+                setattr(converted_config, key, value)
+
+    @classmethod
     def _get_final_mapping(cls, log_handler, is_mla_model: bool = False) -> Dict[str, Union[str, Tuple[str, Callable]]]:
         """
         Merge the CONFIG_MAPPING of all classes in MRO and add the default mapping of the same name (uncovered fields).
         Rule:
           - Process in MRO order (sub-category → parent class);
-          - Once a target is occupied, subsequent rules mapped to the target are ignored.
+          - Subclass rules keep priority for target behavior.
+          - Extra source aliases without transform can still map to an occupied target.
           - Finally, add a default rule with the same name  for the unmapped Megatron fields.
         """
         seen_target_keys = set()
+        seen_source_keys = set()
         final_rules = []  # (sources, target_key, trans_func or None)
 
         # step1: Explicit CONFIG_MAPPING Merge (based on the MRO priority, subClass2 -> subClass1 --> common)
@@ -150,10 +167,17 @@ class ConfigConverter(ABC):
                                           f"Other mapping rule should be implemented in post_process"
                                           )
                     continue
-                # The subclass occupies the target_key first. If the parent class has the same name, skip.
+                # Keep the subclass target priority while preserving other source aliases for that target.
+                new_src_keys = tuple(src_key for src_key in src_keys if src_key not in seen_source_keys)
+                if not new_src_keys:
+                    continue
                 if target_key not in seen_target_keys:
                     seen_target_keys.add(target_key)
-                    final_rules.append((src_keys, target_key, trans_func))
+                    final_rules.append((new_src_keys, target_key, trans_func))
+                    seen_source_keys.update(new_src_keys)
+                elif trans_func is None:
+                    final_rules.append((new_src_keys, target_key, trans_func))
+                    seen_source_keys.update(new_src_keys)
         # step2: Default map with the same name
         megatron_fields = {f.name for f in fields(TransformerConfig)}
         existing_rule_keys = {(src_keys, target_key) for src_keys, target_key, _ in final_rules}
@@ -163,6 +187,8 @@ class ConfigConverter(ABC):
             mla_fields = {f.name for f in fields(MLATransformerConfig)}
             all_default_fields.update(mla_fields - megatron_fields)
         for field in all_default_fields:
+            if field in seen_source_keys:
+                continue
             rule_key = ((field,), field)
             if rule_key not in existing_rule_keys:
                 final_rules.append((rule_key[0], rule_key[1], None))
@@ -210,7 +236,7 @@ class ConfigConverter(ABC):
                 try:
                     target_value = trans_func(src_value)
                     trans_func_name = getattr(trans_func, "__name__", str(trans_func))
-                except Exception as e:
+                except (TypeError, ValueError, KeyError, AttributeError) as e:
                     ctx.log_handler.add_error(
                         "Function Convert Error",
                         f"`{src_key}` → `{target_key}` with func {trans_func_name}: {e}"
@@ -225,6 +251,8 @@ class ConfigConverter(ABC):
                 continue
             # Conflicts check
             if target_key in ctx.result:
+                if ctx.result[target_key] == target_value:
+                    continue
                 existing_sources = ctx.reversed_mapping.get(target_key, [])
                 ctx.log_handler.add_error(
                     "Mapping Conflicts",

@@ -103,9 +103,11 @@ class CausalMaskGenerate(nn.Cell):
         # Mask the padded inputs
         mask_right = self.reshape(input_mask, shape_right)
         attention_mask = mask_right
-        if not self.is_dynamic:
+        if not self.is_dynamic and seq_len == self.seq_length:
             lower_triangle = self.expand_dim(self.lower_triangle_mask, 0)
         else:
+            # Context-parallel input slicing can shorten the local sequence even
+            # when the model config still carries the global seq_length.
             lower_triangle_mask = self.slice(self.lower_triangle_mask, (0, 0), (seq_len, seq_len), (1, 1))
             lower_triangle = self.expand_dim(lower_triangle_mask, 0)
 

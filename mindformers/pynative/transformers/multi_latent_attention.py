@@ -26,6 +26,7 @@ from mindformers.parallel_core.utils.spec_utils import ModuleSpec, build_module
 from mindformers.parallel_core.transformer_config import MLATransformerConfig
 from mindformers.pynative.base_models.common.embeddings.rope_utils import ApplyRotaryPosEmb
 from mindformers.pynative.base_models.common.embeddings.yarn_rotary_pos_embedding import _yarn_get_mscale
+from mindformers.pynative.layers.identity_op import IdentityOp
 
 
 @dataclass
@@ -126,7 +127,11 @@ class MultiLatentAttention(nn.Cell):
         self.shape = ops.shape
         self.reshape = mint.reshape
         self.transpose = mint.transpose
+        self.permute = mint.permute
         self.cast = ops.cast
+        self.q_handoff = IdentityOp()
+        self.k_handoff = IdentityOp()
+        self.v_handoff = IdentityOp()
 
     @staticmethod
     def _to_full_tensor_with_layout(tensor):
@@ -220,17 +225,7 @@ class MultiLatentAttention(nn.Cell):
             raise NotImplementedError("pad_zeros is not supported for now.")
         ori_dtype = x.dtype
         seq_len, bs, _ = self.shape(x)
-
         query, key, value = self.get_query_key_value_tensors(x, rotary_pos_emb=rotary_pos_emb)
-
-        if self.input_layout == "TND":
-            query = self.sbh2tnd(query)
-            key = self.sbh2tnd(key)
-            value = self.sbh2tnd(value)
-
-        query = self.cast(query, self.compute_dtype)
-        key = self.cast(key, self.compute_dtype)
-        value = self.cast(value, self.compute_dtype)
         if self.use_flash_attention:
             if self.use_eod_attn_mask_compression:
                 context_layer = self.core_attention(
@@ -244,6 +239,8 @@ class MultiLatentAttention(nn.Cell):
                     query, key, value, attention_mask,
                 )
                 attn_out = self.reshape(context_layer, (seq_len, bs, -1))
+                if hasattr(attn_out, "contiguous"):
+                    attn_out = attn_out.contiguous()
         else:
             attn_out = self.core_attention(query, key, value, attention_mask)
 
@@ -382,8 +379,9 @@ class MLASelfAttention(MultiLatentAttention):
         """
         Derive query, key, and value tensors from hidden states.
 
-        This method generates query, key, and value tensors from the input hidden states
-        using the configured projection layers and applies rotary position embeddings.
+        The handoff modules are parameter-free boundaries by default. Parallel
+        styles may replace them to start asynchronous transfers at the exact
+        points where Q/K/V become the tensors consumed by ``core_attention``.
 
         Args:
             hidden_states: Input hidden states tensor with shape [seq_length, batch_size, hidden_size].
@@ -424,9 +422,22 @@ class MLASelfAttention(MultiLatentAttention):
                 q, [self.qk_head_dim, self.qk_pos_emb_head_dim], dim=-1
             )
 
+        if rotary_pos_emb is not None:
+            q_pe = self.apply_rotary_emb(
+                q_pe,
+                rotary_pos_emb,
+                rotary_interleaved=self.config.rotary_interleaved,
+                multi_latent_attention=self.config.multi_latent_attention
+            )
+
+        query = self.cat([q_nope, q_pe], 3)
+        query = self.cast(query, self.compute_dtype)
+        if self.input_layout == "TND":
+            query = self.sbh2tnd(query)
+        query = self.q_handoff(query)
+
         k_pe = self.reshape(k_pe, (seq_len, bs, 1, self.qk_pos_emb_head_dim))
         compressed_kv_norm = self.k_layernorm(compressed_kv)
-
         kv = self.linear_kvb(compressed_kv_norm)
         kv = self.reshape(kv, (
             seq_len,
@@ -436,14 +447,12 @@ class MLASelfAttention(MultiLatentAttention):
         ))
 
         k_nope, value = self.split(kv, [self.qk_head_dim, self.v_head_dim], dim=-1)
+        value = self.cast(value, self.compute_dtype)
+        if self.input_layout == "TND":
+            value = self.sbh2tnd(value)
+        value = self.v_handoff(value)
 
         if rotary_pos_emb is not None:
-            q_pe = self.apply_rotary_emb(
-                q_pe,
-                rotary_pos_emb,
-                rotary_interleaved=self.config.rotary_interleaved,
-                multi_latent_attention=self.config.multi_latent_attention
-            )
             k_pe = self.apply_rotary_emb2(
                 k_pe,
                 rotary_pos_emb,
@@ -451,8 +460,11 @@ class MLASelfAttention(MultiLatentAttention):
                 multi_latent_attention=self.config.multi_latent_attention
             )
 
-        query = self.cat([q_nope, q_pe], 3)
         k_pe = self.tile_kv(k_pe, (1, 1, self.num_attention_heads, 1))
         key = self.cat([k_nope, k_pe], 3)
+        key = self.cast(key, self.compute_dtype)
+        if self.input_layout == "TND":
+            key = self.sbh2tnd(key)
+        key = self.k_handoff(key)
 
         return query, key, value

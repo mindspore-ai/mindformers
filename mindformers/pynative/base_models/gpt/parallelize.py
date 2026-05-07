@@ -57,6 +57,10 @@ from mindformers.pynative.distributed.style import (
     RowwiseParallel,
     SequenceParallel,
 )
+from mindformers.pynative.distributed.context_parallel import (
+    apply_context_parallel_model_io,
+    build_context_parallel_attention_style,
+)
 from mindformers.pynative.distributed.tensor_parallel import NoParallel
 from mindformers.pynative.distributed.expert_parallel import ExpertParallel
 from mindformers.pynative.distributed.parallelize import parallelize_module
@@ -592,7 +596,16 @@ def apply_fsdp(
     gpt_model = _unwrap_gptmodel(model)
 
     # --- Resolve dp_mesh ---
-    if parallel_dims.dp_replicate_enabled:
+    if parallel_dims.cp_enabled:
+        dp_mesh = parallel_dims.world_mesh["fsdp"]
+        logger.info(
+            "Using FSDP mesh with CP enabled: dp_shard=%s, cp=%s, fsdp=%s, fsdp_rank_list=%s",
+            parallel_dims.dp_shard,
+            parallel_dims.cp,
+            parallel_dims.fsdp,
+            tuple(getattr(dp_mesh, "rank_list", ())),
+        )
+    elif parallel_dims.dp_replicate_enabled:
         # change `dp_shard` to `fsdp` if hyper-parallel support flatten
         dp_mesh = parallel_dims.get_mesh(["dp_replicate", "dp_shard"])
         logger.info("Using HSDP mesh [dp_replicate, fsdp] (2D)")
@@ -696,6 +709,106 @@ def apply_fsdp(
         logger.info("Successfully applied FSDP (Fully Sharded Data Parallel)")
 
 
+def apply_context_parallel_attention(
+    model: nn.Cell,
+    cp_mesh: DeviceMesh,
+    parallel_dims: Any,
+    parallelism: Any,
+) -> None:
+    """Apply Hyper-Parallel context parallel hooks to GPT attention modules."""
+    cp_size = parallel_dims.cp
+    gpt_model = _unwrap_gptmodel(model)
+    model_config = getattr(gpt_model, "config", None)
+
+    method = getattr(model_config, "_mf_runtime_context_parallel_method", None)
+    if method is None:
+        method = getattr(parallelism, "context_parallel_method", "colossal")
+    method = method.lower()
+
+    async_enabled = bool(getattr(parallelism, "context_parallel_async", False))
+    if model_config is not None:
+        async_enabled = bool(getattr(model_config, "_mf_runtime_context_parallel_async", async_enabled))
+    input_layout = getattr(model_config, "input_layout", None) if model_config is not None else None
+    if async_enabled and method == "colossal":
+        raise NotImplementedError(
+            "Async context parallel currently supports 'ulysses' and 'hybrid' only. "
+            "Use context_parallel_async=false for colossal CP."
+        )
+
+    requested_ulysses_degree = (
+        getattr(model_config, "_mf_runtime_ulysses_degree_in_cp", None)
+        if model_config is not None else None
+    )
+    if requested_ulysses_degree is None:
+        requested_ulysses_degree = getattr(parallelism, "ulysses_degree_in_cp", None)
+
+    if method == "colossal":
+        ulysses_degree = 1
+    elif method == "ulysses":
+        ulysses_degree = cp_size if requested_ulysses_degree is None else requested_ulysses_degree
+    else:
+        ulysses_degree = requested_ulysses_degree
+
+    if model_config is not None:
+        setattr(model_config, "_mf_runtime_context_parallel_method", method)
+        setattr(model_config, "_mf_runtime_context_parallel_async", async_enabled)
+        setattr(model_config, "_mf_runtime_ulysses_degree_in_cp", ulysses_degree)
+        setattr(model_config, "_mf_runtime_cp_rank_list", tuple(cp_mesh.rank_list))
+        rotary_pos_emb = getattr(gpt_model, "rotary_pos_emb", None)
+        if rotary_pos_emb is not None and hasattr(rotary_pos_emb, "use_position_ids"):
+            setattr(rotary_pos_emb, "use_position_ids", True)
+        if async_enabled and method == "ulysses":
+            num_heads = getattr(model_config, "num_attention_heads", None)
+            if num_heads is not None:
+                if num_heads % ulysses_degree != 0:
+                    raise ValueError(
+                        f"num_attention_heads ({num_heads}) must be divisible by "
+                        f"ulysses_degree ({ulysses_degree})."
+                    )
+                setattr(model_config, "_mf_runtime_flash_attention_head_num", num_heads // ulysses_degree)
+
+    cp_style = build_context_parallel_attention_style(
+        method=method,
+        cp_size=cp_size,
+        ulysses_degree_in_cp=ulysses_degree,
+        input_layout=input_layout,
+        async_enabled=async_enabled,
+    )
+
+    decoder = getattr(gpt_model, "decoder", None)
+    decoder_layers = getattr(decoder, "layers", None)
+    if decoder_layers is None:
+        raise ValueError("Unable to locate GPT decoder layers for context parallel application.")
+
+    def _find_one_module(transformer_block, layer_idx, suffix):
+        matches = [
+            (name, cell) for name, cell in transformer_block.cells_and_names()
+            if "self_attention" in name and name.endswith(suffix)
+        ]
+        if len(matches) != 1:
+            raise ValueError(
+                f"Expected one self_attention {suffix} in decoder.layers.{layer_idx}, "
+                f"but got {[name for name, _ in matches]}."
+            )
+        return matches[0]
+
+    for layer_idx, transformer_block in enumerate(decoder_layers):
+        cp_module_path, cp_module = _find_one_module(transformer_block, layer_idx, "core_attention")
+        if async_enabled:
+            attention_path, attention_module = _find_one_module(transformer_block, layer_idx, "self_attention")
+            cp_style.apply_to_attention(attention_module, cp_mesh)
+            logger.info(
+                "Applied async context parallel to decoder.layers.%s.%s through %s handoff boundaries",
+                layer_idx,
+                cp_module_path,
+                attention_path,
+            )
+            continue
+
+        cp_style._apply(cp_module, cp_mesh)
+        logger.info("Applied context parallel to decoder.layers.%s.%s", layer_idx, cp_module_path)
+
+
 # ---------------------------------------------------------------------------
 # GPT parallelization entry point
 # ---------------------------------------------------------------------------
@@ -734,9 +847,11 @@ def parallelize_gptmodel(
 
     # Phase 3: CP
     if parallel_dims.cp_enabled:
-        raise NotImplementedError(
-            "Context Parallelism (CP) is not yet implemented for GPTModel. "
-            "Please set context_parallel=1 in your config."
+        apply_context_parallel_attention(
+            model=model,
+            cp_mesh=parallel_dims.world_mesh["cp"],
+            parallel_dims=parallel_dims,
+            parallelism=parallelism,
         )
 
     # Phase 4: AC
@@ -758,6 +873,11 @@ def parallelize_gptmodel(
             logger.debug(param_name, param.layout, param.placements)
         else:
             logger.debug(f"{param_name} is not DTensor, shape is {param.shape}")
+
+    # Phase 6: CP root I/O hooks. Apply after FSDP so the hooks live on the final
+    # model boundary called by trainer.
+    if parallel_dims.cp_enabled:
+        apply_context_parallel_model_io(model, parallel_dims, parallelism)
 
     # Set the loss scale for the auxiliary loss of the MoE layer.
     main_loss_sense = 1. / (get_world_size() / int(parallelism.pipeline_parallel))

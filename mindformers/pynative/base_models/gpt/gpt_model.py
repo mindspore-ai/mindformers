@@ -164,13 +164,15 @@ class GPTModel(nn.Cell):
         # The MTP implementation pre-computes RotaryEmbedding
         # (unlike Megatron v0.12.0's real-time generation) to minimize dynamic memory usage.
         self.use_rotary_position_embeddings = self.position_embedding_type in ['rope', 'yarn']
+        use_rotary_position_ids = config.use_eod_reset or bool(getattr(config, "use_position_ids", False))
         if self.position_embedding_type == 'rope':
             if config.multi_latent_attention:
                 self.rotary_pos_emb = RotaryEmbedding(
                     kv_channels=config.qk_pos_emb_head_dim,
                     rotary_percent=config.rotary_percent,
                     rotary_base=config.rotary_base,
-                    use_eod_reset=config.use_eod_reset
+                    use_eod_reset=config.use_eod_reset,
+                    use_position_ids=use_rotary_position_ids
                 )
             else:
                 self.rotary_pos_emb = RotaryEmbedding(
@@ -181,7 +183,8 @@ class GPTModel(nn.Cell):
                     rotary_base=rotary_base,
                     rope_scaling=rope_scaling,
                     rope_scaling_factor=rope_scaling_factor,
-                    use_eod_reset=config.use_eod_reset
+                    use_eod_reset=config.use_eod_reset,
+                    use_position_ids=use_rotary_position_ids
                 )
         elif self.position_embedding_type == 'yarn':
             self.rotary_pos_emb = YarnRotaryEmbedding(
@@ -193,7 +196,8 @@ class GPTModel(nn.Cell):
                 beta_slow=config.beta_slow,
                 mscale=config.mscale,
                 mscale_all_dim=config.mscale_all_dim,
-                use_eod_reset=config.use_eod_reset
+                use_eod_reset=config.use_eod_reset,
+                use_position_ids=use_rotary_position_ids
             )
         elif self.position_embedding_type == 'mrope':
             raise NotImplementedError("position_embedding_type = mrope is not supported now.")
@@ -267,7 +271,7 @@ class GPTModel(nn.Cell):
             are included in the loss calculation. Default is None.
             actual_seq_len (Tensor, optional): Actual sequence length tensor. Default is None.
         """
-        if not self.config.use_eod_reset:
+        if not self.config.use_eod_reset and position_ids is None:
             position_ids = None
         elif position_ids is None:
             raise ValueError("When use eod_reset, position_ids should not be None.")
@@ -279,7 +283,7 @@ class GPTModel(nn.Cell):
         # Check mindformers.dataset.blended_datasets.gpt_dataset._get_eod_attention_mask() for implement details.
 
         labels, attention_mask, loss_mask = self._preprocess_input_labels_and_masks(
-            input_ids, labels, attention_mask, loss_mask)
+            input_ids, labels, attention_mask, loss_mask, actual_seq_len)
 
         hidden_states, _ = self.language_model(
             input_ids,
@@ -508,7 +512,8 @@ class GPTModel(nn.Cell):
                                            input_ids: Tensor,
                                            labels: Tensor = None,
                                            attention_mask: Tensor = None,
-                                           loss_mask: Tensor = None):
+                                           loss_mask: Tensor = None,
+                                           actual_seq_len: Tensor = None):
         """Preprocess input_ids and generate labels and masks if they are None.
         """
         if loss_mask is None:
@@ -516,6 +521,9 @@ class GPTModel(nn.Cell):
         if labels is not None:
             label_mask = self.cast(self.not_equal(labels, self.ignore_token_id), dtype.float32)
             loss_mask = self.mul(loss_mask, label_mask)
+        if (self.use_eod_attn_mask_compression and actual_seq_len is not None and attention_mask is None
+                and getattr(self.config, "input_layout", None) == "TND"):
+            return labels, attention_mask, loss_mask
         if self.use_attn_mask_compression:
             attention_mask = self.casual_mask()
         elif attention_mask is None:

@@ -375,6 +375,15 @@ class ParallelismConfig(BaseConfig):
     context_parallel_method: str = "colossal"
     """Implementation method for context parallelism"""
 
+    context_parallel_async: bool = False
+    """Enable Hyper-Parallel async context parallel hooks."""
+
+    ulysses_degree_in_cp: Optional[int] = None
+    """Ulysses degree within CP. Required for hybrid CP, optional otherwise."""
+
+    context_parallel_mask_type: str = "causal"
+    """Attention mask type supported by the PyNative CP input preparation path."""
+
     pipeline_parallel: int = 1
     """Pipeline parallelism degree"""
 
@@ -675,7 +684,10 @@ class RecomputeCommConfig(BaseConfig):
     """Whether to enable communication recomputation. Independent of ``RecomputeConfig.mode``."""
 
     select_module: Optional[Union[dict, list]] = None
-    """Communication module paths and their layer ranges for selective recomputation. Only effective when ``enable`` is ``True``."""
+    """Communication module paths and layer ranges for selective recomputation.
+
+    Only effective when ``enable`` is ``True``.
+    """
 
 
 @dataclass
