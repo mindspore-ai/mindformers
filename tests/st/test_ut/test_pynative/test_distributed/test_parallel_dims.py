@@ -26,7 +26,7 @@ def tensor_to_numpy(data):
 @pytest.fixture(name="mock_platform")
 def fixture_mock_platform():
     """Mock platform-related interfaces (avoid dependency on real hardware/distributed environment)"""
-    with patch("hyper_parallel.core.device_mesh.platform") as platform_mock:
+    with patch("hyper_parallel.core.dtensor.device_mesh.platform") as platform_mock:
         # Mock rank=0, world_size=8
         platform_mock.get_rank.return_value = 0
         platform_mock.get_world_size.return_value = 16
@@ -61,17 +61,21 @@ class TestDeviceMesh:
             world_size=16
         )
         mesh = parallel_dims.world_mesh
-        assert mesh.mesh_shape == (2, 1, 2, 2, 2, 1)
-        assert mesh.mesh_dim_names == ('pp', 'dp_replicate', 'dp_shard', 'cp', 'tp', 'ep')
+        assert mesh.mesh_shape == (2, 1, 2, 2, 2)
+        assert mesh.mesh_dim_names == ('pp', 'dp_replicate', 'dp_shard', 'cp', 'tp')
         assert mesh.rank_list == (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)
 
         assert mesh['pp'].mesh_shape == (2,)
         assert mesh['pp'].mesh_dim_names == ('pp',)
         assert mesh['pp'].rank_list == (0, 8)
 
-        assert mesh['dp'].mesh_shape == (2,)
-        assert mesh['dp'].mesh_dim_names == ('dp',)
-        assert mesh['dp'].rank_list == (0, 4)
+        assert mesh['dp_replicate'].mesh_shape == (1,)
+        assert mesh['dp_replicate'].mesh_dim_names == ('dp_replicate',)
+        assert mesh['dp_replicate'].rank_list == (0,)
+
+        assert mesh['dp_shard'].mesh_shape == (2,)
+        assert mesh['dp_shard'].mesh_dim_names == ('dp_shard',)
+        assert mesh['dp_shard'].rank_list == (0, 4)
 
         assert mesh['cp'].mesh_shape == (2,)
         assert mesh['cp'].mesh_dim_names == ('cp',)
@@ -80,14 +84,6 @@ class TestDeviceMesh:
         assert mesh['tp'].mesh_shape == (2,)
         assert mesh['tp'].mesh_dim_names == ('tp',)
         assert mesh['tp'].rank_list == (0, 1)
-
-        assert mesh['ep'].mesh_shape == (1,)
-        assert mesh['ep'].mesh_dim_names == ('ep',)
-        assert mesh['ep'].rank_list == (0,)
-
-        assert mesh['dp_cp'].mesh_shape == (4,)
-        assert mesh['dp_cp'].mesh_dim_names == ('dp_cp',)
-        assert mesh['dp_cp'].rank_list == (0, 2, 4, 6)
 
     def test_build_mesh_with_ep_reuse_tp(self, mock_platform):
         """
@@ -106,32 +102,32 @@ class TestDeviceMesh:
         )
         mesh = parallel_dims.world_mesh
         assert mesh.mesh_shape == (2, 1, 2, 2, 1, 2)
-        assert mesh.mesh_dim_names == ('pp', 'dp_replicate', 'dp_shard', 'cp', 'tp_shard_mod_ep', 'tp_shard_in_ep')
+        assert mesh.mesh_dim_names == ('pp', 'dp_replicate', 'dp_shard', 'cp', 'tp_mod_ep', 'ep')
         assert mesh.rank_list == (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)
 
         assert mesh['pp'].mesh_shape == (2,)
         assert mesh['pp'].mesh_dim_names == ('pp',)
         assert mesh['pp'].rank_list == (0, 8)
 
-        assert mesh['dp'].mesh_shape == (2,)
-        assert mesh['dp'].mesh_dim_names == ('dp',)
-        assert mesh['dp'].rank_list == (0, 4)
+        assert mesh['dp_replicate'].mesh_shape == (1,)
+        assert mesh['dp_replicate'].mesh_dim_names == ('dp_replicate',)
+        assert mesh['dp_replicate'].rank_list == (0,)
+
+        assert mesh['dp_shard'].mesh_shape == (2,)
+        assert mesh['dp_shard'].mesh_dim_names == ('dp_shard',)
+        assert mesh['dp_shard'].rank_list == (0, 4)
 
         assert mesh['cp'].mesh_shape == (2,)
         assert mesh['cp'].mesh_dim_names == ('cp',)
         assert mesh['cp'].rank_list == (0, 2)
 
-        assert mesh['tp'].mesh_shape == (2,)
-        assert mesh['tp'].mesh_dim_names == ('tp',)
-        assert mesh['tp'].rank_list == (0, 1)
+        assert mesh['tp_mod_ep'].mesh_shape == (1,)
+        assert mesh['tp_mod_ep'].mesh_dim_names == ('tp_mod_ep',)
+        assert mesh['tp_mod_ep'].rank_list == (0,)
 
         assert mesh['ep'].mesh_shape == (2,)
         assert mesh['ep'].mesh_dim_names == ('ep',)
         assert mesh['ep'].rank_list == (0, 1)
-
-        assert mesh['dp_cp'].mesh_shape == (4,)
-        assert mesh['dp_cp'].mesh_dim_names == ('dp_cp',)
-        assert mesh['dp_cp'].rank_list == (0, 2, 4, 6)
 
     def test_build_mesh_with_ep_reuse_cp_tp(self, mock_platform):
         """
@@ -150,32 +146,32 @@ class TestDeviceMesh:
         )
         mesh = parallel_dims.world_mesh
         assert mesh.mesh_shape == (2, 1, 2, 1, 2, 2)
-        assert mesh.mesh_dim_names == ('pp', 'dp_replicate', 'dp_shard', 'cp_shard_mod_ep', 'cp_shard_in_ep', 'tp')
+        assert mesh.mesh_dim_names == ('pp', 'dp_replicate', 'dp_shard', 'cp_tp_mod_ep', 'ep_mod_tp', 'tp')
         assert mesh.rank_list == (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)
 
         assert mesh['pp'].mesh_shape == (2,)
         assert mesh['pp'].mesh_dim_names == ('pp',)
         assert mesh['pp'].rank_list == (0, 8)
 
-        assert mesh['dp'].mesh_shape == (2,)
-        assert mesh['dp'].mesh_dim_names == ('dp',)
-        assert mesh['dp'].rank_list == (0, 4)
+        assert mesh['dp_replicate'].mesh_shape == (1,)
+        assert mesh['dp_replicate'].mesh_dim_names == ('dp_replicate',)
+        assert mesh['dp_replicate'].rank_list == (0,)
 
-        assert mesh['cp'].mesh_shape == (2,)
-        assert mesh['cp'].mesh_dim_names == ('cp',)
-        assert mesh['cp'].rank_list == (0, 2)
+        assert mesh['dp_shard'].mesh_shape == (2,)
+        assert mesh['dp_shard'].mesh_dim_names == ('dp_shard',)
+        assert mesh['dp_shard'].rank_list == (0, 4)
 
-        assert mesh['tp'].mesh_shape == (2,)
+        assert mesh['cp_tp_mod_ep'].mesh_shape == (1,)
+        assert mesh['cp_tp_mod_ep'].mesh_dim_names == ('cp_tp_mod_ep',)
+        assert mesh['cp_tp_mod_ep'].rank_list == (0,)
+
+        assert mesh['ep_mod_tp'].mesh_shape == (2,)
+        assert mesh['ep_mod_tp'].mesh_dim_names == ('ep_mod_tp',)
+        assert mesh['ep_mod_tp'].rank_list == (0, 2)
+
+        assert mesh['tp'].mesh_shape == (1,)
         assert mesh['tp'].mesh_dim_names == ('tp',)
         assert mesh['tp'].rank_list == (0, 1)
-
-        assert mesh['ep'].mesh_shape == (4,)
-        assert mesh['ep'].mesh_dim_names == ('ep',)
-        assert mesh['ep'].rank_list == (0, 1, 2, 3)
-
-        assert mesh['dp_cp'].mesh_shape == (4,)
-        assert mesh['dp_cp'].mesh_dim_names == ('dp_cp',)
-        assert mesh['dp_cp'].rank_list == (0, 2, 4, 6)
 
     def test_build_mesh_with_ep_reuse_dp_cp_tp(self, mock_platform):
         """
@@ -194,16 +190,24 @@ class TestDeviceMesh:
         )
         mesh = parallel_dims.world_mesh
         assert mesh.mesh_shape == (2, 1, 1, 2, 2, 2)
-        assert mesh.mesh_dim_names == ('pp', 'dp_replicate', 'dp_shard_mod_ep', 'dp_shard_in_ep', 'cp', 'tp')
+        assert mesh.mesh_dim_names == ('pp', 'dp_replicate', 'efsdp', 'ep_mod_cp_tp', 'cp', 'tp')
         assert mesh.rank_list == (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)
 
         assert mesh['pp'].mesh_shape == (2,)
         assert mesh['pp'].mesh_dim_names == ('pp',)
         assert mesh['pp'].rank_list == (0, 8)
 
-        assert mesh['dp'].mesh_shape == (2,)
-        assert mesh['dp'].mesh_dim_names == ('dp',)
-        assert mesh['dp'].rank_list == (0, 4)
+        assert mesh['dp_replicate'].mesh_shape == (1,)
+        assert mesh['dp_replicate'].mesh_dim_names == ('dp_replicate',)
+        assert mesh['dp_replicate'].rank_list == (0,)
+
+        assert mesh['efsdp'].mesh_shape == (1,)
+        assert mesh['efsdp'].mesh_dim_names == ('efsdp',)
+        assert mesh['efsdp'].rank_list == (0,)
+
+        assert mesh['ep_mod_cp_tp'].mesh_shape == (2,)
+        assert mesh['ep_mod_cp_tp'].mesh_dim_names == ('ep_mod_cp_tp',)
+        assert mesh['ep_mod_cp_tp'].rank_list == (0, 4)
 
         assert mesh['cp'].mesh_shape == (2,)
         assert mesh['cp'].mesh_dim_names == ('cp',)
@@ -212,11 +216,3 @@ class TestDeviceMesh:
         assert mesh['tp'].mesh_shape == (2,)
         assert mesh['tp'].mesh_dim_names == ('tp',)
         assert mesh['tp'].rank_list == (0, 1)
-
-        assert mesh['ep'].mesh_shape == (8,)
-        assert mesh['ep'].mesh_dim_names == ('ep',)
-        assert mesh['ep'].rank_list == (0, 1, 2, 3, 4, 5, 6, 7)
-
-        assert mesh['dp_cp'].mesh_shape == (4,)
-        assert mesh['dp_cp'].mesh_dim_names == ('dp_cp',)
-        assert mesh['dp_cp'].rank_list == (0, 2, 4, 6)

@@ -87,7 +87,7 @@ class TestProfileMonitor(unittest.TestCase):
         mock_cb_params.cur_step_num = 5
         mock_run_context.original_args.return_value = mock_cb_params
 
-        with patch('mindspore.profiler.mstx.range_start') as mock_range_start:
+        with patch('mindspore.profiler.mstx.Mstx.range_start') as mock_range_start:
             mock_range_start.return_value = "test_range_id"
 
             monitor.on_train_step_begin(mock_run_context)
@@ -112,7 +112,7 @@ class TestProfileMonitor(unittest.TestCase):
         mock_cb_params.cur_step_num = 5
         mock_run_context.original_args.return_value = mock_cb_params
 
-        with patch('mindspore.profiler.mstx.range_end') as mock_range_end:
+        with patch('mindspore.profiler.mstx.Mstx.range_end') as mock_range_end:
             monitor.on_train_step_end(mock_run_context)
 
             # Verify MSTX range was ended
