@@ -19,6 +19,8 @@ import re
 from typing import Sequence, Tuple
 
 import regex
+import mindspore as ms
+
 from mindspore import nn
 from hyper_parallel.core.activation_checkpoint import(
     CheckpointPolicy,
@@ -594,10 +596,34 @@ def apply_recompute(
             _set_select_recompute(model.layers[layer_id], layer_id, comm_layer_to_modules, add_prim_attr=True)
 
 
-def _policy_fn_swap(x):
-    if x.shape == (1, 1, 4096, 4096):
-        return CheckpointPolicy.MUST_SAVE
-    return CheckpointPolicy.MUST_SWAP
+def _build_policy_fn_swap(config):
+    """Build swap policy from model config.
+
+    Keep attention masks on device since FlashAttention backward consumes the
+    shared local uint8 mask directly and the generic swap lifecycle may break
+    that assumption.
+    """
+    seq_length = getattr(config, "seq_length", None)
+    use_mask_compression = bool(
+        getattr(config, "use_attn_mask_compression", False)
+        or getattr(config, "use_eod_attn_mask_compression", False)
+    )
+
+    def _policy_fn_swap(x):
+        if x.dtype != ms.uint8:
+            return CheckpointPolicy.MUST_SWAP
+
+        ndim = getattr(x, "ndim", 0)
+        if ndim == 4 and x.shape[1] == 1:
+            if seq_length is None or (x.shape[2] == x.shape[3] == seq_length):
+                return CheckpointPolicy.MUST_SAVE
+
+        if use_mask_compression and ndim == 2 and x.shape[0] == x.shape[1]:
+            return CheckpointPolicy.MUST_SAVE
+
+        return CheckpointPolicy.MUST_SWAP
+
+    return _policy_fn_swap
 
 
 def _expand_op_swap(config_list, op_swap):
@@ -638,7 +664,7 @@ def parse_op_swap(op_swap) -> list:
     return op_swap_list
 
 
-def _set_pattern_swap(layer, p_list, info=''):
+def _set_pattern_swap(layer, p_list, policy_fn, info=''):
     """Recursively traverse layer cells along p_list path and apply swap_wrapper."""
     log_list = []
     log = ''
@@ -652,19 +678,19 @@ def _set_pattern_swap(layer, p_list, info=''):
         # pylint: disable=W0212
         for name, cell in layer._cells.items():
             if p == name:
-                log = _set_pattern_swap(cell, p_list, info + f'.{name}')
+                log = _set_pattern_swap(cell, p_list, policy_fn, info + f'.{name}')
                 if log:
                     log_list.append(log[1:])
     else:
         # Last path segment: apply swap_wrapper to the target
         for name, cell in layer._cells.items():
             if p == name:
-                setattr(layer, name, swap_wrapper(cell))
+                setattr(layer, name, swap_wrapper(cell, policy_fn=policy_fn))
                 log = f"{info}.{name}"
         for attr in dir(layer):
             if p == attr:
                 operator = getattr(layer, attr)
-                setattr(layer, attr, swap_wrapper(operator, policy_fn=_policy_fn_swap))
+                setattr(layer, attr, swap_wrapper(operator, policy_fn=policy_fn))
                 log = f"{info}.{attr}"
 
     # Restore p_list so the caller's list is unchanged after recursion
@@ -674,11 +700,11 @@ def _set_pattern_swap(layer, p_list, info=''):
     return log
 
 
-def _set_op_swap(layer, layer_id, layer_to_modules):
+def _set_op_swap(layer, layer_id, layer_to_modules, policy_fn):
     """Set op swap for a layer."""
     log_ops = []
     for pattern in layer_to_modules[layer_id]:
-        log = _set_pattern_swap(layer, pattern.split(r'.'))
+        log = _set_pattern_swap(layer, pattern.split(r'.'), policy_fn)
         if log:
             log_ops.append(log[1:])
     log_ops_str = ', '.join(log_ops)
@@ -703,18 +729,19 @@ def apply_swap(
     if sc.op_swap:
         op_swap_list = _expand_op_swap(config_list, parse_op_swap(sc.op_swap))
         layer_to_modules = _clean_and_parse_config(full_target_ids, op_swap_list, label="Swap")
+    policy_fn = _build_policy_fn_swap(model.config)
 
     if not hasattr(model, "layers"):
         raise ValueError(f"{type(model)} must have 'layers' attribute.")
 
     for layer_id in range(num_layers):
         if layer_id in full_target_ids:
-            model.layers[layer_id] = swap_wrapper(model.layers[layer_id], policy_fn=_policy_fn_swap)
+            model.layers[layer_id] = swap_wrapper(model.layers[layer_id], policy_fn=policy_fn)
             SwapManager().set_forward_prefetch_layer(model.layers[layer_id], model.layers[layer_id + prefetch])
             logger.info(f"Set layer swap at layer {layer_id}")
 
         if sc.op_swap and layer_id in layer_to_modules:
-            _set_op_swap(model.layers[layer_id], layer_id, layer_to_modules)
+            _set_op_swap(model.layers[layer_id], layer_id, layer_to_modules, policy_fn)
             SwapManager().set_forward_prefetch_layer(model.layers[layer_id], model.layers[layer_id + prefetch])
 
 
