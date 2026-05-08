@@ -46,6 +46,7 @@ class TestLossCallback:
         moe_router_enable_expert_bias=False,
         num_layers=12,
         first_k_dense_replace=0,
+        moe_layer_freq=None,
     ):
         """Create a mock model with a properly configured TransformerConfig mock."""
         model = MagicMock()
@@ -54,6 +55,7 @@ class TestLossCallback:
         model_config.moe_router_load_balancing_type = moe_router_load_balancing_type
         model_config.moe_router_enable_expert_bias = moe_router_enable_expert_bias
         model_config.num_layers = num_layers
+        model_config.moe_layer_freq = moe_layer_freq
         model_config.first_k_dense_replace = first_k_dense_replace
         model.get_gpt_transformer_config.return_value = model_config
         model.cells_and_names.return_value = []
