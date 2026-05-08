@@ -130,7 +130,17 @@ class LossCallback(TrainerCallback):
 
         moe_aux_loss_coeff = model_config.moe_aux_loss_coeff
         load_balancing_loss = None
-        moe_layer = model_config.num_layers - model_config.first_k_dense_replace
+        if model_config.moe_layer_freq is None:
+            moe_layer = model_config.num_layers
+        elif isinstance(model_config.moe_layer_freq, int):
+            moe_layer_pattern = [1 if (i % model_config.moe_layer_freq == 0) else 0 for i in \
+                                 range(model_config.num_layers)]
+            moe_layer = sum(moe_layer_pattern)
+        elif isinstance(model_config.moe_layer_freq, list):
+            moe_layer = sum(model_config.moe_layer_freq)
+        else:
+            raise ValueError(f"Invalid moe_layer_freq: {model_config.moe_layer_freq}")
+
         if moe_aux_loss_coeff and moe_aux_loss_coeff > 0.0 and moe_layer > 0:
             load_balancing_loss = get_moe_layer_wise_logging_tracker()["values"].sum()
             load_balancing_loss /= moe_layer

@@ -617,9 +617,13 @@ def apply_fsdp(
         if hasattr(layer.mlp, "experts") and edp_mesh is not None:
             fully_shard(layer.mlp.experts, **efsdp_config, reshard_after_forward=reshard_after_forward)
 
+        if hasattr(layer.mlp, "experts"):
+            replicate_params.extend([layer.mlp.tokens_per_expert, layer.mlp.expert_bias])
+
         if hasattr(layer, "attn_hc"):
             replicate_params.extend([
-                layer.attn_hc.alpha_pre, layer.attn_hc.alpha_post, layer.attn_hc.alpha_res,
+                layer.attn_hc.alpha_pre, layer.attn_hc.alpha_post, layer.attn_hc.alpha_res, layer.attn_hc.bias,
+                layer.attn_hc.mapping_proj.weight, layer.ffn_hc.bias, layer.ffn_hc.mapping_proj.weight,
                 layer.ffn_hc.alpha_pre, layer.ffn_hc.alpha_post, layer.ffn_hc.alpha_res,
             ])
 

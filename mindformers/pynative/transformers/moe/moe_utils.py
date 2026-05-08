@@ -227,7 +227,10 @@ def save_to_aux_losses_tracker(
         tracker["values"] = mint.zeros(num_layers)
     if isinstance(loss, DTensor):
         loss = loss.to_local()
-    tracker["values"][layer_number] = tracker["values"][layer_number] + loss  # Aggregate the loss for the layer.
+    if hasattr(loss, "detach"):
+        tracker["values"][layer_number] = tracker["values"][layer_number] + loss.detach()  # Aggregate the loss for the layer.
+    else:
+        tracker["values"][layer_number] = tracker["values"][layer_number] + loss
 
 
 def clear_aux_losses_tracker() -> None:
