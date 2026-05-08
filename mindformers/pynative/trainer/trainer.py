@@ -785,8 +785,13 @@ class Trainer:
         """
         loss = self.compute_loss(model, inputs)
 
-        sense = _get_loss_sense(loss, data_parallel=self.config.parallelism.data_parallel)
+        # Calculate loss sense for distributed parameter
+        sense = _get_loss_sense(
+            enable_parallel=self.enable_parallel,
+            parallelism=self.config.parallelism,
+        )
         loss.backward(sense)
+
         global_norm, grads = _calculate_global_grad_norm(self.optimizer.parameters)
 
         with _no_grad():
