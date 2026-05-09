@@ -888,11 +888,20 @@ class GPTModel(nn.Cell):
         no_tp_list = [
             "linear_q_down_proj",
             "linear_kv_down_proj",
-            "indexer.linear_wk",
-            "indexer.linear_weights_proj",
             "shared_experts",
             "mlp.router",
             "hnorm.weight", "enorm.weight", "eh_proj.weight",
+            # DSA parameters
+            "indexer.linear_wk",
+            "indexer.linear_weights_proj",
+            # mHC parameters
+            "_hc.mapping_weight",
+            "_hc.alpha_pre",
+            "_hc.alpha_post",
+            "_hc.alpha_res",
+            "_hc.bias_pre",
+            "_hc.bias_post",
+            "_hc.bias_res"
         ]
 
         tp_dim_1_list = [
