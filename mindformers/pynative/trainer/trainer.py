@@ -141,6 +141,8 @@ class Trainer:
         self.config = self._init_config(config, run_mode)
         configure_max_logits_tracking(self.config, callbacks, optimizer)
 
+        self._setup_seed_and_determinism()
+
         self.world_size = get_world_size()
         logger.info(f"Current world size: {self.world_size}.")
         self.enable_parallel = self.world_size > 1
@@ -148,8 +150,6 @@ class Trainer:
             init_process_group()
             self.communication_init = True
             logger.info("Distributed communication is initialized.")
-
-        self._setup_seed_and_determinism()
 
         self.global_batch_size = self.config.training.global_batch_size
         self.gradient_accumulation_steps = None
