@@ -169,7 +169,7 @@ class TestDeviceMesh:
         assert mesh['ep_mod_tp'].mesh_dim_names == ('ep_mod_tp',)
         assert mesh['ep_mod_tp'].rank_list == (0, 2)
 
-        assert mesh['tp'].mesh_shape == (1,)
+        assert mesh['tp'].mesh_shape == (2,)
         assert mesh['tp'].mesh_dim_names == ('tp',)
         assert mesh['tp'].rank_list == (0, 1)
 
