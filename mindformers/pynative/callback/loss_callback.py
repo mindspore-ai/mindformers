@@ -18,8 +18,9 @@ import time
 from typing import Dict, Any
 from copy import deepcopy
 
+from mindspore import ops
 from mindspore.nn.learning_rate_schedule import LearningRateSchedule
-from mindspore.mint.distributed import get_world_size
+from mindspore.mint.distributed import get_world_size, all_reduce
 
 from mindformers.pynative.callback.callback import TrainerCallback
 from mindformers.tools.logger import logger
@@ -143,6 +144,9 @@ class LossCallback(TrainerCallback):
 
         if moe_aux_loss_coeff and moe_aux_loss_coeff > 0.0 and moe_layer > 0:
             load_balancing_loss = get_moe_layer_wise_logging_tracker()["values"].sum()
+            if get_world_size() > 1:
+                all_reduce(load_balancing_loss, op=ops.ReduceOp.SUM)
+                load_balancing_loss /= get_world_size()
             load_balancing_loss /= moe_layer
             clear_aux_losses_tracker()
         if model_config.moe_router_enable_expert_bias:
@@ -273,7 +277,7 @@ def _update_expert_bias(model):
     """
     Update expert bias for load-balanced routing and reset per-step token counters.
     """
-    from mindspore import ops, mint
+    from mindspore import mint
     from mindspore.graph.api import _no_grad
     # NOTE: Currently this sync is blocking (thus exposed) and happens on the
     # default compute stream. Need to assess if this is OK performance-wise.

@@ -33,6 +33,7 @@ from typing import Any, List
 
 import mindspore as ms
 from mindspore import nn, Parameter
+from mindspore.mint.distributed import get_world_size
 
 from hyper_parallel import DeviceMesh
 from hyper_parallel.core.dtensor.dtensor import DTensor, distribute_tensor
@@ -62,6 +63,7 @@ from mindformers.pynative.distributed.parallelize import parallelize_module
 from mindformers.pynative.distributed.activation_checkpoint import apply_ac
 from mindformers.pynative.distributed.utils import distribute_module
 from mindformers.pynative.base_models.gpt.gpt_model import GPTModel
+from mindformers.pynative.transformers.moe.moe_utils import _MoEAuxLossAutoScaler
 from mindformers.tools.logger import logger
 
 __all__ = ["parallelize_gptmodel"]
@@ -269,6 +271,25 @@ def _distribute_router(
     )
 
 
+def _collect_layer_replicate_params(layer):
+    """Collect parameters from a transformer layer that must be replicated (not sharded) under FSDP."""
+    replicate_params = []
+    if hasattr(layer.self_attention.core_attention, "max_logits_val"):
+        replicate_params.append(layer.self_attention.core_attention.max_logits_val)
+
+    if hasattr(layer.mlp, "tokens_per_expert"):
+        replicate_params.append(layer.mlp.tokens_per_expert)
+
+    if getattr(layer.mlp, "enable_expert_bias", False):
+        replicate_params.append(layer.mlp.expert_bias)
+
+    if hasattr(layer, "attn_hc"):
+        replicate_params.extend(list(layer.attn_hc.get_parameters()))
+        replicate_params.extend(list(layer.ffn_hc.get_parameters()))
+
+    return replicate_params
+
+
 def apply_non_moe_tp(
     model: nn.Cell,
     tp_mesh: DeviceMesh,
@@ -334,6 +355,8 @@ def apply_non_moe_tp(
     )
 
     for transformer_block in model.model.decoder.layers:
+        distribute_param_plan = []
+
         layer_plan = {
             "input_layernorm": norm_plan,
             "self_attention": prepare_module_input(
@@ -406,7 +429,7 @@ def apply_non_moe_tp(
         core_attention = transformer_block.self_attention.core_attention
         
         if hasattr(core_attention, "max_logits_val"):
-            _distribute_param(core_attention, "max_logits_val", device_mesh=tp_mesh, placements=(Shard(0),))
+            distribute_param_plan.append([core_attention, "max_logits_val", (Shard(0),)])
         if hasattr(transformer_block.mlp, "experts"):
             layer_plan["mlp"] = prepare_module_input_output(
                 input_layouts=(sp_layout,),
@@ -424,24 +447,24 @@ def apply_non_moe_tp(
             )
 
             # distribute parameters for MoE layer
-            distribute_param_plan = [
-                [transformer_block.mlp, "tokens_per_expert", (Replicate(),)],
-            ]
-            if hasattr(transformer_block.mlp, "expert_bias"):
+            distribute_param_plan.append([transformer_block.mlp, "tokens_per_expert", (Replicate(),)])
+            if getattr(transformer_block.mlp, "enable_expert_bias", False):
                 distribute_param_plan.append([transformer_block.mlp, "expert_bias", (Replicate(),)])
             if not enable_ep:
                 # shard expert weight if not enable_ep
-                distribute_param_plan.extend(
-                    [[transformer_block.mlp.experts, "weight1", (Replicate(),)],
-                    [transformer_block.mlp.experts, "weight2", (Replicate(),)],]
-                )
-            for sub_module, param_name, sub_plan in distribute_param_plan:
-                _distribute_param(
-                    sub_module,
-                    param_name=param_name,
-                    device_mesh=tp_mesh,
-                    placements=sub_plan
-                )
+                distribute_param_plan.extend([
+                    [transformer_block.mlp.experts, "weight1", (Replicate(),)],
+                    [transformer_block.mlp.experts, "weight2", (Replicate(),)],
+                ])
+
+            if distribute_param_plan:
+                for sub_module, param_name, sub_plan in distribute_param_plan:
+                    _distribute_param(
+                        sub_module,
+                        param_name=param_name,
+                        device_mesh=tp_mesh,
+                        placements=sub_plan
+                    )
 
             # special parallel for router
             _distribute_router(
@@ -453,6 +476,33 @@ def apply_non_moe_tp(
 
         parallelize_module(
             module=transformer_block,
+            device_mesh=tp_mesh,
+            parallelize_plan=layer_plan,
+        )
+
+    if hasattr(model.model.loss, "log_softmax") and hasattr(model.model.loss, "nll_loss"):
+        # apply parallelism to loss custom backend functions
+        # NOTE: should support loss parallel in future
+        layer_plan = {
+            "log_softmax": PrepareModuleInputOutput(
+                input_layouts=(Replicate(),),
+                desired_input_layouts=(Replicate(),),
+                output_layouts=(Replicate(),),
+                desired_output_layouts=(Replicate(),),
+                use_local_input=True,
+                use_local_output=False,
+            ),
+            "nll_loss": PrepareModuleInputOutput(
+                input_layouts=(Replicate(), None),
+                desired_input_layouts=(Replicate(), None),
+                output_layouts=(Replicate(),),
+                desired_output_layouts=(Replicate(),),
+                use_local_input=True,
+                use_local_output=False,
+            ),
+        }
+        parallelize_module(
+            module=model.model.loss,
             device_mesh=tp_mesh,
             parallelize_plan=layer_plan,
         )
@@ -592,17 +642,11 @@ def apply_fsdp(
                 getattr(gpt_model.decoder, "final_layernorm", None),
                 getattr(gpt_model, "output_layer", None),
             ] if m is not None
-        ],
-        "max_logits": [
-            core_attn.max_logits_val
-            for _, core_attn in gpt_model._iter_core_attentions()
-            if hasattr(core_attn, "max_logits_val")
         ]
     }
     embedding = modules["embedding"]
     layers = modules["layers"]
     tail_modules = modules["tail_modules"]
-    max_logits = modules["max_logits"]
 
     if not layers:
         raise ValueError(f"{type(model).__name__} has no decoder layers")
@@ -612,23 +656,17 @@ def apply_fsdp(
         fully_shard(embedding, **fsdp_config, reshard_after_forward=reshard_after_forward)
 
     # --- 2. Wrap transformer layers ---
-    replicate_params = max_logits
     for layer in layers:
         if hasattr(layer.mlp, "experts") and edp_mesh is not None:
             fully_shard(layer.mlp.experts, **efsdp_config, reshard_after_forward=reshard_after_forward)
 
-        if hasattr(layer.mlp, "experts"):
-            replicate_params.extend([layer.mlp.tokens_per_expert, layer.mlp.expert_bias])
-
-        if hasattr(layer, "attn_hc"):
-            replicate_params.extend([
-                layer.attn_hc.alpha_pre, layer.attn_hc.alpha_post, layer.attn_hc.alpha_res, layer.attn_hc.bias,
-                layer.attn_hc.mapping_proj.weight, layer.ffn_hc.bias, layer.ffn_hc.mapping_proj.weight,
-                layer.ffn_hc.alpha_pre, layer.ffn_hc.alpha_post, layer.ffn_hc.alpha_res,
-            ])
-
-        fully_shard(layer, **fsdp_config, reshard_after_forward=reshard_after_forward,
-                    replicate_params=replicate_params)
+        replicate_params = _collect_layer_replicate_params(layer)
+        fully_shard(
+            layer,
+            **fsdp_config,
+            reshard_after_forward=reshard_after_forward,
+            replicate_params=replicate_params
+        )
 
     # --- 3. Wrap final_layernorm and output_layer together ---
     if tail_modules:
@@ -637,34 +675,6 @@ def apply_fsdp(
         fully_shard(tail_modules, **fsdp_config, reshard_after_forward=reshard_policy == "always")
 
     # --- 4. Wrap root ---
-    if hasattr(gpt_model.loss, "log_softmax") and hasattr(gpt_model.loss, "nll_loss") \
-            and not parallel_dims.only_fsdp_enabled:
-        # apply parallelism to loss custom backend functions
-        # NOTE: should support loss parallel in future
-        layer_plan = {
-            "log_softmax": PrepareModuleInputOutput(
-                input_layouts=(Replicate(),),
-                desired_input_layouts=(Replicate(),),
-                output_layouts=(Replicate(),),
-                desired_output_layouts=(Replicate(),),
-                use_local_input=True,
-                use_local_output=False,
-            ),
-            "nll_loss": PrepareModuleInputOutput(
-                input_layouts=(Replicate(), None),
-                desired_input_layouts=(Replicate(), None),
-                output_layouts=(Replicate(),),
-                desired_output_layouts=(Replicate(),),
-                use_local_input=True,
-                use_local_output=False,
-            ),
-        }
-        parallelize_module(
-            module=gpt_model.loss,
-            device_mesh=dp_mesh,
-            parallelize_plan=layer_plan,
-        )
-        
     fully_shard(model, **fsdp_config)
 
     # --- 5. Disable gradient division ---
@@ -739,6 +749,10 @@ def parallelize_gptmodel(
             logger.debug(param_name, param.layout, param.placements)
         else:
             logger.debug(f"{param_name} is not DTensor, shape is {param.shape}")
+
+    # Set the loss scale for the auxiliary loss of the MoE layer.
+    main_loss_sense = 1. / (get_world_size() / int(parallelism.pipeline_parallel))
+    _MoEAuxLossAutoScaler.set_loss_scale(main_loss_sense)
 
     logger.info("GPTModel parallelization completed.")
     return model

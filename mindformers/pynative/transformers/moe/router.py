@@ -184,7 +184,7 @@ class TopKRouter(nn.Cell):
         scores_for_choice = scores_grouped.masked_fill(
             group_mask.unsqueeze(-1), float("-inf")
         )
-        scores_for_choice = self.reshape(scores_grouped, (-1, self.num_experts))
+        scores_for_choice = self.reshape(scores_for_choice, (-1, self.num_experts))
 
         return scores_for_choice
 

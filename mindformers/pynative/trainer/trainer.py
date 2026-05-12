@@ -792,7 +792,10 @@ class Trainer:
         )
         loss.backward(sense)
 
-        global_norm, grads = _calculate_global_grad_norm(self.optimizer.parameters)
+        global_norm, grads = _calculate_global_grad_norm(
+            self.optimizer.parameters,
+            enable_parallel=self.enable_parallel,
+        )
 
         with _no_grad():
             self.optimizer(grads)

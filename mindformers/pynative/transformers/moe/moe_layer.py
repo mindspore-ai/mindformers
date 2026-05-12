@@ -66,7 +66,7 @@ class MoELayer(nn.Cell):
         #       expert_bias is updated outside the model in an optimizer step pre hook
         #       to work with gradient accumulation.
         self.enable_expert_bias = config.moe_router_enable_expert_bias
-        if self.enable_expert_bias is not None:
+        if self.enable_expert_bias:
             self.expert_bias = Parameter(
                 mint.zeros(self.num_experts, dtype=ms.float32),
                 name="expert_bias",

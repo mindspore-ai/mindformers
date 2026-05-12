@@ -291,11 +291,3 @@ class ParallelDims:
         Equals dp_replicate * dp_shard * cp.
         """
         return self.dp_replicate * self.dp_shard * self.cp
-
-    @property
-    def only_fsdp_enabled(self) -> bool:
-        return self.fsdp_enabled and \
-            not self.cp_enabled and \
-            not self.tp_enabled and \
-            not self.pp_enabled and \
-            not self.etp_enabled
