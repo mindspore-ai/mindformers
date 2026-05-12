@@ -236,5 +236,5 @@ def save_to_aux_losses_tracker(
 def clear_aux_losses_tracker() -> None:
     """Clear the auxiliary losses."""
     tracker = get_moe_layer_wise_logging_tracker()
-    for _ in tracker:
-        tracker["values"].zero_()
+    for value in tracker["values"]:
+        value.zero_()

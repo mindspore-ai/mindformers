@@ -395,7 +395,33 @@ def _build_callback(config):
     )
 
 
-def _calculate_global_grad_norm(parameters):
+def _get_grad_factor(grad) -> float:
+    """
+    Compute the scaling factor for a gradient based on its distributed tensor placements.
+    """
+    from hyper_parallel.core.dtensor.placement_types import Replicate
+    # Non-DTensor gradients do not need scaling
+    if not isinstance(grad, DTensor):
+        return 1.0
+    # Gradients without mesh/placement metadata cannot be analyzed
+    if not hasattr(grad, 'device_mesh') or not hasattr(grad, 'placements'):
+        return 1.0
+
+    mesh = grad.device_mesh
+    placements = grad.placements
+    factor = 1.0
+    # Accumulate the product of mesh sizes along all replicated dimensions
+    for dim, p in enumerate(placements):
+        # Direct isinstance check when Replicate is importable
+        if Replicate is not None and isinstance(p, Replicate):
+            factor *= mesh.size(dim)
+        # Fallback: compare by class name when Replicate import failed
+        elif type(p).__name__ == 'Replicate':
+            factor *= mesh.size(dim)
+    return factor
+
+
+def _calculate_global_grad_norm(parameters, enable_parallel: bool = False):
     """Calculate the global gradient norm across all parameters and clip gradients in-place.
 
     Computes the global L2 norm of gradients, synchronizes it across distributed
@@ -403,27 +429,29 @@ def _calculate_global_grad_norm(parameters):
 
     Args:
         parameters: Iterable of parameters whose gradients will be clipped.
-        max_norm: Maximum allowed gradient norm. Default: 1.0.
-        eps: Epsilon for numerical stability in the clipping coefficient
-            computation. Default: 1e-6.
+        enable_parallel (bool): Whether to enable parallel training. Default: False.
 
     Returns:
         Tuple of (global_norm, grads) where global_norm is the computed global
         gradient norm and grads is a tuple of gradient tensors.
     """
     global_norm = Tensor(0.0)
-    grads = ()
+    grads = []
     for param in parameters:
         if param.grad is not None:
             grad = param.grad
-            grads += (grad,)
-            # For DTensor, use the local shard to compute the norm contribution
-            # will replace full_tensor() with redistribute
-            if isinstance(grad, DTensor):
-                grad = grad.full_tensor()
-            global_norm += grad.pow(2).sum()
+            grads.append(grad)
+            local_grad = grad.to_local() if isinstance(grad, DTensor) else grad
+            local_grad = local_grad.pow(2).sum() / _get_grad_factor(grad)
+            global_norm += local_grad
+
+    if enable_parallel:
+        from mindspore import ops
+        from mindspore.mint.distributed import all_reduce
+        all_reduce(global_norm, op=ops.ReduceOp.SUM)
+
     global_norm = mint.sqrt(global_norm)
-    return global_norm, grads
+    return global_norm, tuple(grads)
 
 
 def _get_loss_sense(parallelism, enable_parallel: bool = False):
