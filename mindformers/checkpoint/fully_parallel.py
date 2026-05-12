@@ -20,6 +20,7 @@ from typing import Callable
 from mindspore import save_checkpoint
 from mindspore.nn import Cell
 
+from mindformers.checkpoint.layout_adapter import LayoutAdapter
 from mindformers.checkpoint.sharded_tensor import get_all_sharded_tensor
 from mindformers.tools.logger import logger
 from mindformers.tools.utils import get_real_rank
@@ -139,7 +140,7 @@ class BalancedSaveStrategy():
             return False
 
         save_checkpoint(
-            self.network,
+            LayoutAdapter.preprocess_params(self.network),
             save_file_name,
             format=self.ckpt_format,
             choice_func=choice_func,
@@ -233,6 +234,9 @@ class BalancedSaveStrategy():
                 parallel access).
             iteration (int): The current iteration number.
         """
+        sharded_tensor_metas = {}
+        if LayoutAdapter.is_pynative_mode():
+            sharded_tensor_metas = get_all_sharded_tensor(self.network, self.filter_func)
         if self.rank_id == 0:
             param_file_mapping = []
             cur_rank_id = 0
@@ -252,7 +256,8 @@ class BalancedSaveStrategy():
                         ))
                     cur_rank_id += 1
 
-            sharded_tensor_metas = get_all_sharded_tensor(self.network, self.filter_func)
+            if not LayoutAdapter.is_pynative_mode():
+                sharded_tensor_metas = get_all_sharded_tensor(self.network, self.filter_func)
             origin_metadata_file = get_metadata_filename(self.checkpoint_path, iteration)
 
             if os.path.exists(origin_metadata_file):
