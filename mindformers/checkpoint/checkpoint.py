@@ -374,6 +374,7 @@ def save_checkpoint(iteration: int, network: Cell, optimizer: Optimizer = None,
         logger.info(f"Model checkpoint successfully saved at '{model_ckpt_filename}.safetensors'.")
 
     # Save optimizer weight.
+    logger.info("....... Start to save optimizer weight .......")
     if optimizer is not None:
         if remove_redundancy and sharded_tensor_metas is not None:
             # Optimizer weight remove redundancy.
@@ -387,7 +388,6 @@ def save_checkpoint(iteration: int, network: Cell, optimizer: Optimizer = None,
             remove_optimizer_redundancy.save(iteration)
         else:
             # Optimizer weight has redundancy.
-            logger.warning("....... Start to save optimizer weight .......")
             optimizer_ckpt_filename = get_checkpoint_name(
                 cur_iter_checkpoint_dir, user_prefix, get_real_rank(), get_real_group_size(), FileType.OPTIMIZER
             )

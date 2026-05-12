@@ -67,9 +67,6 @@ class CheckpointCallback(TrainerCallback):
         self.opt_sharded_tensor_metas = None
         self.save_global_layout_cache = save_global_layout_cache
 
-        if self.remove_redundancy:
-            raise ValueError("remove_redundancy is not supported yet.")
-
         if not self.save_path:
             raise ValueError("save_path must be provided for CheckpointCallback.")
 
