@@ -705,17 +705,7 @@ def parallelize_gptmodel(
     """Unified GPTModel parallelization entry point."""
     logger.info("Starting GPTModel parallelization for MCore architecture...")
 
-    # Phase 1: AC
-    if recompute.mode != "None" or recompute_comm.enable or swap.enable:
-        apply_ac(
-            _unwrap_gptmodel(model).decoder,
-            recompute,
-            recompute_comm,
-            swap,
-            parallel_dims.pp
-        )
-
-    # Phase 2: TP
+    # Phase 1: TP
     tp_mesh = None
     if parallel_dims.tp_enabled:
         tp_mesh = parallel_dims.get_mesh("tp")
@@ -725,7 +715,7 @@ def parallelize_gptmodel(
             enable_ep=parallel_dims.ep_enabled,
         )
 
-    # Phase 3: EP
+    # Phase 2: EP
     if parallel_dims.ep_enabled:
         apply_moe_ep_tp(
             model,
@@ -733,11 +723,21 @@ def parallelize_gptmodel(
             ep_mesh=parallel_dims.get_mesh("ep"),
         )
 
-    # Phase 4: CP
+    # Phase 3: CP
     if parallel_dims.cp_enabled:
         raise NotImplementedError(
             "Context Parallelism (CP) is not yet implemented for GPTModel. "
             "Please set context_parallel=1 in your config."
+        )
+
+    # Phase 4: AC
+    if recompute.mode != "None" or recompute_comm.enable or swap.enable:
+        apply_ac(
+            _unwrap_gptmodel(model).decoder,
+            recompute,
+            recompute_comm,
+            swap,
+            parallel_dims.pp
         )
 
     # Phase 5: FSDP/HSDP
