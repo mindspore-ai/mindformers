@@ -167,7 +167,7 @@ class TestParallelLinear:
                 succeed = False
         assert succeed, "Some precision check failed"
 
-    @pytest.mark.level0
+    @pytest.mark.level1
     @pytest.mark.platform_arm_ascend910b_training
     @pytest.mark.env_onecard
     def test_parallel_linear_quantization(self, tmp_path):

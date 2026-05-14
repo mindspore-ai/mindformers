@@ -36,15 +36,15 @@ class TestQuantDeepseekParallelInference:
         self.run_script_path = self.sh_path / "run_quant_deepseek_infer.py"
         assert self.run_script_path.exists(), f"Run script not found: {self.run_script_path}"
 
-    @pytest.mark.level0
+    @pytest.mark.level1
     @pytest.mark.parametrize("quant_algo", ['A8W8'])
     def test_quant_deepseek_level0(self, quant_algo):
         """Test two cards for quant deepseek."""
         port_id = int(os.environ.get("ASCEND_PORT_ID", random.randint(50000, 65535)))
         cmd_list = [
             "msrun",
-            f"--worker_num=4",
-            f"--local_worker_num=4",  # Should match NPU cards available
+            "--worker_num=4",
+            "--local_worker_num=4",  # Should match NPU cards available
             f"--master_port={port_id}",  # Ensure port is unique per test run if parallelized at pytest level
             f"--log_dir=./msrun_log_{quant_algo}_quant_deepseek_infer",
             "--join=True"]
