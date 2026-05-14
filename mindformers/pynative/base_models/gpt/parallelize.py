@@ -457,15 +457,6 @@ def apply_non_moe_tp(
                     [transformer_block.mlp.experts, "weight2", (Replicate(),)],
                 ])
 
-            if distribute_param_plan:
-                for sub_module, param_name, sub_plan in distribute_param_plan:
-                    _distribute_param(
-                        sub_module,
-                        param_name=param_name,
-                        device_mesh=tp_mesh,
-                        placements=sub_plan
-                    )
-
             # special parallel for router
             _distribute_router(
                 transformer_block.mlp.router,
@@ -473,6 +464,15 @@ def apply_non_moe_tp(
                 input_layouts=(Replicate(), Replicate()),
                 output_layouts=(Replicate(), Replicate(), Replicate()),
             )
+
+        if distribute_param_plan:
+            for sub_module, param_name, sub_plan in distribute_param_plan:
+                _distribute_param(
+                    sub_module,
+                    param_name=param_name,
+                    device_mesh=tp_mesh,
+                    placements=sub_plan
+                )
 
         parallelize_module(
             module=transformer_block,
