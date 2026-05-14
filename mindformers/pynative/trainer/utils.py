@@ -421,7 +421,12 @@ def _get_grad_factor(grad) -> float:
     return factor
 
 
-def _calculate_global_grad_norm(parameters, enable_parallel: bool = False):
+def _calculate_global_grad_norm(
+    parameters,
+    enable_parallel: bool = False,
+    max_norm: float = 1.0,
+    eps: float = 1e-6,
+):
     """Calculate the global gradient norm across all parameters and clip gradients in-place.
 
     Computes the global L2 norm of gradients, synchronizes it across distributed
@@ -430,6 +435,9 @@ def _calculate_global_grad_norm(parameters, enable_parallel: bool = False):
     Args:
         parameters: Iterable of parameters whose gradients will be clipped.
         enable_parallel (bool): Whether to enable parallel training. Default: False.
+        max_norm (float): Maximum allowed gradient norm. Default: 1.0.
+        eps (float): Small epsilon added to the norm for numerical stability when computing the clipping coefficient.
+           Default: 1e-6.
 
     Returns:
         Tuple of (global_norm, grads) where global_norm is the computed global
@@ -451,8 +459,16 @@ def _calculate_global_grad_norm(parameters, enable_parallel: bool = False):
         all_reduce(global_norm, op=ops.ReduceOp.SUM)
 
     global_norm = mint.sqrt(global_norm)
-    return global_norm, tuple(grads)
 
+    # Clip gradients in-place if the global norm exceeds max_norm
+    clip_coef = max_norm / (global_norm + eps)
+    if clip_coef < 1:
+        scale = clip_coef.item()
+        for grad in grads:
+            if grad is not None:
+                grad.mul_(scale)
+
+    return global_norm, tuple(grads)
 
 def _get_loss_sense(parallelism, enable_parallel: bool = False):
     """
