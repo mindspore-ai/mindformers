@@ -20,9 +20,9 @@ The following is the changelog for MindSpore Transformers 1.9.0 compared with 1.
 
 Newly supported models:
 
-| Model     | Variants                                                                                                                                                                                                                                           |
-|-----------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| TeleChat3 | [TeleChat3-36B](https://gitcode.com/mindspore/mindformers/blob/r1.9.0-beta1/configs/telechat3) (pre-training, inference), [TeleChat3-105B-A4.7B](https://gitcode.com/mindspore/mindformers/blob/r1.9.0-beta1/configs/telechat3_moe) (pre-training) |
+| Model     | Variants                                                                                                                                                                                                                               |
+|-----------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| TeleChat3 | [TeleChat3-36B](https://gitcode.com/mindspore/mindformers/blob/r1.9.0/configs/telechat3) (pre-training, inference), [TeleChat3-105B-A4.7B](https://gitcode.com/mindspore/mindformers/blob/r1.9.0/configs/telechat3_moe) (pre-training) |
 
 ### Bug Fixes
 
@@ -56,7 +56,7 @@ Thanks to everyone who contributed during this release cycle:
 
 Contributions in any form are welcome!
 
-<hr />
+---
 
 <ol>
 <li id="fn1">Experimental tests show that loading time for a hundred-billion-parameter model on a hundred-NPU cluster has been reduced by 80%.</li>
