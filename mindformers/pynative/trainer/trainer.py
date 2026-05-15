@@ -34,6 +34,7 @@ from mindspore.graph.api import _no_grad
 
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.platform.mindspore.autograd_compat import enable_mindspore_backward_compat
+from hyper_parallel.core.dtensor.init_weights import init_empty_weights
 
 from mindformers.tools.logger import logger
 from mindformers.pynative.config import TrainConfig
@@ -161,6 +162,11 @@ class Trainer:
             # Apply parallelism to model
             self._apply_parallelism(self.model, self.config.parallelism)
 
+        # After parallelism, parameters will be reset
+        self.model.to_empty()
+        with _no_grad():
+            self.model.init_states()
+
         # Create train dataset
         self.train_dataset = self._create_dataset(
             train_dataset, getattr(self.config, "train_dataset", None)
@@ -195,6 +201,7 @@ class Trainer:
         # Initialize training state
         self.communication_init = False
         self.state = None
+        self._model_states_initialized = False
 
     @staticmethod
     def _init_config(config: Union[str, dict], run_mode: str = "train") -> TrainConfig:
@@ -310,8 +317,9 @@ class Trainer:
             raise ValueError("Either model instance or config.model must be provided.")
 
         logger.info("Building model from config...")
-        # support delay init params in future
-        model = _build_model(model_config)
+        with init_empty_weights():
+            logger.info("[DelayInit] Using meta device for model construction (PyNative mode).")
+            model = _build_model(model_config)
 
         # Apply LoRA if provided (after base model is built)
         lora_config = getattr(self.config, "lora_config", None)
@@ -543,8 +551,6 @@ class Trainer:
 
         # Initialize training state
         self.state = self._init_train_state()
-
-
 
         # Load checkpoint
         checkpoint_path = checkpoint_path or self.config.checkpoint.load_path

@@ -9,7 +9,6 @@ from typing import Tuple, Optional
 
 from mindspore import nn, Tensor, mint, ops
 from mindspore.common.parameter import Parameter
-
 from mindspore.common import dtype as mstype
 
 from mindformers.parallel_core.transformer_config import TransformerConfig
@@ -70,7 +69,7 @@ class TopKRouter(nn.Cell):
             else 1.0
         )
         self.weight = Parameter(
-            config.init_method((num_experts, dim)), name="weight"
+            mint.empty((num_experts, dim)), name="weight"
         )
         self.num_experts = num_experts
         self.num_expert_groups = num_expert_groups or 0
@@ -122,6 +121,10 @@ class TopKRouter(nn.Cell):
         self.histc = mint.histc
         self.stop_gradient = ops.stop_gradient
 
+
+    def reset_parameter(self):
+        """Reset router weights for delayed initialization."""
+        self.weight.normal_(mean=0.0, std=0.01)
 
     def _debug_force_load_balance_routing(
             self, scores: Tensor

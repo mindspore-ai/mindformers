@@ -127,7 +127,7 @@ class FlashAttention(Cell):
         self.track_max_attention_logit = getattr(config, "track_max_attention_logit", False)
         if self.track_max_attention_logit:
             self.max_logits_val = Parameter(
-                mint.zeros((self.head_num,), dtype=mstype.float32),
+                mint.empty((self.head_num,), dtype=mstype.float32),
                 requires_grad=False
             )
             self.amax = mint.amax
@@ -217,3 +217,8 @@ class FlashAttention(Cell):
         x_merge = self.reshape(x, new_shape)
         x_merge = self.fa_out_transpose(x_merge, (1, 0, 2))
         return x_merge
+
+    def reset_parameter(self):
+        """Reset FlashAttention parameters for delayed initialization."""
+        if self.track_max_attention_logit and hasattr(self, 'max_logits_val'):
+            self.max_logits_val.zero()

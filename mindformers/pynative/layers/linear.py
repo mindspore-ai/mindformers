@@ -69,13 +69,15 @@ class Linear(nn.Cell):
         else:
             # Weight is stored as (output_size, input_size) and transposed at runtime
             weight_shape = (output_size, input_size)
-            self.weight = Parameter(init_method(weight_shape), name='weight')
+            self.weight = Parameter(mint.empty(weight_shape), name='weight')
 
         if self.has_bias:
             if bias_init is None:
                 bias_init = init_method_zero(self.params_dtype)
-            self.bias = Parameter(bias_init((output_size,)), name='bias')
+            self.bias_init = bias_init
+            self.bias = Parameter(mint.empty((output_size,)), name='bias')
         else:
+            self.bias_init = None
             self.bias = None
 
         self.matmul = mint.matmul
@@ -118,3 +120,10 @@ class Linear(nn.Cell):
         output = self.cast(output, ori_dtype)
 
         return output
+
+    def reset_parameter(self):
+        """Reset linear parameters for delayed initialization."""
+        if not self.skip_weight_param_allocation and self.weight is not None:
+            self.weight.normal_(mean=0.0, std=0.01)
+        if self.has_bias and self.bias is not None and self.bias_init is not None:
+            self.bias.zero_()

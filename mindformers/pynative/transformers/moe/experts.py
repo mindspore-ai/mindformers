@@ -73,10 +73,10 @@ class GroupedMLP(nn.Cell):
 
         # parameters
         self.weight1 = Parameter(
-            self.init_method([self.num_local_experts * self.hidden_size, self.moe_ffn_hidden_size]),
+            mint.empty([self.num_local_experts * self.hidden_size, self.moe_ffn_hidden_size]),
             name='w1')
         self.weight2 = Parameter(
-            self.init_method([self.num_local_experts * self.config.moe_ffn_hidden_size, self.hidden_size]),
+            mint.empty([self.num_local_experts * self.config.moe_ffn_hidden_size, self.hidden_size]),
             name='w2')
 
         self.cast = ops.cast
@@ -185,3 +185,8 @@ class GroupedMLP(nn.Cell):
             None, tokens_per_expert)[0]
         fc2_output = self.cast(fc2_output, original_dtype)
         return fc2_output
+
+    def reset_parameter(self):
+        """Reset expert weights for delayed initialization."""
+        self.weight1.normal_(mean=0.0, std=0.01)
+        self.weight2.normal_(mean=0.0, std=0.01)

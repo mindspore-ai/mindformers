@@ -62,6 +62,7 @@ class TestModule(nn.Cell):
             init_method=init_method_normal(),
             bias=True
         )
+        self.linear.reset_parameter()
 
     def construct(self, x, y=None, mask=None):
         if mask is not None:

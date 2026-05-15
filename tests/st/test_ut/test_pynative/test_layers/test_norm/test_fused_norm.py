@@ -58,6 +58,7 @@ class TestFusedNorm:
                 params_dtype=config.params_dtype,
                 compute_dtype=config.layernorm_compute_dtype
             )
+            norm.reset_parameter()
         else:  # Static graph mode
             # Get norm factory class and create instance
             norm_factory = get_graph_norm_cls(fused_norm=True)
