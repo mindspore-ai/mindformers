@@ -134,6 +134,13 @@ class GPTModel(nn.Cell):
         self.pad_token_id = config.pad_token_id
         self.ignore_token_id = config.ignore_token_id
         self.calculate_per_token_loss = config.calculate_per_token_loss
+        self.chunk_loss_num = config.chunk_loss_num
+        self._last_chunk_loss_runtime_state = None
+        logger.info(
+            "GPTModel chunk loss config: chunk_loss_num=%s, calculate_per_token_loss=%s",
+            self.chunk_loss_num,
+            self.calculate_per_token_loss
+        )
 
         # Internally generates AttentionMask.
         self.casual_mask = CausalMaskGenerate(
@@ -212,7 +219,11 @@ class GPTModel(nn.Cell):
                                        compute_dtype=self.config.compute_dtype,
                                        params_dtype=self.config.params_dtype)
             config.model_parallel = config.tensor_model_parallel_size
-            self.loss = CrossEntropyLoss(config=config)
+            self.loss = CrossEntropyLoss(
+                calculate_per_token_loss=self.calculate_per_token_loss,
+                chunk_loss_num=self.chunk_loss_num,
+                config=config
+            )
 
         # operations
         self.cast = ops.cast
@@ -226,6 +237,10 @@ class GPTModel(nn.Cell):
         self.sign = mint.sign
         self.transpose = mint.permute
         self.assign = mint.clone
+
+    def _should_use_chunked_loss(self):
+        """Whether current runtime state should use chunked loss."""
+        return self.training and self.chunk_loss_num > 1 and not self.return_logits
 
     def construct(
             self,
@@ -283,17 +298,33 @@ class GPTModel(nn.Cell):
             return hidden_states
 
         # logits origin shape is [s b h], transform it to [b*s h].
+        hidden_states = self.cast(hidden_states, dtype.bfloat16)
         logits = self.output_layer(hidden_states, output_weight)
-        if logits.ndim > 2:
+        need_chunked_loss = self._should_use_chunked_loss()
+        chunk_loss_runtime_state = (self.training, self.return_logits, need_chunked_loss)
+        if chunk_loss_runtime_state != self._last_chunk_loss_runtime_state:
+            logger.info(
+                "GPTModel chunk loss runtime: training=%s, return_logits=%s, need_chunked_loss=%s",
+                self.training,
+                self.return_logits,
+                need_chunked_loss
+            )
+            self._last_chunk_loss_runtime_state = chunk_loss_runtime_state
+        if logits.ndim > 2 and not need_chunked_loss:
             logits = self.transpose(logits, (1, 0, 2))
             logits = self.reshape(logits, (-1, logits.shape[-1]))
-        logits = self.cast(logits, dtype.float32)
 
         if not self.training or self.return_logits:
-            return logits.contiguous()
+            return self.cast(logits, dtype.float32).contiguous()
 
         # labels origin shape is [b s], Transpose is not required.
-        loss = self.compute_language_model_loss(labels, logits, loss_mask)
+        if need_chunked_loss:
+            if logits.ndim != 3:
+                raise ValueError(f"Chunked loss expects 3D logits, but got shape {logits.shape}.")
+            logits = self.transpose(logits, (1, 0, 2))
+            loss = self.compute_language_model_loss(labels, logits, loss_mask)
+        else:
+            loss = self.compute_language_model_loss(labels, logits, loss_mask)
 
         if self.calculate_per_token_loss:
             numerator0, denominator0 = loss
