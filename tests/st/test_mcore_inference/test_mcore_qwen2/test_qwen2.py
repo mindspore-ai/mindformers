@@ -20,10 +20,11 @@ import pytest
 import jieba
 import numpy as np
 
+from transformers import AutoTokenizer
+
 from mindformers import build_context, MindFormerConfig
 from mindformers.models.qwen2.configuration_qwen2 import Qwen2Config
 from mindformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM
-from transformers import AutoTokenizer
 
 
 def _get_all_words(standard_cut_infer_ret_list, test_cut_infer_ret_list):
@@ -69,7 +70,7 @@ def compare_distance(x1, x2, bench_sim=0.95):
     assert sim >= bench_sim
 
 
-@pytest.mark.level0
+@pytest.mark.level1
 @pytest.mark.platform_arm_ascend910b_training
 @pytest.mark.env_onecard
 def test_qwen2_5_3b_predict_mcore():
@@ -135,15 +136,15 @@ def test_qwen2_5_3b_predict_mcore():
         ))
         input_ids_list = []
         answer = batch_data["answer"]
-        for i in range(0, batch_size):
+        for _ in range(batch_size):
             input_ids_list.append(input_ids)
         outputs = network.generate(input_ids_list,
                                    max_length=max_decode_length,
                                    do_sample=False,
                                    return_dict_in_generate=False)
 
-        for i in range(0, len(outputs)):
-            output_text = tokenizer.decode(outputs[i])
+        for output in outputs:
+            output_text = tokenizer.decode(output)
             print("test_qwen2_5_3b_predict_standalone, output_text:", output_text)
             compare_distance(output_text, answer)
 

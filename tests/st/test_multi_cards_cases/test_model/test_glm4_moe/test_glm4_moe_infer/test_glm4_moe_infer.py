@@ -37,7 +37,7 @@ class TestMcoreGlm4MoeParallelInference:
         self.run_script_path = self.sh_path / "run_glm4_moe.py"
         assert self.run_script_path.exists(), f"Run script not found: {self.run_script_path}"
 
-    @pytest.mark.level0
+    @pytest.mark.level1
     def test_two_cards_cases(self):
         """Test two cards for Glm4Moe."""
         port_id = int(os.environ.get("ASCEND_PORT_ID", random.randint(50000, 65535)))

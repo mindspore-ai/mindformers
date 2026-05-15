@@ -36,20 +36,20 @@ class TestMcoreQwen3ParallelInference:
         self.run_script_path = self.sh_path / "run_qwen3.py"
         assert self.run_script_path.exists(), f"Run script not found: {self.run_script_path}"
 
-    @pytest.mark.level0
+    @pytest.mark.level1
     def test_two_cards_cases(self):
         """Test two cards for Qwen3."""
         port_id = int(os.environ.get("ASCEND_PORT_ID", random.randint(50000, 65535)))
         cmd_list = [
             "msrun",
-            f"--worker_num=2",
-            f"--local_worker_num=2",  # Should match NPU cards available
+            "--worker_num=2",
+            "--local_worker_num=2",  # Should match NPU cards available
             f"--master_port={port_id}",  # Ensure port is unique per test run if parallelized at pytest level
-            f"--log_dir=./msrun_log_qwen3",
+            "--log_dir=./msrun_log_qwen3",
             "--join=True"]
         cmd_list += [
             str(self.run_script_path),
-            f"--device_num=2"
+            "--device_num=2"
         ]
         cmd = " ".join(cmd_list)
         logger.info(f"Running command: {cmd}")
