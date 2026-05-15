@@ -191,7 +191,8 @@ class CrossEntropyLoss(nn.Cell):
         (1,)
     """
     @_LogActionOnce(m_logger=logger, key='CrossEntropyLoss')
-    def __init__(self, calculate_per_token_loss=False, loss_tag='lm', **kwargs):
+    def __init__(self, calculate_per_token_loss=False, loss_tag='lm',
+                 chunk_loss_num=1, **kwargs):
         super().__init__()
         self.kwargs = kwargs
         self.loss_tag = loss_tag
@@ -208,9 +209,14 @@ class CrossEntropyLoss(nn.Cell):
         self.nll_loss = _NLLLossModule()
 
         self.calculate_per_token_loss = calculate_per_token_loss
+        self.chunk_loss_num = chunk_loss_num
 
     def construct(self, logits, label, input_mask):
         """Forward process"""
+        if self.chunk_loss_num > 1 and logits.ndim == 3:
+            print(f'[chunk loss], logits shape={logits.shape}, chunk_loss_num={self.chunk_loss_num}.')
+            return _ChunkCrossEntropyLoss.apply(logits, label, input_mask, self.chunk_loss_num)
+
         log_softmax = self.log_softmax(logits)
         loss_reduce = self.nll_loss(log_softmax, label)
 
@@ -224,3 +230,93 @@ class CrossEntropyLoss(nn.Cell):
         if not self.calculate_per_token_loss:
             return self.div(numerator, denominator)
         return numerator, denominator
+
+class _ChunkCrossEntropyLoss(_Function):
+    """
+    Chunked cross entropy with a fused backward.
+
+    The forward computes the loss per sequence chunk but only saves the original logits, labels and mask.
+    The backward recomputes chunk softmax and concatenates chunk gradients, avoiding autograd slice backward
+    materializing multiple full-size logits gradient buffers.
+    """
+
+    @staticmethod
+    def _chunk_sizes(seq_length, chunk_loss_num):
+        active_chunk_num = min(chunk_loss_num, seq_length) if seq_length > 0 else 1
+        chunk_size = seq_length // active_chunk_num
+        chunk_check = seq_length % active_chunk_num
+        if chunk_check == 0:
+            return [chunk_size for _ in range(active_chunk_num)]
+        chunk_sizes = [chunk_size for _ in range(active_chunk_num - 1)]
+        chunk_sizes.append(seq_length - chunk_size * (active_chunk_num - 1))
+        return chunk_sizes
+
+    @staticmethod
+    def _neg_log_softmax(logits):
+        max_val, _ = mint.max(logits, 1, True)
+        shifted = mint.sub(logits, max_val)
+        exp_vals = mint.exp(shifted)
+        sum_exp = mint.sum(exp_vals, -1, True)
+        log_sum = mint.log(sum_exp)
+        return mint.sub(log_sum, shifted)
+
+    @staticmethod
+    def forward(ctx, logits, labels, input_mask, chunk_loss_num):
+        """Forward pass for fused chunked cross entropy."""
+        ctx.logits = logits
+        ctx.labels = labels
+        ctx.input_mask = input_mask
+        ctx.logits_dtype = logits.dtype
+        ctx.chunk_sizes = _ChunkCrossEntropyLoss._chunk_sizes(labels.shape[1], chunk_loss_num)
+
+        denominator = mint.sum(mint.reshape(input_mask, (-1,)))
+        denominator = mint.add(denominator, ops.cast(ops.tuple_to_array((1e-8,)), mstype.float32))
+        ctx.denominator = denominator
+
+        loss = None
+        start_idx = 0
+        for chunk_size in ctx.chunk_sizes:
+            end_idx = start_idx + chunk_size
+            seq_logits = logits[:, start_idx:end_idx, :]
+            seq_logits = ops.cast(mint.reshape(seq_logits, (-1, seq_logits.shape[-1])), mstype.float32)
+            seq_labels = mint.reshape(labels[:, start_idx:end_idx], (-1,))
+            seq_mask = ops.cast(mint.reshape(input_mask[:, start_idx:end_idx], (-1,)), mstype.float32)
+
+            neg_log_softmax = _ChunkCrossEntropyLoss._neg_log_softmax(seq_logits)
+            indices = mint.reshape(seq_labels, (-1, 1))
+            loss_reduce = mint.reshape(mint.gather(neg_log_softmax, 1, indices), (-1,))
+            numerator = mint.sum(mint.mul(loss_reduce, seq_mask))
+            seq_loss = mint.div(numerator, denominator)
+            loss = seq_loss if loss is None else loss + seq_loss
+            start_idx = end_idx
+        return loss
+
+    @staticmethod
+    def backward(ctx, grads):
+        """Backward pass for fused chunked cross entropy."""
+        logits = ctx.logits
+        labels = ctx.labels
+        input_mask = ctx.input_mask
+        grad_logits = mint.empty_like(logits)
+        start_idx = 0
+        for chunk_size in ctx.chunk_sizes:
+            end_idx = start_idx + chunk_size
+            seq_logits = logits[:, start_idx:end_idx, :]
+            seq_shape = seq_logits.shape
+            seq_logits = ops.cast(mint.reshape(seq_logits, (-1, seq_logits.shape[-1])), mstype.float32)
+            seq_labels = mint.reshape(labels[:, start_idx:end_idx], (-1,))
+            seq_mask = ops.cast(mint.reshape(input_mask[:, start_idx:end_idx], (-1,)), mstype.float32)
+
+            max_val, _ = mint.max(seq_logits, 1, True)
+            shifted = mint.sub(seq_logits, max_val)
+            exp_vals = mint.exp(shifted)
+            probs = mint.div(exp_vals, mint.sum(exp_vals, -1, True))
+            indices = mint.reshape(seq_labels, (-1, 1))
+            vals = mint.zeros_like(indices, dtype=probs.dtype) - 1
+            grad = mint.scatter_add(probs, 1, indices, vals)
+            grad_scale = mint.div(mint.mul(seq_mask, grads), ctx.denominator)
+            grad = mint.mul(grad, mint.unsqueeze(grad_scale, -1))
+            grad = ops.cast(mint.reshape(grad, seq_shape), ctx.logits_dtype)
+            grad_logits.narrow(1, start_idx, chunk_size).copy_(grad)
+            start_idx = end_idx
+        return grad_logits, mint.zeros_like(labels), mint.zeros_like(input_mask), None
