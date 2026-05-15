@@ -10,7 +10,7 @@ from mindformers.parallel_core.utils.spec_utils import ModuleSpec, build_module
 from mindformers.parallel_core.transformer_config import TransformerConfig
 from mindformers.pynative.layers.dropout import Dropout
 from mindformers.pynative.layers.identity_op import IdentityOp
-from mindformers.pynative.transformers.hyper_connection import HyperConnectionModule
+from mindformers.pynative.transformers.hyper_connection import HyperConnectionModule, FusedHyperConnectionModule
 
 
 @dataclass
@@ -230,11 +230,12 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             hidden_dropout=hidden_dropout,
         )
         self.n = config.num_residual_streams
-        self.attn_hc = HyperConnectionModule(
+        hc_cls = FusedHyperConnectionModule if config.use_fused_mhc else HyperConnectionModule
+        self.attn_hc = hc_cls(
             config=config,
             layer_number=layer_number,
         )
-        self.ffn_hc = HyperConnectionModule(
+        self.ffn_hc = hc_cls(
             config=config,
             layer_number=layer_number,
         )

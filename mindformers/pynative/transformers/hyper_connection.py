@@ -16,6 +16,11 @@
 import numpy as np
 import mindspore.common.dtype as mstype
 from mindspore import nn, Parameter, Tensor, mint, ops
+from mindspore.common.initializer import initializer
+try:
+    from hyper_parallel.custom_ops.experimental import npu_mhc_pre_sinkhorn, npu_mhc_post
+except ImportError:
+    pass
 from mindformers.parallel_core.transformer_config import TransformerConfig
 from mindformers.parallel_core.utils.init_method import init_method_zero
 from mindformers.pynative.layers.linear import Linear
@@ -250,3 +255,98 @@ class HyperConnectionModule(nn.Cell):
 
         # Reset rms_weight to ones
         self.rms_weight.fill_(1.0)
+
+class FusedHyperConnectionOutputCell(nn.Cell):
+    """Residual-stream update after a sublayer using fused npu_mhc_post kernel.
+
+    Computes:
+        new_streams = h_res^T @ x_streams + h_post * sublayer_out
+    via a single Ascend custom kernel call.
+    """
+
+    def __init__(self, n, hidden_size, dtype=mstype.bfloat16):
+        super().__init__()
+        self.n = n
+        self.hidden_size = hidden_size
+        self.dtype = dtype
+        self.reshape = mint.reshape
+        self.transpose = mint.permute
+        self.squeeze = mint.squeeze
+        self.cast = ops.cast
+
+    def construct(self, h_res, h_post, original_streams, sublayer_out):
+        """Update residual streams via fused kernel.
+
+        Args:
+            h_res: [s, b, n, n] doubly-stochastic residual matrix
+            h_post: [s, b, n, 1] per-stream output scale
+            original_streams: [s, b, n*H] packed streams before the sublayer
+            sublayer_out: [s, b, H] dropout output of the sublayer
+
+        Returns:
+            Updated packed streams with shape [s, b, n*H].
+        """
+        s, b, _ = original_streams.shape
+        n = self.n
+        hidden_size = self.hidden_size
+
+        x = self.reshape(original_streams, (s, b, n, hidden_size))
+        x = self.cast(x, self.dtype)
+
+        output = npu_mhc_post(x, h_res, sublayer_out, self.squeeze(h_post, -1))
+        return self.reshape(output, (s, b, n * hidden_size))
+
+
+class FusedHyperConnectionModule(HyperConnectionModule):
+    """Fused mHC module using npu_mhc_pre_sinkhorn and npu_mhc_post custom kernels.
+
+    Inherits from HyperConnectionModule so that parameter names, shapes and
+    initialisation are identical — checkpoints can be loaded without any name
+    mapping.  Only the forward path is overridden to call the fused kernels.
+
+    Typical usage in TransformerLayer:
+
+        aggregated, h_res, h_post = self.attn_hc(hidden_states)
+        x = input_layernorm(aggregated)
+        x = self_attention(x)
+        x = dropout(x)
+        hidden_states = self.attn_hc.output_cell(h_res, h_post, hidden_states, x)
+    """
+
+    def __init__(self, config: TransformerConfig, layer_number: int):
+        super().__init__(config=config, layer_number=layer_number)
+        self.hc_eps = 1e-6
+        self.output_cell = FusedHyperConnectionOutputCell(self.n, self.hidden_size, self.dtype)
+
+    def construct(self, hidden_states):
+        """Compute connection matrices and aggregate streams via fused kernel.
+
+        Args:
+            hidden_states: [s, b, n*H] packed residual streams (SBH layout)
+
+        Returns:
+            aggregated: [s, b, H] weighted input for the sublayer
+            h_res: [s, b, n, n] doubly-stochastic residual matrix
+            h_post: [s, b, n, 1] per-stream output scale
+        """
+        s, b, _ = hidden_states.shape
+        n = self.n
+        hidden_size = self.hidden_size
+
+        x = self.reshape(hidden_states, (s, b, n, hidden_size))
+        x = self.cast(x, self.dtype)
+
+        alpha = self.concat((self.alpha_pre, self.alpha_post, self.alpha_res), dim=-1)
+
+        h_in, h_post, h_res_flat, *_ = npu_mhc_pre_sinkhorn(
+            x, self.mapping_proj.weight, alpha, self.bias,
+            hc_mult=n,
+            num_iters=self.sinkhorn_iterations,
+            hc_eps=self.hc_eps,
+            norm_eps=self.norm_eps,
+        )
+
+        aggregated = h_in
+        h_res = self.reshape(h_res_flat, (s, b, n, n))
+        h_post = self.reshape(h_post, (s, b, n, 1))
+        return aggregated, h_res, h_post
