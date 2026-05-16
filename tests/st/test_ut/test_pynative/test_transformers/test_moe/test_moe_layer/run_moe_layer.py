@@ -54,7 +54,9 @@ class MoELayerRunner:
         self.inputs = ms.Tensor(init_params.get("inputs"), dtype=ms.float32)
         self.router_weight = init_params.get("router_weight")
         self.experts_weight1 = init_params.get("experts_weight1")
+        self.experts_weight1 = self.experts_weight1.reshape(self.num_experts, self.hidden_size, self.hidden_size * 8)
         self.experts_weight2 = init_params.get("experts_weight2")
+        self.experts_weight2 = self.experts_weight2.reshape(self.num_experts, self.hidden_size * 4, self.hidden_size)
         self.shared_fc1 = init_params.get("shared_fc1")
         self.shared_fc2 = init_params.get("shared_fc2")
 

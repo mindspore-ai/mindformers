@@ -221,4 +221,4 @@ class FlashAttention(Cell):
     def reset_parameter(self):
         """Reset FlashAttention parameters for delayed initialization."""
         if self.track_max_attention_logit and hasattr(self, 'max_logits_val'):
-            self.max_logits_val.zero()
+            self.max_logits_val.zero_()

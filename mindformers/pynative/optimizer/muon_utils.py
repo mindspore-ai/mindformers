@@ -70,8 +70,8 @@ def _split_reshape_concat(param_name, rule, tensor):
 
 def _merge_reshape_concat(param_name, rule, parts_list):
     """Merge a split concat expert weight and restore it to 2D."""
-    _, _, total_intermediate = _eval_tuple(rule["reshape"], param_name, parts_list[0])
-    return mint.reshape(mint.cat(parts_list, dim=-1), (-1, total_intermediate))
+    _, intermediate_size, total_intermediate = _eval_tuple(rule["reshape"], param_name, parts_list[0])
+    return mint.reshape(mint.cat(parts_list, dim=-1), (-1, intermediate_size, total_intermediate))
 
 
 def _split_reshape_only(param_name, rule, tensor):
@@ -82,8 +82,8 @@ def _split_reshape_only(param_name, rule, tensor):
 
 def _merge_reshape_only(param_name, rule, parts_list):
     """Restore a reshape-only Muon block to 2D."""
-    _, _, hidden_size = _eval_tuple(rule["reshape"], param_name, parts_list[0])
-    return mint.reshape(parts_list[0], (-1, hidden_size))
+    _, intermediate_size, hidden_size = _eval_tuple(rule["reshape"], param_name, parts_list[0])
+    return mint.reshape(parts_list[0], (-1, intermediate_size, hidden_size))
 
 
 def _split_block_split(param_name, rule, tensor):
@@ -166,4 +166,5 @@ def make_muon_fns(schema):
         rule, _, merge_handler = _get_handlers(param_name)
         return parts_list[0] if merge_handler is None else merge_handler(param_name, rule, parts_list)
 
+    split_fn._muon_schema = tuple(schema)
     return split_fn, merge_fn

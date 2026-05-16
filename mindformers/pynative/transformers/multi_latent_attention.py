@@ -136,6 +136,11 @@ class MultiLatentAttention(nn.Cell):
         return tensor.full_tensor(), (tensor.device_mesh, tensor.placements)
 
     @staticmethod
+    def _to_local_tensor(tensor):
+        """Return the local tensor for a DTensor, otherwise pass through."""
+        return tensor.to_local() if isinstance(tensor, DTensor) else tensor
+
+    @staticmethod
     def _restore_tensor_layout(tensor, layout):
         """Restore a tensor back to the original DTensor local layout."""
         if layout is None:
@@ -151,12 +156,73 @@ class MultiLatentAttention(nn.Cell):
         ).reshape(-1)
         return mint.unsqueeze(scale_broadcast, 1)
 
+    @staticmethod
+    def _local_head_count(tensor, head_dims):
+        """Return the number of complete local heads represented by tensor rows."""
+        rows = int(tensor.shape[0])
+        rows_per_head = sum(int(dim) for dim in head_dims)
+        if rows_per_head <= 0 or rows % rows_per_head != 0:
+            return None
+        return rows // rows_per_head
+
     def _get_qk_clip_weight(self, param_name):
         """Return the MLA projection weight addressed by an optimizer parameter name."""
         for attr in ("linear_qb", "linear_kvb", "linear_qkv"):
             if f"self_attention.{attr}.weight" in param_name:
                 return getattr(getattr(self, attr, None), "weight", None)
         return None
+
+    def can_apply_qk_clip_to_local_weights(self, scales):
+        """Check whether local MLA projection shards align with local head scales."""
+        if self.config.q_lora_rank is None:
+            return False
+
+        scale_heads = int(scales.shape[0])
+        q_weight = getattr(getattr(self, "linear_qb", None), "weight", None)
+        kv_weight = getattr(getattr(self, "linear_kvb", None), "weight", None)
+        if q_weight is None or kv_weight is None:
+            return False
+
+        q_local = self._to_local_tensor(q_weight)
+        kv_local = self._to_local_tensor(kv_weight)
+        q_heads = self._local_head_count(q_local, (self.qk_head_dim, self.qk_pos_emb_head_dim))
+        kv_heads = self._local_head_count(kv_local, (self.qk_head_dim, self.v_head_dim))
+        return q_heads == scale_heads and kv_heads == scale_heads
+
+    def try_apply_qk_clip_to_local_weights(self, param_prefix, scales, split_fn, merge_fn):
+        """Apply QK-clip on local TP shards without gathering full projection weights."""
+        if not self.can_apply_qk_clip_to_local_weights(scales):
+            return False
+
+        self._apply_qk_clip_to_local_weight(
+            f"{param_prefix}.linear_qb.weight", scales, split_fn, merge_fn)
+        self._apply_qk_clip_to_local_weight(
+            f"{param_prefix}.linear_kvb.weight", scales, split_fn, merge_fn)
+        return True
+
+    def _apply_qk_clip_to_local_weight(self, param_name, scales, split_fn, merge_fn):
+        """Apply QK-clip to one local MLA projection shard."""
+        param = self._get_qk_clip_weight(param_name)
+        if param is None:
+            return
+        local_param = self._to_local_tensor(param)
+
+        if "self_attention.linear_qb.weight" in param_name:
+            with SkipDTensorDispatch():
+                nope, pe = split_fn(param_name, local_param)
+                nope = nope * self._get_scale_broadcast(mint.sqrt(scales), self.qk_head_dim)
+                pe = pe * self._get_scale_broadcast(scales, self.qk_pos_emb_head_dim)
+                weights = merge_fn(param_name, [nope, pe])
+        elif "self_attention.linear_kvb.weight" in param_name:
+            with SkipDTensorDispatch():
+                k_nope, v = split_fn(param_name, local_param)
+                k_nope = k_nope * self._get_scale_broadcast(mint.sqrt(scales), self.qk_head_dim)
+                weights = merge_fn(param_name, [k_nope, v])
+        else:
+            return
+
+        with SkipDTensorDispatch():
+            param.copy_(weights)
 
     def apply_qk_clip_to_weights(self, param_prefix, scales, split_fn, merge_fn):
         """Apply QK-clip scaling to all MLA projection weights owned by this layer."""
@@ -165,6 +231,9 @@ class MultiLatentAttention(nn.Cell):
 
     def apply_qk_clip_to_weight(self, param_name, scales, split_fn, merge_fn):
         """Apply QK-clip scaling to an MLA projection weight in-place."""
+        if "self_attention.linear_qkv.weight" in param_name and self.config.q_lora_rank is not None:
+            return
+
         param = self._get_qk_clip_weight(param_name)
         if param is None:
             return
