@@ -73,10 +73,10 @@ class GroupedMLP(nn.Cell):
 
         # parameters
         self.weight1 = Parameter(
-            mint.empty([self.num_local_experts * self.hidden_size, self.moe_ffn_hidden_size]),
+            mint.empty([self.num_local_experts, self.hidden_size, self.moe_ffn_hidden_size]),
             name='w1')
         self.weight2 = Parameter(
-            mint.empty([self.num_local_experts * self.config.moe_ffn_hidden_size, self.hidden_size]),
+            mint.empty([self.num_local_experts, self.config.moe_ffn_hidden_size, self.hidden_size]),
             name='w2')
 
         self.cast = ops.cast
@@ -163,8 +163,6 @@ class GroupedMLP(nn.Cell):
         w2 = self.cast(self.weight2, self.compute_dtype)
         w1 = w1.to_local() if isinstance(w1, DTensor) else w1
         w2 = w2.to_local() if isinstance(w2, DTensor) else w2
-        w1 = self.reshape(w1, (-1, self.hidden_size, self.moe_ffn_hidden_size))
-        w2 = self.reshape(w2, (-1, self.config.moe_ffn_hidden_size, self.hidden_size))
 
         fc1_output = GroupedMatmul(split_item=3, group_type=0)(
             [permuted_local_hidden_states], [w1], None, None, None, None,

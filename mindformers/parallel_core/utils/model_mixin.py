@@ -680,6 +680,11 @@ class TrainModelMixin:
         model = self.check_and_get_model()
         return model.allreduce_max_attention_logit()
 
+    def has_qk_clip_candidates(self, *args, **kwargs):
+        """Return whether any attention logit reaches the QK clip threshold."""
+        model = self.check_and_get_model()
+        return model.has_qk_clip_candidates(*args, **kwargs)
+
     def apply_qk_clip_scaling(self, *args, **kwargs):
         """Apply QK clip scaling to parameters."""
         model = self.check_and_get_model()

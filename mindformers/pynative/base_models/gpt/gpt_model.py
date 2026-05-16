@@ -23,9 +23,9 @@ __all__ = ['GPTModel']
 from typing import Literal, Optional, Union
 
 from hyper_parallel import SkipDTensorDispatch
-from hyper_parallel.core.dtensor.dtensor import DTensor
-from hyper_parallel.core.dtensor.placement_types import Partial, Replicate
+from hyper_parallel.core.dtensor.dtensor import DTensor, distribute_tensor
 from mindspore import Tensor, dtype, nn, mint, ops
+from mindspore.mint.distributed import all_reduce, get_world_size
 
 from mindformers.tools.logger import logger
 from mindformers.pynative.loss.loss import CrossEntropyLoss
@@ -454,38 +454,50 @@ class GPTModel(nn.Cell):
         and context parallel ranks to ensure consistent max logit values across the model.
         """
         def _allreduce_max_param(param):
-            if not isinstance(param, DTensor):
-                return
+            if isinstance(param, DTensor):
+                mesh = param.device_mesh
+                placements = param.placements
+                synced = param.full_tensor()
+            else:
+                mesh = None
+                placements = None
+                synced = param
 
-            mesh = param.device_mesh
-            placements = list(param.placements)
-            mesh_dim_names = getattr(mesh, "mesh_dim_names", ())
-            if "dp_shard" not in mesh_dim_names:
-                return
+            result = all_reduce(synced, op=ops.ReduceOp.MAX)
+            if result is not None:
+                synced = result
 
-            dp_dim = mesh_dim_names.index("dp_shard")
-
-            partial_placements = placements.copy()
-            partial_placements[dp_dim] = Partial("max")
-
-            target_placements = placements.copy()
-            target_placements[dp_dim] = Replicate()
-
-            synced: DTensor = DTensor.from_local(
-                param.data,
-                device_mesh=mesh,
-                placements=tuple(partial_placements),
-            ).redistribute(
-                device_mesh=mesh,
-                placements=tuple(target_placements),
-            )
             with SkipDTensorDispatch():
-                # inplace update the original param with the synced max values
+                if isinstance(param, DTensor):
+                    synced = distribute_tensor(synced, mesh, placements).to_local()
                 param.copy_(synced)
 
         for _, core_attn in self._iter_core_attentions():
             if hasattr(core_attn, "max_logits_val"):
                 _allreduce_max_param(core_attn.max_logits_val)
+
+    def has_qk_clip_candidates(self, logit_threshold):
+        """Return whether any local/global max attention logit reaches QK-clip threshold."""
+        local_max = None
+        for _, core_attn in self._iter_core_attentions():
+            if not hasattr(core_attn, "max_logits_val"):
+                continue
+            param = core_attn.max_logits_val
+            local_param = param.to_local() if isinstance(param, DTensor) else param
+            with SkipDTensorDispatch():
+                param_max = mint.max(local_param.reshape((-1,)))
+                local_max = param_max if local_max is None else mint.maximum(local_max, param_max)
+        if local_max is None:
+            return False
+
+        with SkipDTensorDispatch():
+            global_max = local_max.reshape((1,))
+        if get_world_size() > 1:
+            result = all_reduce(global_max, op=ops.ReduceOp.MAX)
+            if result is not None:
+                global_max = result
+        with SkipDTensorDispatch():
+            return bool(mint.greater_equal(global_max, logit_threshold).asnumpy()[0])
 
     def get_max_attention_logit(self):
         """Return {full_param_name: Tensor} for layers whose running max is non-zero."""
@@ -494,19 +506,17 @@ class GPTModel(nn.Cell):
             if not hasattr(core_attn, "max_logits_val"):
                 continue
             param = core_attn.max_logits_val
-            if float(param.sum().asnumpy()) <= 0:
-                continue
+            local_param = param.to_local() if isinstance(param, DTensor) else param
+            with SkipDTensorDispatch():
+                if mint.sum(mint.abs(local_param)) <= 0:
+                    continue
             max_logits[f"{prefix}.max_logits_val"] = param
         return max_logits
 
     def reset_max_attention_logit(self):
         """Reset every per-layer max_logits_val to zeros."""
         for _, core_attn in self._iter_core_attentions():
-            if not hasattr(core_attn, "max_logits_val"):
-                continue
-            param = core_attn.max_logits_val
-            with SkipDTensorDispatch():
-                param.copy_(mint.zeros_like(param))
+            core_attn.reset_parameter()
 
     def _preprocess_input_labels_and_masks(self,
                                            input_ids: Tensor,
@@ -652,23 +662,38 @@ class GPTModel(nn.Cell):
             return
 
         ones = mint.ones((1,), dtype=dtype.float32)
-        threshold_val = float(logit_threshold.asnumpy())
 
         for layer_idx, param_prefix, self_attention in self._iter_self_attentions():
             logits_row = self_attention.core_attention.max_logits_val.value()
             logits_row = logits_row.reshape((-1,))
-            logits_row = logits_row.full_tensor() if isinstance(logits_row, DTensor) else logits_row
-            mask = mint.greater_equal(logits_row, logit_threshold)
+            logits_local = logits_row.to_local() if isinstance(logits_row, DTensor) else logits_row
+            with SkipDTensorDispatch():
+                mask_local = mint.greater_equal(logits_local, logit_threshold)
+            can_clip_local = self_attention.can_apply_qk_clip_to_local_weights(logits_local)
+            if can_clip_local:
+                num_clipped_local = int(mint.sum(mask_local.astype(dtype.int32)).asnumpy())
+                if num_clipped_local == 0:
+                    continue
+                with SkipDTensorDispatch():
+                    safe_den_local = mint.where(mask_local, logits_local, ones)
+                    scales_local = mint.where(mask_local, logit_threshold / safe_den_local, ones)
+                self_attention.try_apply_qk_clip_to_local_weights(
+                    param_prefix, scales_local, muon_split_fn, muon_merge_fn)
+                continue
+
+            logits_full = logits_row.full_tensor() if isinstance(logits_row, DTensor) else logits_row
+            mask = mint.greater_equal(logits_full, logit_threshold)
             num_clipped = int(mint.sum(mask.astype(dtype.int32)).asnumpy())
             if num_clipped == 0:
                 continue
             with SkipDTensorDispatch():
-                safe_den = mint.where(mask, logits_row, ones)
+                safe_den = mint.where(mask, logits_full, ones)
                 scales = mint.where(mask, logit_threshold / safe_den, ones)
-                max_logit = float(mint.max(logits_row).asnumpy())
+                max_logit = float(mint.max(logits_full).asnumpy())
+                threshold_val = float(logit_threshold.asnumpy())
             logger.debug(
                 f"[QK-Clip] layer_idx={layer_idx} {param_prefix}: "
-                f"clipping {num_clipped}/{logits_row.shape[0]} heads, "
+                f"clipping {num_clipped}/{logits_full.shape[0]} heads, "
                 f"max_logit={max_logit:.4f}, threshold={threshold_val:.4f}"
             )
             self_attention.apply_qk_clip_to_weights(param_prefix, scales, muon_split_fn, muon_merge_fn)
