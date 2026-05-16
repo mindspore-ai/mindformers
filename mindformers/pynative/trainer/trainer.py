@@ -21,7 +21,7 @@ import json
 import numpy as np
 
 # mindspore modules
-from mindspore import ops, manual_seed, set_deterministic, nn
+from mindspore import Tensor, ops, manual_seed, set_deterministic, nn
 from mindspore.dataset import Dataset
 from mindspore.common import set_seed
 from mindspore.mint.distributed import (
@@ -284,7 +284,7 @@ class Trainer:
         )
 
         # Apply unified parallelization
-        parallelize_model(
+        model = parallelize_model(
             model=model,
             parallel_dims=parallel_dims,
             parallelism=parallelism,
@@ -292,6 +292,7 @@ class Trainer:
             recompute_comm=self.config.recompute_comm,
             swap=self.config.swap
         )
+        return model
 
     def _create_model(self, model, model_config: Optional[Dict]) -> Any:
         """
@@ -319,7 +320,7 @@ class Trainer:
         logger.info("Building model from config...")
         with init_empty_weights():
             logger.info("[DelayInit] Using meta device for model construction (PyNative mode).")
-            model = _build_model(model_config)
+            model = _build_model(self.config)
 
         # Apply LoRA if provided (after base model is built)
         lora_config = getattr(self.config, "lora_config", None)
@@ -771,6 +772,8 @@ class Trainer:
             # We don't use .loss here since the model may return tuples instead of ModelOutput
             if isinstance(outputs, dict):
                 loss = outputs["loss"]
+            elif isinstance(outputs, (Tensor, DTensor)):
+                loss = outputs
             else:
                 # Assume first element is loss
                 loss = outputs[0]
@@ -789,9 +792,8 @@ class Trainer:
         Returns:
             tuple: Tuple containing loss value and gradient norm (loss, grad_norm).
         """
-        loss = self.compute_loss(model, inputs)
-
         # Calculate loss sense for distributed parameter
+        loss = self.compute_loss(model, inputs)
         sense = _get_loss_sense(
             enable_parallel=self.enable_parallel,
             parallelism=self.config.parallelism,

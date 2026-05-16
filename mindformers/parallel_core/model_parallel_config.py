@@ -59,9 +59,9 @@ class ModelParallelConfig:
 
     Degrees of the hierarchical context parallelism.
     Users should provide a list to specify the sizes for different levels.
-    Taking the a2a+p2p cp comm type as example, it contains groups of two levels,
+    Taking the a2a+allgather cp comm type as example, it contains groups of two levels,
     so the first value of the list indicates the group size of the a2a communication type,
-    and the second value indicates the group size of the p2p communication type.
+    and the second value indicates the group size of the allgather communication type.
     """
 
     expert_model_parallel_size: int = 1

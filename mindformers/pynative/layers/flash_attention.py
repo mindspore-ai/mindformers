@@ -97,9 +97,10 @@ class FlashAttention(Cell):
         self.next_tokens = 0
         self.scalar_value = 1. / math.sqrt(hidden_size_per_attention_head) if softmax_scale is None else softmax_scale
         self.inner_precise = 0
+        self.fa_head_num = self._resolve_flash_attention_head_num()
 
         self.flash_attention = FlashAttentionScore(
-            head_num=self.head_num,
+            head_num=self.fa_head_num,
             scale_value=self.scalar_value,
             pre_tokens=self.pre_tokens,
             next_tokens=self.next_tokens,
@@ -127,11 +128,15 @@ class FlashAttention(Cell):
         self.track_max_attention_logit = getattr(config, "track_max_attention_logit", False)
         if self.track_max_attention_logit:
             self.max_logits_val = Parameter(
-                mint.empty((self.head_num,), dtype=mstype.float32),
+                mint.empty((self.fa_head_num,), dtype=mstype.float32),
                 requires_grad=False
             )
             self.amax = mint.amax
             self.maximum = mint.maximum
+
+    def _resolve_flash_attention_head_num(self) -> int:
+        """Resolve FlashAttentionScore head_num from a generic runtime hint."""
+        return getattr(self.config, "_mf_runtime_flash_attention_head_num", self.head_num)
 
     def construct(self,
                   query: Tensor,
@@ -163,20 +168,37 @@ class FlashAttention(Cell):
                     self.max_logits_val.copy_(max_logits.detach())
             return output
 
-        q_seq_len, bsz = query.shape[:2]
-        kv_seq_len = key.shape[0]
+        input_already_in_layout = bool(getattr(self, "_mf_runtime_input_already_in_fa_layout", False))
+        if self.input_layout == "BSH" and input_already_in_layout:
+            bsz, q_seq_len = query.shape[:2]
+            kv_seq_len = key.shape[1]
+        elif self.input_layout == "BNSD" and input_already_in_layout:
+            bsz = query.shape[0]
+            q_seq_len = query.shape[2]
+            kv_seq_len = key.shape[2]
+        else:
+            q_seq_len, bsz = query.shape[:2]
+            kv_seq_len = key.shape[0]
         if self.input_layout == "BNSD":
-            query = self.bnsd_transpose(query, (1, 2, 0, 3))
-            key = self.bnsd_transpose(key, (1, 2, 0, 3))
-            value = self.bnsd_transpose(value, (1, 2, 0, 3))
+            if not input_already_in_layout:
+                query = self.bnsd_transpose(query, (1, 2, 0, 3))
+                key = self.bnsd_transpose(key, (1, 2, 0, 3))
+                value = self.bnsd_transpose(value, (1, 2, 0, 3))
         elif self.input_layout == "BSH":
-            query = self.bsh_transpose(query, (1, 0, 2))
-            key = self.bsh_transpose(key, (1, 0, 2))
-            value = self.bsh_transpose(value, (1, 0, 2))
+            if not input_already_in_layout:
+                query = self.bsh_transpose(query, (1, 0, 2))
+                key = self.bsh_transpose(key, (1, 0, 2))
+                value = self.bsh_transpose(value, (1, 0, 2))
         else:
             query = self.reshape(query, (q_seq_len, bsz, -1))
             key = self.reshape(key, (kv_seq_len, bsz, -1))
             value = self.reshape(value, (kv_seq_len, bsz, -1))
+        if hasattr(query, "contiguous"):
+            query = query.contiguous()
+        if hasattr(key, "contiguous"):
+            key = key.contiguous()
+        if hasattr(value, "contiguous"):
+            value = value.contiguous()
         if self.use_alibi_mask:
             alibi_mask = self.alibi_rescale_mul(alibi_mask, self.cast(self.alibi_rescale_factor, alibi_mask.dtype))
 
@@ -196,9 +218,13 @@ class FlashAttention(Cell):
                 self.max_logits_val.copy_(max_logits.detach())
 
         if self.input_layout == "BNSD":
-            output = self._merge_heads(output)
+            if input_already_in_layout:
+                pass
+            else:
+                output = self._merge_heads(output)
         elif self.input_layout == "BSH":
-            output = self.fa_out_transpose(output, (1, 0, 2))
+            if not input_already_in_layout:
+                output = self.fa_out_transpose(output, (1, 0, 2))
         return output
 
     def _merge_heads(self, x):

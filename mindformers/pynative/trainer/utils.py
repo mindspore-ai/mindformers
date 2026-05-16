@@ -38,6 +38,7 @@ from mindformers.dataset.dataloader.hf_dataloader import HFDataLoader
 from mindformers.dataset.dataloader.utils import _get_mindrecord_files
 from mindformers.pynative.optimizer.adamw import AdamW
 from mindformers.pynative.optimizer import Muon
+from mindformers.pynative.distributed.context_parallel import attach_context_parallel_runtime_hints
 
 
 def compute_parameters(model: nn.Cell) -> None:
@@ -162,19 +163,52 @@ def get_param_groups(model: nn.Cell, weight_decay: float = 0.0) -> List[dict]:
     return list(parameter_groups.values())
 
 
-def _build_model(config):
+def _sync_eod_compression_flag(dataset_config, model_config):
+    """Sync use_eod_attn_mask_compression from dataset config to model config.
+
+    The non-pynative trainer does this in ``_get_columns_with_strategy``.
+    The pynative trainer must do it before model construction so that
+    ``TransformerConfig.__post_init__`` picks the correct input_layout.
+    """
+    if dataset_config is None:
+        return
+    dataloader_cfg = getattr(dataset_config, "dataloader", None)
+    if dataloader_cfg is None:
+        return
+    inner_cfg = getattr(dataloader_cfg, "config", None)
+    if inner_cfg is None:
+        return
+    create_compressed = False
+    if isinstance(inner_cfg, dict):
+        create_compressed = inner_cfg.get("create_compressed_eod_mask", False)
+    else:
+        create_compressed = getattr(inner_cfg, "create_compressed_eod_mask", False)
+    if create_compressed:
+        model_config.use_eod_attn_mask_compression = True
+
+
+def _build_model(config, parallelism_config=None, dataset_config=None):
     """
     Build model instance from MindFormer config.
 
     Args:
         config: Model configuration object.
+        parallelism_config: Optional parallelism config when ``config`` is only a model config.
+        dataset_config: Optional train dataset config used for model-side EOD compression flags.
 
     Returns:
         Model instance.
     """
+    if hasattr(config, "model"):
+        parallelism_config = getattr(config, "parallelism", parallelism_config)
+        dataset_config = getattr(config, "train_dataset", dataset_config)
+        config = config.model
+
     model_config = MindFormerRegister.get_instance_from_cfg(
         config.to_dict(), MindFormerModuleType.CONFIG
     )
+    _sync_eod_compression_flag(dataset_config, model_config)
+    model_config = attach_context_parallel_runtime_hints(model_config, parallelism_config)
 
     model = MindFormerRegister.get_instance_from_cfg(
         model_config.to_dict(),

@@ -73,11 +73,12 @@ def get_cp_comm_type(context_parallel_algo: str):
 
     Returns:
         A string to choose the function for context parallelism.
-        cp_comm_type can be "p2p" or "all_gather" or "a2a" or "a2a+p2p".
+        cp_comm_type can be "all_gather" or "a2a" or "a2a+allgather".
     """
     context_parallelism_mapping = {
         "colossalai_cp": "all_gather",
         "ulysses_cp": "a2a",
+        "hybrid_cp": "a2a+allgather",
     }
 
     if context_parallel_algo not in context_parallelism_mapping:
@@ -188,7 +189,7 @@ DEFAULT_WHITE_KEY.update(PARALLEL_CONFIG_KEY)
 DEFAULT_WHITE_KEY.update(INFER_CONFIG_KEY)
 DEFAULT_WHITE_KEY.update({
     'monitor_config', 'dataset_config', 'multiple_of', 'ffn_dim_multiplier', 'qkv_concat', 'use_past',
-    'scaling_factor', 'input_sliced_sig', 'return_extra_loss', 'moe_config'
+    'scaling_factor', 'input_sliced_sig', 'return_extra_loss', 'moe_config',
 })
 DEFAULT_WHITE_KEY.discard('pad_token_id')  # pad_token_id used in training for generating attention mask
 

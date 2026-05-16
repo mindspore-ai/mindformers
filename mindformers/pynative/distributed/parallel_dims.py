@@ -238,6 +238,21 @@ class ParallelDims:
         return mesh
 
     @property
+    def dp(self) -> int:
+        """Batch-parallel degree used by dataloader sharding."""
+        return self.dp_replicate * self.dp_shard
+
+    @property
+    def batch(self) -> int:
+        """Alias of the batch mesh degree."""
+        return self.dp
+
+    @property
+    def fsdp(self) -> int:
+        """FSDP shard degree, including CP."""
+        return self.dp_shard * self.cp
+
+    @property
     def dp_enabled(self) -> bool:
         return self.dp_replicate > 1 or self.dp_shard > 1
 

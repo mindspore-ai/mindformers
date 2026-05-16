@@ -36,6 +36,7 @@ class RotaryEmbedding(nn.Cell):
         rope_scaling (bool): Whether to enable dynamic RoPE scaling.
         rope_scaling_factor (float): The scaling factor used in RoPE scaling.
         use_eod_reset (bool): Whether to reset the positional offset at eod tokens.
+        use_position_ids (bool): Whether to honor explicit position_ids when provided.
     """
 
     def __init__(self,
@@ -46,7 +47,8 @@ class RotaryEmbedding(nn.Cell):
                  rotary_base: int = 10000,
                  rope_scaling: bool = False,
                  rope_scaling_factor: float = 8.0,
-                 use_eod_reset: bool = False
+                 use_eod_reset: bool = False,
+                 use_position_ids: bool = None
                  ):
         super().__init__()
         dim = kv_channels
@@ -56,6 +58,7 @@ class RotaryEmbedding(nn.Cell):
         self.seq_len_interpolation_factor = seq_len_interpolation_factor
         self.rotary_interleaved = rotary_interleaved
         self.use_eod_reset = use_eod_reset
+        self.use_position_ids = use_eod_reset if use_position_ids is None else use_position_ids
 
         self.inv_freq = 1.0 / (rotary_base ** (np.arange(0, dim, 2, dtype=np.float32) / dim))
         if rope_scaling:
@@ -104,13 +107,14 @@ class RotaryEmbedding(nn.Cell):
         Args:
             max_seq_len (int): The maximum sequence length.
             offset (int): The offset for the sequence.
-            position_ids: user self-defined position_ids for eod_reset.
+            position_ids: user self-defined position_ids for eod_reset or context parallel.
 
         Returns:
             Tensor: Embeddings after applying RoPE.
             Tensor: mscale, return to match yarn interface.
         """
-        if position_ids is None or not self.use_eod_reset:
+        explicit_position_ids = position_ids is not None and self.use_position_ids
+        if not explicit_position_ids:
             bs = 1
             seq = self.arange(max_seq_len, dtype=self.inv_freq.dtype) + offset
         else:
@@ -129,7 +133,7 @@ class RotaryEmbedding(nn.Cell):
         else:
             emb = self.cat((freqs, freqs), dim=-1)
 
-        if position_ids is None or not self.use_eod_reset:
+        if not explicit_position_ids:
             out = self.reshape(emb, (-1, bs, 1, emb.shape[1]))
         else:
             out = self.reshape(emb, (bs, -1, 1, emb.shape[1]))
