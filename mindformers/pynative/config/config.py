@@ -408,6 +408,25 @@ class ParallelismConfig(BaseConfig):
     expert_tensor_parallel: int = 1
     """Expert tensor parallelism degree"""
 
+    npu_nums_per_device: int = 8
+    """Set NPU ranks for each device"""
+
+    moe_token_dispatcher_type: str = "alltoall"
+    """
+    The type of token dispatcher to use. The default is "alltoall".
+
+    Options are 'alltoall', 'alltoall_deredundancy'.
+    """
+
+    def __post_init__(self):
+        """Post-initialization validation."""
+        if self.moe_token_dispatcher_type == "alltoall_deredundancy" and \
+                (self.expert_parallel < self.npu_nums_per_device):
+            raise ValueError(
+                f"expert_parallel must be greater than or equal to npu_nums_per_device when using "
+                f"'alltoall_deredundancy', but got expert_parallel={self.expert_parallel} "
+                f"< npu_nums_per_device={self.npu_nums_per_device}."
+            )
 
 @dataclass
 class OptimizerConfig(BaseConfig):
