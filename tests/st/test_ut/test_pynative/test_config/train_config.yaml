@@ -101,11 +101,11 @@ context:
 profiler:                     # reserved for future use
   # MindSpore profiler configuration
   enable_profiling: False
-  save_traces_folder: "./data"
-  profiler_repeat: 1            # profiling loops
-  profiler_skip_first: 5        # profiling steps before loop
-  profiler_skip_first_wait: 0   # profiling steps in loop for waiting
-  profiler_active: 1            # profiling steps in loop for profiling
-  profiler_warmup: 0            # profiling steps in loop for warming up
-  enable_memory: False          # enable memory profiling
+  start_step: 7                 # step to start profiling
+  end_step: 8                  # step to stop profiling
+  output_path: "./data"         # profiling result save path
+  profiler_rank: [0]            # rank ids to enable profiling
+  profiler_level: 0             # profiling detail level (None/0/1/2)
+  profile_memory: False         # whether to collect Tensor memory data
+  with_stack: False             # whether to collect Python-side stack trace
 
