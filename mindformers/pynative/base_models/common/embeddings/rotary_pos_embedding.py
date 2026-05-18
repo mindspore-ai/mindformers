@@ -60,10 +60,11 @@ class RotaryEmbedding(nn.Cell):
         self.use_eod_reset = use_eod_reset
         self.use_position_ids = use_eod_reset if use_position_ids is None else use_position_ids
 
-        self.inv_freq = 1.0 / (rotary_base ** (np.arange(0, dim, 2, dtype=np.float32) / dim))
+        inv_freq_np = 1.0 / (rotary_base ** (np.arange(0, dim, 2, dtype=np.float32) / dim))
         if rope_scaling:
-            self.inv_freq = self._apply_scaling(self.inv_freq, factor=rope_scaling_factor)
-        self.inv_freq = ms.Tensor(self.inv_freq, dtype=ms.float32)
+            inv_freq_np = self._apply_scaling(inv_freq_np, factor=rope_scaling_factor)
+        self._inv_freq_np = inv_freq_np
+        self._inv_freq = None
 
         if self.rotary_interleaved:
             self.stack = mint.stack
@@ -73,6 +74,12 @@ class RotaryEmbedding(nn.Cell):
         self.reshape = mint.reshape
         self.outer = mint.outer
         self.transpose = mint.transpose
+
+    @property
+    def inv_freq(self):
+        if self._inv_freq is None:
+            self._inv_freq = ms.Tensor(self._inv_freq_np, dtype=ms.float32)
+        return self._inv_freq
 
     def _apply_scaling(
             self,

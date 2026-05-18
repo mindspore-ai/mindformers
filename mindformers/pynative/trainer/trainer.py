@@ -21,6 +21,7 @@ import json
 import numpy as np
 
 # mindspore modules
+import mindspore as ms
 from mindspore import Tensor, ops, manual_seed, set_deterministic, nn
 from mindspore.dataset import Dataset
 from mindspore.common import set_seed
@@ -318,7 +319,7 @@ class Trainer:
             raise ValueError("Either model instance or config.model must be provided.")
 
         logger.info("Building model from config...")
-        with init_empty_weights():
+        with ms.DeviceCtx("meta"):
             logger.info("[DelayInit] Using meta device for model construction (PyNative mode).")
             model = _build_model(self.config)
 

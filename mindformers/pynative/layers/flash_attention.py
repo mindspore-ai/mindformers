@@ -115,7 +115,6 @@ class FlashAttention(Cell):
         self.use_alibi_mask = config.use_alibi_mask
 
         if self.use_alibi_mask:
-            self.alibi_rescale_factor = Tensor([1.0 / self.scalar_value], dtype=mstype.float16)
             self.alibi_rescale_mul = mint.mul
 
         self.bnsd_transpose = mint.permute
@@ -200,7 +199,8 @@ class FlashAttention(Cell):
         if hasattr(value, "contiguous"):
             value = value.contiguous()
         if self.use_alibi_mask:
-            alibi_mask = self.alibi_rescale_mul(alibi_mask, self.cast(self.alibi_rescale_factor, alibi_mask.dtype))
+            alibi_rescale_factor = Tensor([1.0 / self.scalar_value], dtype=mstype.float16)
+            alibi_mask = self.alibi_rescale_mul(alibi_mask, self.cast(alibi_rescale_factor, alibi_mask.dtype))
 
         softmax_val, _, _, output = self.flash_attention(query=query,
                                                          key=key,

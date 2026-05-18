@@ -90,13 +90,20 @@ class YarnRotaryEmbedding(RotaryEmbedding):
         freqs = internal_freq * (1 - inv_freq_mask) + extra_freq * inv_freq_mask
 
         self.mscale = float(_yarn_get_mscale(scaling_factor, mscale) / _yarn_get_mscale(scaling_factor, mscale_all_dim))
-        self.freqs = Tensor(freqs, dtype=ms.float32)
+        self._freqs_np = freqs
+        self._freqs = None
 
         self.arange = mint.arange
         self.reshape = mint.reshape
         self.outer = mint.outer
         self.cat = mint.cat
         self.transpose = mint.transpose
+
+    @property
+    def freqs(self):
+        if self._freqs is None:
+            self._freqs = Tensor(self._freqs_np, dtype=ms.float32)
+        return self._freqs
 
     def construct(self, max_seq_len: int, offset: int = 0, position_ids=None):
         """Generate rotary position embedding.
