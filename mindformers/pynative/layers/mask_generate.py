@@ -61,14 +61,15 @@ class CausalMaskGenerate(nn.Cell):
         self.pad_token_id = pad_token_id
         self.use_attn_mask_compression = use_attn_mask_compression
         self.seq_length = seq_length
-        self.one = Tensor([1.0], dtype=compute_type)
         if use_attn_mask_compression:
             if seq_length < 2048:
                 raise ValueError("seq_length should be larger than 2048 when use mask_compression")
-            self.lower_triangle_mask = Tensor(np.triu(np.ones((2048, 2048), dtype=np.int8), k=1), dtype=ms.uint8)
+            self._lower_triangle_mask_np = np.triu(np.ones((2048, 2048), dtype=np.int8), k=1)
+            self._lower_triangle_mask_dtype = ms.uint8
         else:
-            self.lower_triangle_mask = Tensor(np.tril(np.ones(shape=(seq_length, seq_length), dtype=np.int8)),
-                                              dtype=compute_type)
+            self._lower_triangle_mask_np = np.tril(np.ones(shape=(seq_length, seq_length), dtype=np.int8))
+            self._lower_triangle_mask_dtype = compute_type
+        self._lower_triangle_mask = None
         self.cast = ops.cast
         self.reshape = mint.reshape
         self.not_equal = mint.not_equal
@@ -76,6 +77,12 @@ class CausalMaskGenerate(nn.Cell):
         self.slice = ops.strided_slice
         self.mul = mint.mul
         self.sub = mint.sub
+
+    @property
+    def lower_triangle_mask(self):
+        if self._lower_triangle_mask is None:
+            self._lower_triangle_mask = Tensor(self._lower_triangle_mask_np, dtype=self._lower_triangle_mask_dtype)
+        return self._lower_triangle_mask
 
     def construct(self, tokens=None, masks=None):
         """Forward process of the CausalMask
@@ -113,7 +120,8 @@ class CausalMaskGenerate(nn.Cell):
 
         # the returned shape is [bs, 1, seq_len, seq_len] (seq_len may differ from seq_length when is_dynamic=True)
         attention_mask = self.mul(attention_mask, lower_triangle)
-        attention_mask = self.sub(self.one, attention_mask)
+        one = Tensor([1.0], dtype=self.compute_type)
+        attention_mask = self.sub(one, attention_mask)
         attention_mask = self.expand_dim(attention_mask, 1)
         attention_mask = self.cast(attention_mask, mstype.uint8)
         return attention_mask
