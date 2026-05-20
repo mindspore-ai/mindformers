@@ -330,7 +330,7 @@ class TrainingConfig(BaseConfig):
     deterministic: bool = False
     """Enable deterministic training behavior"""
 
-    def post_init(self):
+    def __post_init__(self):
         """Post-initialization validation."""
         if self.global_batch_size <= 0:
             raise ValueError("training.global_batch_size in config must be positive")
@@ -596,55 +596,49 @@ class ContextConfig(BaseConfig):
 @dataclass
 class ProfilerConfig(BaseConfig):
     """
-    Profiler configuration.
+    Profiler configuration for pynative training.
     """
 
     enable_profiling: bool = False
-    """Whether to enable mindspore profiler."""
+    """Whether to enable profiling."""
 
-    save_traces_folder: str = "profile_traces"
-    """Trace files location."""
+    start_step: int = 1
+    """The step to start profiling."""
 
-    profiler_repeat: int = 0
-    """
-    The number of times to repeat the profiling cycle
+    end_step: int = 1
+    """The step to stop profiling."""
 
-    This is used to configure mindspore.profiler.schedule.
-    """
+    output_path: Optional[str] = None
+    """The result of profiling will be saved in this path. If None, auto-generated."""
 
-    profiler_skip_first: int = 0
-    """
-    The number of initial profiling cycles to skip
+    profiler_rank: Optional[List[int]] = None
+    """Specify rank ids to enable profiling. None means all rank ids are enabled."""
 
-    This is used to configure mindspore.profiler.schedule.
-    """
+    profiler_level: int = 0
+    """Collection level of profiling data(0, 1, 2)."""
 
-    profiler_skip_first_wait: int = 0
-    """
-    The number of wait steps before the warmup step in each profiling cycle.
+    mstx: bool = False
+    """Whether to collect light weight profiling data, collect when True."""
 
-    This is used to configure mindspore.profiler.schedule.
-    """
-
-    profiler_active: int = 1
-    """
-    The number of the active step in each profiling cycle.
-
-    This is used to configure mindspore.profiler.schedule.
-    """
-
-    profiler_warmup: int = 0
-    """
-    The number of warmup steps before the active step in each profiling cycle.
-
-    This is used to configure mindspore.profiler.schedule.
-    """
-
-    enable_memory: bool = False
-    """Whether to dump memory."""
+    profile_memory: bool = False
+    """Whether to collect Tensor memory data."""
 
     with_stack: bool = True
-    """Whether to collect frame host call stack data on the Python side."""
+    """Whether to collect Python-side stack trace data."""
+
+    def __post_init__(self):
+        """Post-initialization validation."""
+        if self.start_step <= 0 or self.end_step <= 0:
+            raise ValueError(
+                "ProfilerConfig.start_step and end_step must be positive, but got "
+                f"{self.start_step} and {self.end_step}"
+            )
+        if self.start_step > self.end_step:
+            raise ValueError(
+                "ProfilerConfig.start_step must be less than or equal to end_step, but got "
+                f"{self.start_step} and {self.end_step}"
+            )
+
 
 @dataclass
 class RecomputeConfig(BaseConfig):
@@ -664,7 +658,7 @@ class RecomputeConfig(BaseConfig):
     select_module: Optional[Union[dict, list]] = None
     """Module paths and their layer ranges for selective recomputation. Only effective when ``mode`` is ``'select'``."""
 
-    def post_init(self):
+    def __post_init__(self):
         """Post-initialization validation."""
         if self.mode not in ["None", "full", "select"]:
             raise ValueError(
