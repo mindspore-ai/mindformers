@@ -558,7 +558,7 @@ def apply_moe_ep_tp(
             # No EP, use TP for experts (TensorParallel on expert weights)
             experts_mesh = tp_mesh
         # Apply TP to experts: shard along the hidden dimension
-        experts_plan = ExpertParallel()
+        experts_plan = ExpertParallel(model.model.config.moe_permute_fusion)
 
         # Apply parallelism to experts module
         if experts_mesh is not None:

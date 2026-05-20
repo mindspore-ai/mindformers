@@ -14,7 +14,6 @@
 # implementation of Expert Parallel for the GroupedMLP in MoE
 
 import hashlib
-import numpy as np
 
 from mindspore import mint, nn, ops, Tensor
 from mindspore.common import dtype as mstype
@@ -46,7 +45,7 @@ class ExpertParallel(ParallelStyle):
 
     """
 
-    def __init__(self):
+    def __init__(self, moe_permute_fusion: bool = False):
         super().__init__()
         self.ctx = None
         self.input_layout = None
@@ -63,6 +62,7 @@ class ExpertParallel(ParallelStyle):
         self.cumsum = mint.cumsum
         self.mul = mint.mul
         self.strided_slice = ops.strided_slice
+        self.moe_permute_fusion = moe_permute_fusion
 
     # performing all-to-all dispatch on the input
     def _token_dispatch(self, device_mesh, cell, args):
@@ -89,25 +89,12 @@ class ExpertParallel(ParallelStyle):
         probs = self.concat((pad_probs, probs), dim=0)
         topk_indices = self.concat((self.pad_topk_indices, topk_indices), dim=0)
 
-        tokens_shape = tokens.shape
+        routed_input, sorted_topk_indices, topk_indices, unsort_token_indices_experts \
+            = self._permute(
+            tokens,
+            topk_indices,
+            self.moe_permute_fusion)
 
-        topk_indices_shape = topk_indices.shape
-        topk_indices = self.transpose(topk_indices, 1, 0)  # (B*S, k) --> (k, B*S)
-        topk_indices = self.reshape(topk_indices, (-1,))  # (k, B*S) --> (k*T,)
-
-        sorted_topk_indices, token_indices_experts_sorted = self.sort(self.cast(topk_indices, mstype.float32), dim=-1)
-
-        _, unsort_token_indices_experts = self.sort(self.cast(token_indices_experts_sorted, mstype.float32), dim=-1)
-        unsort_token_indices_experts = self.reshape(
-            unsort_token_indices_experts,
-            (topk_indices_shape[1], topk_indices_shape[0])
-        )
-        unsort_token_indices_experts = self.transpose(unsort_token_indices_experts, 1, 0)  # (k, B*S) --> (B*S, k)
-
-        inter_map = self.fmod(token_indices_experts_sorted, topk_indices_shape[0])
-        index = self.reshape(inter_map, (-1,))
-        routed_input = self.index_select(tokens, 0, index)
-        routed_input = self.reshape(routed_input, (tokens_shape[0], -1, tokens_shape[-1]))
         num_tokens_per_expert = self.sum(self.one_hot(self.cast(topk_indices, mstype.int32), num_experts), dim=0)
         num_tokens_per_expert = self.cast(num_tokens_per_expert, mstype.float32)
 
@@ -157,6 +144,78 @@ class ExpertParallel(ParallelStyle):
         )
         return global_input_tokens, probs, topk_indices, num_tokens_per_expert
 
+    def _permute(self, tokens, topk_indices, moe_permute_fusion: bool = False):
+        """
+            Route and reorder tokens based on expert assignments for MoE parallel execution.
+
+            This function dispatches tokens to their assigned experts by sorting and reordering
+            operations. It supports two modes: fused optimization using native MoE operators,
+            or manual token permutation with explicit index management.
+
+            Args:
+                tokens: Input token tensor with shape (B*S, H) where B is batch size,
+                    S is sequence length, and H is hidden dimension.
+                topk_indices: Expert assignment indices with shape (B*S, k) where k is the
+                    number of experts each token is routed to.
+                moe_permute_fusion (bool): Whether to use fused MoE permute operators for
+                    optimized performance. When True, uses ops.moe_token_permute; when False,
+                    performs manual token routing with index_select. Default is False.
+
+            Returns:
+                tuple: A tuple containing:
+                    - routed_input: Reordered tokens grouped by experts with shape (B, N, H)
+                        where N is the total number of tokens after routing.
+                    - sorted_topk_indices: Flattened and sorted expert assignment indices.
+                    - topk_indices_transposed: Transposed topk indices with shape (k, B*S)
+                        or flattened version depending on fusion mode.
+                    - unsort_token_indices_experts: Indices to restore original token order,
+                        with shape (B*S, k).
+
+            Note:
+                The function operates in two modes:
+                - Fusion mode (moe_permute_fusion=True): Uses native ops.moe_token_permute
+                    for better performance by combining permute operations.
+                - Manual mode (moe_permute_fusion=False): Performs explicit sorting, index
+                    calculation, and token selection operations.
+        """
+        tokens_shape = tokens.shape
+
+        topk_indices_shape = topk_indices.shape
+        if moe_permute_fusion:
+            topk_indices_kn = self.transpose(topk_indices, 1, 0)  # (B*S, k) --> (k, B*S)
+            topk_indices_kn = self.reshape(topk_indices_kn, (-1,))  # (k, B*S) --> (k*T,)
+            sorted_topk_indices, _ = self.sort(self.cast(topk_indices_kn, mstype.float32),
+                                                                          dim=-1)
+            tokens = ops.reshape(tokens, (-1, tokens_shape[-1]))
+            topk_indices = ops.reshape(topk_indices, (-1, topk_indices.shape[-1]))
+            routed_input, unsort_token_indices_experts = ops.moe_token_permute(tokens,
+                                                                               topk_indices.astype(mstype.int32))
+            routed_input = self.reshape(routed_input, (tokens_shape[0], -1, tokens_shape[-1]))
+            unsort_token_indices_experts = self.reshape(unsort_token_indices_experts,
+                                                        (topk_indices_shape[0], topk_indices_shape[1]))
+            return routed_input, sorted_topk_indices, topk_indices_kn, unsort_token_indices_experts
+
+
+        topk_indices = self.transpose(topk_indices, 1, 0)  # (B*S, k) --> (k, B*S)
+        topk_indices = self.reshape(topk_indices, (-1,))  # (k, B*S) --> (k*T,)
+
+        sorted_topk_indices, token_indices_experts_sorted = self.sort(self.cast(topk_indices, mstype.float32), dim=-1)
+
+        _, unsort_token_indices_experts = self.sort(self.cast(token_indices_experts_sorted, mstype.float32), dim=-1)
+        unsort_token_indices_experts = self.reshape(
+            unsort_token_indices_experts,
+            (topk_indices_shape[1], topk_indices_shape[0])
+        )
+        unsort_token_indices_experts = self.transpose(unsort_token_indices_experts, 1, 0)  # (k, B*S) --> (B*S, k)
+
+        inter_map = self.fmod(token_indices_experts_sorted, topk_indices_shape[0])
+        index = self.reshape(inter_map, (-1,))
+        routed_input = self.index_select(tokens, 0, index)
+        routed_input = self.reshape(routed_input, (tokens_shape[0], -1, tokens_shape[-1]))
+
+        return routed_input, sorted_topk_indices, topk_indices, unsort_token_indices_experts
+
+
     @staticmethod
     def _get_parameter_shard_plan():
         # shard on the expert dimension
@@ -190,13 +249,21 @@ class ExpertParallel(ParallelStyle):
         permutated_local_input_tokens = self.reshape(permutated_local_input_tokens, original_shape)
 
         # AlltoAll output to output
-        index = self.reshape(unsort_token_indices_experts, (-1,))
         permutated_local_input_tokens = self.reshape(
             permutated_local_input_tokens,
             (-1, permutated_local_input_tokens.shape[-1])
         )
-        routed_output = self.index_select(permutated_local_input_tokens, 0, index)
         unsort_token_indices_experts_shape = unsort_token_indices_experts.shape
+        if self.moe_permute_fusion:
+            unsort_token_indices_experts = self.reshape(
+                unsort_token_indices_experts,
+                (-1,)
+            )
+            routed_output = ops.moe_token_unpermute(permutated_local_input_tokens,
+                                                    unsort_token_indices_experts.astype(mstype.int32))
+        else:
+            index = self.reshape(unsort_token_indices_experts, (-1,))
+            routed_output = self.index_select(permutated_local_input_tokens, 0, index)
         routed_output = self.reshape(
             routed_output,
             (unsort_token_indices_experts_shape[0], unsort_token_indices_experts_shape[1], -1)
