@@ -16,6 +16,7 @@
 import hashlib
 
 from mindspore import mint, nn, ops, Tensor
+from mindspore.ops import communication as comm
 from mindspore.common import dtype as mstype
 from mindspore.communication import get_rank
 from mindspore.communication.management import create_group
@@ -63,6 +64,9 @@ class ExpertParallel(ParallelStyle):
         self.mul = mint.mul
         self.strided_slice = ops.strided_slice
         self.moe_permute_fusion = moe_permute_fusion
+        self.split = mint.split
+        self.all_to_all = comm.all_to_all
+        self.all_to_all_single = comm.all_to_all_single
 
     # performing all-to-all dispatch on the input
     def _token_dispatch(self, device_mesh, cell, args):
@@ -100,12 +104,19 @@ class ExpertParallel(ParallelStyle):
 
         # generate the input splits and output splits for all-to-all
         self.ep_group = get_ep_group_name(get_rank(), ep_degree)
-        num_tokens_per_expert_group = ops.AlltoAll(
-            split_count=ep_degree,
-            split_dim=-1,
-            concat_dim=-1,
-            group=self.ep_group
-        )(num_tokens_per_expert)
+
+        chunk_size = num_tokens_per_expert.shape[-1] // ep_degree
+        input_tensor_list = self.split(num_tokens_per_expert, chunk_size, dim=-1)
+
+        output_shape = list(num_tokens_per_expert.shape)
+        output_shape[-1] = output_shape[-1] // ep_degree
+        output_tensor_list = [mint.zeros(output_shape, dtype=num_tokens_per_expert.dtype) for _ in range(ep_degree)]
+
+        output_tensor_list, _ =self.all_to_all(
+            output_tensor_list = output_tensor_list,
+            input_tensor_list = input_tensor_list,
+            group=self.ep_group)
+        num_tokens_per_expert_group = self.concat(output_tensor_list, dim=-1)
 
         num_tokens_per_expert_reshaped = self.reshape(num_tokens_per_expert, (ep_degree, -1))
         input_splits = self.cast(self.sum(num_tokens_per_expert_reshaped, dim=-1, keepdim=False), mstype.int64)
@@ -117,13 +128,27 @@ class ExpertParallel(ParallelStyle):
         # perform expert parallel AlltoAll communication
         original_shape = routed_input.shape
 
-        global_input_tokens = ops.AlltoAllV(group=self.ep_group, block_size=cell.hidden_size)(
-            self.reshape(routed_input, (-1,)), input_splits, output_splits
+        block_size = cell.hidden_size
+        real_input_splits = [x * block_size for x in input_splits]
+        real_output_splits = [x * block_size for x in output_splits]
+
+        global_input_tokens, _ = self.all_to_all_single(
+            output=None,
+            input=self.reshape(routed_input, (-1,)),
+            output_split_sizes=real_output_splits,
+            input_split_sizes=real_input_splits,
+            group=self.ep_group
         )
         global_input_tokens = self.reshape(global_input_tokens, (1, -1, cell.hidden_size))
         routing_map = self.reshape(self.cast(sorted_topk_indices, mstype.float32), (-1,))
-        routing_map = ops.AlltoAllV(group=self.ep_group, block_size=1)(
-            routing_map, input_splits, output_splits
+        real_input_splits = [x.item() for x in input_splits]
+        real_output_splits = [x.item() for x in output_splits]
+        routing_map, _ = self.all_to_all_single(
+            output=None,
+            input=routing_map,
+            output_split_sizes=real_output_splits,
+            input_split_sizes=real_input_splits,
+            group=self.ep_group
         )
         routing_map = self.reshape(routing_map, (1, -1))
 
@@ -243,8 +268,16 @@ class ExpertParallel(ParallelStyle):
         routed_output = self.reshape(routed_output, (routed_output_shape[0], -1, routed_output_shape[-1]))
 
         # perform expert parallel AlltoAll communication
-        permutated_local_input_tokens = ops.AlltoAllV(group=self.ep_group, block_size=cell.hidden_size)(
-            self.reshape(routed_output, (-1,)), output_splits, input_splits
+        block_size = cell.hidden_size
+        real_input_splits = [x * block_size for x in output_splits]
+        real_output_splits = [x * block_size for x in input_splits]
+
+        permutated_local_input_tokens, _ = self.all_to_all_single(
+            output=None,
+            input=self.reshape(routed_output, (-1,)),
+            output_split_sizes=real_output_splits,
+            input_split_sizes=real_input_splits,
+            group=self.ep_group
         )
         permutated_local_input_tokens = self.reshape(permutated_local_input_tokens, original_shape)
 
@@ -305,13 +338,13 @@ class DeredundancyExpertParallel(ExpertParallel):
     This design reduces communication overhead and improves parallel efficiency.
 
     Args:
-        nums_per_device (int, optional): Number of NPUs per device. Default: ``8``.
+        npu_nums_per_device (int, optional): Number of NPUs per device. Default: ``8``.
 
     """
 
-    def __init__(self, nums_per_device: int = 8):
+    def __init__(self, npu_nums_per_device: int = 8):
         super().__init__()
-        self.nums_per_device = nums_per_device
+        self.npu_nums_per_device = npu_nums_per_device
         self.rank_id = get_rank()
         self.local_expert_start_index = None
         self.local_expert_end_index = None
@@ -323,6 +356,8 @@ class DeredundancyExpertParallel(ExpertParallel):
         self.unsqueeze = mint.unsqueeze
         self.logical_and = mint.logical_and
         self.nonzero = mint.nonzero
+        self.all_gather = comm.all_gather_into_tensor
+        self.reduce_scatter = comm.reduce_scatter_tensor
 
     def _token_dispatch(self, device_mesh, cell, args):
         tokens, probs, topk_indices, num_tokens_per_expert = args
@@ -336,7 +371,7 @@ class DeredundancyExpertParallel(ExpertParallel):
         topk_indices = self.cast(self.squeeze(topk_indices, 0), mstype.int32)
 
         # communication group
-        inter_ep = self.nums_per_device
+        inter_ep = self.npu_nums_per_device
         outer_ep = ep_degree // inter_ep
         node_expert_num = num_experts // outer_ep
         ep_idx = self.rank_id % ep_degree
@@ -357,12 +392,18 @@ class DeredundancyExpertParallel(ExpertParallel):
 
         # prepare counter
         iepones = [node_expert_num // inter_ep for i in range(inter_ep)]
-        expert_ids = ops.AllGather(group=self.oep_group)(topk_indices)
+        expert_ids, _ = self.all_gather(output_tensor=None, input_tensor=topk_indices, group=self.oep_group)
         expert_ids = self.reshape(expert_ids, (-1, top_k))
         excounter = self.sum(self.one_hot(self.cast(self.reshape(expert_ids, (-1,)), mstype.int32), num_experts), dim=0)
         excounter = excounter[self.local_expert_start_index: self.local_expert_end_index]
         excounter_reshaped = self.reshape(excounter, (inter_ep, -1))
-        local_excounter = ops.AlltoAllV(group=self.iep_group, block_size=1)(excounter.reshape(-1), iepones, iepones)
+        local_excounter, _ = self.all_to_all_single(
+            output=None,
+            input=excounter.reshape(-1),
+            output_split_sizes=iepones,
+            input_split_sizes=iepones,
+            group=self.iep_group
+        )
         local_excounter_reshaped = self.reshape(local_excounter, (inter_ep, -1))
         exrl = self.sum(local_excounter_reshaped, dim=1, keepdim=False)
         exrl = self.cast(exrl, mstype.int64) # [outer_ep]
@@ -372,7 +413,8 @@ class DeredundancyExpertParallel(ExpertParallel):
         exsl = self.cast(exsl, mstype.int64) # [outer_ep]
 
         # 1. allgather
-        permuted_probs = self.reshape(ops.AllGather(group=self.oep_group)(probs), (-1, top_k))
+        output_tensor, _ = self.all_gather(output_tensor=None, input_tensor=probs, group=self.oep_group)
+        permuted_probs = self.reshape(output_tensor, (-1, top_k))
 
         # 2. exdispatch
         hidden_size = tokens_shape[-1]
@@ -385,7 +427,7 @@ class DeredundancyExpertParallel(ExpertParallel):
         mask = self.logical_and(
             sorted_expert_ids >= self.local_expert_start_index, sorted_expert_ids < self.local_expert_end_index
         )
-        routed_input = ops.AllGather(group=self.oep_group)(tokens)
+        routed_input, _ = self.all_gather(output_tensor=None, input_tensor=tokens, group=self.oep_group)
         routed_input = self.reshape(routed_input, (-1, hidden_size))
         idx = self.reshape(self.nonzero(self.reshape(mask, (-1,))), (-1,))
         dispatch_idx = self.index_select(dispatch_idx_floordiv_k, 0, idx)
@@ -396,13 +438,27 @@ class DeredundancyExpertParallel(ExpertParallel):
         routed_input = self.index_select(routed_input, 0, dispatch_idx)
 
         # 3. inner alltoallv
-        routed_input = ops.AlltoAllV(
-            group=self.iep_group, block_size=hidden_size
-        )(self.reshape(routed_input, (-1,)), exsl, exrl)
+        block_size = hidden_size
+        real_input_splits = [x * block_size for x in exsl]
+        real_output_splits = [x * block_size for x in exrl]
+
+        routed_input, _ = self.all_to_all_single(
+            output=None,
+            input=self.reshape(routed_input, (-1,)),
+            output_split_sizes=real_output_splits,
+            input_split_sizes=real_input_splits,
+            group=self.iep_group
+        )
         routed_input = self.reshape(routed_input, (-1, hidden_size))
-        sorted_expert_ids = ops.AlltoAllV(
-            group=self.iep_group, block_size=1
-        )(self.reshape(sorted_expert_ids, (-1,)), exsl, exrl)
+        real_input_splits = [x.item() for x in exsl]
+        real_output_splits = [x.item() for x in exrl]
+        sorted_expert_ids, _ = self.all_to_all_single(
+            output=None,
+            input=self.reshape(sorted_expert_ids, (-1,)),
+            output_split_sizes=real_output_splits,
+            input_split_sizes=real_input_splits,
+            group=self.iep_group
+        )
 
         # 4. resort
         _, sort_map = mint.sort(self.cast(sorted_expert_ids, mstype.float32))
@@ -419,17 +475,30 @@ class DeredundancyExpertParallel(ExpertParallel):
 
         # -3. allToAllv
         hidden_size = token_orig_shape[-1]
-        routed_output = ops.AlltoAllV(
-            group=self.iep_group, block_size=hidden_size
-        )(self.reshape(routed_output, (-1,)), exrl, exsl)
+
+        block_size = hidden_size
+        real_input_splits = [x * block_size for x in exrl]
+        real_output_splits = [x * block_size for x in exsl]
+        routed_output, _ = self.all_to_all_single(
+            output=None,
+            input=self.reshape(routed_output, (-1,)),
+            output_split_sizes=real_output_splits,
+            input_split_sizes=real_input_splits,
+            group=self.iep_group
+        )
         routed_output = self.reshape(routed_output, (-1, hidden_size))
 
         # -2. excombine
         routed_output = self.mul(self.unsqueeze(probs, 1), routed_output)
+        excombine_whiteboard = self.cast(excombine_whiteboard, routed_output.dtype)
         routed_output = excombine_whiteboard.index_add_(0, self.reshape(dispatch_idx, (-1,)), routed_output)
 
         # -1 reduce scatter
-        routed_output = ops.ReduceScatter(group=self.oep_group)(routed_output)
+        routed_output, _ = self.reduce_scatter(
+            output=None,
+            input=routed_output,
+            group=self.oep_group
+        )
         node_expert_num = self.local_expert_end_index - self.local_expert_start_index
         routed_output = routed_output[node_expert_num:]
 

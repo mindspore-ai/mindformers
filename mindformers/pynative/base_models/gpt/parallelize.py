@@ -34,6 +34,7 @@ from typing import Any, List
 import mindspore as ms
 from mindspore import nn, Parameter
 from mindspore.mint.distributed import get_world_size
+from mindspore.ops.communication import set_comm_ops_inplace
 
 from hyper_parallel import DeviceMesh
 from hyper_parallel.core.dtensor.dtensor import DTensor, distribute_tensor
@@ -62,7 +63,7 @@ from mindformers.pynative.distributed.context_parallel import (
     build_context_parallel_attention_style,
 )
 from mindformers.pynative.distributed.tensor_parallel import NoParallel
-from mindformers.pynative.distributed.expert_parallel import ExpertParallel
+from mindformers.pynative.distributed.expert_parallel import ExpertParallel, DeredundancyExpertParallel
 from mindformers.pynative.distributed.parallelize import parallelize_module
 from mindformers.pynative.distributed.activation_checkpoint import apply_ac
 from mindformers.pynative.distributed.utils import distribute_module
@@ -522,6 +523,8 @@ def apply_moe_ep_tp(
         model: nn.Cell,
         tp_mesh: DeviceMesh = None,
         ep_mesh: DeviceMesh = None,
+        moe_token_dispatcher_type: str = "all_to_all",
+        npu_nums_per_device: int = 8,
 ):
     """
     Apply Expert Parallelism (EP) and Tensor Parallelism (TP) to MoE layers in model.
@@ -557,8 +560,18 @@ def apply_moe_ep_tp(
         if ep_mesh is None:
             # No EP, use TP for experts (TensorParallel on expert weights)
             experts_mesh = tp_mesh
+
+        set_comm_ops_inplace(False)
         # Apply TP to experts: shard along the hidden dimension
-        experts_plan = ExpertParallel(model.model.config.moe_permute_fusion)
+        if moe_token_dispatcher_type == "alltoall":
+            experts_plan = ExpertParallel(model.model.config.moe_permute_fusion)
+        elif moe_token_dispatcher_type == "alltoall_deredundancy":
+            experts_plan = DeredundancyExpertParallel(npu_nums_per_device)
+        else:
+            raise ValueError(
+                f"Unsupported moe_token_dispatcher_type: '{moe_token_dispatcher_type}'. "
+                "Expected 'alltoall' or 'alltoall_deredundancy'."
+            )
 
         # Apply parallelism to experts module
         if experts_mesh is not None:
@@ -843,6 +856,8 @@ def parallelize_gptmodel(
                 model,
                 tp_mesh=tp_mesh,
                 ep_mesh=ep_mesh,
+                moe_token_dispatcher_type=parallelism.moe_token_dispatcher_type,
+                npu_nums_per_device=parallelism.npu_nums_per_device,
             )
 
     # Phase 3: CP
