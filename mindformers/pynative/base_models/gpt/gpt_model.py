@@ -475,58 +475,85 @@ class GPTModel(nn.Cell):
         for _, prefix, self_attn in self._iter_self_attentions():
             yield f"{prefix}.core_attention", self_attn.core_attention
 
-    def allreduce_max_attention_logit(self):
-        """
-        Perform AllReduce-Max operation across DP and CP dimensions for max attention logits.
-
-        This method aggregates the maximum attention logit values from all data parallel
-        and context parallel ranks to ensure consistent max logit values across the model.
-        """
-        def _allreduce_max_param(param):
-            if isinstance(param, DTensor):
-                mesh = param.device_mesh
-                placements = param.placements
-                synced = param.full_tensor()
-            else:
-                mesh = None
-                placements = None
-                synced = param
-
-            result = all_reduce(synced, op=ops.ReduceOp.MAX)
-            if result is not None:
-                synced = result
-
-            with SkipDTensorDispatch():
-                if isinstance(param, DTensor):
-                    synced = distribute_tensor(synced, mesh, placements).to_local()
-                param.copy_(synced)
-
+    def _stacked_synced_max_logits(self):
+        """Allreduce every layer's ``max_logits_val`` in one batched op. Returns
+        ``(params, mesh, placements, stacked)`` (stacked shape: ``(num_layers,
+        num_heads)``), or all-``None`` when no layer has ``max_logits_val``."""
+        params = []
         for _, core_attn in self._iter_core_attentions():
             if hasattr(core_attn, "max_logits_val"):
-                _allreduce_max_param(core_attn.max_logits_val)
+                params.append(core_attn.max_logits_val)
+        if not params:
+            return None, None, None, None
+
+        first = params[0]
+        if isinstance(first, DTensor):
+            mesh = first.device_mesh
+            placements = first.placements
+            full_locals = [p.full_tensor() for p in params]
+        else:
+            mesh = None
+            placements = None
+            full_locals = list(params)
+
+        stacked = mint.stack(full_locals, dim=0)
+        result = all_reduce(stacked, op=ops.ReduceOp.MAX)
+        if result is not None:
+            stacked = result
+        return params, mesh, placements, stacked
+
+    def _writeback_synced_max_logits(self, params, mesh, placements, stacked):
+        """Write the per-row synced max back into each layer's ``max_logits_val``."""
+        with SkipDTensorDispatch():
+            for i, p in enumerate(params):
+                row = stacked[i]
+                if mesh is not None:
+                    row = distribute_tensor(row, mesh, placements).to_local()
+                p.copy_(row)
+
+    def allreduce_max_attention_logit(self):
+        """AllReduce-Max of every layer's ``max_logits_val`` in a single batched
+        collective. Assumes every layer's parameter shares the same DTensor
+        layout — true here, they're all per-layer counters constructed identically."""
+        params, mesh, placements, stacked = self._stacked_synced_max_logits()
+        if params is None:
+            return
+        self._writeback_synced_max_logits(params, mesh, placements, stacked)
+
+    def synced_max_attention_logit_fires(self, logit_threshold):
+        """Combined qk_clip threshold check + sync in one batched AllReduce-Max.
+        Writes the synced values back only on fire so non-fire steps stay
+        bit-identical with the pre-batching behavior."""
+        params, mesh, placements, stacked = self._stacked_synced_max_logits()
+        if params is None:
+            return False
+        global_max = mint.max(stacked).reshape((1,))
+        fires = bool(mint.greater_equal(global_max, logit_threshold).asnumpy()[0])
+        if fires:
+            self._writeback_synced_max_logits(params, mesh, placements, stacked)
+        return fires
 
     def has_qk_clip_candidates(self, logit_threshold):
-        """Return whether any local/global max attention logit reaches QK-clip threshold."""
-        local_max = None
+        """Whether any local/global max attention logit reaches QK-clip threshold.
+        Stacks every layer's ``max_logits_val`` and runs a single ``mint.max``
+        instead of 24 chained per-layer ``mint.max`` / ``mint.maximum`` ops."""
+        locals_list = []
         for _, core_attn in self._iter_core_attentions():
             if not hasattr(core_attn, "max_logits_val"):
                 continue
             param = core_attn.max_logits_val
             local_param = param.to_local() if isinstance(param, DTensor) else param
-            with SkipDTensorDispatch():
-                param_max = mint.max(local_param.reshape((-1,)))
-                local_max = param_max if local_max is None else mint.maximum(local_max, param_max)
-        if local_max is None:
+            locals_list.append(local_param.reshape((-1,)))
+        if not locals_list:
             return False
 
-        with SkipDTensorDispatch():
-            global_max = local_max.reshape((1,))
+        stacked = mint.stack(locals_list, dim=0)
+        local_max = mint.max(stacked).reshape((1,))
         if get_world_size() > 1:
-            result = all_reduce(global_max, op=ops.ReduceOp.MAX)
+            result = all_reduce(local_max, op=ops.ReduceOp.MAX)
             if result is not None:
-                global_max = result
-        with SkipDTensorDispatch():
-            return bool(mint.greater_equal(global_max, logit_threshold).asnumpy()[0])
+                local_max = result
+        return bool(mint.greater_equal(local_max, logit_threshold).asnumpy()[0])
 
     def get_max_attention_logit(self):
         """Return {full_param_name: Tensor} for layers whose running max is non-zero."""
@@ -536,9 +563,8 @@ class GPTModel(nn.Cell):
                 continue
             param = core_attn.max_logits_val
             local_param = param.to_local() if isinstance(param, DTensor) else param
-            with SkipDTensorDispatch():
-                if mint.sum(mint.abs(local_param)) <= 0:
-                    continue
+            if mint.sum(mint.abs(local_param)) <= 0:
+                continue
             max_logits[f"{prefix}.max_logits_val"] = param
         return max_logits
 
@@ -686,40 +712,69 @@ class GPTModel(nn.Cell):
         return tuple(param_layer)
 
     def apply_qk_clip_scaling(self, logit_threshold, muon_split_fn, muon_merge_fn):
-        """Apply QK-clip scaling to attention weight parameters."""
+        """Apply QK-clip scaling to attention weight parameters.
+
+        We collect every layer's mask/scale ops on-device first, then do a
+        *single* ``asnumpy()`` to read back per-layer ``num_clipped`` counts.
+        Previously each layer issued its own ``int(...asnumpy())`` which forces
+        a host↔device sync — 24 syncs per fire-step in 24L models.  Stacking
+        them collapses those into one sync and lets the per-layer ``mint.sum``
+        ops pipeline on the device.
+
+        The else-branch (``can_clip_local`` False) still falls back to per-layer
+        full_tensor / asnumpy because the global path is much rarer (TP-induced
+        sharding-of-head-dim) and has a debug logger that depends on per-layer
+        values.
+        """
         if not self.config.multi_latent_attention:
             return
 
         ones = mint.ones((1,), dtype=dtype.float32)
 
+        # Phase A: per-layer device work (mask + scales for the local-clip case),
+        # collect everything but defer the host sync.
+        local_pending = []  # list of (param_prefix, self_attention, mask_local, scales_local)
+        global_pending = []  # list of (layer_idx, param_prefix, self_attention, logits_row)
+
         for layer_idx, param_prefix, self_attention in self._iter_self_attentions():
             logits_row = self_attention.core_attention.max_logits_val.value()
             logits_row = logits_row.reshape((-1,))
             logits_local = logits_row.to_local() if isinstance(logits_row, DTensor) else logits_row
-            with SkipDTensorDispatch():
-                mask_local = mint.greater_equal(logits_local, logit_threshold)
             can_clip_local = self_attention.can_apply_qk_clip_to_local_weights(logits_local)
             if can_clip_local:
-                num_clipped_local = int(mint.sum(mask_local.astype(dtype.int32)).asnumpy())
-                if num_clipped_local == 0:
+                mask_local = mint.greater_equal(logits_local, logit_threshold)
+                safe_den_local = mint.where(mask_local, logits_local, ones)
+                scales_local = mint.where(mask_local, logit_threshold / safe_den_local, ones)
+                local_pending.append((param_prefix, self_attention, mask_local, scales_local))
+            else:
+                global_pending.append((layer_idx, param_prefix, self_attention, logits_row))
+
+        # Phase B: batched ``num_clipped`` for the local-clip layers.  One stack
+        # + one sum + one asnumpy gives an array of K per-layer counts instead
+        # of K separate host syncs.
+        if local_pending:
+            stacked_masks = mint.stack(
+                [mask for _, _, mask, _ in local_pending], dim=0)
+            counts = mint.sum(stacked_masks.astype(dtype.int32), dim=1).asnumpy()
+            for i, (param_prefix, self_attention, _, scales_local) in enumerate(local_pending):
+                if int(counts[i]) == 0:
                     continue
-                with SkipDTensorDispatch():
-                    safe_den_local = mint.where(mask_local, logits_local, ones)
-                    scales_local = mint.where(mask_local, logit_threshold / safe_den_local, ones)
                 self_attention.try_apply_qk_clip_to_local_weights(
                     param_prefix, scales_local, muon_split_fn, muon_merge_fn)
-                continue
 
+        # Phase C: global-clip fallback for layers where local weights can't
+        # apply the clip (e.g. TP shards the head dim).  These are rare and
+        # already need a per-layer full_tensor() — keep the original logic.
+        for layer_idx, param_prefix, self_attention, logits_row in global_pending:
             logits_full = logits_row.full_tensor() if isinstance(logits_row, DTensor) else logits_row
             mask = mint.greater_equal(logits_full, logit_threshold)
             num_clipped = int(mint.sum(mask.astype(dtype.int32)).asnumpy())
             if num_clipped == 0:
                 continue
-            with SkipDTensorDispatch():
-                safe_den = mint.where(mask, logits_full, ones)
-                scales = mint.where(mask, logit_threshold / safe_den, ones)
-                max_logit = float(mint.max(logits_full).asnumpy())
-                threshold_val = float(logit_threshold.asnumpy())
+            safe_den = mint.where(mask, logits_full, ones)
+            scales = mint.where(mask, logit_threshold / safe_den, ones)
+            max_logit = float(mint.max(logits_full).asnumpy())
+            threshold_val = float(logit_threshold.asnumpy())
             logger.debug(
                 f"[QK-Clip] layer_idx={layer_idx} {param_prefix}: "
                 f"clipping {num_clipped}/{logits_full.shape[0]} heads, "

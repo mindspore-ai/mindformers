@@ -685,6 +685,13 @@ class TrainModelMixin:
         model = self.check_and_get_model()
         return model.has_qk_clip_candidates(*args, **kwargs)
 
+    def synced_max_attention_logit_fires(self, *args, **kwargs):
+        """Combined sync-then-check: returns True iff qk_clip should fire and
+        leaves ``max_logits_val`` synced to the global max when it does.
+        """
+        model = self.check_and_get_model()
+        return model.synced_max_attention_logit_fires(*args, **kwargs)
+
     def apply_qk_clip_scaling(self, *args, **kwargs):
         """Apply QK clip scaling to parameters."""
         model = self.check_and_get_model()

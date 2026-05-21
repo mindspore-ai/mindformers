@@ -213,16 +213,14 @@ class MultiLatentAttention(nn.Cell):
         local_param = self._to_local_tensor(param)
 
         if "self_attention.linear_qb.weight" in param_name:
-            with SkipDTensorDispatch():
-                nope, pe = split_fn(param_name, local_param)
-                nope = nope * self._get_scale_broadcast(mint.sqrt(scales), self.qk_head_dim)
-                pe = pe * self._get_scale_broadcast(scales, self.qk_pos_emb_head_dim)
-                weights = merge_fn(param_name, [nope, pe])
+            nope, pe = split_fn(param_name, local_param)
+            nope = nope * self._get_scale_broadcast(mint.sqrt(scales), self.qk_head_dim)
+            pe = pe * self._get_scale_broadcast(scales, self.qk_pos_emb_head_dim)
+            weights = merge_fn(param_name, [nope, pe])
         elif "self_attention.linear_kvb.weight" in param_name:
-            with SkipDTensorDispatch():
-                k_nope, v = split_fn(param_name, local_param)
-                k_nope = k_nope * self._get_scale_broadcast(mint.sqrt(scales), self.qk_head_dim)
-                weights = merge_fn(param_name, [k_nope, v])
+            k_nope, v = split_fn(param_name, local_param)
+            k_nope = k_nope * self._get_scale_broadcast(mint.sqrt(scales), self.qk_head_dim)
+            weights = merge_fn(param_name, [k_nope, v])
         else:
             return
 
@@ -246,26 +244,23 @@ class MultiLatentAttention(nn.Cell):
         full_param, param_layout = self._to_full_tensor_with_layout(param)
 
         if "self_attention.linear_qb.weight" in param_name:
-            with SkipDTensorDispatch():
-                nope, pe = split_fn(param_name, full_param)
-                nope = nope * self._get_scale_broadcast(mint.sqrt(scales), self.qk_head_dim)
-                pe = pe * self._get_scale_broadcast(scales, self.qk_pos_emb_head_dim)
-                weights = merge_fn(param_name, [nope, pe])
+            nope, pe = split_fn(param_name, full_param)
+            nope = nope * self._get_scale_broadcast(mint.sqrt(scales), self.qk_head_dim)
+            pe = pe * self._get_scale_broadcast(scales, self.qk_pos_emb_head_dim)
+            weights = merge_fn(param_name, [nope, pe])
         elif "self_attention.linear_kvb.weight" in param_name:
-            with SkipDTensorDispatch():
-                k_nope, v = split_fn(param_name, full_param)
-                k_nope = k_nope * self._get_scale_broadcast(mint.sqrt(scales), self.qk_head_dim)
-                weights = merge_fn(param_name, [k_nope, v])
+            k_nope, v = split_fn(param_name, full_param)
+            k_nope = k_nope * self._get_scale_broadcast(mint.sqrt(scales), self.qk_head_dim)
+            weights = merge_fn(param_name, [k_nope, v])
         elif "self_attention.linear_qkv.weight" in param_name:
             # Concat MLA. With LoRA: [q_down, kv_lora, k_pe] has no per-head structure to scale.
             parts = split_fn(param_name, full_param)
             if len(parts) != 4:
                 return
             q_nope, q_pe, kv_lora, k_pe = parts
-            with SkipDTensorDispatch():
-                q_nope = q_nope * self._get_scale_broadcast(mint.sqrt(scales), self.qk_head_dim)
-                q_pe = q_pe * self._get_scale_broadcast(scales, self.qk_pos_emb_head_dim)
-                weights = merge_fn(param_name, [q_nope, q_pe, kv_lora, k_pe])
+            q_nope = q_nope * self._get_scale_broadcast(mint.sqrt(scales), self.qk_head_dim)
+            q_pe = q_pe * self._get_scale_broadcast(scales, self.qk_pos_emb_head_dim)
+            weights = merge_fn(param_name, [q_nope, q_pe, kv_lora, k_pe])
         else:
             return
 
