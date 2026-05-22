@@ -25,14 +25,11 @@ from mindspore.ops.operations.nn_ops import FlashAttentionScore
 from mindspore.context import ParallelMode
 from mindspore.parallel._utils import _get_parallel_mode
 
-from mindformers.tools.utils import get_real_rank
 from mindformers.parallel_core.utils.spec_utils import ModuleSpec, build_module
 from mindformers.parallel_core.transformer_config import MLATransformerConfig
 from mindformers.parallel_core.training_graph.transformer.dsa.dsa_indexer_loss import DSAIndexerLoss
 from mindformers.parallel_core.training_graph.device_matrix import layout
 from mindformers.parallel_core.training_graph.communication import get_dp_cp_tp_id
-from mindformers.parallel_core.training_graph.tensor_parallel.utils import get_tp_group_name
-from mindformers.parallel_core.training_graph.transformer.identity_op import IdentityOp
 from mindformers.parallel_core.training_graph.transformer.mask_generate import CausalEODMaskGenerate
 from mindformers.parallel_core.training_graph.transformer.dsa.utils import adjust_bsnd_input, adjust_tnd_input
 

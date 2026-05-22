@@ -156,7 +156,7 @@ class CausalEODMaskGenerate(nn.Cell):
         self.cp_id = cp_id
 
         self.is_first_iteration = True
-        self.one = Tensor([1.0], dtype=self.dtype)
+        self.one = Tensor([1.0], dtype=mstype.uint8)
         self.clamp= aclnn_ops.ClampScalar()
         self.slice = aclnn_ops.SliceExt()
         self.cast = aclnn_ops.Cast()
@@ -166,12 +166,13 @@ class CausalEODMaskGenerate(nn.Cell):
         self.roll = aclnn_ops.Roll(1, 1)
         self.arange = aclnn_ops.Arange()
         self.repeat = aclnn_ops.RepeatInterleaveTensor()
-        self.tile = aclnn_ops.Tile()
+        self.reverse = aclnn_ops.BitwiseNot()
         self.equal = aclnn_ops.Equal()
         self.generate_full_mask = P.Morph(self._generate_full_mask,
                                           self.eod_full_infer_shape,
                                           lambda *args: mstype.uint8
                                           ).add_prim_attr("self_define_shard", True)
+        self.zeros_like = aclnn_ops.ZerosLikeExt()
         if _get_parallel_mode() in (ParallelMode.SEMI_AUTO_PARALLEL,):
             self.shard()
 
@@ -195,12 +196,10 @@ class CausalEODMaskGenerate(nn.Cell):
 
         sliced_sq = self.seq_length // self.cp
         sliced_mask_1d = self.slice(mask_1d, 1, sliced_sq * self.cp_id, sliced_sq * (self.cp_id + 1), 1)
-        eod_row = self.reshape(sliced_mask_1d, (bsz, -1, 1))
-        eod_col = self.reshape(mask_1d, (bsz, 1, -1))
-        eod_mat1 = self.tile(eod_row, (1, 1, self.seq_length))
-        eod_mat2 = self.tile(eod_col, (1, sliced_sq, 1))
-        eod_mat = self.equal(eod_mat1, eod_mat2)
-        mask = self.cast(self.sub(self.one, self.tril(eod_mat, self.cp_id * sliced_sq)), mstype.uint8)
+        eod_row = self.reshape(self.cast(sliced_mask_1d, mstype.int16), (bsz, -1, 1))
+        eod_col = self.reshape(self.cast(mask_1d, mstype.int16), (bsz, 1, -1))
+        eod_mat = self.equal(eod_row, eod_col)
+        mask = self.cast(self.reverse(self.tril(eod_mat, self.cp_id * sliced_sq)), mstype.uint8)
         mask = self.reshape(mask, (-1, 1, sliced_sq, self.seq_length))
         return mask
 
@@ -215,6 +214,11 @@ class CausalEODMaskGenerate(nn.Cell):
             Tensor, the eod attention mask carrying 0 and 1 values
         """
         return self.generate_full_mask(actual_seq_len)
+
+    # pylint: disable=W0613
+    def bprop(self, actual_seq_len, out, dout):
+        """skip bprop"""
+        return (self.zeros_like(actual_seq_len),)
 
     def shard(self):
         """sharding operators"""
