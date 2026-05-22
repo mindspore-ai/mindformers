@@ -447,6 +447,12 @@ class OptimizerConfig(BaseConfig):
     weight_decay: float = 0.01
     """Weight decay"""
 
+    weight_decay_include: Optional[List[str]] = None
+    """Parameter name rules that force weight decay on"""
+
+    weight_decay_exclude: Optional[List[str]] = None
+    """Parameter name rules that force weight decay off"""
+
 
 @dataclass
 class LrSchedulerConfig(BaseConfig):
