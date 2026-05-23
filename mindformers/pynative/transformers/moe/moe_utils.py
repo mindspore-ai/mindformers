@@ -17,26 +17,27 @@
 MoE Auxiliary Loss computation and gradient injection.
 """
 
-from typing import Optional,Tuple
+from typing import Optional, Tuple, Union, List
 
-from hyper_parallel.core.dtensor.dtensor import DTensor
-from mindspore import Tensor, mint, nn
+from mindspore import Tensor, mint, nn, ops
 from mindspore.common import dtype as mstype
 from mindspore.common._grad_function import _Function
+from mindspore.mint.distributed import get_world_size, all_reduce
 
+from hyper_parallel.core.dtensor.dtensor import DTensor
 
 # MOE logging
 _MOE_LAYER_WISE_LOGGING_TRACKER: dict = {}
 
 
 def switch_load_balancing_loss_func(
-    probs:  Tensor,
-    tokens_per_expert: Tensor,
-    total_num_tokens: int,
-    topk: int,
-    num_experts: int,
-    moe_aux_loss_coeff: float,
-    fused: bool = False,
+        probs: Tensor,
+        tokens_per_expert: Tensor,
+        total_num_tokens: int,
+        topk: int,
+        num_experts: int,
+        moe_aux_loss_coeff: float,
+        fused: bool = False,
 ) -> Tensor:
     """Calculate the auxiliary loss for load balancing.
     Refer to the Switch Transformer (https://arxiv.org/abs/2101.03961)
@@ -96,7 +97,7 @@ def switch_load_balancing_loss_func(
         raise ValueError("Fused version is not supported yet.")
     aggregated_probs_per_expert = probs.sum(dim=0)
     aux_loss = mint.sum(aggregated_probs_per_expert * tokens_per_expert) * (
-        num_experts * moe_aux_loss_coeff / (topk * total_num_tokens * total_num_tokens)
+            num_experts * moe_aux_loss_coeff / (topk * total_num_tokens * total_num_tokens)
     )
     return aux_loss
 
@@ -154,6 +155,7 @@ class _MoEAuxLossAutoScaler(_Function):
         else:
             _MoEAuxLossAutoScaler.main_loss_backward_scale.copy_(scale)
 
+
 class MoEAuxLossAutoScaler(nn.Cell):
     """
     Module wrapper for the custom LogSoftmax function.
@@ -166,10 +168,11 @@ class MoEAuxLossAutoScaler(nn.Cell):
         """
         return _MoEAuxLossAutoScaler.apply(output, aux_loss)
 
+
 def compute_routing_scores_for_aux_loss(
-    logits: Tensor,
-    topk: int,
-    score_function: str,
+        logits: Tensor,
+        topk: int,
+        score_function: str,
 ) -> Tuple[Tensor, Tensor]:
     """Compute routing scores based on the score function.
 
@@ -207,9 +210,9 @@ def get_moe_layer_wise_logging_tracker() -> dict:
 
 
 def save_to_aux_losses_tracker(
-    loss: Tensor,
-    layer_number: int,
-    num_layers: int,
+        loss: Tensor,
+        layer_number: int,
+        num_layers: int,
 ) -> None:
     """Save the auxiliary loss for logging.
     Args:
@@ -228,7 +231,8 @@ def save_to_aux_losses_tracker(
     if isinstance(loss, DTensor):
         loss = loss.to_local()
     if hasattr(loss, "detach"):
-        tracker["values"][layer_number] = tracker["values"][layer_number] + loss.detach()  # Aggregate the loss for the layer.
+        tracker["values"][layer_number] = tracker["values"][
+                                              layer_number] + loss.detach()  # Aggregate the loss for the layer.
     else:
         tracker["values"][layer_number] = tracker["values"][layer_number] + loss
 
@@ -238,3 +242,39 @@ def clear_aux_losses_tracker() -> None:
     tracker = get_moe_layer_wise_logging_tracker()
     for value in tracker["values"]:
         value.zero_()
+
+
+def track_moe_metrics(
+        loss_scale: float,
+        num_layers: Optional[int] = None,
+        moe_layer_freq: Optional[Union[int, List[int]]] = None,
+        mtp_num_layers: Optional[int] = None,
+):
+    """Track and compute average MoE auxiliary loss across all MoE layers."""
+    if not loss_scale or loss_scale <= 0.0:
+        return None
+
+    tracker = get_moe_layer_wise_logging_tracker()
+
+    # Get number of MoE layers
+    if moe_layer_freq is None:
+        num_moe_layers = num_layers
+    elif isinstance(moe_layer_freq, int):
+        assert isinstance(num_layers, int)
+        moe_layer_pattern = [1 if (i % moe_layer_freq == 0) else 0 for i in range(num_layers)]
+        num_moe_layers = sum(moe_layer_pattern)
+    elif isinstance(moe_layer_freq, list):
+        num_moe_layers = sum(moe_layer_freq)
+    else:
+        raise ValueError(f"Invalid moe_layer_freq: {moe_layer_freq}")
+
+    if mtp_num_layers is not None:
+        num_moe_layers += mtp_num_layers
+
+    aux_losses = tracker["values"].sum() / num_moe_layers
+    if get_world_size() > 1:
+        all_reduce(aux_losses, op=ops.ReduceOp.SUM)
+        aux_losses /= get_world_size()
+    clear_aux_losses_tracker()
+
+    return aux_losses

@@ -18,7 +18,7 @@
 # limitations under the License.
 # ============================================================================
 """GPT LayerSpec."""
-from typing import Optional
+from typing import Optional, Union
 
 from mindformers.pynative.layers.linear import Linear
 from mindformers.pynative.transformers.attention import SelfAttentionSubmodules, SelfAttention
@@ -35,8 +35,14 @@ from mindformers.pynative.transformers.transformer_layer import (
 from mindformers.parallel_core.transformer_config import TransformerConfig
 from mindformers.parallel_core.utils.spec_utils import ModuleSpec
 from mindformers.pynative.base_models.gpt.moe_module_specs import get_moe_module_spec
-from mindformers.pynative.transformers.multi_latent_attention import MLASelfAttention, \
+from mindformers.pynative.transformers.multi_latent_attention import (
+    MLASelfAttention,
     MLASelfAttentionSubmodules
+)
+from mindformers.pynative.transformers.multi_token_prediction import (
+    MultiTokenPredictionBlockSubmodules,
+    get_mtp_layer_spec,
+)
 
 def get_mlp_module_spec(
         num_experts: Optional[int] = None,
@@ -190,3 +196,29 @@ def get_gpt_decoder_block_spec(
         layer_specs=layer_specs, layer_norm=get_norm_cls(config.normalization, config.fused_norm))
 
     return block_spec
+
+
+def get_gpt_mtp_block_spec(
+        config: TransformerConfig,
+        spec: Union[TransformerBlockSubmodules, ModuleSpec],
+        normalization: Optional[str] = "RMSNorm",
+) -> MultiTokenPredictionBlockSubmodules:
+    """GPT Multi-Token Prediction (MTP) block spec."""
+    num_layers_to_build = config.mtp_num_layers if config.mtp_num_layers else 0
+    if num_layers_to_build == 0:
+        return None
+
+    if isinstance(spec, TransformerBlockSubmodules):
+        # get the spec for the last layer of decoder block
+        transformer_layer_spec = spec.layer_specs[-1]
+    elif isinstance(spec, ModuleSpec) and spec.module == TransformerLayer:
+        transformer_layer_spec = spec
+    else:
+        raise ValueError(f"Invalid spec: {spec}")
+
+    mtp_layer_spec = get_mtp_layer_spec(
+        transformer_layer_spec=transformer_layer_spec, normalization=normalization, fused_norm=config.fused_norm)
+    mtp_num_layers = config.mtp_num_layers if config.mtp_num_layers else 0
+    mtp_layer_specs = [mtp_layer_spec] * mtp_num_layers
+
+    return MultiTokenPredictionBlockSubmodules(layer_specs=mtp_layer_specs)

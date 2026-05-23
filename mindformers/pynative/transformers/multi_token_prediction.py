@@ -1,3 +1,4 @@
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 # Copyright 2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -26,17 +27,152 @@ __all__ = ['MultiTokenPredictionBlock', 'MultiTokenPredictionBlock',
            'MultiTokenPredictionBlockSubmodules', 'get_mtp_layer_spec']
 
 from dataclasses import dataclass
-from typing import Union, List, Optional
+from typing import Union, List
 
-from mindspore import nn, Tensor
-from mindspore import mint
-from mindspore import ops
+from hyper_parallel.core.dtensor.dtensor import DTensor
+from mindspore import nn, Tensor, mint, ops
+from mindspore.common._grad_function import _Function
+from mindspore.common import dtype as mstype
+from mindspore.mint.distributed import get_world_size, all_reduce
 
 from mindformers.pynative.loss import CrossEntropyLoss
 from mindformers.pynative.layers.layer_norm import get_norm_cls
 from mindformers.parallel_core.utils.spec_utils import ModuleSpec, build_module
 from mindformers.parallel_core.transformer_config import TransformerConfig
 from mindformers.pynative.layers.linear import Linear
+
+# MTP logging
+_MTP_LAYER_WISE_LOGGING_TRACKER: dict = {}
+
+
+class _MTPLossAutoScaler(_Function):
+    """An AutoScaler that triggers the backward pass and scales the grad for mtp loss."""
+
+    main_loss_backward_scale: Tensor = Tensor(1.0)
+
+    @staticmethod
+    def forward(ctx, output: Tensor, mtp_loss: Tensor):
+        """Preserve the mtp by storing it in the context to avoid garbage collection.
+
+        Args:
+            output (Tensor): The output tensor.
+            mtp_loss (Tensor): The mtp loss tensor.
+
+        Returns:
+            Tensor: The output tensor.
+        """
+        ctx.mtp_loss = mtp_loss
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output: Tensor):
+        """Compute and scale the gradient for mtp loss.
+
+        Args:
+            grad_output (Tensor): The gradient of the output.
+
+        Returns:
+            Tuple[Tensor, Tensor]: The gradient of the output, scaled mtp loss
+                                               gradient.
+        """
+        mtp_loss = ctx.mtp_loss
+        mtp_loss_backward_scale = _MTPLossAutoScaler.main_loss_backward_scale
+        scaled_mtp_loss_grad = mint.ones_like(mtp_loss) * mtp_loss_backward_scale
+        return grad_output, scaled_mtp_loss_grad
+
+    @staticmethod
+    def set_loss_scale(scale: Tensor):
+        """set the scale of the mtp loss.
+
+        Args:
+            scale (Tensor): The scale value to set. Please ensure that the scale passed in
+                                  matches the scale of the main_loss.
+        """
+        _MTPLossAutoScaler.main_loss_backward_scale = scale
+
+
+def get_mtp_layer_wise_logging_tracker() -> dict:
+    """Return the mtp layer wise tracker."""
+    # pylint: disable=W0602
+    global _MTP_LAYER_WISE_LOGGING_TRACKER
+    return _MTP_LAYER_WISE_LOGGING_TRACKER
+
+
+def save_to_mtp_losses_tracker(
+        loss: Tensor,
+        layer_number: int,
+        num_layers: int,
+) -> None:
+    """Save the mtp loss for logging.
+    Args:
+        name (str): The name of the loss.
+        loss (Tensor): The loss tensor.
+        layer_number (int): Layer index of the loss.
+        num_layers (int): The number of total layers.
+    """
+    # Skip mtp loss logging if layer_number is None.
+    if layer_number is None:
+        return
+
+    tracker = get_mtp_layer_wise_logging_tracker()
+    if not tracker:
+        tracker["values"] = mint.zeros(num_layers)
+    if isinstance(loss, DTensor):
+        loss = loss.to_local()
+    if hasattr(loss, "detach"):
+        tracker["values"][layer_number] = loss.detach()  # Aggregate the loss for the layer.
+    else:
+        tracker["values"][layer_number] = loss
+
+
+class MTPLossAutoScaler(nn.Cell):
+    """
+    Module wrapper for the custom LogSoftmax function.
+    """
+
+    @staticmethod
+    def construct(output: Tensor, mtp_loss: Tensor):
+        """
+        Forward pass for LogSoftmax.
+        """
+        return _MTPLossAutoScaler.apply(output, mtp_loss)
+
+
+def roll_tensor(tensor: Tensor, shifts: int = 1, dims: int = 0) -> Tensor:
+    """
+    Shift tensor with zero padding.
+
+    Args:
+        tensor (Tensor): Input tensor.
+        shifts (int): Shift amount.
+        dims (int): Dimension to shift along.
+
+    Returns:
+        Tensor: Shifted tensor with zero padding.
+    """
+    if shifts == 0:
+        return tensor
+
+    shape = tensor.shape
+    dim_size = shape[dims]
+    dtype = tensor.dtype
+
+    if abs(shifts) >= dim_size:
+        return ops.zeros(shape, dtype)
+
+    pad_shape = list(shape)
+    pad_shape[dims] = abs(shifts)
+    pad = ops.zeros(tuple(pad_shape), dtype)
+    slices = [slice(None)] * tensor.ndim
+    if shifts > 0:
+        slices[dims] = slice(0, dim_size - shifts)
+        cropped = tensor[tuple(slices)]
+        return ops.concat((pad, cropped), axis=dims)
+
+    shifts = -shifts
+    slices[dims] = slice(shifts, dim_size)
+    cropped = tensor[tuple(slices)]
+    return ops.concat((cropped, pad), axis=dims)
 
 
 @dataclass
@@ -63,7 +199,7 @@ class MultiTokenPredictionLayerSubmodules:
     layer_norm: Union[ModuleSpec, type] = None
 
 
-def get_mtp_layer_spec(transformer_layer_spec: ModuleSpec, normalization, fused_norm=True) -> ModuleSpec:
+def get_mtp_layer_spec(transformer_layer_spec: ModuleSpec, normalization: str, fused_norm=True) -> ModuleSpec:
     """Get the MTP layer spec.
 
     Args:
@@ -166,34 +302,44 @@ class MultiTokenPredictionLayer(nn.Cell):
         self.cast = ops.cast
         self.reshape = mint.reshape
 
-    def construct(self,
-                  decoder_input: Tensor,
-                  hidden_states: Tensor,
-                  attention_mask: Tensor,
-                  rotary_pos_emb: Tensor = None,
-                  actual_seq_len: Tensor = None):
+    def construct(
+            self,
+            input_ids: Tensor,
+            position_ids: Tensor,
+            hidden_states: Tensor,
+            attention_mask: Tensor,
+            rotary_pos_emb: Tensor = None,
+            actual_seq_len: Tensor = None,
+            embedding=None,
+    ):
         """
         Perform the forward pass through the MTP layer.
 
         Args:
-            decoder_input (Tensor): Input tensor of shape [s, b, h] where s is the sequence length, b is the batch size,
-                and h is the hidden size. At the (k - 1)-th MTP module, the i-th element of decoder input is the
-                embedding of (i + K)-th token.
-            hidden_states (Tensor): hidden states tensor of shape [s, b, h] where s is the sequence length, b is the
-                batch size, and h is the hidden size.
-            attention_mask (Tensor): Boolean tensor of shape [1, 1, s, s] for masking self-attention.
+            input_ids (Tensor): Input token IDs .
+            position_ids (Tensor): Positional IDs of the input tokens.
+            hidden_states (Tensor): Hidden states tensor of shape [s, b, h] where s is the
+                sequence length, b is the batch size, and h is the hidden size.
+            attention_mask (Tensor): Boolean tensor of shape [1, 1, s, s] for masking
+                self-attention.
             rotary_pos_emb (Tensor, optional): Rotary positional embeddings.
             actual_seq_len (Tensor, optional): Actual sequence length tensor.
 
         Returns:
             Tuple[Tensor, Tensor]: The output hidden states tensor of shape [s, b, h].
         """
+        input_ids, position_ids, decoder_input, hidden_states = self._get_embeddings(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            embedding=embedding,
+            hidden_states=hidden_states,
+        )
+
         decoder_input = self.enorm(decoder_input)
         hidden_states = self.hnorm(hidden_states)
-
         # At the (k - 1)-th MTP module, concatenates the i-th token's hidden_states
         # and the (i + K)-th token's embedding, and combine them with linear projection.
-        hidden_states = self.cat((decoder_input, hidden_states), -1)
+        hidden_states = mint.cat((decoder_input, hidden_states), -1)
         hidden_states = self.eh_proj(hidden_states)
         hidden_states, _ = self.transformer_layer(
             hidden_states=hidden_states,
@@ -205,7 +351,46 @@ class MultiTokenPredictionLayer(nn.Cell):
         # Layer norm before shared head layer.
         hidden_states = self.final_layernorm(hidden_states)
 
-        return hidden_states
+        return hidden_states, input_ids, position_ids
+
+    def _get_embeddings(
+            self,
+            input_ids: Tensor,
+            position_ids: Tensor,
+            embedding: nn.Cell,
+            hidden_states: Tensor,
+    ):
+        """
+        Preprocesses input data for the Multi-Token Prediction (MTP) layers.
+
+        This function computes the decoder input and sends updated input_ids and position_ids to
+        the next layer.
+
+        Args:
+            input_ids (Tensor): The input token IDs.
+            position_ids (Tensor): The position IDs corresponding to the input tokens.
+            embedding (Callable): The embedding module
+                from gpt model to compute the decoder input.
+            hidden_states (Tensor): hidden states tensor of shape [s, b, h] where s is the
+                sequence length, b is the batch size, and h is the hidden size.
+            packed_seq_params (PackedSeqParams): Parameters for packed sequence processing.
+        """
+        # Calc logits for the current Multi-Token Prediction (MTP) layers.
+        input_ids = roll_tensor(
+            input_ids,
+            shifts=-1,
+            dims=-1,
+        )
+        if position_ids is not None:
+            position_ids = roll_tensor(
+                position_ids,
+                shifts=-1,
+                dims=-1,
+            )
+        # embedding
+        decoder_input = embedding(input_ids=input_ids, position_ids=position_ids)
+
+        return input_ids, position_ids, decoder_input, hidden_states
 
 
 @dataclass
@@ -290,8 +475,8 @@ class MultiTokenPredictionBlock(nn.Cell):
         self.transpose = mint.transpose
         self.reshape = mint.reshape
         self.ones_like = mint.ones_like
-
-
+        self.mtp_loss_auto_scaler = MTPLossAutoScaler()
+        self.concat_hidden_states = _MTPConcat()
 
     def _build_layers(self):
         """Building MTP layers."""
@@ -300,35 +485,16 @@ class MultiTokenPredictionBlock(nn.Cell):
             mtp_layer = build_module(layer_spec, config=self.config)
             self.layers.append(mtp_layer)
 
-    def roll_tensor(self, tensor):
-        """Implement tensor rolling with slice and pad operation.
-
-        Args:
-            tensor (Tensor): Input tensor to roll, shape [b, s].
-
-        Returns:
-            Tensor: Rolled tensor, shape [b, s].
-        """
-        bs, seq_len = self.shape(tensor)
-        pad_zeros = self.zeros((bs, 1))
-        tensor = self.slice(tensor, (0, 1), (bs, seq_len), (1, 1))
-        tensor = self.cat((tensor, self.cast(pad_zeros, tensor.dtype)), -1)
-
-        return tensor
-
     def construct(
             self,
             input_ids: Tensor,
             position_ids: Tensor,
             hidden_states: Tensor,
             attention_mask: Tensor,
-            labels: Tensor = None,
             rotary_pos_emb: Tensor = None,
             extra_block_kwargs: dict = None,
-            loss_mask: Optional[Tensor] = None,
             embedding: nn.Cell = None,
-            output_layer: nn.Cell = None,
-            output_weight: Tensor = None,
+            actual_seq_len: Tensor = None,
     ):
         """
         Perform the forward pass through all of the MTP modules.
@@ -343,66 +509,104 @@ class MultiTokenPredictionBlock(nn.Cell):
             labels (Tensor, optional): Labels tensor with shape [b, s].
             rotary_pos_emb (Tensor, optional): Rotary positional embeddings.
             extra_block_kwargs (dict, optional): Additional keyword arguments for blocks.
-            loss_mask (Tensor, optional): Loss mask tensor with shape [b, s].
             embedding (nn.Cell, optional): Embedding layer for token embedding. Default: ``None``.
             output_layer (nn.Cell, optional): Output layer for logits generation. Default: ``None``.
-            output_weight (Tensor, optional): Output weight tensor. Default: ``None``.
 
         Returns:
-            Union[Tuple[Tensor, Tensor], Tensor]: The MTP loss tensor.
-            - If calculate_per_token_loss is True: Returns tuple of (numerator, denominator)
-            - Otherwise, returns scalar loss tensor.
+            Tensor: The MTP hidden states tensor of shape [s, b, h].
         """
-        if labels is None:
-            raise ValueError("labels should not be None for calculating multi token prediction loss.")
-        if loss_mask is None:
-            # if loss_mask is not provided, use all ones as loss_mask
-            loss_mask = self.ones_like(labels)
-
-        mtp_loss = 0
-        numerator, denominator = 0, 0
+        _ = extra_block_kwargs
+        hidden_states_list = [hidden_states]
         for layer in self.layers:
-            # Calc logits for the current Multi-Token Prediction (MTP) layers.
-            input_ids = self.roll_tensor(input_ids)
-            # embedding
-            decoder_input = embedding(
+            hidden_states, _, _ = layer(
                 input_ids=input_ids,
-                position_ids=position_ids
-            )
-            # norm, linear projection and transformer
-            hidden_states = layer(
-                decoder_input=decoder_input,
+                position_ids=position_ids,
                 hidden_states=hidden_states,
                 attention_mask=attention_mask,
                 rotary_pos_emb=rotary_pos_emb,
-                **(extra_block_kwargs or {}),
+                embedding=embedding,
+                actual_seq_len=actual_seq_len,
             )
-            # output
-            mtp_logits = output_layer(hidden_states, weight=output_weight)
-            mtp_logits = self.transpose(mtp_logits, 0, 1)
-            mtp_logits = self.reshape(mtp_logits, (-1, mtp_logits.shape[-1]))
+            hidden_states_list.append(hidden_states)
+        hidden_states = self.concat_hidden_states(hidden_states_list)
+        return hidden_states
 
-            # Calc loss for the current Multi-Token Prediction (MTP) layers.
-            labels = self.roll_tensor(labels)
-            loss_mask = self.roll_tensor(loss_mask)
 
-            # If the compute_language_model_loss is actually unwrapped CrossEntropyLoss, the inputs should
-            # be reshaped manually.
-            labels_t = self.reshape(labels, (-1,))
-            loss_mask_t = self.reshape(loss_mask, (-1,))
+class _MTPConcat(nn.Cell):
+    # pylint: disable=W0246
+    def __init__(self):
+        super().__init__()
 
-            # config.calculate_per_token_loss is supported in CrossEntropyLoss
-            mtp_layer_loss = self.compute_language_model_loss(mtp_logits, labels_t, loss_mask_t)
+    def construct(self, hidden_states):
+        if not isinstance(hidden_states, list):
+            raise ValueError("hidden_states should be a list of tensors.")
+        hidden_states = mint.cat(hidden_states, dim=0)
+        return hidden_states
 
-            mtp_layer_loss_scale = self.mtp_loss_scaling_factor / self.config.mtp_num_layers
-            if self.calculate_per_token_loss:
-                numerator = numerator + mtp_layer_loss_scale * mtp_layer_loss[0]
-                denominator = denominator + mtp_layer_loss[1]
-            else:
-                mtp_layer_loss = mtp_layer_loss_scale * mtp_layer_loss
-                # MTPLossAutoScaler is not supported for now, forward is not effective, backward grad scale=1.0 by default.
-                mtp_loss = mtp_loss + mtp_layer_loss
 
-        if self.calculate_per_token_loss:
-            return (numerator, denominator)
-        return mtp_loss
+def process_mtp_loss(
+        hidden_states_list,
+        labels,
+        loss_mask,
+        output_layer,
+        output_weight,
+        compute_language_model_loss,
+        config,
+        mtp_loss_auto_scaler,
+):
+    """Process multi-token prediction loss and inject gradients for MTP layers."""
+    if labels is None:
+        raise ValueError("labels should not be None for calculating multi token prediction loss.")
+
+    hidden_states_list = mint.chunk(hidden_states_list, 1 + config.mtp_num_layers, dim=0)
+    hidden_states = hidden_states_list[0]
+
+    # Calc loss for the current Multi-Token Prediction (MTP) layers.
+    mtp_labels = labels.clone()
+    if loss_mask is None:
+        # if loss_mask is not provided, use all ones as loss_mask
+        loss_mask = mint.ones_like(mtp_labels)
+
+    for mtp_layer_number in range(config.mtp_num_layers):
+        mtp_logits = output_layer(hidden_states_list[mtp_layer_number + 1], weight=output_weight)
+        mtp_logits = mtp_logits.transpose(0, 1).reshape((-1, mtp_logits.shape[-1]))
+        mtp_labels = roll_tensor(mtp_labels, shifts=-1, dims=-1)
+        mtp_loss_mask = roll_tensor(loss_mask, shifts=-1, dims=-1)
+        mtp_loss_mask = mint.reshape(mtp_loss_mask, (-1,))
+        mtp_loss_mask = ops.cast(mtp_loss_mask, mstype.float32)
+        mtp_loss = compute_language_model_loss(mtp_labels, mtp_logits)
+        mtp_loss = mint.mul(mtp_loss, mtp_loss_mask)
+        mtp_loss_sum = mtp_loss.sum()
+
+        num_tokens = mtp_loss_mask.sum()
+
+        mtp_loss_scale = config.mtp_loss_scaling_factor / config.mtp_num_layers
+        save_to_mtp_losses_tracker(
+            mtp_loss_scale * mtp_loss_sum / num_tokens,
+            mtp_layer_number,
+            config.mtp_num_layers,
+        )
+
+        if config.calculate_per_token_loss:
+            hidden_states = mtp_loss_auto_scaler(
+                hidden_states, mtp_loss_scale * mtp_loss
+            )
+        else:
+            hidden_states = mtp_loss_auto_scaler(
+                hidden_states, mtp_loss_scale * mtp_loss / num_tokens
+            )
+    return hidden_states
+
+
+def track_mtp_metrics():
+    """Track and aggregate MTP loss metrics across distributed ranks."""
+    tracker = get_mtp_layer_wise_logging_tracker()
+    if not tracker:
+        return None
+
+    mtp_losses = tracker["values"]
+    if get_world_size() > 1:
+        all_reduce(mtp_losses, op=ops.ReduceOp.SUM)
+        mtp_losses /= get_world_size()
+
+    return mtp_losses

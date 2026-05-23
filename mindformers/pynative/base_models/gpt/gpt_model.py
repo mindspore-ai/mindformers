@@ -36,6 +36,7 @@ from mindformers.pynative.base_models.common.embeddings.language_model_embedding
 from mindformers.pynative.base_models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from mindformers.pynative.base_models.common.embeddings.yarn_rotary_pos_embedding import YarnRotaryEmbedding
 from mindformers.pynative.transformers.transformer_block import TransformerBlock, TransformerBlockSubmodules
+from mindformers.pynative.transformers.multi_token_prediction import MultiTokenPredictionBlock, MTPLossAutoScaler
 from mindformers.pynative.layers.linear import Linear
 from mindformers.pynative.optimizer.muon_utils import make_muon_fns
 
@@ -229,6 +230,11 @@ class GPTModel(nn.Cell):
                 config=config
             )
 
+        self.mtp = None
+        if self.mtp_process:
+            self.mtp = MultiTokenPredictionBlock(config=self.config, spec=mtp_block_spec)
+            self.mtp_loss_auto_scaler = MTPLossAutoScaler()
+
         # operations
         self.cast = ops.cast
         self.concat_prefix = mint.concat
@@ -285,7 +291,7 @@ class GPTModel(nn.Cell):
         labels, attention_mask, loss_mask = self._preprocess_input_labels_and_masks(
             input_ids, labels, attention_mask, loss_mask, actual_seq_len)
 
-        hidden_states, _ = self.language_model(
+        hidden_states, rotary_pos_emb = self.language_model(
             input_ids,
             position_ids,
             attention_mask,
@@ -298,8 +304,32 @@ class GPTModel(nn.Cell):
         if self.share_embeddings_and_output_weights:
             output_weight = self.shared_embedding_or_output_weight()
 
+        if self.mtp_process:
+            hidden_states = self.mtp(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                rotary_pos_emb=rotary_pos_emb,
+                embedding=self.embedding,
+                actual_seq_len=actual_seq_len
+            )
+
         if not self.post_process:
             return hidden_states
+
+        if self.mtp_process:
+            from mindformers.pynative.transformers.multi_token_prediction import process_mtp_loss
+            hidden_states = process_mtp_loss(
+                hidden_states_list=hidden_states,
+                labels=labels,
+                loss_mask=loss_mask,
+                output_layer=self.output_layer,
+                output_weight=output_weight,
+                compute_language_model_loss=self.compute_language_model_loss,
+                config=self.config,
+                mtp_loss_auto_scaler=self.mtp_loss_auto_scaler,
+            )
 
         # logits origin shape is [s b h], transform it to [b*s h].
         hidden_states = self.cast(hidden_states, dtype.bfloat16)
@@ -329,7 +359,6 @@ class GPTModel(nn.Cell):
             loss = self.compute_language_model_loss(labels, logits, loss_mask)
         else:
             loss = self.compute_language_model_loss(labels, logits, loss_mask)
-
         if self.calculate_per_token_loss:
             numerator0, denominator0 = loss
             return numerator0, denominator0
@@ -414,7 +443,7 @@ class GPTModel(nn.Cell):
     def compute_language_model_loss(self,
                                     labels: Tensor,
                                     logits: Tensor,
-                                    loss_mask: Tensor
+                                    loss_mask: Tensor=None
                                     ):
         """Post-processing of language model output.
 

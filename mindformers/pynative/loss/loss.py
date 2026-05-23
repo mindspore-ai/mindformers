@@ -211,7 +211,7 @@ class CrossEntropyLoss(nn.Cell):
         self.calculate_per_token_loss = calculate_per_token_loss
         self.chunk_loss_num = chunk_loss_num
 
-    def construct(self, logits, label, input_mask):
+    def construct(self, logits, label, input_mask=None):
         """Forward process"""
         if self.chunk_loss_num > 1 and logits.ndim == 3:
             print(f'[chunk loss], logits shape={logits.shape}, chunk_loss_num={self.chunk_loss_num}.')
@@ -221,6 +221,9 @@ class CrossEntropyLoss(nn.Cell):
         loss_reduce = self.nll_loss(log_softmax, label)
 
         # Using input_mask to mask the loss
+        if input_mask is None:
+            return loss_reduce
+
         input_mask = self.reshape(input_mask, (-1,))
         input_mask = self.cast(input_mask, mstype.float32)
         numerator = self.sum(self.mul(loss_reduce, input_mask))

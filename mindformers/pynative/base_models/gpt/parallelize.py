@@ -69,6 +69,7 @@ from mindformers.pynative.distributed.activation_checkpoint import apply_ac
 from mindformers.pynative.distributed.utils import distribute_module
 from mindformers.pynative.base_models.gpt.gpt_model import GPTModel
 from mindformers.pynative.transformers.moe.moe_utils import _MoEAuxLossAutoScaler
+from mindformers.pynative.transformers.multi_token_prediction import _MTPLossAutoScaler
 from mindformers.tools.logger import logger
 
 __all__ = ["parallelize_gptmodel"]
@@ -215,12 +216,11 @@ def _distribute_router(
     - Inputs are converted to DTensor with correct placements.
     - Outputs are redistributed and optionally converted back to local tensors.
     """
-
-    # pylint: disable=W0613
     def input_fn(device_mesh, mod, args):
         """
         Transform inputs into DTensor with correct placements before forward pass.
         """
+        _ = mod
         hidden_state, expert_bias = args
 
         # Handle hidden_state: convert or redistribute to expected layout
@@ -250,6 +250,7 @@ def _distribute_router(
         """
         Transform outputs to desired placements and optionally convert to local tensors.
         """
+        _, _ = mod, args
         prepared_outputs = []
 
         # Ensure each output matches the expected layout
@@ -277,6 +278,53 @@ def _distribute_router(
     )
 
 
+def _apply_mtp_concat_tp(
+    module,
+    tp_mesh,
+):
+    """Distribute the MTP (Multi-Token Prediction) hidden-states concatenation module."""
+    def input_fn(device_mesh, mod, args):
+        """
+        Transform inputs into DTensor with correct placements before forward pass.
+        """
+        _ = mod
+        (hidden_states,) = args
+        cur_hidden_states = []
+        for h in hidden_states:
+            if isinstance(h, DTensor):
+                hidden_state = h.redistribute(
+                    placements=(Replicate(),),
+                    device_mesh=device_mesh,
+                )
+            else:
+                hidden_state = DTensor.from_local(
+                    h, device_mesh, (Replicate(),)
+                )
+            cur_hidden_states.append(hidden_state)
+        return cur_hidden_states
+
+    def output_fn(device_mesh, mod, args, outputs):
+        """
+        Transform outputs to desired placements and optionally convert to local tensors.
+        """
+        _, _ = mod, args
+        hidden_states = outputs
+        if isinstance(hidden_states, DTensor):
+            hidden_states = hidden_states.redistribute(
+                placements=(Replicate(),),
+                device_mesh=device_mesh,
+            )
+        return hidden_states
+
+    distribute_module(
+        module=module,
+        device_mesh=tp_mesh,
+        parameter_shard_plan={},  # No parameter sharding defined here
+        input_fn=input_fn,
+        output_fn=output_fn
+    )
+
+
 def _collect_layer_replicate_params(layer):
     """Collect parameters from a transformer layer that must be replicated (not sharded) under FSDP."""
     replicate_params = []
@@ -294,6 +342,147 @@ def _collect_layer_replicate_params(layer):
         replicate_params.extend(list(layer.ffn_hc.get_parameters()))
 
     return replicate_params
+
+
+def _apply_layers_tp(
+    transformer_layer,
+    tp_mesh,
+    enable_ep,
+    shard_plans,
+):
+    """Apply tensor-parallel sharding to a single GPT transformer layer."""
+
+    sp_layout, attention_kernel_plan, norm_plan, rowwise_output_plan, rotary_emb_plan = shard_plans
+    colwise_parallel, prepare_module_input, prepare_module_output, prepare_module_input_output = (
+        ColwiseParallel,
+        PrepareModuleInput,
+        PrepareModuleOutput,
+        PrepareModuleInputOutput,
+    )
+
+    distribute_param_plan = []
+    layer_plan = {
+        "input_layernorm": norm_plan,
+        "self_attention": prepare_module_input(
+            input_layouts=(sp_layout),
+            desired_input_layouts=(
+                Replicate()
+            ),
+            use_local_output=False,
+        ),
+        # NOTE: NoParallel() without local_output_grad_placements keeps the output as a
+        # DTensor so that the intermediate results k is generated as a DTensor and its
+        # gradient is correctly handled by the autograd engine.
+        "self_attention.linear_qkv": colwise_parallel(output_layouts=Replicate(), use_local_output=False),
+        "self_attention.linear_kvb": colwise_parallel(output_layouts=Replicate(), use_local_output=False),
+        "self_attention.k_layernorm": NoParallel(use_local_output=False),
+        # NOTE: use_local_output=True so that the inputs to FlexAttention are plain Tensors
+        "self_attention.core_attention": attention_kernel_plan,
+        "self_attention.linear_proj": rowwise_output_plan,
+        "pre_mlp_layernorm": norm_plan,
+        "self_attention.apply_rotary_emb": rotary_emb_plan,
+        "self_attention.apply_rotary_emb2": rotary_emb_plan,
+    }
+
+    if transformer_layer.self_attention.q_rank == 0:
+        raise ValueError(
+            "q_rank should be greater than 0, but got 0!"
+        )
+
+    layer_plan.update(
+        {
+            "self_attention.linear_qb": colwise_parallel(output_layouts=Replicate(), use_local_output=False),
+            "self_attention.q_layernorm": NoParallel(use_local_output=False),
+        }
+    )
+
+    if hasattr(transformer_layer, "attn_hc"):
+        layer_plan.update(
+            {
+                "attn_hc": SequenceParallel(sequence_dim=0, use_local_output=False),
+                "ffn_hc": SequenceParallel(sequence_dim=0, use_local_output=False),
+            }
+        )
+
+    if hasattr(transformer_layer.mlp, "linear_fc1"):
+        layer_plan.update(
+            {
+                "mlp": prepare_module_input(
+                    input_layouts=(sp_layout,),
+                    desired_input_layouts=(Replicate(),),
+                    use_local_output=False,
+                ),
+                "mlp.linear_fc1": colwise_parallel(use_local_output=False),
+                "mlp.linear_fc2": rowwise_output_plan,
+            }
+        )
+
+    if hasattr(transformer_layer.mlp, "shared_experts"):
+        layer_plan.update(
+            {
+                "mlp.shared_experts": prepare_module_output(
+                    output_layouts=(sp_layout,),
+                    desired_output_layouts=(Replicate(),),
+                    use_local_output=False
+                ),
+            }
+        )
+        layer_plan["mlp.shared_experts.linear_fc1"] = colwise_parallel(use_local_output=False)
+        layer_plan["mlp.shared_experts.linear_fc2"] = rowwise_output_plan
+
+    core_attention = transformer_layer.self_attention.core_attention
+
+    if hasattr(core_attention, "max_logits_val"):
+        distribute_param_plan.append([core_attention, "max_logits_val", (Shard(0),)])
+    if hasattr(transformer_layer.mlp, "experts"):
+        layer_plan["mlp"] = prepare_module_input_output(
+            input_layouts=(sp_layout,),
+            desired_input_layouts=(Replicate(),),
+            output_layouts=(Replicate(),),
+            desired_output_layouts=(sp_layout,),
+            use_local_input=False,
+            use_local_output=False
+        )
+
+        layer_plan["mlp.router.moe_aux_loss_auto_scaler"] = prepare_module_output(
+            output_layouts=(Replicate(),),
+            desired_output_layouts=(sp_layout,),
+            use_local_output=False
+        )
+
+        # distribute parameters for MoE layer
+        distribute_param_plan.append([transformer_layer.mlp, "tokens_per_expert", (Replicate(),)])
+        if getattr(transformer_layer.mlp, "enable_expert_bias", False):
+            distribute_param_plan.append([transformer_layer.mlp, "expert_bias", (Replicate(),)])
+        if not enable_ep:
+            # shard expert weight if not enable_ep
+            distribute_param_plan.extend([
+                [transformer_layer.mlp.experts, "weight1", (Replicate(),)],
+                [transformer_layer.mlp.experts, "weight2", (Replicate(),)],
+            ])
+
+        # special parallel for router
+        _distribute_router(
+            transformer_layer.mlp.router,
+            router_mesh=tp_mesh,
+            input_layouts=(Replicate(), Replicate()),
+            output_layouts=(Replicate(), Replicate(), Replicate()),
+        )
+
+    if distribute_param_plan:
+        for sub_module, param_name, sub_plan in distribute_param_plan:
+            _distribute_param(
+                sub_module,
+                param_name=param_name,
+                device_mesh=tp_mesh,
+                placements=sub_plan
+            )
+
+    parallelize_module(
+        module=transformer_layer,
+        device_mesh=tp_mesh,
+        parallelize_plan=layer_plan,
+    )
 
 
 def apply_non_moe_tp(
@@ -317,27 +506,40 @@ def apply_non_moe_tp(
         use_local_output=False,
     )
 
-    parallelize_module(
-        model,
-        tp_mesh,
-        {
-            "model.embedding.word_embeddings": embed_plan,
-            "model.decoder.final_layernorm": SequenceParallel(sequence_dim=0,
-                                                              use_local_output=False) if enable_sp else NoParallel(),
-            "model.output_layer": ColwiseParallel(
-                input_layouts=sp_layout,
-                output_layouts=Shard(-1) if enable_loss_parallel else Replicate(),
-                use_local_output=False,
-            ),
-        },
-    )
-
-    rowwise_parallel, colwise_parallel, prepare_module_input, prepare_module_output, prepare_module_input_output = (
+    rowwise_parallel, prepare_module_input, prepare_module_output, prepare_module_input_output = (
         RowwiseParallel,
-        ColwiseParallel,
         PrepareModuleInput,
         PrepareModuleOutput,
         PrepareModuleInputOutput,
+    )
+
+    model_plan = {
+        "model.embedding.word_embeddings": embed_plan,
+        "model.decoder.final_layernorm": SequenceParallel(
+            sequence_dim=0, use_local_output=False) if enable_sp else NoParallel(),
+        "model.output_layer": ColwiseParallel(
+            input_layouts=sp_layout,
+            output_layouts=Shard(-1) if enable_loss_parallel else Replicate(),
+            use_local_output=False,
+        ),
+
+    }
+
+    if hasattr(model.model, "mtp_loss_auto_scaler"):
+        model_plan.update(
+            {
+                "model.mtp_loss_auto_scaler": prepare_module_output(
+                    output_layouts=(Replicate(),),
+                    desired_output_layouts=(Replicate(),),
+                    use_local_output=False,
+                )
+            }
+        )
+
+    parallelize_module(
+        model,
+        tp_mesh,
+        model_plan,
     )
 
     attention_kernel_plan = prepare_module_input(
@@ -360,131 +562,42 @@ def apply_non_moe_tp(
         use_local_output=False,
     )
 
-    for transformer_block in model.model.decoder.layers:
-        distribute_param_plan = []
-
-        layer_plan = {
-            "input_layernorm": norm_plan,
-            "self_attention": prepare_module_input(
-                input_layouts=(sp_layout),
-                desired_input_layouts=(
-                    Replicate()
-                ),
-                use_local_output=False,
-            ),
-            # NOTE: NoParallel() without local_output_grad_placements keeps the output as a
-            # DTensor so that the intermediate results k is generated as a DTensor and its
-            # gradient is correctly handled by the autograd engine.
-            "self_attention.linear_qkv": colwise_parallel(output_layouts=Replicate(), use_local_output=False),
-            "self_attention.linear_kvb": colwise_parallel(output_layouts=Replicate(), use_local_output=False),
-            "self_attention.k_layernorm": NoParallel(use_local_output=False),
-            # NOTE: use_local_output=True so that the inputs to FlexAttention are plain Tensors
-            "self_attention.core_attention": attention_kernel_plan,
-            "self_attention.linear_proj": rowwise_output_plan,
-            "pre_mlp_layernorm": norm_plan,
-            "self_attention.apply_rotary_emb": rotary_emb_plan,
-            "self_attention.apply_rotary_emb2": rotary_emb_plan,
-        }
-
-        if transformer_block.self_attention.q_rank == 0:
-            raise ValueError(
-                "q_rank should be greater than 0, but got 0!"
-            )
-
-        layer_plan.update(
-            {
-                "self_attention.linear_qb": colwise_parallel(output_layouts=Replicate(), use_local_output=False),
-                "self_attention.q_layernorm": NoParallel(use_local_output=False),
-            }
+    for transformer_layer in model.model.decoder.layers:
+        _apply_layers_tp(
+            transformer_layer,
+            tp_mesh,
+            enable_ep,
+            (sp_layout, attention_kernel_plan, norm_plan, rowwise_output_plan, rotary_emb_plan,),
         )
 
-        if hasattr(transformer_block, "attn_hc"):
-            layer_plan.update(
-                {
-                    "attn_hc": SequenceParallel(sequence_dim=0, use_local_output=False),
-                    "ffn_hc": SequenceParallel(sequence_dim=0, use_local_output=False),
-                }
-            )
-
-        if hasattr(transformer_block.mlp, "linear_fc1"):
-            layer_plan.update(
-                {
-                    "mlp": prepare_module_input(
-                        input_layouts=(sp_layout,),
-                        desired_input_layouts=(Replicate(),),
-                        use_local_output=False,
-                    ),
-                    "mlp.linear_fc1": colwise_parallel(use_local_output=False),
-                    "mlp.linear_fc2": rowwise_output_plan,
-                }
-            )
-
-        if hasattr(transformer_block.mlp, "shared_experts"):
-            layer_plan.update(
-                {
-                    "mlp.shared_experts": prepare_module_output(
-                        output_layouts=(sp_layout,),
-                        desired_output_layouts=(Replicate(),),
-                        use_local_output=False
-                    ),
-                }
-            )
-            layer_plan["mlp.shared_experts.linear_fc1"] = colwise_parallel(use_local_output=False)
-            layer_plan["mlp.shared_experts.linear_fc2"] = rowwise_output_plan
-
-        core_attention = transformer_block.self_attention.core_attention
-
-        if hasattr(core_attention, "max_logits_val"):
-            distribute_param_plan.append([core_attention, "max_logits_val", (Shard(0),)])
-        if hasattr(transformer_block.mlp, "experts"):
-            layer_plan["mlp"] = prepare_module_input_output(
-                input_layouts=(sp_layout,),
-                desired_input_layouts=(Replicate(),),
-                output_layouts=(Replicate(),),
-                desired_output_layouts=(sp_layout,),
-                use_local_input=False,
-                use_local_output=False
-            )
-
-            layer_plan["mlp.router.moe_aux_loss_auto_scaler"] = prepare_module_output(
-                output_layouts=(Replicate(),),
-                desired_output_layouts=(sp_layout,),
-                use_local_output=False
-            )
-
-            # distribute parameters for MoE layer
-            distribute_param_plan.append([transformer_block.mlp, "tokens_per_expert", (Replicate(),)])
-            if getattr(transformer_block.mlp, "enable_expert_bias", False):
-                distribute_param_plan.append([transformer_block.mlp, "expert_bias", (Replicate(),)])
-            if not enable_ep:
-                # shard expert weight if not enable_ep
-                distribute_param_plan.extend([
-                    [transformer_block.mlp.experts, "weight1", (Replicate(),)],
-                    [transformer_block.mlp.experts, "weight2", (Replicate(),)],
-                ])
-
-            # special parallel for router
-            _distribute_router(
-                transformer_block.mlp.router,
-                router_mesh=tp_mesh,
-                input_layouts=(Replicate(), Replicate()),
-                output_layouts=(Replicate(), Replicate(), Replicate()),
-            )
-
-        if distribute_param_plan:
-            for sub_module, param_name, sub_plan in distribute_param_plan:
-                _distribute_param(
-                    sub_module,
-                    param_name=param_name,
-                    device_mesh=tp_mesh,
-                    placements=sub_plan
-                )
-
-        parallelize_module(
-            module=transformer_block,
-            device_mesh=tp_mesh,
-            parallelize_plan=layer_plan,
+    if getattr(model.model, "mtp"):
+        _apply_mtp_concat_tp(
+            model.model.mtp.concat_hidden_states,
+            tp_mesh,
         )
+
+        for layer in model.model.mtp.layers:
+            parallelize_module(
+                layer,
+                tp_mesh,
+                {
+                    "enorm": SequenceParallel(
+                        sequence_dim=0, use_local_output=False) if enable_sp else NoParallel(),
+                    "hnorm": SequenceParallel(
+                        sequence_dim=0, use_local_output=False) if enable_sp else NoParallel(),
+                    "eh_proj": RowwiseParallel(
+                        input_layouts=Shard(0), output_layouts=Shard(0), use_local_output=False),
+                    "final_layernorm": SequenceParallel(
+                        sequence_dim=0, use_local_output=False) if enable_sp else NoParallel(),
+                },
+            )
+
+            _apply_layers_tp(
+                layer.transformer_layer,
+                tp_mesh,
+                enable_ep,
+                (sp_layout, attention_kernel_plan, norm_plan, rowwise_output_plan, rotary_emb_plan,),
+            )
 
     if hasattr(model.model.loss, "log_softmax") and hasattr(model.model.loss, "nll_loss"):
         # apply parallelism to loss custom backend functions
@@ -549,8 +662,13 @@ def apply_moe_ep_tp(
     if tp_mesh is None and ep_mesh is None:
         raise ValueError("At least one of ep_mesh or tp_mesh must be provided.")
 
-    for transformer_block in model.model.decoder.layers:
-        # Check if this layer has MoE (has experts attribute)
+    transformer_layers = list(model.model.decoder.layers)
+    if getattr(model.model, "mtp", None) is not None:
+        transformer_layers.extend(
+            mtp_layer.transformer_layer for mtp_layer in model.model.mtp.layers
+        )
+
+    for transformer_block in transformer_layers:
         if not hasattr(transformer_block.mlp, 'experts'):
             continue
 
@@ -572,9 +690,7 @@ def apply_moe_ep_tp(
                 f"Unsupported moe_token_dispatcher_type: '{moe_token_dispatcher_type}'. "
                 "Expected 'alltoall' or 'alltoall_deredundancy'."
             )
-
-        # Apply parallelism to experts module
-        if experts_mesh is not None:
+        if hasattr(transformer_block.mlp, 'experts') and experts_mesh is not None:
             parallelize_module(
                 module=transformer_block.mlp.experts,
                 device_mesh=experts_mesh,
@@ -664,16 +780,35 @@ def apply_fsdp(
     modules = {
         "embedding": getattr(gpt_model, "embedding", None),
         "layers": list(gpt_model.decoder.layers),
-        "tail_modules": [
-            m for m in [
-                getattr(gpt_model.decoder, "final_layernorm", None),
-                getattr(gpt_model, "output_layer", None),
-            ] if m is not None
-        ]
     }
+
+    if hasattr(gpt_model, "mtp"):
+        modules.update(
+            {
+                "tail_modules": [
+                    m for m in [
+                        getattr(gpt_model.decoder, "final_layernorm", None),
+                    ] if m is not None
+                ],
+                "mtp": getattr(gpt_model, "mtp", None),
+            }
+        )
+    else:
+        modules.update(
+            {
+                "tail_modules": [
+                    m for m in [
+                        getattr(gpt_model.decoder, "final_layernorm", None),
+                        getattr(gpt_model, "output_layer", None),
+                    ] if m is not None
+                ],
+            }
+        )
+
     embedding = modules["embedding"]
     layers = modules["layers"]
     tail_modules = modules["tail_modules"]
+    mtp = modules["mtp"]
 
     if not layers:
         raise ValueError(f"{type(model).__name__} has no decoder layers")
@@ -700,10 +835,33 @@ def apply_fsdp(
 
     # --- 3. Wrap final_layernorm and output_layer together ---
     if tail_modules:
-        # As an optimization, do not reshard_after_forward the last layers by default
-        # since FSDP would prefetch them immediately after the forward pass.
         with ms.DeviceCtx("meta"):
-            fully_shard(tail_modules, **fsdp_config, reshard_after_forward=reshard_policy == "always")
+            if not mtp:
+                # As an optimization, do not reshard_after_forward the last layers by default
+                # since FSDP would prefetch them immediately after the forward pass.
+                fully_shard(
+                    tail_modules,
+                    **fsdp_config,
+                    reshard_after_forward=reshard_policy == "always"
+                )
+            else:
+                for tail_module in tail_modules:
+                    fully_shard(
+                        tail_module,
+                        **fsdp_config,
+                        reshard_after_forward=reshard_policy == "always"
+                    )
+
+    if mtp:
+        with ms.DeviceCtx("meta"):
+            for layer in mtp.layers:
+                mtp_replicate_params = _collect_layer_replicate_params(layer.transformer_layer)
+                fully_shard(
+                    layer,
+                    **fsdp_config,
+                    reshard_after_forward=reshard_after_forward,
+                    replicate_params=mtp_replicate_params,
+                )
 
     # --- 4. Wrap root ---
     with ms.DeviceCtx("meta"):
@@ -897,6 +1055,7 @@ def parallelize_gptmodel(
     # Set the loss scale for the auxiliary loss of the MoE layer.
     main_loss_sense = 1. / (get_world_size() / int(parallelism.pipeline_parallel))
     _MoEAuxLossAutoScaler.set_loss_scale(main_loss_sense)
+    _MTPLossAutoScaler.set_loss_scale(main_loss_sense)
 
     logger.info("GPTModel parallelization completed.")
     return model

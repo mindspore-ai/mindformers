@@ -28,10 +28,8 @@ from mindformers.models.utils import (
     convert_transformer_config_to_args_for_tflops,
     num_floating_point_operations,
 )
-from mindformers.pynative.transformers.moe.moe_utils import (
-    get_moe_layer_wise_logging_tracker,
-    clear_aux_losses_tracker,
-)
+from mindformers.pynative.transformers.moe.moe_utils import track_moe_metrics
+from mindformers.pynative.transformers.multi_token_prediction import track_mtp_metrics
 
 
 class LossCallback(TrainerCallback):
@@ -65,7 +63,7 @@ class LossCallback(TrainerCallback):
         """
         self.step_time = time.time()
         self.epoch_time = time.time()
-    
+
     def on_train_end(self, args, state, **kwargs):
         """
         Called at the end of training.
@@ -129,28 +127,23 @@ class LossCallback(TrainerCallback):
         model_config = deepcopy(model.get_gpt_transformer_config())
         reset_model_temporary_tensors(model_config, model)
 
-        moe_aux_loss_coeff = model_config.moe_aux_loss_coeff
-        load_balancing_loss = None
-        if model_config.moe_layer_freq is None:
-            moe_layer = model_config.num_layers
-        elif isinstance(model_config.moe_layer_freq, int):
-            moe_layer_pattern = [1 if (i % model_config.moe_layer_freq == 0) else 0 for i in \
-                                 range(model_config.num_layers)]
-            moe_layer = sum(moe_layer_pattern)
-        elif isinstance(model_config.moe_layer_freq, list):
-            moe_layer = sum(model_config.moe_layer_freq)
-        else:
-            raise ValueError(f"Invalid moe_layer_freq: {model_config.moe_layer_freq}")
-
-        if moe_aux_loss_coeff and moe_aux_loss_coeff > 0.0 and moe_layer > 0:
-            load_balancing_loss = get_moe_layer_wise_logging_tracker()["values"].sum()
-            if get_world_size() > 1:
-                all_reduce(load_balancing_loss, op=ops.ReduceOp.SUM)
-                load_balancing_loss /= get_world_size()
-            load_balancing_loss /= moe_layer
-            clear_aux_losses_tracker()
+        # process aux loss
+        load_balancing_loss = track_moe_metrics(
+            loss_scale=model_config.moe_aux_loss_coeff,
+            num_layers=model_config.num_layers,
+            moe_layer_freq=model_config.moe_layer_freq,
+            mtp_num_layers=model_config.mtp_num_layers,
+        )
         if model_config.moe_router_enable_expert_bias:
             _update_expert_bias(model)
+
+        # process mtp loss
+        mtp_loss = track_mtp_metrics()
+        if mtp_loss:
+            mtp_loss_values = []
+            for ind, val in enumerate(mtp_loss):
+                mtp_loss_values.append(f"mtp_{str(ind + 1)}_loss: {self._to_float(val):10.6f}")
+            mtp_loss = ", ".join(mtp_loss_values)
 
         # Calculate total FLOPs for the model
         model_config = convert_transformer_config_to_args_for_tflops(model_config)
@@ -173,6 +166,7 @@ class LossCallback(TrainerCallback):
             "learning_rate": self._parse_lr_info(
                 kwargs.get("lr_scheduler"), state.global_step
             ),
+            "mtp_loss": mtp_loss,
         }
 
         # Print the collected log information
@@ -207,6 +201,10 @@ class LossCallback(TrainerCallback):
         load_balancing_loss = log_info.get("load_balancing_loss")
         if load_balancing_loss is not None:
             log_parts.append(f"load_balancing_loss: {load_balancing_loss:10.6f}")
+
+        mtp_loss = log_info.get("mtp_loss")
+        if mtp_loss is not None:
+            log_parts.append(mtp_loss)
 
         lr = log_info.get("learning_rate")
         if lr is not None:
@@ -287,6 +285,9 @@ def _update_expert_bias(model):
             continue
         tokens_per_expert = module.tokens_per_expert
         tokens_per_expert_list.append(tokens_per_expert)
+
+    if not tokens_per_expert_list:
+        return
     tokens_per_expert_by_layer = ops.vstack(tokens_per_expert_list)
 
     moe_layer_idx = 0

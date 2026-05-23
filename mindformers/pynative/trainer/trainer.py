@@ -804,7 +804,7 @@ class Trainer:
         global_norm, grads = _calculate_global_grad_norm(
             self.optimizer.parameters,
             enable_parallel=self.enable_parallel,
-            max_norm=self.config.training.max_norm,
+            max_norm=self.config.training.max_norm
         )
 
         with _no_grad():
