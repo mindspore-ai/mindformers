@@ -104,12 +104,13 @@ class GroupedMLP(nn.Cell):
 
         # Reorder the token indices to match the order of the experts
         # token_indices_experts_sorted shape (bs*slen*top_k,)
+        selected_experts_indices = self.cast(selected_experts_indices, ms.float32)
         token_indices_experts_sorted = self.argsort(self.reshape(selected_experts_indices, (-1,)), stable=True)
 
         top_scores_experts_sorted = self.reshape(top_scores, (-1,))[token_indices_experts_sorted]
 
         # shape (bs*slen*top_k, dim)
-        routed_input = tokens[token_indices_experts_sorted // self.top_k]
+        routed_input = tokens[mint.floor_divide(token_indices_experts_sorted, self.top_k)]
         routed_input = self.reshape(routed_input, (-1, self.hidden_size))
         return num_tokens_per_expert, token_indices_experts_sorted, top_scores_experts_sorted, routed_input
 
