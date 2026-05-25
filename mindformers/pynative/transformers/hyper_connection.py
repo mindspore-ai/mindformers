@@ -292,6 +292,7 @@ class FusedHyperConnectionOutputCell(nn.Cell):
 
         x = self.reshape(original_streams, (s, b, n, hidden_size))
         x = self.cast(x, self.dtype)
+        sublayer_out = self.cast(sublayer_out, self.dtype)
 
         output = npu_mhc_post(x, h_res, sublayer_out, self.squeeze(h_post, -1))
         return self.reshape(output, (s, b, n * hidden_size))
