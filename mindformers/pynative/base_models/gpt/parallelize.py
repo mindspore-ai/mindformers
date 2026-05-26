@@ -1035,7 +1035,6 @@ def parallelize_gptmodel(
             recompute,
             recompute_comm,
             swap,
-            parallel_dims.pp
         )
 
     # Phase 5: FSDP/HSDP

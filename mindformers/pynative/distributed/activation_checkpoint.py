@@ -49,7 +49,6 @@ def _validate_recompute_config(
     recompute,
     recompute_comm,
     num_layers: int,
-    pipeline_parallel: int = 1
 ) -> None:
     """Validate recompute configuration."""
     rc = recompute
@@ -57,22 +56,15 @@ def _validate_recompute_config(
 
     need_recompute = rc.mode != "None"
     need_comm = rc_comm.enable
-    if (need_recompute or need_comm) and pipeline_parallel != 1:
-        logger.error("[Recompute Config] recompute/recompute_comm requires pipeline_parallel=1 "
-                     f"(pipeline parallelism is not supported); got pipeline_parallel={pipeline_parallel}")
-        raise ValueError(
-            "TrainConfig: recompute/recompute_comm requires pipeline_parallel=1 "
-            f"(pipeline parallelism is not supported); got pipeline_parallel={pipeline_parallel}"
-        )
     if need_recompute:
-        _validate_recompute_structure(rc, pipeline_parallel)
-        _validate_recompute_layer_specs_no_pp(rc, num_layers)
+        _validate_recompute_structure(rc)
+        _validate_recompute_layer_specs(rc, num_layers)
     if need_comm:
-        _validate_recompute_comm_structure(rc_comm, pipeline_parallel)
-        _validate_recompute_comm_layer_specs_no_pp(rc_comm, num_layers)
+        _validate_recompute_comm_structure(rc_comm)
+        _validate_recompute_comm_layer_specs(rc_comm, num_layers)
 
 
-def _validate_recompute_structure(recompute_cfg: RecomputeConfig, pp: int) -> None:
+def _validate_recompute_structure(recompute_cfg: RecomputeConfig) -> None:
     """Validate recompute configuration structure and mode-specific requirements."""
     pfx = "TrainConfig.recompute"
     if recompute_cfg.select_module is not None:
@@ -97,31 +89,17 @@ def _validate_recompute_structure(recompute_cfg: RecomputeConfig, pp: int) -> No
                     f"{pfx}.select_module[{key!r}]: value must be a list or tuple of layer ranges, "
                     f"got {type(ranges).__name__}"
                 )
-        _validate_select_module_size_for_pp(
-            recompute_cfg.select_module,
-            f"{pfx}.select_module",
-            pp,
-            "mode is 'select'",
-        )
     if recompute_cfg.mode == "full" and not recompute_cfg.full_recompute_layer:
         logger.error(f"[Recompute Config] {pfx}: mode is 'full' but full_recompute_layer is missing or empty")
         raise ValueError(
             f"{pfx}: mode is 'full' but full_recompute_layer is missing or empty"
-        )
-    if recompute_cfg.full_recompute_layer is not None and len(recompute_cfg.full_recompute_layer) != pp:
-        logger.error(f"[Recompute Config] {pfx}.full_recompute_layer must contain "
-                     f"exactly one layer range string when pipeline_parallel={pp}; "
-                     f"got {len(recompute_cfg.full_recompute_layer)} entries")
-        raise ValueError(
-            f"{pfx}.full_recompute_layer must contain exactly one layer range string when "
-            f"pipeline_parallel={pp}; got {len(recompute_cfg.full_recompute_layer)} entries"
         )
     if recompute_cfg.mode == "select" and not recompute_cfg.select_module:
         logger.error(f"[Recompute Config] {pfx}: mode is 'select' but select_module is missing or empty")
         raise ValueError(f"{pfx}: mode is 'select' but select_module is missing or empty")
 
 
-def _validate_recompute_comm_structure(recompute_comm_cfg: RecomputeCommConfig, pp: int) -> None:
+def _validate_recompute_comm_structure(recompute_comm_cfg: RecomputeCommConfig) -> None:
     """Validate communication recompute configuration structure."""
     pfx = "TrainConfig.recompute_comm"
     if recompute_comm_cfg.select_module is not None:
@@ -145,64 +123,40 @@ def _validate_recompute_comm_structure(recompute_comm_cfg: RecomputeCommConfig, 
                     f"{pfx}.select_module[{key!r}]: value must be a list or tuple of layer ranges, "
                     f"got {type(ranges).__name__}"
                 )
-        _validate_select_module_size_for_pp(
-            recompute_comm_cfg.select_module,
-            f"{pfx}.select_module",
-            pp,
-            "communication recompute is enabled",
-        )
     if recompute_comm_cfg.enable and not recompute_comm_cfg.select_module:
         logger.error(f"[Recompute Config] {pfx}: enable is True but select_module is missing or empty")
         raise ValueError(f"{pfx}: enable is True but select_module is missing or empty")
 
 
-def _validate_recompute_layer_specs_no_pp(recompute_cfg: RecomputeConfig, num_layers: int) -> None:
+def _validate_recompute_layer_specs(recompute_cfg: RecomputeConfig, num_layers: int) -> None:
     """Validate and normalize layer spec strings in recompute configuration."""
     pfx = "TrainConfig.recompute_config.recompute"
     if recompute_cfg.mode == "None":
         return
     if recompute_cfg.full_recompute_layer:
-        recompute_cfg.full_recompute_layer[0] = _validate_layer_id_range(
-            f"{pfx}.full_recompute_layer", recompute_cfg.full_recompute_layer[0], num_layers
+        _validate_layer_specs(
+            recompute_cfg.full_recompute_layer, f"{pfx}.full_recompute_layer", num_layers
         )
     elif recompute_cfg.mode == "select":
         for key, ranges in recompute_cfg.select_module.items():
-            ranges[0] = _validate_layer_id_range(
-                f"{pfx}.select_module[{key!r}]", ranges[0], num_layers
+            _validate_layer_specs(
+                ranges, f"{pfx}.select_module[{key!r}]", num_layers
             )
 
 
-def _validate_recompute_comm_layer_specs_no_pp(
+def _validate_recompute_comm_layer_specs(
         recompute_comm_cfg: RecomputeCommConfig, num_layers: int) -> None:
-    """Validate comm recompute layer specs when pipeline_parallel is 1."""
+    """Validate comm recompute layer specs."""
     if not recompute_comm_cfg.enable:
         return
     pfx = "TrainConfig.recompute_config.recompute_comm"
     for key, ranges in recompute_comm_cfg.select_module.items():
-        ranges[0] = _validate_layer_id_range(
-            f"{pfx}.select_module[{key!r}][0]", ranges[0], num_layers
+        _validate_layer_specs(
+            ranges, f"{pfx}.select_module[{key!r}]", num_layers
         )
 
 
-def _validate_select_module_size_for_pp(
-    select_module: dict,
-    label_prefix: str,
-    pp: int,
-    reason: str,
-) -> None:
-    """Validate that each select_module entry has exactly pp layer range strings."""
-    for key, ranges in select_module.items():
-        if len(ranges) != pp:
-            logger.error(f"[Recompute Config] {label_prefix}[{key!r}]: must contain "
-                         f"exactly one layer range string when {reason}; "
-                         f"got {len(ranges)} entries")
-            raise ValueError(
-                f"{label_prefix}[{key!r}]: must contain exactly one layer range string when "
-                f"{reason}; got {len(ranges)} entries"
-            )
-
-
-def _validate_layer_id_range(label: str, value: object, num_layers: int, prefetch=None) -> str:
+def _validate_layer_id_range(label: str, value: object, num_layers: int) -> str:
     """Validate one layer spec."""
     normalized = str(value).strip()
     m = _LAYER_ID_SPEC_PATTERN.match(normalized)
@@ -224,46 +178,61 @@ def _validate_layer_id_range(label: str, value: object, num_layers: int, prefetc
         raise ValueError(
             f"{label}: layer id {hi} out of range [0, {num_layers - 1}], got {value!r}"
         )
-    if prefetch and hi + prefetch >= num_layers:
-        logger.error(f"[Swap Config] {label}: layer id {hi} out of range "
-                     f"[0, {num_layers - prefetch - 1}], got {value!r}")
-        raise ValueError(
-            f"{label}: layer id {hi} out of range [0, {num_layers - prefetch - 1}], got {value!r}"
-        )
     return normalized
 
 
-def _validate_swap_config(swap, num_layers: int, pipeline_parallel: int = 1) -> None:
+def _validate_layer_specs(specs, label_prefix, num_layers, prefetch=None):
+    """Validate layer spec strings.
+
+    Checks: each spec is valid and specs are in ascending order.
+    When prefetch is specified, validates that the maximum layer id
+    plus prefetch does not exceed num_layers.
+    """
+    if not specs:
+        return
+    prev_hi = -1
+    for i, spec in enumerate(specs):
+        specs[i] = _validate_layer_id_range(f"{label_prefix}[{i}]", spec, num_layers)
+        lo, hi = _parse_spec_lo_hi(specs[i])
+        if lo <= prev_hi:
+            logger.error(f"[Recompute Config] {label_prefix}: layer specs must be in strictly "
+                         f"ascending order; spec[{i}] '{specs[i]}' starts at {lo} "
+                         f"but previous spec ends at {prev_hi}")
+            raise ValueError(
+                f"{label_prefix}: layer specs must be in strictly ascending order; "
+                f"spec[{i}] '{specs[i]}' starts at {lo} but previous spec ends at {prev_hi}"
+            )
+        prev_hi = hi
+    if prefetch and prev_hi >= 0 and prev_hi + prefetch >= num_layers:
+        logger.error(f"[Swap Config] {label_prefix}: max layer id {prev_hi} plus prefetch "
+                     f"{prefetch} exceeds num_layers ({num_layers}); "
+                     f"max allowed layer id is {num_layers - prefetch - 1}")
+        raise ValueError(
+            f"{label_prefix}: max layer id {prev_hi} plus prefetch {prefetch} "
+            f"exceeds num_layers ({num_layers}); "
+            f"max allowed layer id is {num_layers - prefetch - 1}"
+        )
+
+
+def _validate_swap_config(swap, num_layers: int) -> None:
     """Validate swap configuration."""
     sc = swap
 
-    if sc.enable and pipeline_parallel != 1:
-        logger.error("[Swap Config] swap requires pipeline_parallel=1 "
-                     f"(pipeline parallelism is not supported); got pipeline_parallel={pipeline_parallel}")
-        raise ValueError(
-            "TrainConfig: swap requires pipeline_parallel=1 "
-            f"(pipeline parallelism is not supported); got pipeline_parallel={pipeline_parallel}"
-        )
-    _validate_swap_structure(sc, pipeline_parallel, num_layers)
-    _validate_swap_layers_no_pp(sc, num_layers)
+    _validate_swap_structure(sc, num_layers)
+    _validate_swap_layers(sc, num_layers)
 
 
-def _validate_swap_entry_shared_fields(item: dict, label: str, pp: int) -> None:
-    """Validate shared swap entry fields: `layers``."""
+def _validate_swap_entry_shared_fields(item: dict, label: str) -> None:
+    """Validate shared swap entry fields: `layers`."""
     layers = item["layers"]
     if not isinstance(layers, (list, tuple)):
         raise TypeError(
             f"{label}.layers: expected list/tuple of layer ids or ranges like ['5'], ['0-19'], "
             f"got {type(layers).__name__}: {layers!r}"
         )
-    if len(layers) != pp:
-        raise ValueError(
-            f"{label}.layers: expected {pp} layer spec entries for pipeline_parallel={pp}, "
-            f"got {len(layers)}"
-        )
 
 
-def _validate_swap_structure(swap_cfg: SwapConfig, pp: int, num_layers: int) -> None:
+def _validate_swap_structure(swap_cfg: SwapConfig, num_layers: int) -> None:
     """Validate swap configuration structure."""
     pfx = "TrainConfig.swap_config"
 
@@ -275,7 +244,6 @@ def _validate_swap_structure(swap_cfg: SwapConfig, pp: int, num_layers: int) -> 
             f"{pfx}.default_prefetch: value {prefetch} "
             f"out of range [1, {num_layers - 1}]"
         )
-    # Validate layer_swap structure.
     if swap_cfg.layer_swap is not None:
         if not isinstance(swap_cfg.layer_swap, list):
             logger.error(f"[Swap Config] {pfx}.layer_swap must be a list, "
@@ -289,9 +257,8 @@ def _validate_swap_structure(swap_cfg: SwapConfig, pp: int, num_layers: int) -> 
                 raise ValueError(
                     f"{label}: each entry must include 'layers', got {item!r}"
                 )
-            _validate_swap_entry_shared_fields(item, label, pp)
+            _validate_swap_entry_shared_fields(item, label)
 
-    # Validate op_swap structure.
     if swap_cfg.op_swap is not None:
         if not isinstance(swap_cfg.op_swap, list):
             logger.error(f"[Swap Config] {pfx}.op_swap must be a list, "
@@ -309,14 +276,13 @@ def _validate_swap_structure(swap_cfg: SwapConfig, pp: int, num_layers: int) -> 
             opn = item["op_name"]
             if not isinstance(opn, str) or not opn.strip():
                 raise ValueError(f"{label}.op_name must be a non-empty str, got {opn!r}")
-            _validate_swap_entry_shared_fields(item, label, pp)
+            _validate_swap_entry_shared_fields(item, label)
 
 
-def _validate_swap_layers_no_pp(swap_cfg: SwapConfig, num_layers: int) -> None:
-    """Validate swap layer specs when pipeline_parallel is 1."""
+def _validate_swap_layers(swap_cfg: SwapConfig, num_layers: int) -> None:
+    """Validate swap layer specs."""
     pfx = "TrainConfig.swap_config"
     prefetch = swap_cfg.default_prefetch
-    # Validate no-pp layer_swap.layers specs.
     layer_items = (
         []
         if swap_cfg.layer_swap is None
@@ -324,9 +290,8 @@ def _validate_swap_layers_no_pp(swap_cfg: SwapConfig, num_layers: int) -> None:
     )
     for idx, item in enumerate(layer_items):
         label = f"{pfx}.layer_swap[{idx}]"
-        _validate_layer_id_range(f"{label}.layers[0]", item["layers"][0], num_layers, prefetch)
+        _validate_layer_specs(item["layers"], f"{label}.layers", num_layers, prefetch)
 
-    # Validate no-pp op_swap.layers specs.
     op_items = (
         []
         if swap_cfg.op_swap is None
@@ -334,7 +299,7 @@ def _validate_swap_layers_no_pp(swap_cfg: SwapConfig, num_layers: int) -> None:
     )
     for idx, item in enumerate(op_items):
         label = f"{pfx}.op_swap[{idx}]"
-        _validate_layer_id_range(f"{label}.layers[0]", item["layers"][0], num_layers, prefetch)
+        _validate_layer_specs(item["layers"], f"{label}.layers", num_layers, prefetch)
 
 
 def regex_match(pattern, string, timeout=1):
@@ -813,7 +778,6 @@ def apply_ac(
     recompute,
     recompute_comm,
     swap,
-    pipeline_parallel: int = 1
 ):
     """Apply activation checkpointing to the model."""
     global _config_list
@@ -834,9 +798,9 @@ def apply_ac(
         _check_recompute_swap_overlap(recompute, recompute_comm, swap)
 
     if enable_recompute:
-        _validate_recompute_config(recompute, recompute_comm, num_layers, pipeline_parallel)
+        _validate_recompute_config(recompute, recompute_comm, num_layers)
         apply_recompute(model, recompute, recompute_comm, num_layers)
 
     if enable_swap:
-        _validate_swap_config(swap, num_layers, pipeline_parallel)
+        _validate_swap_config(swap, num_layers)
         apply_swap(model, swap, num_layers)
