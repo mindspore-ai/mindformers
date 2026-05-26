@@ -21,17 +21,21 @@ Unlike the static graph version, this version:
 """
 
 import copy as cp
+import math
 from fnmatch import fnmatch
 
-from mindspore import mint
+from mindspore import mint, Parameter
 from mindspore.common import dtype as mstype
 from mindspore.common.parameter import ParameterTuple
 from mindspore.ops import functional as F, operations as P
+from mindspore.ops import auto_generate as gen
 from mindspore.ops.function import comm_func
 from mindspore.nn.optim.optimizer import Optimizer
 from mindspore.common.tensor import Tensor
 from mindspore.communication import get_rank, get_group_size
-from mindspore.mint.distributed import broadcast, irecv, isend
+from mindspore.mint.distributed import (
+    P2POp, batch_isend_irecv, broadcast, irecv, isend,
+)
 
 from hyper_parallel import DTensor
 from hyper_parallel import SkipDTensorDispatch
@@ -43,7 +47,7 @@ from hyper_parallel.platform import get_platform
 
 from mindformers.core import context as core_context
 from mindformers.tools.logger import logger
-from mindformers.pynative.optimizer.adamw import _run_adamw_opt
+from mindformers.pynative.optimizer.adamw import _run_adamw_opt, _run_fused_adamw_opt
 
 
 _HP_PLATFORM = get_platform()
@@ -222,15 +226,40 @@ class _AsyncAllConcatTensor:
         return mint.concat(output_tensors, self.concat_dim)
 
 
+class _SharedBatchHandle:
+    """Single batched HCCL handle shared by many per-weight pending objects.
+
+    ``batch_isend_irecv`` returns one handle that covers the entire P2POp
+    list, so we wrap it here and let every weight's :class:`_PendingP2PGather`
+    hold a reference.  :meth:`wait` is idempotent — the first caller drains
+    the handle, the rest are no-ops.
+    """
+
+    __slots__ = ("_handle", "_waited")
+
+    def __init__(self, handle):
+        self._handle = handle
+        self._waited = False
+
+    def wait(self):
+        if not self._waited:
+            if self._handle is not None:
+                self._handle.wait()
+            self._waited = True
+
+
 class _PendingP2PGather:
     """P2P gather of a sharded 2D weight to ``assigned_rank``; only the owner
-    receives data so total HCCS traffic is ``N`` times less than all-gather."""
+    receives data so total HCCS traffic is ``N`` times less than all-gather.
+    With ``shared_handle`` set the per-weight ``_handles`` are unused and waiting
+    happens on the single :class:`_SharedBatchHandle` from :func:`batch_isend_irecv`."""
 
     __slots__ = ("full_tensor", "_handles", "_shards", "_concat_dim", "_keep_alive",
-                 "_prealloc_full", "_deferred")
+                 "_prealloc_full", "_deferred", "shared_handle")
 
     def __init__(self, full_tensor=None, handles=(), shards=None, concat_dim=0,
-                 keep_alive=(), prealloc_full=None, deferred=None):
+                 keep_alive=(), prealloc_full=None, deferred=None,
+                 shared_handle=None):
         self.full_tensor = full_tensor
         self._handles = list(handles)
         self._shards = shards
@@ -240,9 +269,13 @@ class _PendingP2PGather:
         # N-D shard slices are non-contiguous, so irecv lands in a scratch buffer
         # and is copied into ``prealloc_full`` here in wait() as ``(slice, buf)``.
         self._deferred = deferred
+        # Shared batched handle (set by _run_muon_batched after batch_isend_irecv).
+        self.shared_handle = shared_handle
 
     def wait(self):
         """Block on outstanding handles and return the full tensor (owner) or None."""
+        if self.shared_handle is not None:
+            self.shared_handle.wait()
         for handle in self._handles:
             if handle is not None:
                 handle.wait()
@@ -370,6 +403,258 @@ def _start_full_tensor_async(local_tensor, device_mesh, placements, rank_id):
     output, handle = comm_func.all_gather_into_tensor(
         None, local_tensor, group=group, async_op=True)
     return _AsyncAllConcatTensor(output, handle, concat_size, concat_dim)
+
+
+def _get_or_create_buffer(buffer_cache, key, shape, dtype):
+    """Return a cached buffer matching ``(shape, dtype)`` or allocate fresh.
+
+    Cache lifetime is per optimizer instance; entries are reused across
+    optimizer steps.  Safe because Phase 4 of :func:`_run_muon_batched`
+    waits every outstanding HCCL handle before returning, so by the next
+    call there is no live in-flight access to any cached buffer.
+
+    The key embeds shape + dtype so that a parameter whose layout changes
+    (rare) gets a fresh buffer rather than silently aliasing a stale one.
+    """
+    full_key = (key, tuple(int(d) for d in shape), dtype)
+    if buffer_cache is None:
+        return mint.empty(shape, dtype=dtype)
+    buf = buffer_cache.get(full_key)
+    if buf is None:
+        buf = mint.empty(shape, dtype=dtype)
+        buffer_cache[full_key] = buf
+    return buf
+
+
+def _build_full_tensor_p2p_gather_ops(
+    local_tensor, assigned_rank, op_list, layout=None,
+    rank_list_tuple=None, mesh_shape_tuple=None, tensor_map_list=None,
+    full_shape_tuple=None, buffer_cache=None, buffer_key=None,
+    rank_id=None,
+):
+    """Like :func:`_start_full_tensor_p2p_gather_async` but builds P2POps lazily.
+
+    ``op_list`` is the pre-probed redistribution op list from
+    :func:`_get_full_tensor_ops`, threaded in by the caller (see
+    :meth:`Muon._recompute_muon_assigned_ranks`).  Probing once at init —
+    instead of per-step inside this function — lets us drop the hot-path
+    ``try/except`` that previously silently swallowed introspection errors;
+    the same error is now surfaced via a single ``logger.warning`` at init.
+
+    Returns ``(pending, p2p_ops)`` where ``pending`` is a :class:`_PendingP2PGather`
+    with no handle yet (its ``shared_handle`` is set by the caller after one
+    :func:`batch_isend_irecv` covers every weight's gather ops), and ``p2p_ops``
+    is the list of :class:`P2POp` objects to merge into that batch.
+
+    Returns ``None`` when ``op_list`` is ``None`` (introspection failed at
+    init) or when the layout can't be P2P-gathered — caller falls back to
+    all-gather, preserving the contract of the eager variant.
+    """
+    if op_list is None:
+        return None
+    if not op_list:
+        return _PendingP2PGather(full_tensor=local_tensor), []
+    if any(op[0] != "all_concat" for op in op_list):
+        return None
+    if len(op_list) > 1:
+        return _build_full_tensor_p2p_gather_multi_ops(
+            local_tensor, rank_id, int(assigned_rank), layout,
+            rank_list_tuple=rank_list_tuple,
+            mesh_shape_tuple=mesh_shape_tuple,
+            tensor_map_list=tensor_map_list,
+            full_shape_tuple=full_shape_tuple,
+            buffer_cache=buffer_cache, buffer_key=buffer_key,
+        )
+
+    concat_dim, concat_size, rank_list = op_list[0][1]
+    concat_size = int(concat_size)
+    rank_list = tuple(int(r) for r in rank_list)
+
+    if concat_size <= 1:
+        return _PendingP2PGather(full_tensor=local_tensor), []
+
+    assigned_rank = int(assigned_rank)
+    if assigned_rank not in rank_list or int(rank_id) not in rank_list:
+        return None
+
+    p2p_ops = []
+    if int(rank_id) != assigned_rank:
+        if not local_tensor.is_contiguous():
+            local_tensor = local_tensor.contiguous()
+        p2p_ops.append(P2POp('isend', local_tensor, assigned_rank))
+        return _PendingP2PGather(keep_alive=[local_tensor]), p2p_ops
+
+    # Owner branch — preallocate a single contiguous full-tensor buffer when
+    # the gather dim is 0 so irecv lands directly into its row slices.
+    can_prealloc = concat_dim == 0
+    if can_prealloc:
+        local_shape = local_tensor.shape
+        full_shape = list(local_shape)
+        full_shape[0] *= concat_size
+        full_shape_t = tuple(full_shape)
+        prealloc_full = _get_or_create_buffer(
+            buffer_cache, (buffer_key, 'gather_prealloc'),
+            full_shape_t, local_tensor.dtype)
+        local_rank_list = list(rank_list)
+        my_pos = local_rank_list.index(int(rank_id))
+        shard_rows = int(local_shape[0])
+        test_slice = prealloc_full[0:shard_rows]
+        if not test_slice.is_contiguous():
+            can_prealloc = False
+        else:
+            start_row = int(my_pos) * shard_rows
+            prealloc_full[start_row:start_row + shard_rows].copy_(local_tensor)
+            for pos, src_rank in enumerate(local_rank_list):
+                if pos == my_pos:
+                    continue
+                start = pos * shard_rows
+                buf_slice = prealloc_full[start:start + shard_rows]
+                p2p_ops.append(P2POp('irecv', buf_slice, int(src_rank)))
+            return _PendingP2PGather(prealloc_full=prealloc_full), p2p_ops
+
+    # Fallback: per-shard scratch buffers + concat in wait().
+    shards = []
+    for src_rank in rank_list:
+        if int(src_rank) == int(rank_id):
+            shards.append(local_tensor)
+            continue
+        buf = _get_or_create_buffer(
+            buffer_cache, (buffer_key, 'gather_shard', int(src_rank)),
+            local_tensor.shape, local_tensor.dtype)
+        shards.append(buf)
+        p2p_ops.append(P2POp('irecv', buf, int(src_rank)))
+    return _PendingP2PGather(shards=shards, concat_dim=int(concat_dim)), p2p_ops
+
+
+def _build_full_tensor_p2p_gather_multi_ops(
+    local_tensor, rank_id, assigned_rank, layout,
+    rank_list_tuple=None, mesh_shape_tuple=None, tensor_map_list=None,
+    full_shape_tuple=None, buffer_cache=None, buffer_key=None,
+):
+    """Build P2POps for the N-D (multi all_concat) path; returns ``(pending, p2pops)``.
+
+    Mirrors :func:`_start_full_tensor_p2p_gather_multi` exactly but defers
+    issuing comms — the caller batches them via :func:`batch_isend_irecv`.
+    """
+    if rank_list_tuple is not None and mesh_shape_tuple is not None \
+            and tensor_map_list is not None and full_shape_tuple is not None:
+        rank_list = rank_list_tuple
+        mesh_shape = mesh_shape_tuple
+        tensor_map = tensor_map_list
+        full_shape = full_shape_tuple
+    else:
+        if layout is None:
+            return None
+        try:
+            rank_list = tuple(int(r) for r in layout.rank_list)
+            mesh_shape = tuple(int(d) for d in layout.mesh_shape)
+            tensor_map = list(layout.tensor_map)
+            full_shape = tuple(int(d) for d in layout.get_global_shape(local_tensor.shape))
+        except (AttributeError, TypeError, ValueError):
+            return None
+
+    mesh_numel = 1
+    for dim in mesh_shape:
+        mesh_numel *= int(dim)
+    if mesh_numel != len(rank_list):
+        return None
+
+    rank_id = int(rank_id)
+    assigned_rank = int(assigned_rank)
+    if assigned_rank not in rank_list or rank_id not in rank_list:
+        return None
+
+    p2p_ops = []
+    if rank_id != assigned_rank:
+        if not local_tensor.is_contiguous():
+            local_tensor = local_tensor.contiguous()
+        p2p_ops.append(P2POp('isend', local_tensor, assigned_rank))
+        return _PendingP2PGather(keep_alive=[local_tensor]), p2p_ops
+
+    # Owner branch: receive each shard into a scratch buffer, then place into
+    # the full tensor's layout-defined slice in :meth:`_PendingP2PGather.wait`.
+    prealloc_full = _get_or_create_buffer(
+        buffer_cache, (buffer_key, 'gather_prealloc_nd'),
+        full_shape, local_tensor.dtype)
+    deferred = []
+    keep_alive = []
+    for inner_rank_id, src_rank in enumerate(rank_list):
+        slice_area = _infer_slice_area_by_rank(
+            mesh_shape, tensor_map, inner_rank_id, full_shape)
+        slice_spec = tuple(slice(int(begin), int(end)) for begin, end in slice_area)
+        if int(src_rank) == rank_id:
+            prealloc_full[slice_spec] = local_tensor
+            continue
+        buf = _get_or_create_buffer(
+            buffer_cache, (buffer_key, 'gather_shard_nd', int(src_rank)),
+            local_tensor.shape, local_tensor.dtype)
+        p2p_ops.append(P2POp('irecv', buf, int(src_rank)))
+        keep_alive.append(buf)
+        deferred.append((slice_spec, buf))
+    return _PendingP2PGather(
+        prealloc_full=prealloc_full,
+        deferred=deferred,
+        keep_alive=keep_alive,
+    ), p2p_ops
+
+
+def _build_local_shard_scatter_ops(info, x_ret_full, rank_id, buffer_cache=None):
+    """Build :class:`P2POp` ops to scatter ``x_ret_full`` from owner to all peers.
+
+    Returns ``(ok, p2p_ops)``.  ``ok=False`` means this rank cannot participate
+    in P2P scatter for this weight (layout mismatch); caller should fallback
+    to broadcast.  ``ok=True`` with empty ``p2p_ops`` means the trivial single-
+    rank case where no comm is needed.
+
+    Owner-side keeps the per-destination shards alive via ``info['p2p_tensors']``
+    so the send buffers outlive ``batch_isend_irecv``.  Non-owner side parks the
+    recv buffer in ``info['x_ret']`` (cached across steps when ``buffer_cache``
+    is provided).
+
+    ``x_ret_full`` is the full Newton-Schulz output on the owner and ``None``
+    on non-owners (which only allocate a recv buffer).
+    """
+    rank_list = info.get('rank_list_tuple')
+    if rank_list is None:
+        layout = info['layout']
+        rank_list = tuple(int(rank) for rank in layout.rank_list)
+    assigned_rank = int(info['assigned_rank'])
+    if assigned_rank not in rank_list or int(rank_id) not in rank_list:
+        return False, []
+
+    if len(rank_list) == 1:
+        info['x_ret'] = x_ret_full
+        info['x_ret_is_local'] = True
+        return True, []
+
+    ops = []
+    if int(rank_id) == assigned_rank:
+        mesh_shape = info.get('mesh_shape_tuple')
+        tensor_map = info.get('tensor_map_list')
+        if mesh_shape is not None and tensor_map is not None:
+            shards = _list_full_tensor_local_shards_cached(
+                x_ret_full, rank_list, mesh_shape, tensor_map)
+        else:
+            shards = _list_full_tensor_local_shards(x_ret_full, info['layout'])
+        p2p_tensors = []
+        local_output = None
+        for dst_rank, shard in zip(rank_list, shards):
+            if dst_rank == int(rank_id):
+                local_output = shard
+            else:
+                p2p_tensors.append(shard)
+                ops.append(P2POp('isend', shard, int(dst_rank)))
+        info['x_ret'] = local_output
+        info['p2p_tensors'] = p2p_tensors
+    else:
+        ns_inputs_local = info['ns_inputs_local']
+        local_output = _get_or_create_buffer(
+            buffer_cache, (info['param_name'], 'scatter_recv'),
+            ns_inputs_local.shape, ns_inputs_local.dtype)
+        info['x_ret'] = local_output
+        ops.append(P2POp('irecv', local_output, assigned_rank))
+    info['x_ret_is_local'] = True
+    return True, ops
 
 
 def _start_full_tensor_p2p_gather_async(
@@ -561,7 +846,6 @@ def _apply_muon_ns(
     lr, matched_adamw_rms
 ):
     """Run Newton-Schulz on the full tensor: split → NS per piece → merge → scale."""
-    op_cast = P.Cast()
     ns_inputs_list = muon_split_fn(param_name, ns_inputs)
     x_list = []
 
@@ -569,9 +853,11 @@ def _apply_muon_ns(
         dim_a, dim_b = ns_inputs_item.shape[-2:]
         x = newton_schulz(
             ns_inputs_item, dim_a, dim_b, eps, ns_steps, ns_coefficients, matmul_op, addmm_op)
-        adjusted_lr = lr * mint.sqrt(op_cast(max(dim_a, dim_b), mstype.float32)) * \
-            matched_adamw_rms
-        x = adjusted_lr * x
+        # base_scale is a constant w.r.t. (dim_a, dim_b, matched_adamw_rms);
+        # keep it as a Python float so the cast + sqrt + scalar-mul kernels are
+        # gone — ``lr * base_scale`` collapses to a single scalar-tensor multiply.
+        base_scale = math.sqrt(max(int(dim_a), int(dim_b))) * matched_adamw_rms
+        x = (lr * base_scale) * x
         x_list.append(x)
     return muon_merge_fn(param_name, x_list).contiguous()
 
@@ -584,7 +870,6 @@ def _apply_muon_ns_batched(
     """Run Newton-Schulz on ``K`` same-shape weights in one bmm-batched pass.
     Stacks pieces across weights on a new batch dim so ``K * 15``-ish kernel
     launches collapse into ``15``-ish per piece. Per-weight ``lr`` may differ."""
-    op_cast = P.Cast()
     n_weights = len(full_tensors)
     if n_weights == 1:
         return [_apply_muon_ns(
@@ -629,14 +914,16 @@ def _apply_muon_ns_batched(
                 f"(piece shape {tuple(ref_shape)})"
             )
 
-        base_scale = mint.sqrt(
-            op_cast(max(dim_a, dim_b), mstype.float32)) * matched_adamw_rms
+        # base_scale = sqrt(max(dim_a, dim_b)) * matched_adamw_rms is constant
+        # per piece shape — keep it as a Python float to drop the cast + sqrt +
+        # scalar-mul kernels (saves 3 launches per piece per group per step).
+        base_scale = math.sqrt(max(int(dim_a), int(dim_b))) * matched_adamw_rms
         if lrs_all_same:
             x_batched = (lrs[0] * base_scale) * x_batched
         else:
             # Broadcast (K,) per-weight scale over the batched output.
             scale_vec = Tensor(
-                [float(lr) for lr in lrs], dtype=mstype.float32) * base_scale
+                [float(lr) * base_scale for lr in lrs], dtype=mstype.float32)
             x_batched = x_batched * scale_vec.reshape(
                 (n_weights,) + (1,) * (x_batched.dim() - 1))
 
@@ -769,6 +1056,130 @@ def _prepare_muon_input_compute(gradient, muon_m, momentum, use_nesterov):
     return ns_inputs_local, next_m
 
 
+def _prepare_muon_input_batched(gradients, muon_m_list, momentum, use_nesterov):
+    """Phase 0 batched momentum update for ``K`` same-shape weights.
+
+    Stacks the ``K`` gradients and ``K`` momenta on a new leading dim, runs
+    a single ``cast → add → (nesterov add →) cast`` chain across the batched
+    tensors, and slices the per-slot results out as views.  Collapses
+    ``K × 4`` element-wise launches into ~6 (stack + 2 casts + 1-2 adds + 1
+    cast).
+
+    Returns ``(ns_inputs_list, next_m_list)`` — both length ``K``; each
+    element is a view of the stacked output that stays alive via the views
+    themselves (callers store the views in their ``info`` dicts).
+    """
+    op_cast = P.Cast()
+    n_slots = len(gradients)
+    if n_slots == 1:
+        ns_input, next_m = _prepare_muon_input_compute(
+            gradients[0], muon_m_list[0], momentum, use_nesterov)
+        return [ns_input], [next_m]
+
+    grads_local = [_to_local(g) for g in gradients]
+    ms_local = [_to_local(m) for m in muon_m_list]
+    stacked_g = mint.stack(grads_local, dim=0)
+    stacked_m = mint.stack(ms_local, dim=0)
+    g_fp32 = op_cast(stacked_g, mstype.float32)
+    m_fp32 = op_cast(stacked_m, mstype.float32)
+    next_m_stacked = mint.add(g_fp32, m_fp32, alpha=momentum)
+    if use_nesterov:
+        ns_input_stacked = mint.add(g_fp32, next_m_stacked, alpha=momentum)
+    else:
+        ns_input_stacked = next_m_stacked
+    ns_inputs_local_stacked = op_cast(ns_input_stacked, mstype.bfloat16)
+    # Slice into per-slot views.  Views share the underlying stacked tensor
+    # which is kept alive by their refcount.
+    return (
+        [ns_inputs_local_stacked[k] for k in range(n_slots)],
+        [next_m_stacked[k] for k in range(n_slots)],
+    )
+
+
+def _apply_prepared_update_batched(infos, op_cast):
+    """Phase 4 batched apply for ``n_slots`` same-shape weights.
+
+    Stacks ``param`` / ``x_ret`` / ``next_m`` across the group, runs one
+    fused ``cast → mul scalar → sub → cast`` chain, then K small ``copy_``
+    writes back to the original Parameter slots.  ``muon_m`` is updated
+    by a separate batched cast + per-slot copy_.
+
+    Per-weight ``lr * wd`` may differ across slots; we use a scalar when
+    they're identical (the common case for non-grouped LR) and broadcast a
+    ``(n_slots,)`` factor reshape otherwise.
+
+    Returns the list of updated ``param`` Parameters in the input order.
+    """
+    n_slots = len(infos)
+    if n_slots == 1:
+        info = infos[0]
+        x_ret = info['x_ret']
+        if info['needs_redist'] and not info.get('x_ret_is_local', False):
+            x_ret = distribute_tensor(
+                x_ret, info['dev_mesh'], info['placements']).to_local()
+        param = info['param']
+        muon_m = info['muon_m']
+        with SkipDTensorDispatch():
+            param_fp32 = op_cast(param, mstype.float32) * (1 - info['lr'] * info['wd'])
+            next_param = param_fp32 - x_ret.reshape(param_fp32.shape)
+            param.copy_(op_cast(next_param, F.dtype(param)))
+            muon_m.copy_(op_cast(info['next_m'], F.dtype(muon_m)))
+        return [param]
+
+    params = [info['param'] for info in infos]
+    muon_ms = [info['muon_m'] for info in infos]
+    next_ms = [info['next_m'] for info in infos]
+    # Materialize x_rets to local shape (mirrors _apply_prepared_update).
+    x_rets = []
+    for info in infos:
+        x_ret = info['x_ret']
+        if info['needs_redist'] and not info.get('x_ret_is_local', False):
+            x_ret = distribute_tensor(
+                x_ret, info['dev_mesh'], info['placements']).to_local()
+        x_rets.append(x_ret)
+
+    # Use pre-computed Python-float weight-decay scales when present (set by
+    # :meth:`Muon._construct_deredundency`).  Falls back to the per-slot
+    # ``float(Tensor)`` path for legacy callers — that path triggers a
+    # ~352 µs device→host sync per ``float()`` call (trace evidence) and
+    # dominates ~150 ms of host time per step at K≈24×6 batched applies.
+    if infos[0].get('wd_scale') is not None:
+        scales = [info['wd_scale'] for info in infos]
+    else:
+        scales = [1.0 - float(info['lr']) * float(info['wd']) for info in infos]
+    scales_all_same = all(s == scales[0] for s in scales)
+    param_dtype = F.dtype(params[0])
+    m_dtype = F.dtype(muon_ms[0])
+
+    with SkipDTensorDispatch():
+        # ``param.shape`` for DTensor Parameter reports the GLOBAL shape, so
+        # peel off the local tensors first; everything below operates on
+        # local-shape tensors only.
+        params_local = [_to_local(p) for p in params]
+        local_shape = params_local[0].shape
+
+        stacked_param = mint.stack(params_local, dim=0)
+        stacked_x_ret = mint.stack(
+            [x_ret.reshape(local_shape) for x_ret in x_rets], dim=0)
+        stacked_next_m = mint.stack(next_ms, dim=0)
+
+        param_fp32 = op_cast(stacked_param, mstype.float32)
+        if scales_all_same:
+            scaled = param_fp32 * scales[0]
+        else:
+            scale_vec = Tensor(scales, dtype=mstype.float32).reshape(
+                (n_slots,) + (1,) * (param_fp32.dim() - 1))
+            scaled = param_fp32 * scale_vec
+        next_param_stacked = scaled - stacked_x_ret
+        next_param_cast = op_cast(next_param_stacked, param_dtype)
+        next_m_cast = op_cast(stacked_next_m, m_dtype)
+
+        for k in range(n_slots):
+            params[k].copy_(next_param_cast[k])
+            muon_ms[k].copy_(next_m_cast[k])
+    return params
+
+
 def _prepare_muon_input(gradient, muon_m, momentum, use_nesterov):
     """Phase 0 slow path: compute momentum-updated gradient *and* extract
     DTensor metadata via ``gradient.layout`` / ``device_mesh`` / ``placements``.
@@ -802,6 +1213,9 @@ def _run_muon_batched(
     rank_id,
     overlap_callback=None,
     muon_metas=None,
+    buffer_cache=None,
+    runtime_groups=None,
+    muon_wd_scales=None,
 ):
     """Batched Muon update with parallel Newton-Schulz across ranks.
 
@@ -842,76 +1256,20 @@ def _run_muon_batched(
             muon_m.copy_(op_cast(info['next_m'], F.dtype(muon_m)))
         return param
 
-    def _try_start_local_shard_scatter(info, x_ret_full):
-        """Use P2P sends so each rank receives only its local shard.
-
-        Layout subsets are fine: ranks outside ``rank_list`` are skipped
-        upstream via ``info['skip_redist_comm']`` and never enter this
-        function, so we only need the owner and the current rank to be in
-        ``rank_list``.  If the gating below fails the caller falls back to
-        a world broadcast — that fallback assumes every rank in the world
-        group participates, which is only safe when the layout itself covers
-        the whole group, hence the optional broadcast-fallback gate added at
-        the call site.
-
-        Reads ``info['rank_list_tuple']`` / ``mesh_shape_tuple`` / ``tensor_map_list``
-        when available so the per-step ``layout`` property accesses are avoided.
-        """
-        rank_list = info.get('rank_list_tuple')
-        if rank_list is None:
-            layout = info['layout']
-            rank_list = tuple(int(rank) for rank in layout.rank_list)
-        assigned_rank = int(info['assigned_rank'])
-        if assigned_rank not in rank_list or int(rank_id) not in rank_list:
-            return False
-
-        if len(rank_list) == 1:
-            info['x_ret'] = x_ret_full
-            info['x_ret_is_local'] = True
-            return True
-
-        if int(rank_id) == assigned_rank:
-            mesh_shape = info.get('mesh_shape_tuple')
-            tensor_map = info.get('tensor_map_list')
-            if mesh_shape is not None and tensor_map is not None:
-                shards = _list_full_tensor_local_shards_cached(
-                    x_ret_full, rank_list, mesh_shape, tensor_map)
-            else:
-                shards = _list_full_tensor_local_shards(x_ret_full, info['layout'])
-            p2p_handles = []
-            p2p_tensors = []
-            local_output = None
-            for dst_rank, shard in zip(rank_list, shards):
-                if dst_rank == int(rank_id):
-                    local_output = shard
-                else:
-                    p2p_tensors.append(shard)
-                    p2p_handles.append(isend(shard, dst=dst_rank))
-            info['x_ret'] = local_output
-            info['p2p_tensors'] = p2p_tensors
-            info['p2p_handles'] = p2p_handles
-        else:
-            local_output = mint.empty_like(info['ns_inputs_local'])
-            info['x_ret'] = local_output
-            info['p2p_handles'] = [irecv(local_output, src=assigned_rank)]
-
-        info['x_ret_is_local'] = True
-        return True
-
     # ------------------------------------------------------------------
     # Phase 0 — Prepare (all local, no communication)
     # ------------------------------------------------------------------
-    # Per-weight: momentum update, cast to bf16, read frozen mesh metadata,
-    # and decide whether this rank participates in this weight's redist.
+    # Build the per-slot ``info`` dicts first (no NS inputs yet), then run
+    # the momentum update.  When ``runtime_groups`` is provided we batch
+    # same-shape weights through :func:`_prepare_muon_input_batched`:
+    # ``K × (cast + add + cast)`` launches collapse into ~5 launches per
+    # shape group, which is a big win on models with many small same-shape
+    # weights (24-layer DSv3 has ~200 muon params across ~6 shape groups).
     prepared = []
     for i in range(n_weights):
         meta = muon_metas[i] if muon_metas is not None else None
 
         if meta is not None:
-            # Fast path: metadata frozen at first construct; skip per-step
-            # DTensor introspection entirely.
-            ns_inputs_local, next_m = _prepare_muon_input_compute(
-                muon_gradients[i], muon_m_ms[i], muon_momentum, use_nesterov)
             ndim = meta['ndim']
             needs_redist = meta['needs_redist']
             dev_mesh = meta['dev_mesh']
@@ -924,23 +1282,22 @@ def _run_muon_batched(
             layout_covers_world = meta['layout_covers_world']
             skip_redist_comm = meta['skip_redist_comm']
             group_sig = meta.get('group_sig')
+            p2p_op_list = meta.get('p2p_op_list')
         else:
-            # Slow path: derive everything from gradient.layout (legacy).
-            ns_inputs_local, next_m, needs_redist, dev_mesh, plmts, layout = \
-                _prepare_muon_input(
-                    muon_gradients[i], muon_m_ms[i], muon_momentum, use_nesterov)
             ndim = len(muon_gradients[i].shape)
+            needs_redist = isinstance(muon_gradients[i], DTensor) and ndim == 2
+            dev_mesh = muon_gradients[i].device_mesh if needs_redist else None
+            plmts = muon_gradients[i].placements if needs_redist else None
+            layout = muon_gradients[i].layout if needs_redist else None
             rank_list_tuple = None
             mesh_shape_tuple = None
             tensor_map_list = None
             full_shape_tuple = None
             group_sig = None
-            # A 2D DTensor whose layout does not include this rank has no local
-            # shard here; subsequent phases must not enter its gather/scatter
-            # collective or they would either hang on a broadcast that nobody
-            # sources or burn a no-op allgather on a sub-group we are outside of.
             skip_redist_comm = False
             layout_covers_world = False
+            # Legacy path: no pre-probe, hot path falls back to all-gather.
+            p2p_op_list = None
             if needs_redist and layout is not None:
                 rank_list_tuple = tuple(int(r) for r in layout.rank_list)
                 if int(rank_id) not in rank_list_tuple:
@@ -955,8 +1312,8 @@ def _run_muon_batched(
             addmm_op = mint.baddbmm
 
         prepared.append({
-            'ns_inputs_local': ns_inputs_local,
-            'next_m': next_m,
+            'ns_inputs_local': None,  # filled below by batched / per-weight path
+            'next_m': None,
             'needs_redist': needs_redist,
             'dev_mesh': dev_mesh,
             'placements': plmts,
@@ -971,26 +1328,53 @@ def _run_muon_batched(
             'muon_m': muon_m_ms[i],
             'lr': muon_lrs[i],
             'wd': muon_wds[i],
+            # Pre-computed Python float of ``(1 - lr*wd)`` for this slot — used
+            # by Phase 4 batched apply to avoid a per-slot ``float(Tensor)``
+            # host-sync (~352 µs each) when ``info['lr']`` / ``info['wd']``
+            # are scalar Tensors.  ``None`` falls back to the per-step compute.
+            'wd_scale': muon_wd_scales[i] if muon_wd_scales is not None else None,
             'param_name': muon_param_names[i],
             'assigned_rank': muon_assigned_ranks[i],
             'skip_redist_comm': skip_redist_comm,
             'layout_covers_world': layout_covers_world,
             'group_sig': group_sig,
+            'p2p_op_list': p2p_op_list,
         })
+
+    phase0_groups = (runtime_groups or {}).get('phase0_groups') if runtime_groups else None
+    if phase0_groups:
+        for slots in phase0_groups.values():
+            grads_for_group = [muon_gradients[s] for s in slots]
+            ms_for_group = [muon_m_ms[s] for s in slots]
+            ns_inputs_list, next_m_list = _prepare_muon_input_batched(
+                grads_for_group, ms_for_group, muon_momentum, use_nesterov)
+            for s, ns_input, next_m in zip(slots, ns_inputs_list, next_m_list):
+                prepared[s]['ns_inputs_local'] = ns_input
+                prepared[s]['next_m'] = next_m
+    else:
+        # Legacy per-weight path (kept for the muon_metas=None fallback).
+        for i, info in enumerate(prepared):
+            ns_input, next_m = _prepare_muon_input_compute(
+                muon_gradients[i], muon_m_ms[i], muon_momentum, use_nesterov)
+            info['ns_inputs_local'] = ns_input
+            info['next_m'] = next_m
 
     # ------------------------------------------------------------------
     # Phase 1 — Gather inputs to the assigned rank
     # ------------------------------------------------------------------
-    # P2P gather is preferred: each non-owner rank only ``isend`` its shard,
-    # so non-owners never receive the (N-1)*shard bytes they would discard.
-    # Layout subsets are supported — ranks outside the layout skip the weight
-    # entirely via ``skip_redist_comm`` so no broadcast / collective is left
-    # dangling.  Analysis failures fall back to the sync ``DTensor.full_tensor()``.
+    # Every 2D weight whose layout supports P2P gather contributes its
+    # ``P2POp`` list to ``gather_p2p_ops``; a single :func:`batch_isend_irecv`
+    # at the end of the loop issues all of them as one HCCL transaction so we
+    # pay one launch instead of ``N_weights × (N_ranks - 1)`` P2P launches.
+    # The single returned handle is wrapped in :class:`_SharedBatchHandle` and
+    # referenced by every weight's :class:`_PendingP2PGather`; ``wait()`` only
+    # drains it once.
     #
-    # We iterate in param order (the same order on every rank) — HCCL's
-    # auto-tagging for tag-less isend/irecv depends on the rank-global P2P
-    # launch sequence matching between peers, so any per-rank reordering
-    # (e.g. owner-first) trips ``HcomRecv ret:4`` mid-training.
+    # We iterate in param order — HCCL's auto-tagging for tag-less isend/irecv
+    # depends on the per-rank launch sequence matching between peers, so any
+    # per-rank reordering would trip ``HcomRecv ret:4`` mid-training.
+    gather_p2p_ops = []
+    gather_pending_objs = []  # objects whose shared_handle we set after batch
     for info in prepared:
         if not info['needs_redist']:
             info['ns_inputs_full'] = info['ns_inputs_local']
@@ -999,25 +1383,34 @@ def _run_muon_batched(
             # This rank holds no shard of this weight; nothing to gather.
             info['ns_inputs_full'] = info['ns_inputs_local']
             continue
-        pending_full = _start_full_tensor_p2p_gather_async(
+        built = _build_full_tensor_p2p_gather_ops(
             info['ns_inputs_local'],
-            info['dev_mesh'],
-            info['placements'],
-            rank_id,
             info['assigned_rank'],
+            info['p2p_op_list'],
             info['layout'],
             rank_list_tuple=info['rank_list_tuple'],
             mesh_shape_tuple=info['mesh_shape_tuple'],
             tensor_map_list=info['tensor_map_list'],
             full_shape_tuple=info['full_shape_tuple'],
+            buffer_cache=buffer_cache,
+            buffer_key=info['param_name'],
+            rank_id=rank_id,
         )
-        if pending_full is None:
-            pending_full = _start_full_tensor_async(
-                info['ns_inputs_local'],
-                info['dev_mesh'],
-                info['placements'],
-                rank_id,
-            )
+        if built is not None:
+            pending_full, ops = built
+            info['pending_full_tensor'] = pending_full
+            if ops:
+                gather_p2p_ops.extend(ops)
+                gather_pending_objs.append(pending_full)
+            continue
+
+        # Fallback to async all-gather for layouts the P2P builder declined.
+        pending_full = _start_full_tensor_async(
+            info['ns_inputs_local'],
+            info['dev_mesh'],
+            info['placements'],
+            rank_id,
+        )
         if pending_full is None:
             info['ns_inputs_full'] = DTensor.from_local(
                 info['ns_inputs_local'],
@@ -1027,21 +1420,44 @@ def _run_muon_batched(
         else:
             info['pending_full_tensor'] = pending_full
 
+    # One batched HCCL launch for every P2P gather op across all weights.
+    gather_shared = None
+    if gather_p2p_ops:
+        handles = batch_isend_irecv(gather_p2p_ops)
+        # batch_isend_irecv currently returns a single packaging handle.
+        gather_handle = handles[0] if isinstance(handles, (list, tuple)) else handles
+        gather_shared = _SharedBatchHandle(gather_handle)
+        for pending in gather_pending_objs:
+            pending.shared_handle = gather_shared
+
     # Local weights, including every 3D Muon weight, do not depend on the
     # 2D allgather result.  Run them while async allgathers are in flight.
     # Same-group same-shape weights (e.g. all `mlp.experts.weight1` across
     # layers) are batched into a single bmm-NS via ``_apply_muon_ns_batched``
     # — for a 24-layer MoE this collapses ~46 sequential NS calls into ~2.
-    local_groups = {}
-    local_singletons = []
-    for info in prepared:
-        if info['needs_redist']:
-            continue
-        sig = info.get('group_sig')
-        if sig is None:
-            local_singletons.append(info)
-        else:
-            local_groups.setdefault(sig, []).append(info)
+    # Use cached local_groups when available; the per-step dict build is a
+    # small Python cost but the cached version also lets us short-circuit
+    # the "is needs_redist?" loop entirely.
+    local_groups_cached = (
+        (runtime_groups or {}).get('local_groups_slots') if runtime_groups else None)
+    if local_groups_cached is not None:
+        local_groups = {sig: [prepared[s] for s in slots]
+                        for sig, slots in local_groups_cached.items()}
+        local_singletons = [
+            prepared[i] for i in range(n_weights)
+            if not prepared[i]['needs_redist'] and prepared[i].get('group_sig') is None
+        ]
+    else:
+        local_groups = {}
+        local_singletons = []
+        for info in prepared:
+            if info['needs_redist']:
+                continue
+            sig = info.get('group_sig')
+            if sig is None:
+                local_singletons.append(info)
+            else:
+                local_groups.setdefault(sig, []).append(info)
 
     for info in local_singletons:
         info['x_ret'] = _apply_muon_ns(
@@ -1076,97 +1492,104 @@ def _run_muon_batched(
         overlap_callback()
 
     # ------------------------------------------------------------------
-    # Phase 2/3 — Materialize gather, batched Newton-Schulz, P2P scatter
+    # Phase 2/3 — All owner NS first, then one batched scatter
     # ------------------------------------------------------------------
-    # Iterate weights sorted by (group_sig, original index).  All ranks use
-    # the same sort key because group_sig is derived deterministically from
-    # the model (piece shapes + rank_list), so the HCCL tag-less P2P sequence
-    # stays synchronized — same property the previous param-order loop relied
-    # on.  Consecutive owned weights from the same group are buffered and run
-    # through a single bmm-batched ``_apply_muon_ns_batched`` instead of N
-    # individual NS calls, collapsing N*15-ish kernel launches into 15-ish per
-    # piece.  Non-owned weights and outside-layout weights are processed in
-    # place inside the same iteration so their P2P scatter recv / placeholder
-    # x_ret bookkeeping happens in the same flat order on every rank.
-    flat_order_2d = sorted(
-        (idx for idx, info in enumerate(prepared) if info['needs_redist']),
-        key=lambda idx: (
-            prepared[idx].get('group_sig') if prepared[idx].get('group_sig') is not None
-            else ('__ungrouped__', idx),
-            idx,
-        ),
-    )
+    # ``flat_order_2d`` is sorted by (group_sig, original index) so all ranks
+    # iterate weights in the same deterministic order.  We do TWO passes:
+    #   Pass A — owner NS per group (gather wait is implicit on first
+    #            ``_materialize_full_tensor``; remaining gather isends drain
+    #            via ``gather_shared_handle.wait()`` below).
+    #   Pass B — build every weight's scatter :class:`P2POp` list in flat order
+    #            and issue them as ONE :func:`batch_isend_irecv` transaction.
+    #            Same launch-order argument as gather: as long as both peers
+    #            agree on the weight ordering, HCCL pairs the tag-less ops
+    #            correctly.
+    # Compared to the old per-weight interleaved scatter, this trades a small
+    # amount of NS/scatter pipelining for a large reduction in HCCL launch
+    # count (one collective per phase instead of N_weights × N_ranks).
+    flat_order_2d = (
+        (runtime_groups or {}).get('flat_order_2d_slots') if runtime_groups else None)
+    if flat_order_2d is None:
+        flat_order_2d = sorted(
+            (idx for idx, info in enumerate(prepared) if info['needs_redist']),
+            key=lambda idx: (
+                prepared[idx].get('group_sig') if prepared[idx].get('group_sig') is not None
+                else ('__ungrouped__', idx),
+                idx,
+            ),
+        )
 
-    # Buffer of (info, ns_inputs_full) for the current owner-batched group.
-    batch_buffer = []
-    batch_group_sig = None
+    # Pass A — owner NS, grouped by group_sig (bmm-batched).
+    owner_batch_buffer = []
+    owner_batch_sig = None
 
-    def _flush_owned_batch():
-        nonlocal batch_buffer, batch_group_sig
-        if not batch_buffer:
+    def _flush_owner_ns():
+        nonlocal owner_batch_buffer, owner_batch_sig
+        if not owner_batch_buffer:
             return
-        # Run NS — single weight goes through the legacy path, batch>=2 uses bmm.
-        full_tensors = [ns for _, ns in batch_buffer]
-        infos = [info for info, _ in batch_buffer]
+        full_tensors = [_materialize_full_tensor(i) for i in owner_batch_buffer]
+        infos = owner_batch_buffer
         x_ret_list = _apply_muon_ns_batched(
             full_tensors,
-            [info['param_name'] for info in infos],
-            [info['lr'] for info in infos],
+            [i['param_name'] for i in infos],
+            [i['lr'] for i in infos],
             muon_split_fn, muon_merge_fn,
             eps, ns_steps, ns_coefficients, matched_adamw_rms,
         )
-        # Scatter each in the buffer's iteration order (= flat-order subset on
-        # this rank); the same param_index order is observed by every peer's
-        # irecv path below, so per-channel FIFO is preserved.
         for info, x_ret_full in zip(infos, x_ret_list):
-            if _try_start_local_shard_scatter(info, x_ret_full):
-                continue
-            if not info['layout_covers_world']:
-                raise RuntimeError(
-                    f"Muon allgather_deredundency: cannot fall back to world "
-                    f"broadcast for param={info['param_name']!r} because its "
-                    f"layout does not cover the full worker group."
-                )
-            info['x_ret'] = x_ret_full
-            info['broadcast_handle'] = broadcast(
-                info['x_ret'], src=info['assigned_rank'], async_op=True)
-        batch_buffer = []
-        batch_group_sig = None
+            info['x_ret_full'] = x_ret_full
+        owner_batch_buffer = []
+        owner_batch_sig = None
 
     for prep_idx in flat_order_2d:
         info = prepared[prep_idx]
         if info['skip_redist_comm']:
-            # Outside this weight's layout: nothing to gather, NS, or scatter.
-            # Make sure the previous owned-group is flushed first so this
-            # rank's P2P-scatter launches stay ordered relative to peers.
-            _flush_owned_batch()
             info['x_ret'] = info['ns_inputs_local']
             info['x_ret_is_local'] = True
             continue
-
+        if rank_id != info['assigned_rank']:
+            continue
         current_sig = info.get('group_sig')
-        is_owner = rank_id == info['assigned_rank']
+        if owner_batch_sig is not None and current_sig != owner_batch_sig:
+            _flush_owner_ns()
+        owner_batch_sig = current_sig
+        owner_batch_buffer.append(info)
+    _flush_owner_ns()
 
+    # Drain any remaining gather isends (non-owners) so their keep-alive can be
+    # released and the next step's cached buffers are safe to reuse.
+    if gather_shared is not None:
+        gather_shared.wait()
+
+    # Pass B — build every weight's scatter P2POps; one batched HCCL call.
+    scatter_p2p_ops = []
+    scatter_pending_infos = []
+    for prep_idx in flat_order_2d:
+        info = prepared[prep_idx]
+        if info.get('x_ret_is_local'):
+            continue  # skip_redist_comm — already populated above
+
+        is_owner = rank_id == info['assigned_rank']
+        x_ret_full = info.pop('x_ret_full', None) if is_owner else None
+
+        ok, ops = _build_local_shard_scatter_ops(
+            info, x_ret_full, rank_id, buffer_cache=buffer_cache)
+        if ok:
+            if ops:
+                scatter_p2p_ops.extend(ops)
+                scatter_pending_infos.append(info)
+            continue
+
+        # Broadcast fallback (rare; only fires for layouts P2P scatter rejects).
+        if not info['layout_covers_world']:
+            raise RuntimeError(
+                f"Muon allgather_deredundency: cannot fall back to world "
+                f"broadcast for param={info['param_name']!r} because its "
+                f"layout does not cover the full worker group."
+            )
         if is_owner:
-            # Flush whenever the group_sig changes (also flushes a non-owner
-            # interleave inside the same group — see below).
-            if batch_group_sig is not None and current_sig != batch_group_sig:
-                _flush_owned_batch()
-            batch_group_sig = current_sig
-            batch_buffer.append((info, _materialize_full_tensor(info)))
+            info['x_ret'] = x_ret_full
         else:
-            # Non-owner: if we have an owned batch pending, flush it first so
-            # its scatter isends are issued before this irecv is queued.
-            _flush_owned_batch()
-            _materialize_full_tensor(info)  # waits the gather isend handle
-            if _try_start_local_shard_scatter(info, None):
-                continue
-            if not info['layout_covers_world']:
-                raise RuntimeError(
-                    f"Muon allgather_deredundency: cannot fall back to world "
-                    f"broadcast for param={info['param_name']!r} because its "
-                    f"layout does not cover the full worker group."
-                )
             ns_inputs_full = info.get('ns_inputs_full')
             if ns_inputs_full is not None:
                 info['x_ret'] = mint.empty_like(ns_inputs_full)
@@ -1177,36 +1600,63 @@ def _run_muon_batched(
                     f"already skipped the full-tensor materialization on rank "
                     f"{rank_id}."
                 )
-            info['broadcast_handle'] = broadcast(
-                info['x_ret'], src=info['assigned_rank'], async_op=True)
+        info['broadcast_handle'] = broadcast(
+            info['x_ret'], src=info['assigned_rank'], async_op=True)
 
-    # End of iteration — flush any tail owned batch.
-    _flush_owned_batch()
+    scatter_shared = None
+    if scatter_p2p_ops:
+        handles = batch_isend_irecv(scatter_p2p_ops)
+        scatter_handle = handles[0] if isinstance(handles, (list, tuple)) else handles
+        scatter_shared = _SharedBatchHandle(scatter_handle)
+        for info in scatter_pending_infos:
+            info['scatter_shared'] = scatter_shared
 
     # ------------------------------------------------------------------
     # Phase 4 — Apply updates
     # ------------------------------------------------------------------
     results = [None] * len(prepared)
 
-    # Local/3D weights can be applied while 2D scatters are still in flight.
-    for index, info in enumerate(prepared):
-        if not info['needs_redist']:
-            results[index] = _apply_prepared_update(info)
+    # Local/3D weights can be applied while the 2D scatter is still in flight.
+    # When ``runtime_groups`` is available we batch same-shape applies; on
+    # legacy path we fall back to per-weight :func:`_apply_prepared_update`.
+    phase4_local = (
+        (runtime_groups or {}).get('phase4_groups_local') if runtime_groups else None)
+    if phase4_local is not None:
+        for slots in phase4_local.values():
+            infos = [prepared[s] for s in slots]
+            updated = _apply_prepared_update_batched(infos, op_cast)
+            for s, p in zip(slots, updated):
+                results[s] = p
+    else:
+        for index, info in enumerate(prepared):
+            if not info['needs_redist']:
+                results[index] = _apply_prepared_update(info)
 
-    for index, info in enumerate(prepared):
+    # Wait the single batched scatter handle once for every weight that used
+    # it.  Per-weight broadcast handles (fallback) are waited individually.
+    if scatter_shared is not None:
+        scatter_shared.wait()
+    for info in prepared:
         if not info['needs_redist']:
             continue
-        p2p_handles = info.pop('p2p_handles', None)
-        if p2p_handles is not None:
-            for handle in p2p_handles:
-                handle.wait()
-            # Release send-side keep-alive buffers as soon as handles complete.
-            info.pop('p2p_tensors', None)
-            results[index] = _apply_prepared_update(info)
-        else:
-            handle = info.pop('broadcast_handle', None)
-            if handle is not None:
-                handle.wait()
+        handle = info.pop('broadcast_handle', None)
+        if handle is not None:
+            handle.wait()
+        info.pop('scatter_shared', None)
+        info.pop('p2p_tensors', None)
+
+    phase4_2d = (
+        (runtime_groups or {}).get('phase4_groups_2d') if runtime_groups else None)
+    if phase4_2d is not None:
+        for slots in phase4_2d.values():
+            infos = [prepared[s] for s in slots]
+            updated = _apply_prepared_update_batched(infos, op_cast)
+            for s, p in zip(slots, updated):
+                results[s] = p
+    else:
+        for index, info in enumerate(prepared):
+            if not info['needs_redist']:
+                continue
             results[index] = _apply_prepared_update(info)
 
     return results
@@ -1255,6 +1705,7 @@ class Muon(Optimizer):
         qk_clip_threshold=100,
         model=None,
         comm_strategy="allgather",
+        use_fused_adamw=False,
         **kwargs,
     ):
         super().__init__(learning_rate, params, weight_decay)
@@ -1278,6 +1729,24 @@ class Muon(Optimizer):
         self.muon_split_fn, self.muon_merge_fn = model.make_model_muon_fns()
         self.logit_threshold = Tensor([qk_clip_threshold], dtype=mstype.float32) if qk_clip_enabled else None
 
+        # ---- Optional fused AdamW (single TBE kernel) for non-muon weights ----
+        # The default per-weight AdamW (`_run_adamw_opt`) launches ~8 small
+        # kernels per param (cast + mul + add + addcmul + sqrt + add + cast +
+        # copy_).  Trace shows this costs ~187 ms host time per step on DSv3
+        # 24L — larger than the gather HCCL window (~50 ms) so the existing
+        # ``overlap_callback`` placement cannot fully hide it.  Switching to
+        # the fused ``gen.AdamW()`` primitive collapses the chain to 1 kernel
+        # per param; expected host time ~23 ms → fully hidden inside gather.
+        # Default off to preserve bit-identical loss with the existing path.
+        self.use_fused_adamw = bool(use_fused_adamw)
+        self.amsgrad = False
+        self.maximize = False
+        # Fused AdamW reuses ``self.global_step`` (Optimizer base class) so the
+        # step counter survives checkpoint resume — an independent counter
+        # would reset to -1 on resume and feed step=0 into ``gen.AdamW``, which
+        # collapses bias_correction = 1 - beta^step and blows up step_size.
+        self.fused_adamw_opt = gen.AdamW() if self.use_fused_adamw else None
+
         # ---- comm_strategy ----
         if comm_strategy not in ("allgather", "allgather_deredundency"):
             raise ValueError(
@@ -1287,10 +1756,29 @@ class Muon(Optimizer):
         self.comm_strategy = comm_strategy
         if self.comm_strategy == "allgather_deredundency":
             self._rank_id = get_rank()
+            # Per-step reusable HCCL recv / shard buffers.  Allocated lazily
+            # by :func:`_get_or_create_buffer`; entries keyed by
+            # ``(param_name, role, shape, dtype)`` and reused across optimizer
+            # steps since Phase 4 of :func:`_run_muon_batched` drains every
+            # handle before returning.
+            self._muon_buffer_cache = {}
+            # Slot orderings / phase-0 / phase-4 / flat-order / local-groups
+            # populated on first construct() via _build_muon_runtime_groups.
+            self._muon_runtime_groups = None
         else:
             self._rank_id = None  # not used in allgather mode
+            self._muon_buffer_cache = None
+            self._muon_runtime_groups = None
 
         self._initialize_state(model)
+
+        # ``max_exp_avg_sq`` is required by ``gen.AdamW()`` even when
+        # amsgrad=False.  Following :class:`AdamW` at ``adamw.py:196`` we alias
+        # it to ``moments2`` (the exp_avg_sq state) to avoid an extra buffer.
+        if self.use_fused_adamw:
+            self.max_exp_avg_sq = self.moments2
+        else:
+            self.max_exp_avg_sq = None
 
         self.model = model
 
@@ -1438,6 +1926,11 @@ class Muon(Optimizer):
                 'layout_covers_world': False,
                 'skip_redist_comm': False,
                 'group_sig': None,
+                # Pre-probed redistribution ops for the P2P gather fast path.
+                # ``None`` means introspection failed → hot path falls back to
+                # all-gather without re-attempting (and re-catching) the same
+                # error every step.  See ``_build_full_tensor_p2p_gather_ops``.
+                'p2p_op_list': None,
             }
             rank_list = None
             if ndim == 2 and isinstance(grad, DTensor):
@@ -1462,6 +1955,17 @@ class Muon(Optimizer):
                     })
                 except (AttributeError, TypeError, ValueError):
                     pass  # keep defaults — falls back to per-step path
+                if entry['needs_redist']:
+                    try:
+                        entry['p2p_op_list'] = _get_full_tensor_ops(
+                            grad.to_local(), grad.device_mesh,
+                            grad.placements, rank_id_int)
+                    except (AttributeError, TypeError, ValueError) as exc:
+                        logger.warning(
+                            "[Muon P2P gather] param '%s' layout introspection "
+                            "failed (%s: %s); this param will fall back to "
+                            "all-gather every step.",
+                            self.param_name_tuple[i], type(exc).__name__, exc)
             meta[i] = entry
             # Group signature for batched NS: same (piece-shape tuple, rank_list)
             # ⇒ weights can be stacked and run as a single bmm-batched NS.
@@ -1521,6 +2025,7 @@ class Muon(Optimizer):
 
         self._muon_assigned_rank = new_assignment
         self._muon_param_meta = meta
+        self._muon_runtime_groups = self._build_muon_runtime_groups(gradients, meta)
         self._muon_assigned_ranks_finalized = True
 
         # One-line summary of unique 2D groups + max batch size per rank.
@@ -1549,6 +2054,89 @@ class Muon(Optimizer):
             f"(rank_id={self._rank_id}); estimated_loads=[{load_summary}]; "
             f"max_batch_per_rank={max_batch_per_rank}"
         )
+
+    def _build_muon_runtime_groups(self, gradients, meta):
+        """Precompute slot orderings and Phase 0/4/NS group dicts.
+
+        Called once from :meth:`_recompute_muon_assigned_ranks` after the
+        gradient layouts are known.  Everything we cache here is derived from
+        information that is stable across optimizer steps (parameter shapes,
+        dtypes, ``optim_filter`` / ``use_muon`` flags, frozen meta), so the
+        per-step :func:`_run_muon_batched` only has to *index into* these
+        structures instead of re-sorting / re-grouping every call.
+
+        Builds:
+          - ``param_idx_for_slot`` — flat slot order seen by
+            :meth:`_construct_deredundency` (skips ``max_logits_val`` /
+            non-optim_filter / non-muon params, in parameter order).
+          - ``phase0_groups`` — ``(local_shape, grad_dtype, m_dtype)`` →
+            ``[slot, …]`` used by the Phase 0 batched momentum update.
+          - ``phase4_groups`` — ``(local_shape, param_dtype, m_dtype)`` →
+            ``[slot, …]`` used by the Phase 4 batched apply.
+          - ``flat_order_2d_slots`` — slot order sorted by ``(group_sig, idx)``,
+            replaces the per-step sort previously inlined in
+            :func:`_run_muon_batched`.
+          - ``local_groups_slots`` — ``group_sig`` → ``[slot, …]`` for
+            non-redist (3D / local) weights, used by the Phase 1.5 local NS.
+        """
+        param_idx_for_slot = []
+        for i in range(len(self._parameters)):
+            pname = self.param_name_tuple[i]
+            if "max_logits_val" in pname:
+                continue
+            if not self.optim_filter[i]:
+                continue
+            if not self.use_muon[i]:
+                continue
+            param_idx_for_slot.append(i)
+
+        phase0_groups = {}
+        phase4_groups_local = {}  # non-redist slots — applied while scatter is in flight
+        phase4_groups_2d = {}     # needs_redist slots — applied after scatter wait
+        flat_order_2d_slots = []
+        local_groups_slots = {}
+
+        for slot, param_idx in enumerate(param_idx_for_slot):
+            param = self._parameters[param_idx]
+            m = self.muon_m[self.state_indices[param_idx]]
+            grad = gradients[param_idx] if param_idx < len(gradients) else None
+            grad_local = _to_local(grad) if grad is not None else None
+            m_local = _to_local(m)
+            param_local = _to_local(param)
+
+            if grad_local is not None:
+                p0_key = (tuple(int(d) for d in grad_local.shape),
+                          grad_local.dtype, m_local.dtype)
+                phase0_groups.setdefault(p0_key, []).append(slot)
+
+            p4_key = (tuple(int(d) for d in param_local.shape),
+                      param_local.dtype, m_local.dtype)
+
+            meta_entry = meta.get(param_idx)
+            needs_redist = (meta_entry or {}).get('needs_redist', False)
+            group_sig = (meta_entry or {}).get('group_sig') if meta_entry else None
+            if needs_redist:
+                phase4_groups_2d.setdefault(p4_key, []).append(slot)
+                flat_order_2d_slots.append(slot)
+            else:
+                phase4_groups_local.setdefault(p4_key, []).append(slot)
+                if group_sig is not None:
+                    local_groups_slots.setdefault(group_sig, []).append(slot)
+
+        # Same sort key as the previously per-step sort in _run_muon_batched.
+        def _sort_key(slot):
+            sig = meta.get(param_idx_for_slot[slot], {}).get('group_sig')
+            return (sig if sig is not None else ('__ungrouped__', slot), slot)
+        flat_order_2d_slots.sort(key=_sort_key)
+
+        return {
+            'param_idx_for_slot': param_idx_for_slot,
+            'phase0_groups': phase0_groups,
+            'phase4_groups_local': phase4_groups_local,
+            'phase4_groups_2d': phase4_groups_2d,
+            'flat_order_2d_slots': flat_order_2d_slots,
+            'local_groups_slots': local_groups_slots,
+        }
 
     def construct(self, gradients):
         """Construct method for optimizer.
@@ -1637,12 +2225,37 @@ class Muon(Optimizer):
         # layouts) are available.  After the first call this is a no-op.
         self._recompute_muon_assigned_ranks(gradients)
 
+        # Pre-sync scalar-Tensor lr / weight_decay to Python float ONCE per
+        # step so the Phase-4 batched apply can skip per-slot ``float()`` host
+        # syncs.  Trace evidence: ``tensor.py:__float__`` is ~352 µs/call and
+        # was hit K times per batched apply → ~150 ms host stall per step.
+        # ``lr`` / ``weight_decay`` themselves are NOT replaced — they stay
+        # Tensors so the NS scaling path (``lr * base_scale * x_bf16``) keeps
+        # its fp32 promotion semantics and remains numerically bit-identical.
+        # We only thread an extra parallel list of Python-float ``1 - lr*wd``
+        # scales down to :func:`_run_muon_batched` for Phase 4.
+        def _scalar_float(value):
+            if isinstance(value, Tensor) and value.numel() == 1:
+                return float(value)
+            return value
+
+        if self.is_group:
+            if self.is_group_lr:
+                lr_scalar_floats = [_scalar_float(item) for item in lr]
+            else:
+                lr_scalar_floats = _scalar_float(lr)
+            wd_scalar_floats = [_scalar_float(item) for item in weight_decay]
+        else:
+            lr_scalar_floats = _scalar_float(lr)
+            wd_scalar_floats = _scalar_float(weight_decay)
+
         # --- collect muon weight info ---
         muon_grads = []
         muon_params = []
         muon_m_ms = []
         muon_lrs = []
         muon_wds = []
+        muon_wd_scales = []  # per-slot Python float of (1 - lr*wd) for Phase 4
         muon_names = []
         muon_assigned = []
         muon_metas = []  # frozen per-param DTensor metadata from _muon_param_meta
@@ -1668,9 +2281,14 @@ class Muon(Optimizer):
             if self.is_group:
                 param_lr = lr[i] if self.is_group_lr else lr
                 param_wd = weight_decay[i]
+                param_lr_f = (lr_scalar_floats[i] if self.is_group_lr
+                              else lr_scalar_floats)
+                param_wd_f = wd_scalar_floats[i]
             else:
                 param_lr = lr
                 param_wd = weight_decay
+                param_lr_f = lr_scalar_floats
+                param_wd_f = wd_scalar_floats
 
             if use_muon:
                 muon_grads.append(gradient)
@@ -1678,6 +2296,10 @@ class Muon(Optimizer):
                 muon_m_ms.append(self.muon_m[self.state_indices[i]])
                 muon_lrs.append(param_lr)
                 muon_wds.append(param_wd)
+                muon_wd_scales.append(1.0 - param_lr_f * param_wd_f
+                                      if isinstance(param_lr_f, float)
+                                      and isinstance(param_wd_f, float)
+                                      else None)
                 muon_names.append(param_name)
                 muon_assigned.append(self._muon_assigned_rank.get(i, self._rank_id))
                 muon_metas.append(param_meta.get(i))
@@ -1685,7 +2307,20 @@ class Muon(Optimizer):
                 muon_slot_idx += 1
             else:
                 state_idx = self.state_indices[i]
-                adamw_tasks.append((i, param, gradient, param_lr, param_wd, state_idx))
+                # Tuple carries BOTH the Tensor lr/wd (legacy _run_adamw_opt
+                # path) and the pre-synced Python float versions (fused TBE
+                # AdamW path, which requires scalars).
+                adamw_tasks.append((i, param, gradient,
+                                    param_lr, param_wd,
+                                    param_lr_f, param_wd_f,
+                                    state_idx))
+
+        # ``self.global_step`` is already incremented at the entry of
+        # ``construct()`` (see line 2138).  Reuse it for the fused TBE step
+        # so resume from checkpoint restores the correct step value.
+        adamw_step_int64 = None
+        if self.use_fused_adamw and adamw_tasks:
+            adamw_step_int64 = P.Cast()(self.global_step, mstype.int64)
 
         adamw_done = False
 
@@ -1694,14 +2329,48 @@ class Muon(Optimizer):
             if adamw_done:
                 return
             adamw_done = True
-            for task_i, task_param, task_gradient, task_lr, task_wd, task_state_idx in adamw_tasks:
-                with SkipDTensorDispatch():
-                    _run_adamw_opt(
-                        self.beta1, self.beta2, self.adamw_eps,
-                        task_lr, task_wd, task_param, task_gradient,
-                        self.moments1[task_state_idx], self.moments2[task_state_idx],
-                        True, bias_correction1, bias_correction2, one_minus_beta2)
-                optim_result[task_i] = task_param
+            if self.use_fused_adamw:
+                # Fused TBE path — single ``gen.AdamW()`` kernel per param
+                # replaces the cast+mul+add+addcmul+sqrt+add+cast+copy_ chain
+                # (~8 launches each).  Falls back to ``_run_adamw_opt`` for
+                # any slot whose lr/wd couldn't be pre-synced to Python float
+                # (e.g. non-scalar Tensor lr); fused TBE needs scalar lr/wd.
+                for (task_i, task_param, task_gradient,
+                     task_lr_t, task_wd_t,
+                     task_lr_f, task_wd_f,
+                     task_state_idx) in adamw_tasks:
+                    with SkipDTensorDispatch():
+                        if isinstance(task_lr_f, float) and isinstance(task_wd_f, float):
+                            _run_fused_adamw_opt(
+                                self.fused_adamw_opt, self.amsgrad, self.maximize,
+                                self.beta1, self.beta2, self.adamw_eps,
+                                adamw_step_int64, task_lr_f, task_wd_f,
+                                task_param, task_gradient,
+                                self.moments1[task_state_idx],
+                                self.moments2[task_state_idx],
+                                self.max_exp_avg_sq[task_state_idx],
+                            )
+                        else:
+                            _run_adamw_opt(
+                                self.beta1, self.beta2, self.adamw_eps,
+                                task_lr_t, task_wd_t, task_param, task_gradient,
+                                self.moments1[task_state_idx],
+                                self.moments2[task_state_idx],
+                                True, bias_correction1, bias_correction2,
+                                one_minus_beta2)
+                    optim_result[task_i] = task_param
+            else:
+                for (task_i, task_param, task_gradient,
+                     task_lr, task_wd,
+                     _, _,
+                     task_state_idx) in adamw_tasks:
+                    with SkipDTensorDispatch():
+                        _run_adamw_opt(
+                            self.beta1, self.beta2, self.adamw_eps,
+                            task_lr, task_wd, task_param, task_gradient,
+                            self.moments1[task_state_idx], self.moments2[task_state_idx],
+                            True, bias_correction1, bias_correction2, one_minus_beta2)
+                    optim_result[task_i] = task_param
 
         # --- run batched muon update ---
         if muon_grads:
@@ -1716,6 +2385,9 @@ class Muon(Optimizer):
                 self._rank_id,
                 overlap_callback=run_adamw_tasks,
                 muon_metas=muon_metas,
+                buffer_cache=self._muon_buffer_cache,
+                runtime_groups=self._muon_runtime_groups,
+                muon_wd_scales=muon_wd_scales,
             )
             # place muon results back into optim_result
             for param_idx, slot in muon_result_slot.items():
