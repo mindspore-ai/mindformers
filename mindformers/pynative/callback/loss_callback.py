@@ -134,6 +134,8 @@ class LossCallback(TrainerCallback):
             moe_layer_freq=model_config.moe_layer_freq,
             mtp_num_layers=model_config.mtp_num_layers,
         )
+        if load_balancing_loss is not None:
+            load_balancing_loss /= state.num_accumulation_steps
         if model_config.moe_router_enable_expert_bias:
             _update_expert_bias(model)
 
@@ -142,6 +144,7 @@ class LossCallback(TrainerCallback):
         if mtp_loss:
             mtp_loss_values = []
             for ind, val in enumerate(mtp_loss):
+                val /= state.num_accumulation_steps
                 mtp_loss_values.append(f"mtp_{str(ind + 1)}_loss: {self._to_float(val):10.6f}")
             mtp_loss = ", ".join(mtp_loss_values)
 

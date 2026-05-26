@@ -38,6 +38,8 @@ class TrainerState:
             Number of steps in one epoch. Used to determine epoch boundaries.
         global_batch_size (int):
             Global batch size across all devices.
+        num_accumulation_steps (int):
+            Number of steps to accumulate gradients before performing an optimizer step.
         total_flops (float):
             Total FLOPs for the model.
         best_metric (float):
@@ -57,6 +59,7 @@ class TrainerState:
     save_steps: int = 0
     epoch_step: int = 0
     global_batch_size: int = 0
+    num_accumulation_steps: int = 1
     total_flops: float = 0.0
     best_metric: Optional[float] = None
     best_model_checkpoint: Optional[str] = None
@@ -83,6 +86,7 @@ class TrainerState:
             "save_steps": self.save_steps,
             "epoch_step": self.epoch_step,
             "global_batch_size": self.global_batch_size,
+            "num_accumulation_steps": self.num_accumulation_steps,
             "total_flops": self.total_flops,
             "best_metric": self.best_metric,
             "best_model_checkpoint": self.best_model_checkpoint,
@@ -106,5 +110,15 @@ class TrainerState:
         return (
             f"TrainerState(epoch={self.epoch}, "
             f"global_step={self.global_step}, "
-            f"max_steps={self.max_steps})"
+            f"max_steps={self.max_steps}, "
+            f"eval_steps={self.eval_steps}, "
+            f"save_steps={self.save_steps}, "
+            f"epoch_step={self.epoch_step}, "
+            f"global_batch_size={self.global_batch_size}, "
+            f"num_accumulation_steps={self.num_accumulation_steps}, "
+            f"total_flops={self.total_flops}, "
+            f"best_metric={self.best_metric}, "
+            f"best_model_checkpoint={self.best_model_checkpoint}, "
+            f"is_train_begin={self.is_train_begin}, "
+            f"is_train_end={self.is_train_end})"
         )

@@ -528,6 +528,7 @@ class Trainer:
             max_steps=self.config.training.steps,
             save_steps=self.config.checkpoint.save_interleaved_steps,
             global_batch_size=self.global_batch_size,
+            num_accumulation_steps=self.num_accumulation_steps,
             is_train_begin=True,
             is_train_end=False,
         )
@@ -630,7 +631,7 @@ class Trainer:
 
     def _inner_train_loop(self):
         """
-        Internal training loop.
+        Internal training loop with gradient accumulation support.
         """
         # Create dataset iterator
         dataset_iter = self._create_dataset_iterator(self.train_dataset)
@@ -660,11 +661,29 @@ class Trainer:
                 # Step begin callback
                 self.callback_handler.on_step_begin(self.config, self.state)
 
-                # Training step
-                try:
-                    loss, grad_norm = self.training_step(self.model, inputs)
-                except Exception as e:
-                    raise RuntimeError(f"Error in training step {step}.") from e
+                # Gradient accumulation: accumulate over micro-batches
+                loss = 0.0
+                grad_norm = 0.0
+                for micro_step in range(self.num_accumulation_steps):
+                    micro_inputs = self._split_micro_batch(inputs, micro_step)
+
+                    try:
+                        micro_loss = self._forward_backward(self.model, micro_inputs)
+                    except Exception as e:
+                        raise RuntimeError(f"Error in training step {step}.") from e
+                    loss += micro_loss
+
+                    # Only perform optimizer step after gradient accumulation
+                    if micro_step >= self.num_accumulation_steps - 1:
+                        # Compute grad norm and update optimizer
+                        grad_norm = self._optimizer_update()
+
+                        # Loss reduction for parallel training
+                        if self.enable_parallel:
+                            if isinstance(loss, DTensor):
+                                loss = loss.to_local()
+                            all_reduce(loss, op=ops.ReduceOp.SUM)
+                            loss /= self.world_size
 
                 # Update state
                 self.state.global_step += 1
@@ -746,6 +765,26 @@ class Trainer:
     def _get_batch_naive(self, dataset_iter):
         """Fetch next batch in naive loading mode (simplified)."""
         return next(dataset_iter)
+    
+    def _split_micro_batch(self, inputs: Dict[str, Any], acc_step: int):
+        """
+        Split a batch of data into a micro-batch for gradient accumulation.
+
+        Args:
+            inputs (Dict[str, Any]): Input data dictionary.
+            acc_step (int): Current accumulation step.
+
+        Returns:
+            Dict[str, Any]: Dictionary containing micro-batch data.
+        """
+        local_batch_size = self.config.training.local_batch_size
+        start_idx = acc_step * local_batch_size
+        end_idx = (acc_step + 1) * local_batch_size
+
+        micro_inputs = {
+            k: v[start_idx:end_idx] for k, v in inputs.items()
+        }
+        return micro_inputs
 
     def compute_loss(self, model, inputs: Dict[str, Any]):
         """
@@ -782,25 +821,37 @@ class Trainer:
         # return value must be Tensor or DTensor
         return loss
 
-    def training_step(self, model, inputs: Dict[str, Any]):
+    def _forward_backward(self, model, inputs: Dict[str, Any]):
         """
-        Perform a single training step.
+        Compute loss and perform backward pass for a single micro-batch.
+        Loss is scaled by 1/num_accumulation_steps for gradient accumulation.
 
         Args:
             model (PreTrainedModel): Model instance.
             inputs (Dict[str, Any]): Input data dictionary.
 
         Returns:
-            tuple: Tuple containing loss value and gradient norm (loss, grad_norm).
+            Tensor: Unscaled loss value for reporting.
         """
-        # Calculate loss sense for distributed parameter
         loss = self.compute_loss(model, inputs)
         sense = _get_loss_sense(
             enable_parallel=self.enable_parallel,
             parallelism=self.config.parallelism,
         )
-        loss.backward(sense)
 
+        if self.num_accumulation_steps > 1:
+            loss = loss / self.num_accumulation_steps
+        
+        loss.backward(sense)
+        return loss
+
+    def _optimizer_update(self):
+        """
+        Compute gradient norm, clip gradients, update optimizer and zero gradients.
+
+        Returns:
+            Tensor: Global gradient norm.
+        """
         global_norm, grads = _calculate_global_grad_norm(
             self.optimizer.parameters,
             enable_parallel=self.enable_parallel,
@@ -811,15 +862,10 @@ class Trainer:
             self.optimizer(grads)
 
         # zero grad
-        if hasattr(model, "zero_grad"):
-            model.zero_grad()
+        if hasattr(self.model, "zero_grad"):
+            self.model.zero_grad()
         else:
-            for param in model.trainable_params():
+            for param in self.model.trainable_params():
                 param.grad = None
 
-        if self.enable_parallel:
-            if isinstance(loss, DTensor):
-                loss = loss.to_local()
-            all_reduce(loss, op=ops.ReduceOp.SUM)
-            loss /= self.world_size
-        return loss, global_norm
+        return global_norm
