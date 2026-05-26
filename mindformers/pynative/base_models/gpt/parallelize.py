@@ -389,12 +389,13 @@ def _apply_layers_tp(
             "q_rank should be greater than 0, but got 0!"
         )
 
-    layer_plan.update(
-        {
-            "self_attention.linear_qb": colwise_parallel(output_layouts=Replicate(), use_local_output=False),
-            "self_attention.q_layernorm": NoParallel(use_local_output=False),
-        }
-    )
+    if transformer_layer.self_attention.config.q_lora_rank is not None:
+        layer_plan.update(
+            {
+                "self_attention.linear_qb": colwise_parallel(output_layouts=Replicate(), use_local_output=False),
+                "self_attention.q_layernorm": NoParallel(use_local_output=False),
+            }
+        )
 
     if hasattr(transformer_layer, "attn_hc"):
         layer_plan.update(
