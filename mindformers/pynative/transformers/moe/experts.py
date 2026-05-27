@@ -70,6 +70,7 @@ class GroupedMLP(nn.Cell):
         self.moe_token_dispatcher_type = config.moe_token_dispatcher_type
         self.init_method = config.init_method
         self.compute_dtype = config.compute_dtype
+        self.moe_permute_fusion = config.moe_permute_fusion
 
         # parameters
         self.weight1 = Parameter(
@@ -95,12 +96,36 @@ class GroupedMLP(nn.Cell):
     def permute(self, tokens, top_scores, selected_experts_indices, num_tokens_per_expert):
         """
         Reorders token indices to match the order of experts for MoE routing.
+
+        Returns:
+            tuple: (num_tokens_per_expert, sort_index, permuted_probs, routed_input)
+                - sort_index: in fusion mode this is the ``unsort_map`` produced by
+                  ``ops.moe_token_permute`` (used directly by ``ops.moe_token_unpermute``);
+                  in non-fusion mode it is the argsort index used to scatter outputs back.
+                - permuted_probs: in fusion mode it is in original ``(N, K)`` order unless
+                  ``moe_apply_probs_on_input`` is enabled, in which case it is gathered into
+                  expert-sorted order so it can be broadcast onto ``routed_input``. In
+                  non-fusion mode it is always expert-sorted ``(N*K,)``.
         """
         _, _, dim = tokens.shape
         tokens = self.reshape(tokens, (-1, dim))
 
         num_tokens_per_expert = self.cast(num_tokens_per_expert, selected_experts_indices.dtype)
         num_tokens_per_expert = self.cumsum(num_tokens_per_expert, dim=0, dtype=ms.int64)
+
+        if self.moe_permute_fusion:
+            routing_map = self.reshape(selected_experts_indices, (-1, self.top_k))
+            routed_input, unsort_map = ops.moe_token_permute(
+                tokens, routing_map.astype(ms.int32))
+            routed_input = self.reshape(routed_input, (-1, self.hidden_size))
+            if self.config.moe_apply_probs_on_input:
+                # need probs in expert-sorted order to broadcast onto routed_input
+                sort_map = self.argsort(self.cast(unsort_map, ms.float32))
+                permuted_probs = self.reshape(top_scores, (-1,))[sort_map]
+            else:
+                # leave probs unpermuted; ops.moe_token_unpermute will consume (N, K)
+                permuted_probs = top_scores
+            return num_tokens_per_expert, unsort_map, permuted_probs, routed_input
 
         # Reorder the token indices to match the order of the experts
         # token_indices_experts_sorted shape (bs*slen*top_k,)
@@ -119,12 +144,22 @@ class GroupedMLP(nn.Cell):
         Restores the original token order from expert-sorted outputs for MoE routing.
         """
         (bs, slen, dim) = shape
+
+        if self.moe_permute_fusion:
+            # token_indices_experts_sorted is the unsort_map from ops.moe_token_permute.
+            # ops.moe_token_unpermute with probs scatters back and reduces over top_k in one op.
+            unsort_map = self.reshape(token_indices_experts_sorted, (-1,))
+            probs = self.reshape(probs, (-1, self.top_k))
+            probs = self.cast(probs, routed_output.dtype)
+            out_experts = ops.moe_token_unpermute(routed_output, unsort_map, probs)
+            return out_experts
+
         # Unsort routed outputs
         routed_output_unsorted = self.zeros(
             (bs * slen * self.top_k, dim),
             dtype=routed_output.dtype,
         )
-        
+
         probs = self.cast(probs, routed_output.dtype)
         routed_output = self.mul(routed_output, self.unsqueeze(probs, -1))
         routed_output_unsorted[token_indices_experts_sorted] = routed_output
