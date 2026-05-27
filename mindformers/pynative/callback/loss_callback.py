@@ -262,44 +262,52 @@ class LossCallback(TrainerCallback):
 def reset_model_temporary_tensors(config, model):
     """
     Reset the temporary tensors of the model.
+
+    Uses cached module list to avoid full cell tree traversal on every step.
     """
-    for _, module in model.cells_and_names():
-        if (
-                config.moe_router_load_balancing_type == "global_aux_loss"
-                and hasattr(module, 'reset_global_aux_loss_tracker')
-        ):
-            module.reset_global_aux_loss_tracker()
+    if config.moe_router_load_balancing_type != "global_aux_loss":
+        return
+
+    cache = getattr(reset_model_temporary_tensors, '_cache', None)
+    if cache is None:
+        cache = [
+            module for _, module in model.cells_and_names()
+            if hasattr(module, 'reset_global_aux_loss_tracker')
+        ]
+        reset_model_temporary_tensors._cache = cache
+
+    for module in cache:
+        module.reset_global_aux_loss_tracker()
 
 
 def _update_expert_bias(model):
     """
     Update expert bias for load-balanced routing and reset per-step token counters.
+
+    Uses cached module list to avoid full cell tree traversal on every step.
     """
     from mindspore import mint
     from mindspore.graph.api import _no_grad
+
+    cache = getattr(_update_expert_bias, '_cache', None)
+    if cache is None:
+        cache = [
+            module for _, module in model.cells_and_names()
+            if getattr(module, 'enable_expert_bias', False)
+        ]
+        _update_expert_bias._cache = cache
+
+    if not cache:
+        return
+
     # NOTE: Currently this sync is blocking (thus exposed) and happens on the
     # default compute stream. Need to assess if this is OK performance-wise.
-    tokens_per_expert_list = []
-    for _, module in model.cells_and_names():
-        if not getattr(module, 'enable_expert_bias', False):
-            continue
-        tokens_per_expert = module.tokens_per_expert
-        tokens_per_expert_list.append(tokens_per_expert)
-
-    if not tokens_per_expert_list:
-        return
+    tokens_per_expert_list = [module.tokens_per_expert for module in cache]
     tokens_per_expert_by_layer = ops.vstack(tokens_per_expert_list)
 
-    moe_layer_idx = 0
     with _no_grad():
-        for _, module in model.cells_and_names():
-            if not getattr(module, 'enable_expert_bias', False):
-                continue
-
-            tokens_per_expert = tokens_per_expert_by_layer[
-                moe_layer_idx
-            ].float()
-            moe_layer_idx += 1
+        for moe_layer_idx, module in enumerate(cache):
+            tokens_per_expert = tokens_per_expert_by_layer[moe_layer_idx].float()
 
             # update the expert bias
             # this is not exactly the same as https://arxiv.org/pdf/2408.15664 proposed
