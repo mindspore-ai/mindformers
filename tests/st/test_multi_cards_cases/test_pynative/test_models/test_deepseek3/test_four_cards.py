@@ -141,3 +141,53 @@ def test_fsdp_tp2_ep2_gbs2():
         f"{result.returncode}.\n"
         f"Stdout:\n{result.stdout}\nStderr:\n{result.stderr}"
     )
+
+
+@pytest.mark.level0
+def test_fsdp_tp2_ep2_deredundancy_gbs2():
+    """
+    Feature: DeepSeek3 FSDP + Tensor Parallel + Expert Parallel with alltoall_deredundancy training
+    Description: Test DeepSeek3 training with FSDP, tensor parallel 2, expert parallel 2 and
+                 moe_token_dispatcher_type alltoall_deredundancy on 4 cards, global batch size 2.
+    Expectation: msrun script exits with code 0.
+    """
+    generate_dataset()
+    with open(BASE_CONFIG, "r") as fp:
+        configs = yaml.safe_load(fp)
+
+    configs["train_dataset"]["dataloader"]["dataset_files"] = [DATASET_PATH]
+    configs["training"]["local_batch_size"] = 1
+    configs["parallelism"]["tensor_parallel"] = 2
+    configs["parallelism"]["expert_parallel"] = 2
+    configs["parallelism"]["moe_token_dispatcher_type"] = "alltoall_deredundancy"
+    configs["parallelism"]["npu_nums_per_device"] = 2
+    configs["training"]["steps"] = 10
+
+    local_config_path = f"{CUR_DIR}/ds3_fsdp_tp2_ep2_deredundancy_gbs2.yaml"
+    with open(local_config_path, "w") as fp:
+        yaml.dump(configs, fp, indent=2)
+
+    run_script_path = os.path.join(CUR_DIR, "run_deepseek3.py")
+    port_id = int(os.environ.get("ASCEND_PORT_ID", random.randint(50000, 65535)))
+    assert os.path.exists(
+        run_script_path
+    ), f"Run script not found: {run_script_path}"
+    cmd = [
+        "msrun",
+        "--worker_num=4",
+        "--local_worker_num=4",
+        f"--master_port={port_id}",
+        f"--log_dir={CUR_DIR}/log_fsdp_tp2_ep2_deredundancy_gbs2",
+        "--join=True",
+        f"{run_script_path}",
+        "--config",
+        f"{local_config_path}",
+    ]
+    result = subprocess.run(
+        cmd, shell=False, capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 0, (
+        f"PrepareModuleOO script failed with non-zero exit code: "
+        f"{result.returncode}.\n"
+        f"Stdout:\n{result.stdout}\nStderr:\n{result.stderr}"
+    )

@@ -361,6 +361,9 @@ class DeredundancyExpertParallel(ExpertParallel):
 
     def _token_dispatch(self, device_mesh, cell, args):
         tokens, probs, topk_indices, num_tokens_per_expert = args
+        if isinstance(tokens, DTensor):
+            self.input_layout = tokens.layout
+            tokens = tokens.to_local()
         ep_degree = device_mesh.mesh_shape[0]
         num_experts = num_tokens_per_expert.shape[0]
 
@@ -501,7 +504,12 @@ class DeredundancyExpertParallel(ExpertParallel):
         )
         node_expert_num = self.local_expert_end_index - self.local_expert_start_index
         routed_output = routed_output[node_expert_num:]
-
+        if self.input_layout is not None:
+            return DTensor.from_local(
+                routed_output,
+                self.input_layout.mesh,
+                self.input_layout.alias_placements
+            )
         return routed_output
 
 
