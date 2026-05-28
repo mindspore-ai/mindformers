@@ -783,7 +783,7 @@ def apply_fsdp(
         "layers": list(gpt_model.decoder.layers),
     }
 
-    if hasattr(gpt_model, "mtp"):
+    if getattr(gpt_model, "mtp"):
         modules.update(
             {
                 "tail_modules": [
@@ -809,7 +809,7 @@ def apply_fsdp(
     embedding = modules["embedding"]
     layers = modules["layers"]
     tail_modules = modules["tail_modules"]
-    mtp = modules["mtp"]
+    mtp = modules.get("mtp")
 
     if not layers:
         raise ValueError(f"{type(model).__name__} has no decoder layers")
