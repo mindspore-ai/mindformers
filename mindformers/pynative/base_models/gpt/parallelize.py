@@ -543,9 +543,14 @@ def apply_non_moe_tp(
         model_plan,
     )
 
+    decoder_layers = model.model.decoder.layers
+    attn_input_layout = getattr(
+        decoder_layers[0].self_attention.config, "input_layout", None
+    ) if decoder_layers else None
+    attn_qkv_shard = Shard(1) if attn_input_layout == "TND" else Shard(2)
     attention_kernel_plan = prepare_module_input(
         input_layouts=(Replicate(), Replicate(), Replicate(), None),
-        desired_input_layouts=(Shard(2), Shard(2), Shard(2), None),
+        desired_input_layouts=(attn_qkv_shard, attn_qkv_shard, attn_qkv_shard, None),
         use_local_output=False,
     )
     # Apply tensor + sequence parallelism to every transformer block

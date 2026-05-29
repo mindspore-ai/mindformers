@@ -289,7 +289,7 @@ class GPTModel(nn.Cell):
         # Check mindformers.dataset.blended_datasets.gpt_dataset._get_eod_attention_mask() for implement details.
 
         labels, attention_mask, loss_mask = self._preprocess_input_labels_and_masks(
-            input_ids, labels, attention_mask, loss_mask, actual_seq_len)
+            input_ids, labels, attention_mask, loss_mask)
 
         hidden_states, rotary_pos_emb = self.language_model(
             input_ids,
@@ -577,8 +577,7 @@ class GPTModel(nn.Cell):
                                            input_ids: Tensor,
                                            labels: Tensor = None,
                                            attention_mask: Tensor = None,
-                                           loss_mask: Tensor = None,
-                                           actual_seq_len: Tensor = None):
+                                           loss_mask: Tensor = None):
         """Preprocess input_ids and generate labels and masks if they are None.
         """
         if loss_mask is None:
@@ -586,9 +585,6 @@ class GPTModel(nn.Cell):
         if labels is not None:
             label_mask = self.cast(self.not_equal(labels, self.ignore_token_id), dtype.float32)
             loss_mask = self.mul(loss_mask, label_mask)
-        if (self.use_eod_attn_mask_compression and actual_seq_len is not None and attention_mask is None
-                and getattr(self.config, "input_layout", None) == "TND"):
-            return labels, attention_mask, loss_mask
         if self.use_attn_mask_compression:
             attention_mask = self.casual_mask()
         elif attention_mask is None:
