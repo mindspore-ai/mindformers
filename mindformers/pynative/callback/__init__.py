@@ -17,6 +17,7 @@
 from .callback import TrainerCallback, CallbackHandler
 from .loss_callback import LossCallback
 from .checkpoint_callback import CheckpointCallback
+from .training_state_callback import TrainingStateCallback
 from .max_logits_monitor import (
     MaxLogitsMonitor,
     MaxLogitsReset,
@@ -29,6 +30,7 @@ __all__ = [
     'CallbackHandler',
     'LossCallback',
     'CheckpointCallback',
+    'TrainingStateCallback',
     'MaxLogitsMonitor',
     'MaxLogitsReset',
     'configure_max_logits_tracking',

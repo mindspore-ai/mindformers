@@ -549,14 +549,14 @@ class TrainStateConfig(BaseConfig):
     Training state monitoring configuration.
     """
 
-    local_norm: bool = False
-    """Monitor local gradient/parameter norm"""
+    local_norm: Union[bool, str, List[str]] = ""
+    """Monitor local gradient/parameter norm, supports bool, string or list of strings"""
 
     local_loss: bool = False
     """Monitor local training loss"""
 
-    device_norm: bool = False
-    """Monitor device-level norm statistics"""
+    device_norm: Union[bool, str, List[str]] = False
+    """Monitor device-level norm statistics, supports bool, string or list of strings"""
 
     device_loss: bool = False
     """Monitor device-level loss statistics"""

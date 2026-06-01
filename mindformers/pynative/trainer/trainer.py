@@ -46,6 +46,7 @@ from mindformers.pynative.callback import (
     TrainerCallback,
     LossCallback,
     CheckpointCallback,
+    TrainingStateCallback,
     configure_max_logits_tracking,
     ensure_max_logits_reset_callback,
 )
@@ -58,6 +59,7 @@ from mindformers.pynative.distributed.parallelize import parallelize_model
 from mindformers.checkpoint.checkpoint import CommonInfo, get_checkpoint_path
 
 from .train_state import TrainerState
+from ..tools.monitor import MonitorGroup
 from .utils import (
     _build_model,
     _build_dataset,
@@ -198,6 +200,9 @@ class Trainer:
 
         # Store other parameters
         self.compute_loss_func = compute_loss_func
+
+        # Initialize monitor
+        self.monitor = MonitorGroup(self.config)
 
         # Initialize training state
         self.communication_init = False
@@ -462,7 +467,7 @@ class Trainer:
         """
         checkpoint = self.config.checkpoint
         if not checkpoint.enable_save:
-            return [LossCallback()]
+            return [LossCallback(), TrainingStateCallback()]
 
         # build checkpoint callback
         checkpoint_callback = CheckpointCallback(
@@ -478,6 +483,7 @@ class Trainer:
 
         return [
             LossCallback(),
+            TrainingStateCallback(),
             checkpoint_callback,
         ]
 
@@ -664,6 +670,8 @@ class Trainer:
                 # Gradient accumulation: accumulate over micro-batches
                 loss = 0.0
                 grad_norm = 0.0
+                self.monitor.reset()
+
                 for micro_step in range(self.num_accumulation_steps):
                     micro_inputs = self._split_micro_batch(inputs, micro_step)
 
@@ -673,17 +681,22 @@ class Trainer:
                         raise RuntimeError(f"Error in training step {step}.") from e
                     loss += micro_loss
 
-                    # Only perform optimizer step after gradient accumulation
+                    self.monitor.record("local_loss", micro_loss,
+                                        context={"micro_step": micro_step, "model": self.model})
+                    self.monitor.record("local_norm",
+                                        context={"micro_step": micro_step, "model": self.model})
+
                     if micro_step >= self.num_accumulation_steps - 1:
-                        # Compute grad norm and update optimizer
                         grad_norm = self._optimizer_update()
 
-                        # Loss reduction for parallel training
                         if self.enable_parallel:
                             if isinstance(loss, DTensor):
                                 loss = loss.to_local()
                             all_reduce(loss, op=ops.ReduceOp.SUM)
                             loss /= self.world_size
+
+                        self.monitor.record("device_loss", loss)
+                        self.monitor.record("device_norm")
 
                 # Update state
                 self.state.global_step += 1
@@ -691,7 +704,7 @@ class Trainer:
 
                 # Step end callback (pass loss)
                 self.callback_handler.on_step_end(
-                    self.config, self.state, loss=loss, grad_norm=grad_norm
+                    self.config, self.state, loss=loss, grad_norm=grad_norm, monitor=self.monitor
                 )
 
                 # Epoch end callback (pass loss)

@@ -75,7 +75,7 @@ monitor:
     global_norm_skip_time: 10             # number of consecutive skips allowed before triggering actions
 
   train_state:                 # training state monitoring
-    local_norm: false          # monitor local gradient/parameter norm
+    local_norm: ""             # monitor local gradient/parameter norm, supports bool, string or list of strings
     local_loss: false          # monitor local training loss
     device_norm: false         # monitor device-level norm statistics
     device_loss: false         # monitor device-level loss statistics
