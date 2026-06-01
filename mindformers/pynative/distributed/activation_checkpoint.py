@@ -456,10 +456,6 @@ def _clean_and_parse_comm_config(full_target_ids, select_layer_to_modules, comm_
     return layer_to_modules
 
 
-def _policy_fn_recompute(ctx, op, *args, **kwargs): # pylint: disable=W0613
-    return CheckpointPolicy.MUST_RECOMPUTE
-
-
 def _set_pattern_recompute(layer, p_list, add_prim_attr=False, info=''):
     """Recursively traverse layer cells along p_list path and apply checkpoint_wrapper."""
     log_list = []
@@ -491,7 +487,7 @@ def _set_pattern_recompute(layer, p_list, add_prim_attr=False, info=''):
         for attr in dir(layer):
             if p == attr:
                 operator = getattr(layer, attr)
-                setattr(layer, attr, checkpoint_wrapper(operator, policy_fn=_policy_fn_recompute))
+                setattr(layer, attr, checkpoint_wrapper(operator, output_recompute=True))
                 log = f"{info}.{attr}"
 
     # Restore p_list so the caller's list is unchanged after recursion
