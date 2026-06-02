@@ -39,6 +39,7 @@ from mindformers.pynative.transformers.transformer_block import TransformerBlock
 from mindformers.pynative.transformers.multi_token_prediction import MultiTokenPredictionBlock, MTPLossAutoScaler
 from mindformers.pynative.layers.linear import Linear
 from mindformers.pynative.optimizer.muon_utils import make_muon_fns
+from mindformers.pynative.transformers.multi_token_prediction import process_mtp_loss
 
 
 class GPTModel(nn.Cell):
@@ -319,7 +320,6 @@ class GPTModel(nn.Cell):
             return hidden_states
 
         if self.mtp_process:
-            from mindformers.pynative.transformers.multi_token_prediction import process_mtp_loss
             hidden_states = process_mtp_loss(
                 hidden_states_list=hidden_states,
                 labels=labels,

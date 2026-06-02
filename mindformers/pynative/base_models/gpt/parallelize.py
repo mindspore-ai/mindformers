@@ -854,9 +854,16 @@ def apply_fsdp(
                     )
 
     if mtp:
-        with ms.DeviceCtx("meta"):
-            for layer in mtp.layers:
-                mtp_replicate_params = _collect_layer_replicate_params(layer.transformer_layer)
+        for layer in mtp.layers:
+            if hasattr(layer.transformer_layer.mlp, "experts") and edp_mesh is not None:
+                with ms.DeviceCtx("meta"):
+                    fully_shard(
+                        layer.transformer_layer.mlp.experts, **efsdp_config,
+                        reshard_after_forward=reshard_after_forward,
+                    )
+
+            mtp_replicate_params = _collect_layer_replicate_params(layer.transformer_layer)
+            with ms.DeviceCtx("meta"):
                 fully_shard(
                     layer,
                     **fsdp_config,
