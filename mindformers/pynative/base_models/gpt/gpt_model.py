@@ -670,20 +670,6 @@ class GPTModel(nn.Cell):
 
         return make_muon_fns(schema)
 
-    def get_muon_filter(self):
-        """Return a filter function to determine if a parameter should use Muon optimization.
-
-        Returns:
-            A function that takes a parameter and returns True if it should use Muon.
-        """
-        def muon_filter(param):
-            return (
-                (len(param.shape) == 2 or len(param.shape) == 3)
-                and "word_embeddings" not in param.name
-                and "output_layer" not in param.name
-            )
-        return muon_filter
-
     def get_param_layer_indices(self, params):
         """Return layer indices for each parameter (used for QK-clip).
 
