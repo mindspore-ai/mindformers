@@ -103,8 +103,16 @@ class MLP(nn.Cell):
         self.add = mint.add
         self.transpose = mint.transpose
 
-    def construct(self, hidden_states: Tensor) -> Tensor:
-        """ Construct function of mlp block. """
+    def construct(self, hidden_states: Tensor, input_ids: Tensor = None) -> Tensor:
+        """Construct function of mlp block.
+
+        Args:
+            hidden_states (Tensor): Input tensor of shape (seq_len, bs, hidden_size).
+            input_ids (Tensor, optional): Token IDs; accepted so a TransformerLayer can call
+                dense MLP and MoELayer with the same signature, but ignored here (dense MLP has
+                no router). Default: None.
+        """
+        del input_ids
         # [seq_len, bs, hidden_size] -> [seq_len, bs, ffn_hidden_size]
         intermediate_parallel = self.linear_fc1(hidden_states)
 

@@ -13,6 +13,7 @@ from mindspore.common import dtype as mstype
 
 from mindformers.parallel_core.transformer_config import TransformerConfig
 from mindformers.parallel_core.utils.init_method import init_method_normal
+from mindformers.tools.logger import logger
 from .moe_utils import (
     compute_routing_scores_for_aux_loss,
     switch_load_balancing_loss_func,
@@ -38,8 +39,8 @@ class TopKRouter(nn.Cell):
             - moe_router_group_topk (int | None): Number of groups to select in node-limited routing. Required when
               moe_router_num_groups is set.
             - moe_router_topk (int): Number of experts each token will be routed to in token-choice routing.
-            - moe_router_score_function (Literal["softmax", "sigmoid"]): Whether to use sigmoid or
-              softmax for router scores.
+            - moe_router_score_function (Literal["softmax", "sigmoid", "sqrtsoftplus"]): Score function
+              applied to router logits.
             - norm_topk_prob (bool): Whether to normalize the routing scores when using sigmoid.
             - moe_router_topk_scaling_factor (float): Scaling factor applied to the routing scores.
             - moe_router_force_expert_balance (bool): Whether to force load balance via round-robin
@@ -50,10 +51,12 @@ class TopKRouter(nn.Cell):
             self,
             config: TransformerConfig,
             layer_number: int = 0,
+            is_mtp_layer: bool = False,
     ):
         super().__init__()
         self.config = config
         self.layer_number = layer_number
+        self.is_mtp_layer = is_mtp_layer
 
         # Extract parameters from config
         dim = config.hidden_size
@@ -83,21 +86,50 @@ class TopKRouter(nn.Cell):
         self.calculate_per_token_loss = False
         self.moe_aux_loss_auto_scaler = MoEAuxLossAutoScaler()
 
-        # Auxiliary loss components
+        # Hash-based MoE routing (RFC §3.4.2.2, aligns Megatron router.py:181-202).
+        # The leading moe_n_hash_layers decoder layers (0-based decoder layer index) select
+        # experts from a fixed tid2eid lookup table instead of learned top-k routing
+        # (aligns mindspeed convert_ckpt_deepseek4.py:246 hash_layer = i < n_hash_layers).
+        # MTP layers never use hash routing.
+        if config.moe_n_hash_layers > 0 and layer_number is None:
+            raise ValueError(f"layer_number({layer_number}) is required for the hash-based router.")
+        self.is_hash_layer = (
+            not self.is_mtp_layer
+            and config.moe_n_hash_layers > 0
+            and layer_number < config.moe_n_hash_layers
+        )
+        if self.is_hash_layer:
+            # DSv4-Pro ships a pre-trained tid2eid table in its inference checkpoint;
+            # no public initialization recipe is documented. Round-robin is used here
+            # only as a placeholder so the layer is runnable from scratch.
+            # framework adaptation: torch register_buffer -> MindSpore Parameter(requires_grad=False).
+            # Build the int32 index table directly (no astype chain, NPU-friendly).
+            vocab_size = config.actual_vocab_size
+            self.tid2eid = Parameter(
+                mint.empty((vocab_size, top_k), dtype=mstype.int32),
+                name="tid2eid",
+                requires_grad=False,
+            )
+            logger.info(f"Using hash routing for layer {layer_number}")
+        else:
+            self.tid2eid = None
+
+        # Auxiliary loss components. Hash layers do not produce aux loss
+        # (aligns Megatron router.py:200-202: expert bias / aux loss disabled on hash layers).
         self.moe_aux_loss_coeff = 0.0
-        if config.moe_aux_loss_coeff:
+        if config.moe_aux_loss_coeff and not self.is_hash_layer:
             self.moe_aux_loss_coeff = config.moe_aux_loss_coeff
 
         self.aux_loss_type = config.moe_router_load_balancing_type
         # Initialize global tokens per expert for global aux loss
         if self.aux_loss_type == "global_aux_loss":
             self.global_tokens_per_expert = Parameter(
-                mint.zeros(num_experts, dtype=mstype.float32),
+                mint.empty(num_experts, dtype=mstype.float32),
                 name="global_tokens_per_expert",
                 requires_grad=False,
             )
             self.ga_steps = Parameter(
-                Tensor(0, dtype=mstype.float32),
+                mint.empty((), dtype=mstype.float32),
                 name="ga_steps",
                 requires_grad=False,
             )
@@ -109,6 +141,8 @@ class TopKRouter(nn.Cell):
         self.linear = mint.nn.functional.linear
         self.sigmoid = mint.nn.functional.sigmoid
         self.softmax = mint.nn.functional.softmax
+        self.softplus = mint.nn.functional.softplus
+        self.sqrt = mint.sqrt
         self.cast = ops.cast
         self.arange = mint.arange
         self.gather = mint.gather
@@ -123,8 +157,29 @@ class TopKRouter(nn.Cell):
 
 
     def reset_parameter(self):
-        """Reset router weights for delayed initialization."""
+        """Reset router weights for delayed initialization.
+
+        Under delayed (meta-device) init the model is built on meta then materialized via
+        ``to_empty()``, which leaves all Parameters as uninitialized real memory. Besides the
+        learned ``weight``, the router also owns deterministic non-grad Parameters
+        (``tid2eid``, ``global_tokens_per_expert``, ``ga_steps``) whose ``__init__`` values do
+        not survive ``to_empty()``. Re-run their deterministic init in-place here so hash
+        routing reads a valid table instead of garbage.
+        """
         self.weight.normal_(mean=0.0, std=0.01)
+
+        if self.is_hash_layer:
+            # Rebuild the int32 hash table exactly as __init__ does (see is_hash_layer branch).
+            vocab_size = self.config.actual_vocab_size
+            ids = self.arange(vocab_size, dtype=mstype.int32)
+            tid2eid = mint.stack(
+                [(ids + k) % self.num_experts for k in range(self.top_k)], dim=1
+            )
+            self.tid2eid.set_data(tid2eid)
+
+        if self.aux_loss_type == "global_aux_loss":
+            self.global_tokens_per_expert.zero_()
+            self.ga_steps.zero_()
 
     def _debug_force_load_balance_routing(
             self, scores: Tensor
@@ -191,14 +246,70 @@ class TopKRouter(nn.Cell):
 
         return scores_for_choice
 
+    def _hash_routing(
+            self, logits: Tensor, input_ids: Tensor
+    ) -> Tuple[Tensor, Tensor]:
+        """Hash-based routing: expert indices come from the tid2eid lookup table.
+
+        Scores are still computed from the gating logits for weight computation,
+        but expert selection is determined by the pre-computed hash table.
+        Aligns Megatron router.py:616-655.
+
+        Framework adaptation (RFC §3.4.2.2): unlike Megatron, which scatters the
+        result back to a dense ``[num_tokens, num_experts]`` routing_probs / routing_map,
+        the PyNative dispatcher consumes the ``[b*s, top_k]`` form, so this returns
+        ``(top_scores, selected_experts_indices)`` directly from the tid2eid lookup
+        (no dense scatter).
+
+        Args:
+            logits (Tensor): Gating logits, shape ``[num_tokens, num_experts]``.
+            input_ids (Tensor): Token IDs, shape ``[b, s]``.
+
+        Returns:
+            Tuple[Tensor, Tensor]:
+                - top_scores (Tensor): combine weights for selected experts, ``[num_tokens, top_k]``.
+                - selected_experts_indices (Tensor): expert indices, ``[num_tokens, top_k]`` int64.
+        """
+        # Scores are only used for combine weights; expert selection is from tid2eid.
+        if self.score_func == "sigmoid":
+            scores = self.sigmoid(self.cast(logits, mstype.float32))
+        elif self.score_func == "softmax":
+            scores = self.softmax(self.cast(logits, mstype.float32), dim=1)
+        elif self.score_func == "sqrtsoftplus":
+            scores = self.sqrt(self.softplus(self.cast(logits, mstype.float32)))
+        else:
+            raise NotImplementedError(f"Unknown score function {self.score_func}")
+
+        # input_ids is [b, s] from the model, but hidden_states are [s, b, h] and get
+        # flattened to [s*b, h]; transpose then flatten to align token order
+        # (aligns Megatron router.py:640-642 .T.reshape(-1)).
+        flat_ids = self.reshape(input_ids.T, (-1,))
+        # int64 keeps the returned indices consistent with the non-hash path (construct)
+        # and matches the documented int64 return type long().
+        selected_experts_indices = self.cast(
+            mint.index_select(self.tid2eid, 0, flat_ids),
+            mstype.int64
+        )
+
+        top_scores = self.gather(scores, dim=1, index=selected_experts_indices)
+        if self.score_func != "softmax":
+            denominator = self.sum(top_scores, dim=-1, keepdim=True) + 1e-20
+            top_scores = self.div(top_scores, denominator)
+        top_scores = self.mul(top_scores, self.route_scale)
+
+        return top_scores, selected_experts_indices
+
     def construct(
-            self, x: Tensor, expert_bias: Optional[Tensor] = None
+            self, x: Tensor, expert_bias: Optional[Tensor] = None,
+            input_ids: Optional[Tensor] = None
     ) -> Tuple[Tensor, Tensor, Tensor]:
         """
         Args:
             x (Tensor): Input tensor with shape ``(bs*slen, dim)``.
             expert_bias (Tensor | None, optional): Optional bias tensor for experts with shape ``(num_experts,)``.
                 Used for load balancing. Defaults to None.
+            input_ids (Tensor | None, optional): Token IDs with shape ``(b, s)``. Required on hash
+                layers (consumed by the tid2eid lookup); ignored on non-hash layers. Defaults to None.
 
         Returns:
             Tuple[Tensor, Tensor, Tensor]:
@@ -218,11 +329,29 @@ class TopKRouter(nn.Cell):
         x = self.cast(x, self.config.moe_router_dtype)
         logits = self.linear(x, self.weight)
 
+        # Hash-based routing: select experts from tid2eid, weights from gating scores.
+        if self.is_hash_layer:
+            if input_ids is None:
+                raise ValueError(
+                    "input_ids is required for hash-based routing but was None. "
+                    "Ensure moe_n_hash_layers is set correctly and input_ids are passed."
+                )
+            top_scores, selected_experts_indices = self._hash_routing(logits, input_ids)
+            num_tokens_per_expert = self.histc(
+                selected_experts_indices,
+                bins=self.num_experts,
+                min=0,
+                max=self.num_experts,
+            )
+            return top_scores, selected_experts_indices, num_tokens_per_expert
+
         # By default, sigmoid or softmax is performed in float32 to avoid loss explosion
         if self.score_func == "sigmoid":
             scores = self.sigmoid(self.cast(logits, mstype.float32))
         elif self.score_func == "softmax":
             scores = self.softmax(self.cast(logits, mstype.float32), dim=1)
+        elif self.score_func == "sqrtsoftplus":
+            scores = self.sqrt(self.softplus(self.cast(logits, mstype.float32)))
         else:
             raise NotImplementedError(f"Unknown score function {self.score_func}")
 

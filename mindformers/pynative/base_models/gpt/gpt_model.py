@@ -253,6 +253,7 @@ class GPTModel(nn.Cell):
         """Whether current runtime state should use chunked loss."""
         return self.training and self.chunk_loss_num > 1 and not self.return_logits
 
+    # pylint: disable=arguments-differ
     def construct(
             self,
             input_ids: Tensor,
@@ -417,12 +418,15 @@ class GPTModel(nn.Cell):
             attn_mask = self.concat_prefix((prefix_mask, attn_mask))
 
         # Run decoder.
+        # input_ids is forwarded so hash-based MoE layers can look up tid2eid;
+        # default None keeps non-hash models bit-for-bit unchanged.
         hidden_states = self.decoder(
             decoder_input,
             attn_mask,
             rotary_pos_emb,
             prefix_keys_values,
-            actual_seq_len
+            actual_seq_len,
+            input_ids=input_ids
         )
 
         return hidden_states, rotary_pos_emb
@@ -572,7 +576,8 @@ class GPTModel(nn.Cell):
     def reset_max_attention_logit(self):
         """Reset every per-layer max_logits_val to zeros."""
         for _, core_attn in self._iter_core_attentions():
-            core_attn.reset_parameter()
+            if hasattr(core_attn, "max_logits_val"):
+                core_attn.reset_parameter()
 
     def _preprocess_input_labels_and_masks(self,
                                            input_ids: Tensor,
