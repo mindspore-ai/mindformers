@@ -263,7 +263,6 @@ class MultiTokenPredictionLayer(nn.Cell):
             self.submodules.enorm,
             dim=config.hidden_size,
             eps=config.layernorm_epsilon,
-            params_dtype=config.params_dtype,
             compute_dtype=config.layernorm_compute_dtype
         )
 
@@ -271,7 +270,6 @@ class MultiTokenPredictionLayer(nn.Cell):
             self.submodules.hnorm,
             dim=config.hidden_size,
             eps=config.layernorm_epsilon,
-            params_dtype=config.params_dtype,
             compute_dtype=config.layernorm_compute_dtype
         )
 
@@ -294,7 +292,6 @@ class MultiTokenPredictionLayer(nn.Cell):
             self.submodules.layer_norm,
             dim=self.config.hidden_size,
             eps=self.config.layernorm_epsilon,
-            params_dtype=config.params_dtype,
             compute_dtype=config.layernorm_compute_dtype
         )
 

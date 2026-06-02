@@ -93,7 +93,6 @@ class TransformerLayer(nn.Cell, BaseTransformerLayer):
             submodules.input_layernorm,
             dim=config.hidden_size,
             eps=config.layernorm_epsilon,
-            params_dtype=config.params_dtype,
             compute_dtype=config.layernorm_compute_dtype
         )
 
@@ -109,7 +108,6 @@ class TransformerLayer(nn.Cell, BaseTransformerLayer):
             submodules.pre_cross_attn_layernorm,
             dim=config.hidden_size,
             eps=config.layernorm_epsilon,
-            params_dtype=config.params_dtype,
             compute_dtype=config.layernorm_compute_dtype
         )
 
@@ -127,7 +125,6 @@ class TransformerLayer(nn.Cell, BaseTransformerLayer):
             submodules.pre_mlp_layernorm,
             dim=config.hidden_size,
             eps=config.layernorm_epsilon,
-            params_dtype=config.params_dtype,
             compute_dtype=config.layernorm_compute_dtype
         )
 

@@ -62,6 +62,7 @@ from mindformers.pynative.distributed.context_parallel import (
     apply_context_parallel_model_io,
     build_context_parallel_attention_style,
 )
+from mindformers.pynative.layers.layer_norm import FusedLayerNorm, FusedRMSNorm
 from mindformers.pynative.distributed.tensor_parallel import NoParallel
 from mindformers.pynative.distributed.expert_parallel import ExpertParallel, DeredundancyExpertParallel
 from mindformers.pynative.distributed.parallelize import parallelize_module
@@ -105,6 +106,13 @@ def _unwrap_gptmodel(model: nn.Cell) -> nn.Cell:
     return gpt_models[0]
 
 
+def _layer_inner_hsdp_modules(layer: nn.Cell) -> List[nn.Cell]:
+    """Return all FSDP-wrapped sub-modules nested inside a layer (excluding the layer itself)."""
+    if not layer:
+        return []
+    return [m for _, m in layer.cells_and_names() if isinstance(m, HSDPModule) and m is not layer]
+
+
 def _setup_gpt_prefetch(
         embedding: nn.Cell,
         transformer_layers: List[nn.Cell],
@@ -112,11 +120,9 @@ def _setup_gpt_prefetch(
 ) -> None:
     """Set up forward and backward prefetch chains for GPT FSDP modules.
 
-    Args:
-        embedding: The embedding module.
-        final_layernorm: The final layer norm module.
-        output_layer: The output projection module.
-        transformer_layers: List of transformer layers.
+    Each layer additionally prefetches its own inner fully_shard-wrapped
+    sub-modules (norms, q/k norms inside self_attention, attn_hc/ffn_hc, MoE
+    experts) so their all-gathers can overlap with the layer's forward/backward.
     """
     if not transformer_layers:
         return
@@ -131,16 +137,21 @@ def _setup_gpt_prefetch(
 
     # --- Forward prefetch: embedding -> layer[0] -> ... -> [final_layernorm, output_layer] ---
     if embedding is not None and isinstance(embedding, HSDPModule):
-        embedding.set_modules_to_forward_prefetch([transformer_layers[0]])
+        targets = _layer_inner_hsdp_modules(transformer_layers[0])
+        targets.append(transformer_layers[0])
+        embedding.set_modules_to_forward_prefetch(targets)
 
     next_layers = transformer_layers[1:] + [None]
     for layer, next_layer in zip(transformer_layers, next_layers):
         if not isinstance(layer, HSDPModule):
             continue
+        targets = _layer_inner_hsdp_modules(next_layer)
         if next_layer is not None:
-            layer.set_modules_to_forward_prefetch([next_layer])
+            targets.append(next_layer)
         elif tail_modules is not None:
-            layer.set_modules_to_forward_prefetch(tail_modules)
+            targets.extend(tail_modules)
+        if targets:
+            layer.set_modules_to_forward_prefetch(targets)
 
     # --- Backward prefetch: output_layer -> layer[N-1] -> ... -> embedding ---
     reversed_layers = list(reversed(transformer_layers))
@@ -152,10 +163,13 @@ def _setup_gpt_prefetch(
     for layer, prev_layer in zip(reversed_layers, prev_layers):
         if not isinstance(layer, HSDPModule):
             continue
+        targets = _layer_inner_hsdp_modules(prev_layer)
         if prev_layer is not None:
-            layer.set_modules_to_backward_prefetch([prev_layer])
+            targets.append(prev_layer)
         elif embedding is not None and isinstance(embedding, HSDPModule):
-            layer.set_modules_to_backward_prefetch([embedding])
+            targets.append(embedding)
+        if targets:
+            layer.set_modules_to_backward_prefetch(targets)
 
 
 def _distribute_param(module, param_name, device_mesh, placements):
@@ -325,8 +339,23 @@ def _apply_mtp_concat_tp(
     )
 
 
+def _collect_layer_norms(layer):
+    """Collect independent norm submodules from a transformer layer for separate FSDP wrapping."""
+    norms = {}
+    norm_cls = (FusedLayerNorm, FusedRMSNorm)
+    for attr_name in ("input_layernorm", "pre_mlp_layernorm", "pre_cross_attn_layernorm"):
+        norm = getattr(layer, attr_name, None)
+        if isinstance(norm, norm_cls):
+            norms[attr_name] = norm
+    for attr_name in ("q_layernorm", "k_layernorm"):
+        norm = getattr(layer.self_attention, attr_name, None)
+        if isinstance(norm, norm_cls):
+            norms[attr_name] = norm
+    return norms
+
+
 def _collect_layer_replicate_params(layer):
-    """Collect parameters from a transformer layer that must be replicated (not sharded) under FSDP."""
+    """Collect non-module parameters that must be replicated (not sharded) under FSDP."""
     replicate_params = []
     if hasattr(layer.self_attention.core_attention, "max_logits_val"):
         replicate_params.append(layer.self_attention.core_attention.max_logits_val)
@@ -337,10 +366,16 @@ def _collect_layer_replicate_params(layer):
     if getattr(layer.mlp, "enable_expert_bias", False):
         replicate_params.append(layer.mlp.expert_bias)
 
-    if hasattr(layer, "attn_hc"):
-        replicate_params.extend(list(layer.attn_hc.get_parameters()))
-        replicate_params.extend(list(layer.ffn_hc.get_parameters()))
+    return replicate_params
 
+
+def _collect_hc_replicate_params(hc_module):
+    """Collect small HC params as replicate_params (avoid sharding issues with delayed init)."""
+    replicate_params = []
+    for attr in ("alpha_pre", "alpha_post", "alpha_res", "bias"):
+        p = getattr(hc_module, attr, None)
+        if p is not None:
+            replicate_params.append(p)
     return replicate_params
 
 
@@ -714,6 +749,7 @@ def apply_fsdp(
         model: nn.Cell,
         parallel_dims: Any,
         parallelism: Any,
+        accumulate_allreduce_grads_in_fp32: bool = True,
 ) -> None:
     """Apply FSDP/HSDP to a GPT model.
 
@@ -757,10 +793,6 @@ def apply_fsdp(
         )
         edp_mesh = parallel_dims.get_mesh(edp_mesh_names)
 
-    # --- Resolve dtypes ---
-    param_dtype_str = getattr(parallelism, "param_dtype", None)
-    reduce_dtype_str = getattr(parallelism, "reduce_dtype", None)
-
     # --- Build FSDP config ---
     reshard_policy = getattr(parallelism, "reshard_after_forward_policy", "default")
     reshard_after_forward = get_fsdp_reshard_after_forward_policy(
@@ -768,20 +800,17 @@ def apply_fsdp(
     )
 
     cpu_offload = getattr(parallelism, "cpu_offload", False)
+    reduce_dtype = ms.float32 if accumulate_allreduce_grads_in_fp32 else None
     fsdp_config = {
         "mesh": dp_mesh,
         "offload_policy": CPUOffloadPolicy() if cpu_offload else OffloadPolicy(),
+        "mp_policy": MixedPrecisionPolicy(reduce_dtype=reduce_dtype),
     }
     efsdp_config = {
         "mesh": edp_mesh,
         "offload_policy": CPUOffloadPolicy() if cpu_offload else OffloadPolicy(),
+        "mp_policy": MixedPrecisionPolicy(reduce_dtype=reduce_dtype),
     }
-
-    if param_dtype_str is not None:
-        param_dtype = _DTYPE_MAP.get(param_dtype_str, ms.bfloat16)
-        reduce_dtype = _DTYPE_MAP.get(reduce_dtype_str, ms.float32) if reduce_dtype_str is not None else ms.float32
-        fsdp_config["mp_policy"] = MixedPrecisionPolicy(param_dtype=param_dtype, reduce_dtype=reduce_dtype)
-        efsdp_config["mp_policy"] = MixedPrecisionPolicy(param_dtype=param_dtype, reduce_dtype=reduce_dtype)
 
     modules = {
         "embedding": getattr(gpt_model, "embedding", None),
@@ -825,11 +854,51 @@ def apply_fsdp(
             fully_shard(embedding, **fsdp_config, reshard_after_forward=reshard_after_forward)
 
     # --- 2. Wrap transformer layers ---
+    # Principle: small modules first, then larger modules
     for layer in layers:
+        # 2a. Expert FSDP (small expert block)
         if hasattr(layer.mlp, "experts") and edp_mesh is not None:
             with ms.DeviceCtx("meta"):
                 fully_shard(layer.mlp.experts, **efsdp_config, reshard_after_forward=reshard_after_forward)
 
+        # 2a'. Wrap MoE router (and shared-expert gate) independently. Their weights are
+        # stored in moe_router_dtype (fp32) for gradient precision, so they must NOT share
+        # an HSDP param-group with the layer's bf16 params — fully_shard asserts a single
+        # original dtype per group. Same treatment as the fp32 embedding wrapped above.
+        router = getattr(layer.mlp, "router", None)
+        if router is not None:
+            with ms.DeviceCtx("meta"):
+                fully_shard(router, **fsdp_config, reshard_after_forward=reshard_after_forward)
+        shared_experts = getattr(layer.mlp, "shared_experts", None)
+        shared_gate = getattr(shared_experts, "shared_experts_gate", None) if shared_experts is not None else None
+        if shared_gate is not None:
+            with ms.DeviceCtx("meta"):
+                fully_shard(shared_gate, **fsdp_config, reshard_after_forward=reshard_after_forward)
+
+        # 2b. Wrap norms independently (small modules first)
+        layer_norms = _collect_layer_norms(layer)
+        for norm in layer_norms.values():
+            with ms.DeviceCtx("meta"):
+                fully_shard(norm, **fsdp_config)
+
+        # 2c. Wrap HC modules independently (small modules, all params replicated)
+        def shard_plan(param):
+            if len(param.shape) == 1:
+                return Shard(0)
+            return Shard(1)
+
+        if hasattr(layer, "attn_hc"):
+            with ms.DeviceCtx("meta"):
+                fully_shard(layer.attn_hc, **fsdp_config, shard_placement_fn=shard_plan,
+                            reshard_after_forward=reshard_after_forward,
+                            replicate_params=_collect_hc_replicate_params(layer.attn_hc))
+        if hasattr(layer, "ffn_hc"):
+            with ms.DeviceCtx("meta"):
+                fully_shard(layer.ffn_hc, **fsdp_config, shard_placement_fn=shard_plan,
+                            reshard_after_forward=reshard_after_forward,
+                            replicate_params=_collect_hc_replicate_params(layer.ffn_hc))
+
+        # 2d. Wrap the transformer layer (large module)
         replicate_params = _collect_layer_replicate_params(layer)
         with ms.DeviceCtx("meta"):
             fully_shard(
@@ -839,24 +908,22 @@ def apply_fsdp(
                 replicate_params=replicate_params
             )
 
-    # --- 3. Wrap final_layernorm and output_layer together ---
+    # --- 3. Wrap final_layernorm and output_layer independently ---
+    # Principle: small modules (norms) first, then larger modules (output_layer)
     if tail_modules:
         with ms.DeviceCtx("meta"):
-            if not mtp:
-                # As an optimization, do not reshard_after_forward the last layers by default
-                # since FSDP would prefetch them immediately after the forward pass.
-                fully_shard(
-                    tail_modules,
-                    **fsdp_config,
-                    reshard_after_forward=reshard_policy == "always"
-                )
-            else:
-                for tail_module in tail_modules:
-                    fully_shard(
-                        tail_module,
-                        **fsdp_config,
-                        reshard_after_forward=reshard_policy == "always"
-                    )
+            for tm in tail_modules:
+                if isinstance(tm, (FusedLayerNorm, FusedRMSNorm)):
+                    # Small module: wrap norm independently
+                    with ms.DeviceCtx("meta"):
+                        fully_shard(tm, **fsdp_config)
+                else:
+                    # Larger module: output_layer, do not reshard_after_forward by default
+                    # since FSDP would prefetch it immediately after the forward pass.
+                    with ms.DeviceCtx("meta"):
+                        fully_shard(tm,
+                                    **fsdp_config,
+                                    reshard_after_forward=reshard_policy == "always")
 
     if mtp:
         for layer in mtp.layers:
@@ -1004,6 +1071,7 @@ def parallelize_gptmodel(
         recompute: Any,
         recompute_comm: Any,
         swap: Any,
+        accumulate_allreduce_grads_in_fp32: bool = True,
 ) -> nn.Cell:
     """Unified GPTModel parallelization entry point."""
     logger.info("Starting GPTModel parallelization for MCore architecture...")
@@ -1051,7 +1119,7 @@ def parallelize_gptmodel(
 
     # Phase 5: FSDP/HSDP
     if parallel_dims.fsdp_enabled:
-        apply_fsdp(model, parallel_dims, parallelism)
+        apply_fsdp(model, parallel_dims, parallelism, accumulate_allreduce_grads_in_fp32)
 
     for param_name, param in model.parameters_and_names():
         if isinstance(param, DTensor):

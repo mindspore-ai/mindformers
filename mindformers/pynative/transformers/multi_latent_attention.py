@@ -170,11 +170,24 @@ class MultiLatentAttention(nn.Cell):
             return None
         return rows // rows_per_head
 
-    def _get_qk_clip_weight(self, param_name):
-        """Return the MLA projection weight addressed by an optimizer parameter name."""
+    def _get_qk_clip_weight(self, param_name, fp32_param_map=None):
+        """Return the MLA projection weight addressed by an optimizer parameter name.
+
+        When ``fp32_param_map`` is provided (Muon mixed-precision path), the fp32
+        master copy is returned so QK-clip scales the value the optimizer reads,
+        not the bf16/fp16 model parameter that gets overwritten on the next
+        copy-back.
+        """
         for attr in ("linear_qb", "linear_kvb", "linear_qkv"):
             if f"self_attention.{attr}.weight" in param_name:
-                return getattr(getattr(self, attr, None), "weight", None)
+                param = getattr(getattr(self, attr, None), "weight", None)
+                if param is None:
+                    return None
+                if fp32_param_map is not None:
+                    fp32_param = fp32_param_map.get(param.name)
+                    if fp32_param is not None:
+                        return fp32_param
+                return param
         return None
 
     def can_apply_qk_clip_to_local_weights(self, scales):
@@ -194,20 +207,24 @@ class MultiLatentAttention(nn.Cell):
         kv_heads = self._local_head_count(kv_local, (self.qk_head_dim, self.v_head_dim))
         return q_heads == scale_heads and kv_heads == scale_heads
 
-    def try_apply_qk_clip_to_local_weights(self, param_prefix, scales, split_fn, merge_fn):
+    def try_apply_qk_clip_to_local_weights(self, param_prefix, scales, split_fn, merge_fn,
+                                           fp32_param_map=None):
         """Apply QK-clip on local TP shards without gathering full projection weights."""
         if not self.can_apply_qk_clip_to_local_weights(scales):
             return False
 
         self._apply_qk_clip_to_local_weight(
-            f"{param_prefix}.linear_qb.weight", scales, split_fn, merge_fn)
+            f"{param_prefix}.linear_qb.weight", scales, split_fn, merge_fn,
+            fp32_param_map=fp32_param_map)
         self._apply_qk_clip_to_local_weight(
-            f"{param_prefix}.linear_kvb.weight", scales, split_fn, merge_fn)
+            f"{param_prefix}.linear_kvb.weight", scales, split_fn, merge_fn,
+            fp32_param_map=fp32_param_map)
         return True
 
-    def _apply_qk_clip_to_local_weight(self, param_name, scales, split_fn, merge_fn):
+    def _apply_qk_clip_to_local_weight(self, param_name, scales, split_fn, merge_fn,
+                                       fp32_param_map=None):
         """Apply QK-clip to one local MLA projection shard."""
-        param = self._get_qk_clip_weight(param_name)
+        param = self._get_qk_clip_weight(param_name, fp32_param_map=fp32_param_map)
         if param is None:
             return
         local_param = self._to_local_tensor(param)
@@ -227,17 +244,20 @@ class MultiLatentAttention(nn.Cell):
         with SkipDTensorDispatch():
             param.copy_(weights)
 
-    def apply_qk_clip_to_weights(self, param_prefix, scales, split_fn, merge_fn):
+    def apply_qk_clip_to_weights(self, param_prefix, scales, split_fn, merge_fn,
+                                 fp32_param_map=None):
         """Apply QK-clip scaling to all MLA projection weights owned by this layer."""
         for weight_name in ("linear_qb.weight", "linear_kvb.weight", "linear_qkv.weight"):
-            self.apply_qk_clip_to_weight(f"{param_prefix}.{weight_name}", scales, split_fn, merge_fn)
+            self.apply_qk_clip_to_weight(f"{param_prefix}.{weight_name}", scales, split_fn, merge_fn,
+                                         fp32_param_map=fp32_param_map)
 
-    def apply_qk_clip_to_weight(self, param_name, scales, split_fn, merge_fn):
+    def apply_qk_clip_to_weight(self, param_name, scales, split_fn, merge_fn,
+                                fp32_param_map=None):
         """Apply QK-clip scaling to an MLA projection weight in-place."""
         if "self_attention.linear_qkv.weight" in param_name and self.config.q_lora_rank is not None:
             return
 
-        param = self._get_qk_clip_weight(param_name)
+        param = self._get_qk_clip_weight(param_name, fp32_param_map=fp32_param_map)
         if param is None:
             return
 
@@ -378,7 +398,6 @@ class MLASelfAttention(MultiLatentAttention):
                     submodules.q_layernorm,
                     dim=self.config.q_lora_rank,
                     eps=self.config.layernorm_epsilon,
-                    params_dtype=config.params_dtype,
                     compute_dtype=config.layernorm_compute_dtype
                 )
             else:
@@ -409,7 +428,6 @@ class MLASelfAttention(MultiLatentAttention):
                 submodules.k_layernorm,
                 dim=self.kv_lora_rank,
                 eps=self.config.layernorm_epsilon,
-                params_dtype=config.params_dtype,
                 compute_dtype=config.layernorm_compute_dtype
             )
         else:

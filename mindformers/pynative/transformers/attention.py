@@ -302,7 +302,6 @@ class SelfAttention(Attention):
                 submodules.q_layernorm,
                 dim=self.head_dim,
                 compute_dtype=self.layernorm_compute_dtype,
-                params_dtype=self.config.params_dtype,
                 eps=self.config.layernorm_epsilon
             )
         else:
@@ -312,7 +311,6 @@ class SelfAttention(Attention):
             self.k_layernorm = build_module(
                 submodules.k_layernorm,
                 compute_dtype=self.layernorm_compute_dtype,
-                params_dtype=self.config.params_dtype,
                 dim=self.head_dim,
                 eps=self.config.layernorm_epsilon
             )

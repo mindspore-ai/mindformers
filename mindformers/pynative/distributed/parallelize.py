@@ -138,11 +138,14 @@ def parallelize_model(
     recompute: Any,
     recompute_comm: Any,
     swap: Any,
+    accumulate_allreduce_grads_in_fp32: bool = True,
 ) -> nn.Cell:
     """Route to the correct model-specific parallelization function.
 
     Args:
         model: The model to parallelize.
+        accumulate_allreduce_grads_in_fp32: If True, FSDP reduce-scatter and all-reduce
+            use fp32 precision. Aligns with Megatron-LM.
 
     Returns:
         The parallelized model.
@@ -154,7 +157,8 @@ def parallelize_model(
     if model_cls in _PARALLELIZE_FN:
         logger.info("Parallelizing %s", model_cls.__name__)
         return _PARALLELIZE_FN[model_cls](
-            model, parallel_dims, parallelism, recompute, recompute_comm, swap
+            model, parallel_dims, parallelism, recompute, recompute_comm, swap,
+            accumulate_allreduce_grads_in_fp32=accumulate_allreduce_grads_in_fp32,
         )
     registered = [c.__name__ for c in _PARALLELIZE_FN]
     raise ValueError(

@@ -93,6 +93,13 @@ class TrainMode(enum.Enum):
     PRETRAIN = "pretrain"
 
 
+def _cast_grad_to_fp32(grad):
+    """Backward hook: cast gradient to fp32 if it is in a lower-precision dtype."""
+    if grad.dtype in (ms.bfloat16, ms.float16):
+        return ops.cast(grad, ms.float32)
+    return grad
+
+
 class Trainer:
     """
     Trainer for training models in MindFormers.
@@ -296,7 +303,10 @@ class Trainer:
             parallelism=parallelism,
             recompute=self.config.recompute,
             recompute_comm=self.config.recompute_comm,
-            swap=self.config.swap
+            swap=self.config.swap,
+            accumulate_allreduce_grads_in_fp32=(
+                self.config.optimizer.accumulate_allreduce_grads_in_fp32
+            ),
         )
         return model
 
@@ -539,6 +549,29 @@ class Trainer:
             is_train_end=False,
         )
 
+    def _register_grad_hooks(self):
+        """Register backward hooks to cast low-precision gradients to fp32.
+
+        When enabled, bf16/fp16 parameter gradients are cast to fp32 during backward
+        so that gradient accumulation and all-reduce operate in fp32 precision,
+        aligning with Megatron-LM's accumulate_allreduce_grads_in_fp32 behavior.
+        """
+        if not self.config.optimizer.accumulate_allreduce_grads_in_fp32:
+            return
+
+        low_precision_types = (ms.bfloat16, ms.float16)
+        hook_count = 0
+        for param in self.model.trainable_params():
+            if param.dtype in low_precision_types:
+                hook_count += 1
+                param.register_hook(_cast_grad_to_fp32)
+
+        if hook_count > 0:
+            logger.info(
+                "[GradReduceFP32] Registered fp32-cast hooks on %d low-precision parameters",
+                hook_count,
+            )
+
     def train(
         self,
         checkpoint_path: Optional[str] = None,
@@ -565,6 +598,9 @@ class Trainer:
         checkpoint_path = checkpoint_path or self.config.checkpoint.load_path
         if checkpoint_path:
             self._load_checkpoint(checkpoint_path, self.model, self.optimizer)
+
+        # Register gradient hooks for fp32 accumulation
+        self._register_grad_hooks()
 
         # Call train begin callback
         self.callback_handler.on_train_begin(self.config, self.state)
@@ -634,6 +670,13 @@ class Trainer:
             global_step=global_step,
             balanced_load=checkpoint.load_balanced,
         )
+
+        # When optimizer state is not loaded (weights-only resume), the fp32 master
+        # weights still hold their pre-load init values. Refresh them from the freshly
+        # loaded model params so master and model start aligned.
+        if checkpoint.no_load_optim and optimizer is not None:
+            logger.info("no_load_optim=True: refreshing fp32 master weights from loaded model params.")
+            optimizer.reload_main_params_from_model()
 
     def _inner_train_loop(self):
         """

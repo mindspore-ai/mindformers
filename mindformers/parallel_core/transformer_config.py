@@ -1052,6 +1052,18 @@ class TransformerConfig:
         }
     )
 
+    embedding_params_dtype: str = field(
+        default="float32",
+        metadata={
+            "description": "Storage dtype of the word-embedding table. Defaults to float32 so the "
+                           "embedding gradient (a scatter-add over all tokens) accumulates in fp32 "
+                           "and matches a full-fp32 reference.",
+            "usage": ParamUsage.COMMON,
+            "source": ParamSource.MF,
+            "mode": ParamMode.PYNATIVE
+        }
+    )
+
     ###################
     # CPU Offloading
     ###################
@@ -2086,6 +2098,7 @@ class TransformerConfig:
         self.rotary_dtype = convert_str_to_mstype(self.rotary_dtype)
         self.moe_router_dtype = convert_str_to_mstype(self.moe_router_dtype)
         self.softmax_compute_dtype = convert_str_to_mstype(self.softmax_compute_dtype)
+        self.embedding_params_dtype = convert_str_to_mstype(self.embedding_params_dtype)
 
         if not isinstance(self.hidden_dropout, float) or not 0 <= self.hidden_dropout < 1:
             raise ValueError(f"hidden_dropout should be a float within [0, 1), but get {self.hidden_dropout}.")

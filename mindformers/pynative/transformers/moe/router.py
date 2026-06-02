@@ -69,7 +69,7 @@ class TopKRouter(nn.Cell):
             else 1.0
         )
         self.weight = Parameter(
-            mint.empty((num_experts, dim)), name="weight"
+            mint.empty((num_experts, dim), dtype=config.moe_router_dtype), name="weight"
         )
         self.num_experts = num_experts
         self.num_expert_groups = num_expert_groups or 0
@@ -216,8 +216,7 @@ class TopKRouter(nn.Cell):
         # scores shape (bs*slen, num_experts)
         # Compute gate in float32 to help stability of expert load balancing.
         x = self.cast(x, self.config.moe_router_dtype)
-        weight = self.cast(self.weight, self.config.moe_router_dtype)
-        logits = self.linear(x, weight)
+        logits = self.linear(x, self.weight)
 
         # By default, sigmoid or softmax is performed in float32 to avoid loss explosion
         if self.score_func == "sigmoid":

@@ -63,11 +63,11 @@ class LanguageModelEmbedding(nn.Cell):
         self.num_tokentypes = num_tokentypes
         self.init_method = config.init_method
 
-        # Word embedding
         self.word_embeddings = VocabEmbedding(
             num_embeddings=vocab_size,
             embedding_dim=config.hidden_size,
-            init_method=self.init_method)
+            init_method=self.init_method,
+            params_dtype=config.embedding_params_dtype)
 
         # Position embedding
         self.add_position_embedding = position_embedding_type == 'learned_absolute'
@@ -75,7 +75,8 @@ class LanguageModelEmbedding(nn.Cell):
             self.position_embeddings = VocabEmbedding(
                 num_embeddings=max_sequence_length,
                 embedding_dim=config.hidden_size,
-                init_method=self.init_method)
+                init_method=self.init_method,
+                params_dtype=config.embedding_params_dtype)
         else:
             self.position_embeddings = None
 
@@ -84,7 +85,8 @@ class LanguageModelEmbedding(nn.Cell):
             self.tokentype_embeddings = VocabEmbedding(
                 num_embeddings=num_tokentypes,
                 embedding_dim=config.hidden_size,
-                init_method=self.init_method)
+                init_method=self.init_method,
+                params_dtype=config.embedding_params_dtype)
         else:
             self.tokentype_embeddings = None
 

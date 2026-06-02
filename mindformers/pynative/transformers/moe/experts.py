@@ -74,10 +74,12 @@ class GroupedMLP(nn.Cell):
 
         # parameters
         self.weight1 = Parameter(
-            mint.empty([self.num_local_experts, self.hidden_size, self.moe_ffn_hidden_size]),
+            mint.empty([self.num_local_experts, self.hidden_size, self.moe_ffn_hidden_size],
+                       dtype=self.config.params_dtype),
             name='w1')
         self.weight2 = Parameter(
-            mint.empty([self.num_local_experts, self.config.moe_ffn_hidden_size, self.hidden_size]),
+            mint.empty([self.num_local_experts, self.config.moe_ffn_hidden_size, self.hidden_size],
+                       dtype=self.config.params_dtype),
             name='w2')
 
         self.cast = ops.cast

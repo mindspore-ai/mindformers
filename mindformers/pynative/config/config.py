@@ -351,12 +351,6 @@ class ParallelismConfig(BaseConfig):
     data_parallel_shard_strategy: str = "optim_grads_params"
     """Data parallel sharding strategy"""
 
-    param_dtype: str = "float32"
-    """Parameter data type for FSDP (float16/float32/bfloat16)"""
-
-    reduce_dtype: str = "float32"
-    """Gradient reduction data type for FSDP (float16/float32/bfloat16)"""
-
     reshard_after_forward_policy: str = "default"
     """FSDP reshard policy: always/never/default"""
 
@@ -452,6 +446,11 @@ class OptimizerConfig(BaseConfig):
 
     weight_decay_exclude: Optional[List[str]] = None
     """Parameter name rules that force weight decay off"""
+
+    accumulate_allreduce_grads_in_fp32: bool = True
+    """When True, register backward hooks on bf16/fp16 parameters to cast gradients to fp32
+    before storage, so gradient accumulation and optimizer step operate in fp32 precision.
+    Aligns with Megatron-LM's accumulate_allreduce_grads_in_fp32 behavior."""
 
 
 @dataclass

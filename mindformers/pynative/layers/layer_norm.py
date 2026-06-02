@@ -54,9 +54,6 @@ class FusedLayerNorm(nn.Cell):
         eps (float, optional):
             Small constant added to variance for numerical stability.
             Default: 1e-5.
-        params_dtype (mindspore.dtype, optional):
-            Data type of learnable parameters (gamma, beta).
-            Default: mindspore.float32.
         compute_dtype (mindspore.dtype, optional):
             Data type used during LayerNorm computation.
             Default: mindspore.float32.
@@ -71,19 +68,18 @@ class FusedLayerNorm(nn.Cell):
             Normalized tensor with the same shape and dtype as the input.
     """
 
-    def __init__(self, dim, eps=1e-5, params_dtype=dtype.float32, compute_dtype=dtype.float32):
+    def __init__(self, dim, eps=1e-5, compute_dtype=dtype.float32):
         super().__init__()
-        self.params_dtype = params_dtype
         self.compute_type = compute_dtype
         self.eps = eps
 
         self.layer_norm = layer_norm
         self.gamma = Parameter(
-            mint.empty(dim, dtype=self.params_dtype),
+            mint.empty(dim, dtype=self.compute_type),
             name="gamma"
         )
         self.beta = Parameter(
-            mint.empty(dim, dtype=self.params_dtype),
+            mint.empty(dim, dtype=self.compute_type),
             name="beta"
         )
         self.cast = cast
@@ -91,9 +87,10 @@ class FusedLayerNorm(nn.Cell):
     def construct(self, x):
         """Apply fused Layer Normalization."""
         original_type = x.dtype
-        output = self.layer_norm(self.cast(x, self.compute_type), x.shape[-1], self.gamma, self.beta, self.eps)
-        output = self.cast(output, original_type)
-        return output
+        compute_type = self.compute_type
+        x = self.cast(x, compute_type)
+        output = self.layer_norm(x, x.shape[-1], self.gamma, self.beta, self.eps)
+        return self.cast(output, original_type)
 
     def reset_parameter(self):
         """Reset LayerNorm parameters for delayed initialization."""
@@ -119,9 +116,6 @@ class FusedRMSNorm(nn.Cell):
         eps (float, optional):
             Small constant added for numerical stability.
             Default: 1e-5.
-        params_dtype (mindspore.dtype, optional):
-            Data type of the learnable weight parameter.
-            Default: mindspore.float32.
         compute_dtype (mindspore.dtype, optional):
             Data type used during RMSNorm computation.
             Default: mindspore.float32.
@@ -136,13 +130,12 @@ class FusedRMSNorm(nn.Cell):
             Normalized tensor with the same shape and dtype as the input.
     """
 
-    def __init__(self, dim, eps=1e-5, params_dtype=dtype.float32, compute_dtype=dtype.float32):
+    def __init__(self, dim, eps=1e-5, compute_dtype=dtype.float32):
         super().__init__()
-        self.params_dtype = params_dtype
         self.compute_type = compute_dtype
 
         self.eps = eps
-        self.weight = Parameter(mint.empty(dim, dtype=self.params_dtype))
+        self.weight = Parameter(mint.empty(dim, dtype=self.compute_type))
 
         self.norm = rms_norm
         self.cast = cast
@@ -150,9 +143,11 @@ class FusedRMSNorm(nn.Cell):
     def construct(self, x):
         """Apply fused RMS Normalization."""
         original_type = x.dtype
-        output = self.norm(self.cast(x, self.compute_type), self.weight, self.eps)[0]
-        output = self.cast(output, original_type)
-        return output
+        compute_type = self.compute_type
+        x = self.cast(x, compute_type)
+        weight = self.cast(self.weight, compute_type) if self.weight.dtype != compute_type else self.weight
+        output = self.norm(x, weight, self.eps)[0]
+        return self.cast(output, original_type)
 
     def reset_parameter(self):
         """Reset RMSNorm parameters for delayed initialization."""
