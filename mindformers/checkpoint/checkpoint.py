@@ -501,7 +501,7 @@ def load_checkpoint(
     else:
         dst_sharded_tensor_metas = get_cur_sharded_tensor(network, filter_func) \
             if get_real_group_size() > 1 else get_sharded_tensor_from_cell(network, optimizer)
-        if LayoutAdapter.is_pynative_mode() and get_real_group_size() > 1:
+        if optimizer and LayoutAdapter.is_pynative_mode() and get_real_group_size() > 1:
             dst_sharded_tensor_metas_opt = get_cur_sharded_tensor(optimizer, filter_func)
             for key, value in dst_sharded_tensor_metas_opt.items():
                 if key not in dst_sharded_tensor_metas:

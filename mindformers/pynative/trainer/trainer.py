@@ -624,7 +624,7 @@ class Trainer:
         load_checkpoint(
             checkpoint=checkpoint_path,
             network=model,
-            optimizer=optimizer,
+            optimizer=optimizer if not checkpoint.no_load_optim else None,
             global_step=global_step,
             balanced_load=checkpoint.load_balanced,
         )
