@@ -26,8 +26,10 @@ from mindformers.pynative.distributed.style import (
 )
 
 
-def _prepare_attention_qkv(method, args):
+def _prepare_attention_qkv(method, args, input_layout=None):
     """Convert model-native SBND QKV to the layout expected by CP FlashAttention."""
+    if (input_layout or "").upper() == "TND":
+        return tuple(args)
     new_args = list(args)
     query, key, value = new_args[:3]
     seq_len, batch_size = query.shape[:2]
@@ -46,8 +48,10 @@ def _prepare_attention_qkv(method, args):
     return tuple(new_args)
 
 
-def _restore_attention_output(method, output):
+def _restore_attention_output(method, output, input_layout=None):
     """Convert CP FlashAttention output back to model-native SBH."""
+    if (input_layout or "").upper() == "TND":
+        return output
     if method == "colossal":
         return mint.transpose(output, 0, 1)
 
@@ -77,11 +81,11 @@ class ContextParallelAttentionStyle(ParallelStyle):
 
         def input_fn(hook_module, args, kwargs):
             del hook_module
-            return _prepare_attention_qkv(self.method, args), kwargs
+            return _prepare_attention_qkv(self.method, args, self.input_layout), kwargs
 
         def output_fn(hook_module, args, kwargs, outputs):
             del hook_module, args, kwargs
-            return _restore_attention_output(self.method, outputs)
+            return _restore_attention_output(self.method, outputs, self.input_layout)
 
         module.register_forward_pre_hook(input_fn, with_kwargs=True)
         hp_style = build_hp_cp_style(
