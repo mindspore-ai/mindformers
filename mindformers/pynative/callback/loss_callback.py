@@ -125,6 +125,8 @@ class LossCallback(TrainerCallback):
 
         model = kwargs.get("model")
         model_config = deepcopy(model.get_gpt_transformer_config())
+        metric_group = kwargs.get("metric_reduce_group")
+        metric_group_size = kwargs.get("metric_reduce_group_size")
         reset_model_temporary_tensors(model_config, model)
 
         # process aux loss
@@ -133,6 +135,8 @@ class LossCallback(TrainerCallback):
             num_layers=model_config.num_layers,
             moe_layer_freq=model_config.moe_layer_freq,
             mtp_num_layers=model_config.mtp_num_layers,
+            group=metric_group,
+            group_size=metric_group_size,
         )
         if load_balancing_loss is not None:
             load_balancing_loss /= state.num_accumulation_steps
@@ -140,7 +144,7 @@ class LossCallback(TrainerCallback):
             _update_expert_bias(model)
 
         # process mtp loss
-        mtp_loss = track_mtp_metrics()
+        mtp_loss = track_mtp_metrics(group=metric_group, group_size=metric_group_size,)
         if mtp_loss:
             mtp_loss_values = []
             for ind, val in enumerate(mtp_loss):

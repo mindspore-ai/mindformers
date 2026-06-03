@@ -24,8 +24,10 @@ from typing import Literal, Optional, Union
 
 from hyper_parallel import SkipDTensorDispatch
 from hyper_parallel.core.dtensor.dtensor import DTensor, distribute_tensor
+
 from mindspore import Tensor, dtype, nn, mint, ops
 from mindspore.mint.distributed import all_reduce, get_world_size
+from mindspore._c_expression import pyboost_detach
 
 from mindformers.tools.logger import logger
 from mindformers.pynative.loss.loss import CrossEntropyLoss
@@ -93,6 +95,10 @@ class GPTModel(nn.Cell):
             rope_scaling_factor: float = 8.0,
             seq_len_interpolation_factor: Optional[float] = None,
             mtp_block_spec: ModuleSpec = None,
+            layer_start: int = 0,
+            layer_end: int = None,
+            vp_size: int = 1,
+            stage_idx: int = 0,
     ):
         super().__init__()
 
@@ -100,8 +106,10 @@ class GPTModel(nn.Cell):
         self.transformer_layer_spec = transformer_layer_spec
         self.vocab_size = vocab_size
         self.max_sequence_length = max_sequence_length
-        self.pre_process = pre_process
-        self.post_process = post_process
+        self.layer_start = layer_start
+        self.layer_end = layer_end if layer_end else config.num_layers - 1
+        self.pre_process = pre_process and (self.layer_start == 0)
+        self.post_process = post_process and (self.layer_end == config.num_layers - 1)
         self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
         self.use_attn_mask_compression = config.use_attn_mask_compression or config.use_eod_attn_mask_compression
         self.return_logits = False
@@ -125,7 +133,9 @@ class GPTModel(nn.Cell):
         self.rotary_seq_len_interpolation_factor = seq_len_interpolation_factor \
             if seq_len_interpolation_factor is not None else config.rotary_seq_len_interpolation_factor
         self.seq_length = config.seq_length
-        self.mtp_process = mtp_block_spec is not None
+        self.mtp_process = mtp_block_spec is not None and self.post_process
+        self.stage_idx = stage_idx
+        self.vp_size = vp_size
 
         # get value from config
         self.use_eod_attn_mask_compression = config.use_eod_attn_mask_compression
@@ -212,6 +222,8 @@ class GPTModel(nn.Cell):
             # so it won't cause significant impact.
             pre_process=self.pre_process,
             post_process=self.post_process,
+            layer_start=self.layer_start,
+            layer_end=self.layer_end,
         )
 
         # Output
@@ -318,7 +330,7 @@ class GPTModel(nn.Cell):
             )
 
         if not self.post_process:
-            return hidden_states
+            return input_ids, labels, hidden_states, attention_mask
 
         if self.mtp_process:
             hidden_states = process_mtp_loss(
@@ -363,6 +375,8 @@ class GPTModel(nn.Cell):
         if self.calculate_per_token_loss:
             numerator0, denominator0 = loss
             return numerator0, denominator0
+        logits = pyboost_detach(logits)
+        hidden_states = pyboost_detach(hidden_states)
         return loss, logits, hidden_states
 
     def language_model(
@@ -463,8 +477,7 @@ class GPTModel(nn.Cell):
 
     def _iter_self_attentions(self):
         """Yield (layer_idx, param_name_prefix, self_attention_module) for every transformer / MTP layer."""
-        num_layers = self.config.num_layers
-        for i in range(num_layers):
+        for i in range(self.layer_start, self.layer_end + 1):
             self_attn = self.decoder.layers[i].self_attention
             yield i, f"decoder.layers.{i}.self_attention", self_attn
 

@@ -65,6 +65,32 @@ def _get_block_submodules(
         raise Exception(f"specialize for {spec.module.__name__}.")
     raise Exception(f"specialize for {type(spec).__name__}.")
 
+class CustomIndexCellList(nn.CellList):
+    """
+    Custom CellList that supports indexed access.
+    """
+    def __init__(self, indexed_cells=None):
+        super().__init__()
+
+        if indexed_cells is not None:
+            for idx, cell in indexed_cells:
+                if not isinstance(cell, nn.Cell):
+                    raise TypeError(f"Item must be the subclass of the nn.Cell, but get {type(cell).__name__}")
+
+                self._cells[str(idx)] = cell
+
+    def __setitem__(self, idx, cell):
+        if not isinstance(cell, nn.Cell):
+            raise TypeError("Item must be the subclass of the nn.Cell")
+        self._cells[str(idx)] = cell
+
+    def __getitem__(self, idx):
+        return self._cells[str(idx)]
+
+    def get_first_cell(self):
+        if not self._cells:
+            return None
+        return next(iter(self._cells.values()))
 
 class TransformerBlock(nn.Cell):
     """
@@ -101,6 +127,8 @@ class TransformerBlock(nn.Cell):
             post_layer_norm: bool = True,
             pre_process: bool = True,
             post_process: bool = True,
+            layer_start: int = 0,
+            layer_end: int = None,
     ):
         super().__init__()
 
@@ -111,6 +139,8 @@ class TransformerBlock(nn.Cell):
         self.post_process = post_process
         self.num_layers = config.num_layers
         self.hc = config.enable_hyper_connections
+        self.layer_start = layer_start
+        self.layer_end = layer_end
         if config.enable_hyper_connections:
             self.n = config.num_residual_streams
             self.hidden_size = config.hidden_size
@@ -138,12 +168,13 @@ class TransformerBlock(nn.Cell):
                 config.mhc_init_gating_factor,
             )
 
-        self.layers = nn.CellList()
-        for layer_id in range(config.num_layers):
+        custom_layers = []
+        for layer_id in range(self.layer_start, self.layer_end + 1):
             layer = build_module(self.submodules.layer_specs[layer_id], config=config, layer_number=layer_id)
-            self.layers.append(layer)
+            custom_layers.append((layer_id, layer))
+        self.layers = CustomIndexCellList(custom_layers)
 
-        if self.post_layer_norm:
+        if self.post_layer_norm and self.post_process:
             self.final_layernorm = build_module(self.submodules.layer_norm,
                                                 dim=config.hidden_size,
                                                 eps=config.layernorm_epsilon,
@@ -189,7 +220,7 @@ class TransformerBlock(nn.Cell):
             hidden_states = self.tile(hidden_states, (1, 1, self.n, 1))
             hidden_states = self.reshape(hidden_states, (s, -1, self.n * self.hidden_size))
 
-        for index in range(self.num_layers):
+        for index in range(self.layer_start, self.layer_end + 1):
             layer = self._get_layer(index)
             prefix_kv = prefix_keys_values[index] if prefix_keys_values is not None else None
             hidden_states, _ = layer(
@@ -207,7 +238,7 @@ class TransformerBlock(nn.Cell):
             hidden_states = self.mean(hidden_states, dim=2)
 
         # final layernorm.
-        if self.post_layer_norm:
+        if self.post_layer_norm and self.post_process:
             hidden_states = self.final_layernorm(hidden_states)
 
         return hidden_states

@@ -37,6 +37,7 @@ from mindspore.mint.distributed import get_world_size
 from mindspore.ops.communication import set_comm_ops_inplace
 
 from hyper_parallel import DeviceMesh
+from hyper_parallel.core.pipeline_parallel import ScheduleInterleaved1F1B
 from hyper_parallel.core.dtensor.dtensor import DTensor, distribute_tensor
 from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
 from hyper_parallel.core.fully_shard.api import (
@@ -65,6 +66,7 @@ from mindformers.pynative.distributed.context_parallel import (
 from mindformers.pynative.layers.layer_norm import FusedLayerNorm, FusedRMSNorm
 from mindformers.pynative.distributed.tensor_parallel import NoParallel
 from mindformers.pynative.distributed.expert_parallel import ExpertParallel, DeredundancyExpertParallel
+from mindformers.pynative.distributed.pipeline_parallel import PpLayerSetting, StageModelBuilder
 from mindformers.pynative.distributed.parallelize import parallelize_module
 from mindformers.pynative.distributed.activation_checkpoint import apply_ac
 from mindformers.pynative.distributed.utils import distribute_module
@@ -581,17 +583,33 @@ def apply_non_moe_tp(
         PrepareModuleInputOutput,
     )
 
-    model_plan = {
-        "model.embedding.word_embeddings": embed_plan,
-        "model.decoder.final_layernorm": SequenceParallel(
-            sequence_dim=0, use_local_output=False) if enable_sp else NoParallel(),
-        "model.output_layer": ColwiseParallel(
-            input_layouts=sp_layout,
-            output_layouts=Shard(-1) if enable_loss_parallel else Replicate(),
-            use_local_output=False,
-        ),
+    model_plan = {}
 
-    }
+    if hasattr(model.model, "embedding"):
+        model_plan.update(
+            {
+                "model.embedding.word_embeddings": embed_plan,
+            }
+        )
+
+    if getattr(model.model.decoder, "final_layernorm", None):
+        model_plan.update(
+            {
+                "model.decoder.final_layernorm": SequenceParallel(
+                    sequence_dim=0, use_local_output=False) if enable_sp else NoParallel(),
+            }
+        )
+
+    if hasattr(model.model, "output_layer"):
+        model_plan.update(
+            {
+                "model.output_layer": ColwiseParallel(
+                    input_layouts=sp_layout,
+                    output_layouts=Shard(-1) if enable_loss_parallel else Replicate(),
+                    use_local_output=False,
+                ),
+            }
+        )
 
     if hasattr(model.model, "mtp_loss_auto_scaler"):
         model_plan.update(
@@ -612,8 +630,8 @@ def apply_non_moe_tp(
 
     decoder_layers = model.model.decoder.layers
     attn_input_layout = getattr(
-        decoder_layers[0].self_attention.config, "input_layout", None
-    ) if decoder_layers else None
+        decoder_layers.get_first_cell().self_attention.config, "input_layout", None
+        ) if decoder_layers else None 
     attn_qkv_shard = Shard(1) if attn_input_layout == "TND" else Shard(2)
     attention_kernel_plan = prepare_module_input(
         input_layouts=(Replicate(), Replicate(), Replicate(), None),
@@ -672,7 +690,8 @@ def apply_non_moe_tp(
                 (sp_layout, attention_kernel_plan, norm_plan, rowwise_output_plan, rotary_emb_plan,),
             )
 
-    if hasattr(model.model.loss, "log_softmax") and hasattr(model.model.loss, "nll_loss"):
+    if hasattr(model.model, "loss") and (hasattr(model.model.loss, "log_softmax") and
+                                         hasattr(model.model.loss, "nll_loss")):
         # apply parallelism to loss custom backend functions
         # NOTE: should support loss parallel in future
         layer_plan = {
@@ -1147,12 +1166,7 @@ def apply_context_parallel_attention(
         for layer_idx, mtp_layer in enumerate(mtp.layers):
             _apply_cp_to_block(mtp_layer, f"mtp.layers.{layer_idx}")
 
-
-# ---------------------------------------------------------------------------
-# GPT parallelization entry point
-# ---------------------------------------------------------------------------
-
-def parallelize_gptmodel(
+def _apply_spmd_parallelism(
         model: nn.Cell,
         parallel_dims: Any,
         parallelism: Any,
@@ -1217,7 +1231,7 @@ def parallelize_gptmodel(
 
     # Phase 6: CP root I/O hooks. Apply after FSDP so the hooks live on the final
     # model boundary called by trainer.
-    if parallel_dims.cp_enabled:
+    if parallel_dims.cp_enabled and model.model.stage_idx == 0:
         apply_context_parallel_model_io(model, parallel_dims, parallelism)
 
     # Set the loss scale for the auxiliary loss of the MoE layer.
@@ -1227,3 +1241,79 @@ def parallelize_gptmodel(
 
     logger.info("GPTModel parallelization completed.")
     return model
+
+
+def apply_pp(
+        model,
+        pp_mesh,
+        parallel_dims,
+        parallelism,
+        recompute,
+        recompute_comm,
+        swap,
+        accumulate_allreduce_grads_in_fp32: bool = True,
+):
+    """Apply pipeline parallelism to the GPTModel."""
+    layer_setting = PpLayerSetting(model.config.num_hidden_layers, parallelism)
+
+    model_cls = type(model)
+    builder = StageModelBuilder(layer_setting)
+    stages, model_parts = builder.build_stages(model_cls, model.config, pp_mesh)
+    del model
+
+    for part in model_parts:
+        _apply_spmd_parallelism(
+            part,
+            parallel_dims,
+            parallelism,
+            recompute,
+            recompute_comm,
+            swap,
+            accumulate_allreduce_grads_in_fp32,
+        )
+
+    micro_batch_num = parallelism.pipeline_parallel_microbatch_size
+    schedule = ScheduleInterleaved1F1B(
+        stages, micro_batch_num,
+        overlap_p2p=parallelism.pipeline_parallel_overlap_p2p,
+        overlap_b_f=parallelism.pipeline_parallel_overlap_b_f,
+    )
+    logger.info(f"schedule.exec_oder: {schedule.exec_order}")
+
+    has_first = any(s.stage_index == 0 for s in stages)
+    has_last = any(s.stage_index == layer_setting.num_virtual_stages - 1 for s in stages)
+
+    return model_parts, schedule, has_first, has_last
+
+# ---------------------------------------------------------------------------
+# GPT parallelization entry point
+# ---------------------------------------------------------------------------
+
+def parallelize_gptmodel(
+        model: nn.Cell,
+        parallel_dims: Any,
+        parallelism: Any,
+        recompute: Any,
+        recompute_comm: Any,
+        swap: Any,
+        accumulate_allreduce_grads_in_fp32: bool = True,
+) -> List[nn.Cell]:
+    """Apply pipeline parallelism to the GPTModel."""
+        
+    if parallel_dims.pp_enabled:
+        pp_mesh = parallel_dims.get_mesh("pp")
+        return apply_pp(
+            model,
+            pp_mesh=pp_mesh,
+            parallel_dims=parallel_dims,
+            parallelism=parallelism,
+            recompute=recompute,
+            recompute_comm=recompute_comm,
+            swap=swap,
+            accumulate_allreduce_grads_in_fp32=accumulate_allreduce_grads_in_fp32,
+        )
+
+    _apply_spmd_parallelism(model, parallel_dims, parallelism, recompute, recompute_comm, swap,
+                            accumulate_allreduce_grads_in_fp32)
+
+    return [model], None, False, False

@@ -381,7 +381,7 @@ class ParallelismConfig(BaseConfig):
     pipeline_parallel: int = 1
     """Pipeline parallelism degree"""
 
-    pipeline_parallel_layers_per_stage: Optional[List[List[int]]] = None
+    pipeline_parallel_layers_per_stage: Optional[Union[List[List[int]], List[str], str]] = None
     """Layers assigned to each pipeline stage"""
 
     pipeline_parallel_schedule: str = "1f1b"
@@ -392,6 +392,15 @@ class ParallelismConfig(BaseConfig):
 
     pipeline_parallel_interleave_num: int = 1
     """Number of interleaved model chunks"""
+
+    pipeline_parallel_overlap_p2p: bool = False
+    """Enable overlap of pipeline stages communication"""
+
+    pipeline_parallel_overlap_b_f: bool = False
+    """Enable overlap of pipeline stages compute"""
+
+    pipeline_parallel_enable_dxdw_split: bool = False
+    """Enable split of dxdw communication in pipeline parallelism"""
 
     sequence_parallel: bool = False
     """Enable sequence parallelism"""
