@@ -571,14 +571,14 @@ def process_mtp_loss(
         mtp_logits = output_layer(hidden_states_list[mtp_layer_number + 1], weight=output_weight)
         mtp_logits = mtp_logits.transpose(0, 1).reshape((-1, mtp_logits.shape[-1]))
         mtp_labels = roll_tensor(mtp_labels, shifts=-1, dims=-1)
-        mtp_loss_mask = roll_tensor(loss_mask, shifts=-1, dims=-1)
-        mtp_loss_mask = mint.reshape(mtp_loss_mask, (-1,))
-        mtp_loss_mask = ops.cast(mtp_loss_mask, mstype.float32)
+        loss_mask = roll_tensor(loss_mask, shifts=-1, dims=-1)
+        loss_mask = mint.reshape(loss_mask, (-1,))
+        loss_mask = ops.cast(loss_mask, mstype.float32)
         mtp_loss = compute_language_model_loss(mtp_labels, mtp_logits)
-        mtp_loss = mint.mul(mtp_loss, mtp_loss_mask)
+        mtp_loss = mint.mul(mtp_loss, loss_mask)
         mtp_loss_sum = mtp_loss.sum()
 
-        num_tokens = mtp_loss_mask.sum()
+        num_tokens = loss_mask.sum()
 
         mtp_loss_scale = config.mtp_loss_scaling_factor / config.mtp_num_layers
         save_to_mtp_losses_tracker(
