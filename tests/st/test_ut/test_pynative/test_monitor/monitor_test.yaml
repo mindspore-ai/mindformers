@@ -1,0 +1,91 @@
+checkpoint:
+  enable_save: False
+  save_path: "_checkpoints/monitor_test"
+  save_max: 1
+  save_interleaved_steps: 100
+  no_save_optim: False
+  async_save: False
+  prefix: "monitor"
+  remove_redundancy: False
+
+  load_path: ""
+  load_balanced: False
+  no_load_optim: True
+  load_worker_number: 1
+
+training:
+  steps: 10
+  local_batch_size: 2
+  global_batch_size: 2
+  max_norm: 1.0
+  seed: 42
+  deterministic: True
+
+optimizer:
+  type: AdamW
+  betas:
+    - 0.9
+    - 0.95
+  eps: 1.e-8
+  weight_decay: 0.01
+
+lr_scheduler:
+  type: ConstantWarmUpLR
+  learning_rate: 1.e-5
+  warmup_ratio: 0
+
+parallelism:
+  data_parallel_shard: -1
+  data_parallel_shard_strategy: "optim_grads_params"
+  disable_gradient_division: True
+
+  expert_parallel: 1
+  tensor_parallel: 1
+  context_parallel: 1
+  context_parallel_method: colossal
+  pipeline_parallel: 1
+  pipeline_parallel_schedule: "1f1b"
+  pipeline_parallel_microbatch_size: 1
+  pipeline_parallel_interleave_num: 1
+  pipeline_parallel_layers_per_stage: null
+  sequence_parallel: false
+
+train_dataset:
+  dataloader:
+    type: MindDataset
+    dataset_files: "train_dataset"
+    column_names: ["input_ids", "labels", "loss_mask", "position_ids"]
+    shuffle: false
+  drop_remainder: True
+  num_parallel_workers: 1
+  prefetch_size: 1
+  numa_enable: False
+
+model:
+  model_type: deepseek_v3
+  architectures: DeepseekV3ForCausalLM
+  vocab_size: 128
+  seq_length: 32
+  hidden_size: 64
+  intermediate_size: 128
+  first_k_dense_replace: 1
+  num_hidden_layers: 2
+  max_position_embeddings: 32
+  hidden_act: "silu"
+  num_attention_heads: 2
+  rms_norm_eps: 1.e-6
+  use_flash_attention: False
+  moe_grouped_gemm: True
+  params_dtype: "float32"
+  compute_dtype: "float32"
+  layernorm_compute_dtype: "float32"
+  softmax_compute_dtype: "float32"
+  rotary_dtype: "float32"
+  initializer_range: 0.01
+
+monitor:
+  train_state:
+    local_loss: true
+    local_norm: "embedding"
+    device_loss: true
+    device_norm: true
