@@ -226,7 +226,6 @@ def attach_context_parallel_runtime_hints(model_config, parallelism_config):
                 f"num_attention_heads ({model_config.num_attention_heads}) must be divisible by "
                 f"ulysses_degree ({ulysses_degree})."
             )
-        model_config._mf_runtime_flash_attention_head_num = model_config.num_attention_heads // ulysses_degree
     return model_config
 
 
