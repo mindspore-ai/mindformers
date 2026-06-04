@@ -246,7 +246,7 @@ def convert_transformer_config_to_args_for_tflops(
     if config.num_attention_heads != config.num_query_groups and not config.multi_latent_attention:
         config.group_query_attention = True
 
-    if config.hidden_act in ['silu', 'swiglu']:
+    if config.hidden_act in ['silu', 'swiglu', 'fusedswiglu']:
         config.swiglu = True
 
     return config
