@@ -818,15 +818,21 @@ def _start_full_tensor_p2p_gather_multi(
 
 
 def newton_schulz(x, dim_a, dim_b, eps, ns_steps, ns_coefficients, matmul_op, addmm_op):
-    """Apply Newton-Schulz iteration."""
-    a, b, c = ns_coefficients
+    """Apply Newton-Schulz iteration.
 
+    ``ns_coefficients`` is a per-step schedule: a tuple of length ``ns_steps``,
+    each element an ``(a, b, c)`` triple applied at that iteration.  A constant
+    schedule (every step the same triple) reproduces the classic single-triple
+    behaviour; a phased schedule (e.g. DeepSeek V4's first-8 / last-2) lets the
+    coefficients change across iterations.  See :meth:`Muon._normalize_ns_schedule`.
+    """
     if dim_a > dim_b:
         x = x.mT
     # Ensure spectral norm is at most 1
     x = mint.nn.functional.normalize(x, p=2, dim=(-2, -1), eps=eps)
     # Perform the NS iterations
-    for _ in range(ns_steps):
+    for step in range(ns_steps):
+        a, b, c = ns_coefficients[step]
         # a_mat = x @ x.T
         a_mat = matmul_op(x, x.mT)
 
@@ -1673,8 +1679,18 @@ class Muon(Optimizer):
         matched_adamw_rms (float): RMS matching parameter for AdamW. Default: ``0.2``.
         momentum (float): Momentum factor. Default: ``0.95``.
         nesterov (bool): Whether to use Nesterov momentum. Default: ``True``.
-        ns_steps (int): Number of Newton-Schulz steps. Default: ``5``.
-        ns_coefficients (tuple): Newton-Schulz coefficients. Default: ``(3.4445, -4.7750, 2.0315)``.
+        ns_steps (int): Number of Newton-Schulz steps. Default: ``5``. Used only
+            with the flat ``ns_coefficients`` form; with a segmented schedule the
+            step count is derived from the schedule and this value is ignored.
+        ns_coefficients: Newton-Schulz coefficients. Two YAML forms are accepted:
+
+            - Flat triple ``[a, b, c]`` (default ``(3.4445, -4.7750, 2.0315)``):
+              the same triple is applied for all ``ns_steps`` iterations.
+            - Segmented schedule ``[[[a, b, c], count], ...]``: each segment
+              repeats its triple ``count`` times across consecutive iterations,
+              and the total step count is the sum of the ``count`` values. For
+              example, DeepSeek V4's first-8 / last-2 schedule is
+              ``[[[3.4445, -4.7750, 2.0315], 8], [[2.0, -1.5, 0.5], 2]]``.
         adamw_betas (tuple): Beta parameters for AdamW. Default: ``(0.95, 0.95)``.
         adamw_eps (float): Epsilon for AdamW. Default: ``1e-8``.
         qk_clip_enabled (bool): Whether to apply QK clip scaling. Default: ``True``.
@@ -1686,6 +1702,11 @@ class Muon(Optimizer):
               rank, but NS runs only on one assigned rank per weight. 3D/local
               weights run NS independently on each rank, matching allgather mode.
         model: The model model. Default: ``None``.
+        adamw_include (list[str]): Glob patterns (``fnmatch``); 2D/3D weights
+            whose name matches any pattern are optimized by AdamW instead of
+            Muon. This replaces the model-side ``get_muon_filter`` hook. When
+            ``None`` it defaults to ``["*word_embeddings*", "*output_layer*"]``,
+            reproducing the historical behaviour. Default: ``None``.
     """
 
     def __init__(
@@ -1706,6 +1727,7 @@ class Muon(Optimizer):
         model=None,
         comm_strategy="allgather",
         use_fused_adamw=False,
+        adamw_include=None,
         **kwargs,
     ):
         super().__init__(learning_rate, params, weight_decay)
@@ -1720,11 +1742,19 @@ class Muon(Optimizer):
         self.eps = eps
         self.matched_adamw_rms = matched_adamw_rms
         self.use_nesterov = nesterov
-        self._verify_config(ns_steps, ns_coefficients, qk_clip_enabled, qk_clip_threshold)
-        self.ns_steps = ns_steps
-        self.ns_coefficients = tuple(ns_coefficients)
+        # Expand the (flat or segmented) ns_coefficients config into a per-step
+        # schedule; ``self.ns_steps`` is the schedule length so that it stays in
+        # lock-step with ``self.ns_coefficients`` for every NS call site.
+        self.ns_coefficients, self.ns_steps = self._normalize_ns_schedule(ns_coefficients, ns_steps)
+        self._verify_config(self.ns_steps, self.ns_coefficients, qk_clip_enabled, qk_clip_threshold)
         self.qk_clip_enabled = qk_clip_enabled
         self.param_name_tuple = tuple(p.name for p in self._parameters)
+
+        # Which params get Muon (vs AdamW) is decided here from ``adamw_include``
+        # config, fully replacing the model-side ``get_muon_filter`` hook. The
+        # default reproduces the historical model policy exactly (2D/3D weights,
+        # with word_embeddings / output_layer routed to AdamW).
+        self._muon_filter = self._build_muon_filter(adamw_include)
 
         self.muon_split_fn, self.muon_merge_fn = model.make_model_muon_fns()
         self.logit_threshold = Tensor([qk_clip_threshold], dtype=mstype.float32) if qk_clip_enabled else None
@@ -1770,7 +1800,7 @@ class Muon(Optimizer):
             self._muon_buffer_cache = None
             self._muon_runtime_groups = None
 
-        self._initialize_state(model)
+        self._initialize_state()
 
         # ``max_exp_avg_sq`` is required by ``gen.AdamW()`` even when
         # amsgrad=False.  Following :class:`AdamW` at ``adamw.py:196`` we alias
@@ -1797,18 +1827,102 @@ class Muon(Optimizer):
             raise ValueError("Current Muon implementation only supports models with Multi-Latent Attention enabled.")
 
     @staticmethod
+    def _normalize_ns_schedule(ns_coefficients, ns_steps):
+        """Expand the ``ns_coefficients`` config into a per-step schedule.
+
+        Two YAML / Python forms are accepted (see the class docstring):
+
+        - Flat triple ``[a, b, c]`` — broadcast to all ``ns_steps`` iterations,
+          reproducing the classic single-triple behaviour.
+        - Segmented ``[[[a, b, c], count], ...]`` — each segment repeats its
+          triple ``count`` times; the total step count is the sum of ``count``
+          and the passed ``ns_steps`` is ignored.
+
+        Returns ``(schedule, n_steps)`` where ``schedule`` is a tuple of length
+        ``n_steps``, each element an ``(a, b, c)`` float triple.
+        """
+        if not isinstance(ns_coefficients, (list, tuple)) or len(ns_coefficients) == 0:
+            raise ValueError(
+                f"ns_coefficients must be a non-empty list/tuple, got {ns_coefficients!r}.")
+
+        # Flat triple: first element is a scalar number (``bool`` is excluded so
+        # a stray boolean is not silently treated as a coefficient).
+        first = ns_coefficients[0]
+        if isinstance(first, (int, float)) and not isinstance(first, bool):
+            if len(ns_coefficients) != 3:
+                raise ValueError(
+                    f"flat ns_coefficients must have 3 elements, got {ns_coefficients!r}.")
+            if ns_steps <= 0:
+                raise ValueError(f"ns_steps must be positive, got {ns_steps!r}.")
+            triple = tuple(float(v) for v in ns_coefficients)
+            return tuple(triple for _ in range(ns_steps)), ns_steps
+
+        # Segmented schedule: list of ``[triple, count]`` pairs.
+        schedule = []
+        for seg_idx, segment in enumerate(ns_coefficients):
+            if not isinstance(segment, (list, tuple)) or len(segment) != 2:
+                raise ValueError(
+                    f"segmented ns_coefficients entry {seg_idx} must be "
+                    f"[[a, b, c], count], got {segment!r}.")
+            triple_raw, count = segment
+            if not isinstance(triple_raw, (list, tuple)) or len(triple_raw) != 3:
+                raise ValueError(
+                    f"segmented ns_coefficients entry {seg_idx} must hold a "
+                    f"3-element triple, got {triple_raw!r}.")
+            count = int(count)
+            if count <= 0:
+                raise ValueError(
+                    f"segmented ns_coefficients entry {seg_idx} count must be "
+                    f"positive, got {count!r}.")
+            triple = tuple(float(v) for v in triple_raw)
+            schedule.extend(triple for _ in range(count))
+        return tuple(schedule), len(schedule)
+
+    @staticmethod
+    def _build_muon_filter(adamw_include):
+        """Build the Muon-vs-AdamW param predicate (``True`` ⇒ optimized by Muon).
+
+        Muon applies to 2D/3D weights only; any such weight whose name matches an
+        ``adamw_include`` glob is routed to AdamW instead.  ``adamw_include=None``
+        keeps the historical default of ``word_embeddings`` / ``output_layer`` on
+        AdamW.  Patterns are ``fnmatch`` globs (``"*word_embeddings*"`` is the
+        glob equivalent of a substring match).
+        """
+        if adamw_include is None:
+            adamw_include = ("*word_embeddings*", "*output_layer*")
+        if isinstance(adamw_include, str):
+            adamw_include = (adamw_include,)
+        adamw_include = tuple(adamw_include)
+        if not all(isinstance(pat, str) for pat in adamw_include):
+            raise ValueError("adamw_include must be a list of glob strings.")
+
+        def muon_filter(param):
+            if len(param.shape) not in (2, 3):
+                return False
+            return not any(fnmatch(param.name, pat) for pat in adamw_include)
+
+        return muon_filter
+
+    @staticmethod
     def _verify_config(ns_steps, ns_coefficients, qk_clip_enabled, qk_clip_threshold):
         """Validate Newton-Schulz and QK-clip hyperparameters."""
         if ns_steps <= 0:
             raise ValueError(f"ns_steps must be positive, got {ns_steps!r}.")
-        if len(ns_coefficients) != 3:
-            raise ValueError(f"ns_coefficients must have 3 elements, got {ns_coefficients!r}.")
+        if len(ns_coefficients) != ns_steps:
+            raise ValueError(
+                f"ns_coefficients schedule length ({len(ns_coefficients)}) must "
+                f"match ns_steps ({ns_steps}).")
+        for step, triple in enumerate(ns_coefficients):
+            if len(triple) != 3:
+                raise ValueError(
+                    f"each ns_coefficients entry must have 3 elements, got "
+                    f"{triple!r} at step {step}.")
         if qk_clip_enabled and qk_clip_threshold <= 0:
             raise ValueError(f"qk_clip_threshold must be positive, got {qk_clip_threshold!r}.")
 
-    def _initialize_state(self, model):
+    def _initialize_state(self):
         """Create Muon momentum and AdamW moment state in one pass over self._parameters."""
-        muon_filter = model.get_muon_filter()
+        muon_filter = self._muon_filter
 
         muon_m = []
         moments1 = []
