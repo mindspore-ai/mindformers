@@ -89,7 +89,7 @@ def zeropower_via_newtonschulz5_3d(x, dim_a, dim_b):
     return x
 
 
-def _slice_tensor_to_shards(x, tp, tp_dim, op, rank_id, op_group, tp_group):
+def _slice_tensor_to_shards(x, tp, tp_dim, op, rank_id):
     """Slice tensor to tp_shard and op_shard."""
     # slice X to tp_shard and slice X to op_shard
     if tp > 1:
@@ -137,7 +137,7 @@ def _apply_muon_update(
             ns_inputs_item = _perform_allgather_op(
                 ns_inputs_item, op, tp, tp_dim, op_group, tp_group, param_name)
             x = zeropower_via_newtonschulz5_2d(ns_inputs_item, dim_a, dim_b)
-            x = _slice_tensor_to_shards(x, tp, tp_dim, op, rank_id, op_group, tp_group)
+            x = _slice_tensor_to_shards(x, tp, tp_dim, op, rank_id)
         else:
             x = zeropower_via_newtonschulz5_3d(ns_inputs_item, dim_a, dim_b)
 
@@ -361,14 +361,23 @@ class Muon(Optimizer):
         for idx, param in enumerate(self._parameters):
             self.param_idx_in_opt[param.name] = idx
 
-        for param in self._parameters:
+        for idx, param in enumerate(self._parameters):
             if muon_filter(param):
                 x1 = param.clone("zeros")
                 x1.name = "muon_m" + "." + x1.name
                 self.muon_m.append(x1)
                 logger.info(f"Muon apply: {param}")
             else:
-                self.muon_m.append(Parameter(Tensor(np.array([0]).astype(np.float32)), name="muon_m." + param.name))
+                # Placeholder for a param that does NOT use Muon (its real state
+                # lives in moments1/moments2). It is never read by the update and
+                # only exists to keep this ParameterTuple aligned with
+                # self._parameters for hyper_map. Its name must NOT embed
+                # param.name: otherwise checkpoint resume associates this dummy
+                # [1] tensor with the real (possibly sharded) parameter and tries
+                # to load it, which fails when not using pipeline parallel.
+                self.muon_m.append(
+                    Parameter(Tensor(np.array([0]).astype(np.float32)),
+                              name=f"muon_m.placeholder.{idx}"))
         self.muon_m = ParameterTuple(self.muon_m)
         self.use_muon = tuple(muon_filter(param) for param in self._parameters)
 
@@ -382,7 +391,7 @@ class Muon(Optimizer):
 
         self.moments1 = []
         self.moments2 = []
-        for param in self._parameters:
+        for idx, param in enumerate(self._parameters):
             if not muon_filter(param):
                 x1 = param.clone("zeros")
                 x1.name = "adam_m" + "." + x1.name
@@ -392,8 +401,16 @@ class Muon(Optimizer):
                 self.moments2.append(x2)
                 logger.info(f"Adam apply: {param}")
             else:
-                self.moments1.append(Parameter(Tensor(np.array([0]).astype(np.float32)), name="adam_m." + param.name))
-                self.moments2.append(Parameter(Tensor(np.array([0]).astype(np.float32)), name="adam_v." + param.name))
+                # Placeholder for a param that uses Muon (its real state lives in
+                # muon_m). Never read by the update; only keeps moments1/moments2
+                # aligned with self._parameters for hyper_map. The name must NOT
+                # embed param.name -- see _initialize_muon_moments for why.
+                self.moments1.append(
+                    Parameter(Tensor(np.array([0]).astype(np.float32)),
+                              name=f"adam_m.placeholder.{idx}"))
+                self.moments2.append(
+                    Parameter(Tensor(np.array([0]).astype(np.float32)),
+                              name=f"adam_v.placeholder.{idx}"))
         self.moments1 = ParameterTuple(self.moments1)
         self.moments2 = ParameterTuple(self.moments2)
 
