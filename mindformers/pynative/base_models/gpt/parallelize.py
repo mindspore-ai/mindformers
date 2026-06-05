@@ -367,7 +367,7 @@ def _collect_layer_norms(layer):
     return norms
 
 
-def _collect_layer_replicate_params(layer):
+def _collect_layer_replicate_params(layer, shard_size):
     """Collect non-module parameters that must be replicated (not sharded) under FSDP."""
     replicate_params = []
     if hasattr(layer.self_attention.core_attention, "max_logits_val"):
@@ -382,6 +382,17 @@ def _collect_layer_replicate_params(layer):
     if hasattr(layer.mlp, "router"):
         if hasattr(layer.mlp.router, "tid2eid") and layer.mlp.router.tid2eid is not None:
             replicate_params.append(layer.mlp.router.tid2eid)
+
+    for param_name, param in layer.parameters_and_names():
+        if isinstance(param, DTensor):
+            shape = param.local_shape
+        else:
+            shape = param.shape
+
+        if shape[0] % shard_size != 0:
+            replicate_params.append(param)
+            logger.warning("The shape[0]=%s of parameter %s is not divisible by data_parallel_shard=%s, " \
+                 "then this parameter will not be applied fsdp.", shape[0], param_name, shard_size)
 
     return replicate_params
 
@@ -882,7 +893,7 @@ def apply_fsdp(
             with ms.DeviceCtx("meta"):
                 fully_shard(layer.mlp.experts, **efsdp_config, reshard_after_forward=reshard_after_forward)
 
-        replicate_params = _collect_layer_replicate_params(layer)
+        replicate_params = _collect_layer_replicate_params(layer, parallel_dims.fsdp)
 
         # 2a'. Wrap MoE router (and shared-expert gate) independently. Their weights are
         # stored in moe_router_dtype (fp32) for gradient precision, so they must NOT share
@@ -964,7 +975,7 @@ def apply_fsdp(
                         reshard_after_forward=reshard_after_forward,
                     )
 
-            mtp_replicate_params = _collect_layer_replicate_params(layer.transformer_layer)
+            mtp_replicate_params = _collect_layer_replicate_params(layer.transformer_layer, parallel_dims.fsdp)
 
             # Router (fp32) — independent wrap to avoid dtype conflict with bf16 params
             router = getattr(layer.transformer_layer.mlp, "router", None)
