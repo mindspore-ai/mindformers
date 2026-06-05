@@ -964,33 +964,41 @@ def apply_context_parallel_attention(
     if decoder_layers is None:
         raise ValueError("Unable to locate GPT decoder layers for context parallel application.")
 
-    def _find_one_module(transformer_block, layer_idx, suffix):
+    def _find_one_module(transformer_block, block_label, suffix):
         matches = [
             (name, cell) for name, cell in transformer_block.cells_and_names()
             if "self_attention" in name and name.endswith(suffix)
         ]
         if len(matches) != 1:
             raise ValueError(
-                f"Expected one self_attention {suffix} in decoder.layers.{layer_idx}, "
+                f"Expected one self_attention {suffix} in {block_label}, "
                 f"but got {[name for name, _ in matches]}."
             )
         return matches[0]
 
-    for layer_idx, transformer_block in enumerate(decoder_layers):
-        cp_module_path, cp_module = _find_one_module(transformer_block, layer_idx, "core_attention")
+    def _apply_cp_to_block(transformer_block, block_label):
+        cp_module_path, cp_module = _find_one_module(transformer_block, block_label, "core_attention")
         if async_enabled:
-            attention_path, attention_module = _find_one_module(transformer_block, layer_idx, "self_attention")
+            attention_path, attention_module = _find_one_module(transformer_block, block_label, "self_attention")
             cp_style.apply_to_attention(attention_module, cp_mesh)
             logger.info(
-                "Applied async context parallel to decoder.layers.%s.%s through %s handoff boundaries",
-                layer_idx,
+                "Applied async context parallel to %s.%s through %s handoff boundaries",
+                block_label,
                 cp_module_path,
                 attention_path,
             )
-            continue
+            return
 
         cp_style._apply(cp_module, cp_mesh)
-        logger.info("Applied context parallel to decoder.layers.%s.%s", layer_idx, cp_module_path)
+        logger.info("Applied context parallel to %s.%s", block_label, cp_module_path)
+
+    for layer_idx, transformer_block in enumerate(decoder_layers):
+        _apply_cp_to_block(transformer_block, f"decoder.layers.{layer_idx}")
+
+    mtp = getattr(gpt_model, "mtp", None)
+    if mtp:
+        for layer_idx, mtp_layer in enumerate(mtp.layers):
+            _apply_cp_to_block(mtp_layer, f"mtp.layers.{layer_idx}")
 
 
 # ---------------------------------------------------------------------------
