@@ -288,17 +288,8 @@ class Trainer:
         """
         logger.info("Applying parallelism to model...")
 
-        # Build ParallelDims
-        self.parallel_dims = ParallelDims(
-            dp_replicate=parallelism.data_parallel_replicate,
-            dp_shard=parallelism.data_parallel_shard,
-            cp=parallelism.context_parallel,
-            tp=parallelism.tensor_parallel,
-            pp=parallelism.pipeline_parallel,
-            ep=parallelism.expert_parallel,
-            etp=parallelism.expert_tensor_parallel,
-            world_size=self.world_size,
-        )
+        # Build ParallelDims (dp_replicate / dp_shard derived inside from_config)
+        self.parallel_dims = ParallelDims.from_config(parallelism, self.world_size)
 
         # Apply unified parallelization
         model, schedule, has_first, has_last = parallelize_model(
@@ -618,7 +609,7 @@ class Trainer:
 
         if self.parallel_dims is not None and (
                 self.parallel_dims.pp_enabled or self.parallel_dims.dp_cp_enabled):
-            loss_mesh = self.parallel_dims.get_mesh("loss_mesh")
+            loss_mesh = self.parallel_dims.get_mesh("loss")
             self.metric_reduce_group_size = loss_mesh.size()
             self.metric_reduce_group = loss_mesh.get_group()
 

@@ -408,9 +408,6 @@ class ParallelismConfig(BaseConfig):
     expert_parallel: int = 1
     """Expert parallelism degree"""
 
-    expert_tensor_parallel: int = 1
-    """Expert tensor parallelism degree"""
-
     npu_nums_per_device: int = 8
     """Set NPU ranks for each device"""
 
