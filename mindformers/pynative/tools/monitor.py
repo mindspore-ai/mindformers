@@ -12,8 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Monitor for collecting and outputting local/device loss and norm during training."""
+"""Monitor for collecting and outputting training metrics during training."""
 
+import json
+import re
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -32,8 +34,9 @@ class Monitor(ABC):
         record(value, context) — collect a metric
     """
 
-    def __init__(self):
+    def __init__(self, model=None):
         self._records: List[Dict[str, Any]] = []
+        self._model = model
 
     @abstractmethod
     def record(self, value: Any = None, context: Optional[Dict[str, Any]] = None):
@@ -55,6 +58,14 @@ class Monitor(ABC):
     def _flush_tensorboard(self, records: List[Dict[str, Any]], step: int):  # pylint: disable=W0613
         pass
 
+    def set_model(self, model):
+        """Bind a model instance to the monitor."""
+        self._model = model
+
+    def _resolve_model(self):
+        """Return the bound model."""
+        return self._model
+
     @staticmethod
     def _to_scalar(value: Any) -> float:
         if hasattr(value, "asnumpy"):
@@ -64,6 +75,20 @@ class Monitor(ABC):
         return float(value)
 
 
+def _parse_moe_tpe_module_name(module_name: str) -> Optional[Tuple[str, Optional[int], int]]:
+    """Parse a MoE MLP module name into ``(block, mtp_idx, layer)``."""
+    match = re.fullmatch(r"(?:.*\.)?decoder\.layers\.(\d+)\.mlp", module_name)
+    if match:
+        return "decoder", None, int(match.group(1))
+    match = re.fullmatch(r"(?:.*\.)?mtp\.layers\.(\d+)\.transformer_layer\.mlp", module_name)
+    if match:
+        return "mtp", int(match.group(1)), 0
+    match = re.fullmatch(r"(?:.*\.)?mtp\.layers\.(\d+)\.mtp_model_layer\.layers\.(\d+)\.mlp", module_name)
+    if match:
+        return "mtp", int(match.group(1)), int(match.group(2))
+    return None
+
+
 class TrainStateMonitor(Monitor):
     """Monitor for local/device loss and norm during training.
 
@@ -71,8 +96,8 @@ class TrainStateMonitor(Monitor):
     Each metric is controlled by config and recorded via record(key, value, context).
     """
 
-    def __init__(self, config):
-        super().__init__()
+    def __init__(self, config, model=None):
+        super().__init__(model=model)
         has_monitor = (hasattr(config, 'monitor')
                        and hasattr(config.monitor, 'train_state'))
         train_state = getattr(config.monitor, 'train_state', None) if has_monitor else None
@@ -134,7 +159,9 @@ class TrainStateMonitor(Monitor):
     def _record_local_norm(self, value, context):  # pylint: disable=W0613
         """Record local gradient norms for parameters matching the config filter."""
         from mindformers.pynative.trainer.utils import _get_grad_factor
-        model = context.get("model")
+        model = self._resolve_model()
+        if model is None:
+            return
         micro_step = context.get("micro_step", 0)
 
         if self._record_config.get("local_norm", False):
@@ -189,6 +216,142 @@ class TrainStateMonitor(Monitor):
         return not norm_config or any(p in param_name for p in norm_config if p)
 
 
+class MoeMonitor(Monitor):
+    """Monitor that prints MoE tokens-per-expert records in Megatron's JSON format."""
+
+    def __init__(self, config, model=None):
+        super().__init__(model=model)
+        moe_monitor = getattr(getattr(config, "monitor", None), "moe_monitor", None)
+        self._interval = getattr(moe_monitor, "save_tokens_per_expert_interval", None)
+        self._target_layers = self._parse_target_layers(getattr(moe_monitor, "target_layers", None))
+        self._module_cache: List[Tuple[Tuple[str, Optional[int], int], Any]] = self._discover_moe_layers(self._model)
+        self._prev_tpe: Dict[Tuple[str, Optional[int], int], Any] = {}
+        self._step_tpe_records: Dict[Tuple[str, Optional[int], int], List[Tuple[int, int, int, Any]]] = {}
+
+    def set_model(self, model):
+        """Bind a model instance and rebuild the cached MoE layer list."""
+        super().set_model(model)
+        self._module_cache = self._discover_moe_layers(model)
+
+    @property
+    def active(self):
+        return self._interval is not None
+
+    def reset(self):
+        super().reset()
+        self._prev_tpe = {}
+        self._step_tpe_records = {}
+
+    def record(self, key: str = None, value: Any = None, context: Optional[Dict[str, Any]] = None):
+        if self._interval is None:
+            return
+
+        context = context or {}
+
+        if key == "moe_tpe_step_begin":
+            self._prev_tpe = {
+                meta: self._snapshot_tpe(module)
+                for meta, module in self._module_cache
+            }
+            return
+
+        if key != "moe_tpe":
+            return
+
+        global_micro_step = context.get("global_micro_step")
+        step_id = context.get("step")
+        micro_step = context.get("micro_step")
+        if global_micro_step is None:
+            return
+
+        for meta, module in self._module_cache:
+            current = self._snapshot_tpe(module)
+            previous = self._prev_tpe.get(meta)
+            if previous is None:
+                previous = current.copy()
+            delta = current - previous
+            if global_micro_step % self._interval == 0:
+                self._step_tpe_records.setdefault(meta, []).append((global_micro_step, step_id, micro_step, delta))
+            self._prev_tpe[meta] = current
+
+    def flush(self, step: int):  # pylint: disable=W0613
+        if not self._step_tpe_records:
+            return
+
+        for (block, mtp_idx, layer), microbatches in sorted(self._step_tpe_records.items()):
+            for iter_id, step_id, micro_step, microbatch in microbatches:
+                record = {
+                    "iter": iter_id,
+                    "step": step_id,
+                    "micro_step": micro_step,
+                    "block": block,
+                    "layer": layer,
+                    "tpe": [self._tensor_to_list(microbatch)],
+                }
+                if block == "mtp":
+                    record = {
+                        "iter": iter_id,
+                        "step": step_id,
+                        "micro_step": micro_step,
+                        "block": block,
+                        "mtp_idx": mtp_idx,
+                        "layer": layer,
+                        "tpe": [self._tensor_to_list(microbatch)],
+                    }
+                logger.info(json.dumps(record))
+
+        self._step_tpe_records = {}
+        self._prev_tpe = {}
+
+    def _discover_moe_layers(self, model):
+        """Discover MoE layers from the bound model."""
+        if model is None:
+            return []
+        modules = []
+        moe_decoder_layers = set()
+        for module_name, module in model.cells_and_names():
+            if not hasattr(module, "tokens_per_expert"):
+                continue
+            parsed = _parse_moe_tpe_module_name(module_name)
+            if parsed is not None:
+                block, _, layer = parsed
+                if self._target_layers is not None:
+                    if block != "decoder" or layer not in self._target_layers:
+                        continue
+                if block == "decoder":
+                    moe_decoder_layers.add(layer)
+                modules.append((parsed, module))
+        if self._target_layers is not None:
+            for layer in sorted(self._target_layers):
+                if layer not in moe_decoder_layers:
+                    logger.warning(
+                        "decoder.layers.%s is not a MoE layer, no tokens_per_expert.",
+                        layer,
+                    )
+        return modules
+
+    @staticmethod
+    def _snapshot_tpe(module) -> List[int]:
+        return module.tokens_per_expert.copy()
+
+    @staticmethod
+    def _tensor_to_list(value):
+        if hasattr(value, "asnumpy"):
+            return [int(round(float(v))) for v in value.asnumpy().reshape(-1).tolist()]
+        if isinstance(value, list):
+            return value
+        return [int(round(float(value)))]
+
+    @staticmethod
+    def _parse_target_layers(target_layers):
+        """Normalize target_layers config to a set of decoder layer ids."""
+        if target_layers is None:
+            return None
+        if isinstance(target_layers, int):
+            return set(range(target_layers))
+        return set(target_layers)
+
+
 class MonitorGroup:
     """Manage sub-monitors based on config. Delegates record/flush/reset.
 
@@ -201,15 +364,20 @@ class MonitorGroup:
         self.monitor.record("local_norm", context={...})
         self.monitor.record("device_loss", loss)
         self.monitor.record("device_norm")
-        # flush is called in TrainingStateCallback
+        # flush is called in MonitorCallback
     """
 
-    def __init__(self, config):
+    def __init__(self, config, model=None):
         self._monitors: Dict[str, Monitor] = {}
+        self._model = model
 
-        train_state_monitor = TrainStateMonitor(config)
+        train_state_monitor = TrainStateMonitor(config, model=model)
         if train_state_monitor.active:
             self._monitors["train_state"] = train_state_monitor
+
+        moe_monitor = MoeMonitor(config, model=model)
+        if moe_monitor.active:
+            self._monitors["moe_monitor"] = moe_monitor
 
     @property
     def active(self):
@@ -218,6 +386,12 @@ class MonitorGroup:
     def reset(self):
         for m in self._monitors.values():
             m.reset()
+
+    def set_model(self, model):
+        """Bind a model instance to all child monitors."""
+        self._model = model
+        for monitor in self._monitors.values():
+            monitor.set_model(model)
 
     def record(self, key: str, value: Any = None, context: Optional[Dict[str, Any]] = None):
         for m in self._monitors.values():

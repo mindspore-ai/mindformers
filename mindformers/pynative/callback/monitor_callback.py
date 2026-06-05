@@ -12,12 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Training state callback for outputting monitor metrics."""
+"""Monitor callback for outputting monitor metrics."""
 
 from mindformers.pynative.callback.callback import TrainerCallback
 
 
-class TrainingStateCallback(TrainerCallback):
+class MonitorCallback(TrainerCallback):
     """Callback for outputting monitor-collected metrics at each training step end."""
 
     def on_step_end(self, args, state, **kwargs):

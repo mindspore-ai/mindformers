@@ -578,6 +578,38 @@ class TensorboardConfig(BaseConfig):
 
 
 @dataclass
+class MoeMonitorConfig(BaseConfig):
+    """
+    MoE monitor configuration.
+    """
+
+    save_tokens_per_expert_interval: Optional[int] = None
+    """Interval of micro-steps to print tokens-per-expert records. ``None`` disables it."""
+
+    target_layers: Optional[Union[int, List[int]]] = None
+    """Target decoder layers to monitor. ``int`` means the first N layers; ``list[int]`` means exact layer ids."""
+
+    def __post_init__(self):
+        """Post-initialization validation."""
+        if isinstance(self.save_tokens_per_expert_interval, bool):
+            raise TypeError("monitor.moe_monitor.save_tokens_per_expert_interval should be int or None, not bool.")
+        if self.save_tokens_per_expert_interval is not None and self.save_tokens_per_expert_interval <= 0:
+            raise ValueError("monitor.moe_monitor.save_tokens_per_expert_interval must be positive or None.")
+        if isinstance(self.target_layers, bool):
+            raise TypeError("monitor.moe_monitor.target_layers should be int, list[int] or None, not bool.")
+        if isinstance(self.target_layers, int):
+            if self.target_layers <= 0:
+                raise ValueError("monitor.moe_monitor.target_layers must be positive when it is an int.")
+        elif isinstance(self.target_layers, list):
+            if not all(isinstance(layer, int) and not isinstance(layer, bool) for layer in self.target_layers):
+                raise TypeError("monitor.moe_monitor.target_layers should contain only ints.")
+            if not all(layer >= 0 for layer in self.target_layers):
+                raise ValueError("monitor.moe_monitor.target_layers list values must be non-negative.")
+        elif self.target_layers is not None:
+            raise TypeError("monitor.moe_monitor.target_layers should be int, list[int] or None.")
+
+
+@dataclass
 class MonitorConfig(BaseConfig):
     """
     Monitor configuration.
@@ -588,6 +620,7 @@ class MonitorConfig(BaseConfig):
     )
     train_state: TrainStateConfig = field(default_factory=TrainStateConfig)
     tensorboard: TensorboardConfig = field(default_factory=TensorboardConfig)
+    moe_monitor: MoeMonitorConfig = field(default_factory=MoeMonitorConfig)
 
 
 @dataclass

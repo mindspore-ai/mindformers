@@ -46,7 +46,7 @@ from mindformers.pynative.callback import (
     TrainerCallback,
     LossCallback,
     CheckpointCallback,
-    TrainingStateCallback,
+    MonitorCallback,
     configure_max_logits_tracking,
     ensure_max_logits_reset_callback,
 )
@@ -209,7 +209,7 @@ class Trainer:
         self.compute_loss_func = compute_loss_func
 
         # Initialize monitor
-        self.monitor = MonitorGroup(self.config)
+        self.monitor = MonitorGroup(self.config, model=self.model)
 
         # Initialize training state
         self.communication_init = False
@@ -477,7 +477,7 @@ class Trainer:
         """
         checkpoint = self.config.checkpoint
         if not checkpoint.enable_save:
-            return [LossCallback(), TrainingStateCallback()]
+            return [LossCallback(), MonitorCallback()]
 
         # build checkpoint callback
         checkpoint_callback = CheckpointCallback(
@@ -493,7 +493,7 @@ class Trainer:
 
         return [
             LossCallback(),
-            TrainingStateCallback(),
+            MonitorCallback(),
             checkpoint_callback,
         ]
 
@@ -714,6 +714,7 @@ class Trainer:
                 loss = 0.0
                 grad_norm = 0.0
                 self.monitor.reset()
+                self.monitor.record("moe_tpe_step_begin")
 
                 for micro_step in range(self.num_accumulation_steps):
                     micro_inputs = self._split_micro_batch(inputs, micro_step)
@@ -725,9 +726,18 @@ class Trainer:
                     loss += micro_loss
 
                     self.monitor.record("local_loss", micro_loss,
-                                        context={"micro_step": micro_step, "model": self.model})
+                                        context={"micro_step": micro_step})
                     self.monitor.record("local_norm",
-                                        context={"micro_step": micro_step, "model": self.model})
+                                        context={"micro_step": micro_step})
+                    global_micro_step = step * self.num_accumulation_steps + micro_step + 1
+                    self.monitor.record(
+                        "moe_tpe",
+                        context={
+                            "step": step + 1,
+                            "micro_step": micro_step + 1,
+                            "global_micro_step": global_micro_step,
+                        },
+                    )
 
                     if micro_step >= self.num_accumulation_steps - 1:
                         grad_norm = self._optimizer_update()

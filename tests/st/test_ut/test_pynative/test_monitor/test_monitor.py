@@ -16,11 +16,16 @@
 
 import pytest
 
-from mindformers.pynative.config.config import TrainConfig, TrainStateConfig, MonitorConfig
-from mindformers.pynative.tools.monitor import Monitor, TrainStateMonitor, MonitorGroup
+from mindformers.pynative.config.config import (
+    TrainConfig,
+    TrainStateConfig,
+    MonitorConfig,
+    MoeMonitorConfig,
+)
+from mindformers.pynative.tools.monitor import Monitor, TrainStateMonitor, MoeMonitor, MonitorGroup
 
 
-def _make_config(local_loss=False, local_norm="", device_loss=False, device_norm=False):
+def _make_config(local_loss=False, local_norm="", device_loss=False, device_norm=False, moe_interval=None):
     """Helper to build a config object with given train_state settings."""
     train_state = TrainStateConfig(
         local_loss=local_loss,
@@ -28,7 +33,10 @@ def _make_config(local_loss=False, local_norm="", device_loss=False, device_norm
         device_loss=device_loss,
         device_norm=device_norm,
     )
-    monitor = MonitorConfig(train_state=train_state)
+    monitor = MonitorConfig(
+        train_state=train_state,
+        moe_monitor=MoeMonitorConfig(save_tokens_per_expert_interval=moe_interval),
+    )
     config = TrainConfig(monitor=monitor)
     return config
 
@@ -197,6 +205,42 @@ class TestMonitorGroup:
         assert len(train_state_monitor._records) == 1
         group.reset()
         assert train_state_monitor._records == []
+
+
+class TestMoeMonitorConfig:
+    """Test MoE monitor config recognition."""
+
+    @pytest.mark.level0
+    @pytest.mark.platform_x86_cpu
+    @pytest.mark.env_onecard
+    def test_moe_monitor_none_disabled(self):
+        """save_tokens_per_expert_interval=None should disable MoeMonitor."""
+        config = _make_config(moe_interval=None)
+        group = MonitorGroup(config)
+        assert "moe_monitor" not in group._monitors
+        assert group.active is False
+
+    @pytest.mark.level0
+    @pytest.mark.platform_x86_cpu
+    @pytest.mark.env_onecard
+    def test_moe_monitor_one_enabled(self):
+        """save_tokens_per_expert_interval=1 should enable MoeMonitor."""
+        config = _make_config(moe_interval=1)
+        group = MonitorGroup(config)
+        assert "moe_monitor" in group._monitors
+        assert isinstance(group._monitors["moe_monitor"], MoeMonitor)
+        assert group._monitors["moe_monitor"].active is True
+        assert group.active is True
+
+    @pytest.mark.level0
+    @pytest.mark.platform_x86_cpu
+    @pytest.mark.env_onecard
+    def test_moe_monitor_invalid_interval(self):
+        """MoeMonitorConfig should reject bool and non-positive interval values."""
+        invalid_cases = [False, 0, -1]
+        for value in invalid_cases:
+            with pytest.raises((TypeError, ValueError)):
+                MoeMonitorConfig(save_tokens_per_expert_interval=value)
 
 
 class TestMonitorBaseClass:
