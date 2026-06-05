@@ -956,6 +956,7 @@ def apply_fsdp(
 
     if mtp:
         for layer in mtp.layers:
+            # Expert FSDP (same as main decoder layers)
             if hasattr(layer.transformer_layer.mlp, "experts") and edp_mesh is not None:
                 with ms.DeviceCtx("meta"):
                     fully_shard(
@@ -964,6 +965,39 @@ def apply_fsdp(
                     )
 
             mtp_replicate_params = _collect_layer_replicate_params(layer.transformer_layer)
+
+            # Router (fp32) — independent wrap to avoid dtype conflict with bf16 params
+            router = getattr(layer.transformer_layer.mlp, "router", None)
+            if router is not None:
+                with ms.DeviceCtx("meta"):
+                    fully_shard(
+                        router,
+                        **fsdp_config,
+                        reshard_after_forward=reshard_after_forward,
+                        replicate_params=mtp_replicate_params
+                    )
+
+            # Shared experts gate (fp32) — independent wrap
+            shared_experts = getattr(layer.transformer_layer.mlp, "shared_experts", None)
+            shared_gate = getattr(shared_experts, "shared_experts_gate", None) if shared_experts is not None else None
+            if shared_gate is not None:
+                with ms.DeviceCtx("meta"):
+                    fully_shard(shared_gate, **fsdp_config, reshard_after_forward=reshard_after_forward)
+
+            # Norms inside transformer_layer (fp32) — independent wrap
+            layer_norms = _collect_layer_norms(layer.transformer_layer)
+            for norm in layer_norms.values():
+                with ms.DeviceCtx("meta"):
+                    fully_shard(norm, **fsdp_config)
+
+            # MTP-specific norms (fp32) — independent wrap
+            for norm_attr in ("enorm", "hnorm", "final_layernorm"):
+                norm = getattr(layer, norm_attr, None)
+                if norm is not None:
+                    with ms.DeviceCtx("meta"):
+                        fully_shard(norm, **fsdp_config)
+
+            # Wrap the MTP layer (remaining: eh_proj + transformer_layer residual, all bf16)
             with ms.DeviceCtx("meta"):
                 fully_shard(
                     layer,
@@ -981,6 +1015,12 @@ def apply_fsdp(
         disable_fsdp_gradient_division(model)
 
     # --- 6. Prefetch chains ---
+    # Extend the prefetch chain with MTP layers so their FSDP all-gathers overlap
+    # with the preceding layer's forward/backward compute.
+    if mtp:
+        for mtp_layer in mtp.layers:
+            layers.append(mtp_layer)
+
     _setup_gpt_prefetch(embedding, layers, tail_modules)
 
     if parallel_dims.dp_replicate_enabled:
