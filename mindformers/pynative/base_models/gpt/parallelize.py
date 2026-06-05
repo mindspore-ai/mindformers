@@ -235,7 +235,7 @@ def _distribute_router(
         Transform inputs into DTensor with correct placements before forward pass.
         """
         _ = mod
-        hidden_state, expert_bias = args
+        hidden_state, expert_bias, input_ids = args
 
         # Handle hidden_state: convert or redistribute to expected layout
         if not isinstance(hidden_state, DTensor):
@@ -258,6 +258,19 @@ def _distribute_router(
                     placements=(input_layouts[1],), device_mesh=device_mesh
                 )
 
+        # Handle input_ids if provided (for hash routing)
+        if input_ids is not None and len(input_layouts) > 2:
+            if not isinstance(input_ids, DTensor):
+                input_ids = DTensor.from_local(
+                    input_ids, device_mesh, (input_layouts[2],)
+                )
+            elif input_ids.placements != input_layouts[2]:
+                input_ids = input_ids.redistribute(
+                    placements=(input_layouts[2],), device_mesh=device_mesh
+                )
+
+        if input_ids is not None:
+            return hidden_state, expert_bias, input_ids
         return hidden_state, expert_bias
 
     def output_fn(device_mesh, mod, args, outputs):
@@ -365,6 +378,10 @@ def _collect_layer_replicate_params(layer):
 
     if getattr(layer.mlp, "enable_expert_bias", False):
         replicate_params.append(layer.mlp.expert_bias)
+
+    if hasattr(layer.mlp, "router"):
+        if hasattr(layer.mlp.router, "tid2eid") and layer.mlp.router.tid2eid is not None:
+            replicate_params.append(layer.mlp.router.tid2eid)
 
     return replicate_params
 
@@ -490,6 +507,10 @@ def _apply_layers_tp(
         distribute_param_plan.append([transformer_layer.mlp, "tokens_per_expert", (Replicate(),)])
         if getattr(transformer_layer.mlp, "enable_expert_bias", False):
             distribute_param_plan.append([transformer_layer.mlp, "expert_bias", (Replicate(),)])
+        if hasattr(transformer_layer.mlp, "router"):
+            if getattr(transformer_layer.mlp.router, "is_hash_layer", False):
+                distribute_param_plan.append([transformer_layer.mlp.router, "tid2eid", (Replicate(),)])
+
         if not enable_ep:
             # shard expert weight if not enable_ep
             distribute_param_plan.extend([
@@ -501,7 +522,7 @@ def _apply_layers_tp(
         _distribute_router(
             transformer_layer.mlp.router,
             router_mesh=tp_mesh,
-            input_layouts=(Replicate(), Replicate()),
+            input_layouts=(Replicate(), Replicate(), Replicate()),
             output_layouts=(Replicate(), Replicate(), Replicate()),
         )
 
@@ -861,6 +882,8 @@ def apply_fsdp(
             with ms.DeviceCtx("meta"):
                 fully_shard(layer.mlp.experts, **efsdp_config, reshard_after_forward=reshard_after_forward)
 
+        replicate_params = _collect_layer_replicate_params(layer)
+
         # 2a'. Wrap MoE router (and shared-expert gate) independently. Their weights are
         # stored in moe_router_dtype (fp32) for gradient precision, so they must NOT share
         # an HSDP param-group with the layer's bf16 params — fully_shard asserts a single
@@ -868,7 +891,13 @@ def apply_fsdp(
         router = getattr(layer.mlp, "router", None)
         if router is not None:
             with ms.DeviceCtx("meta"):
-                fully_shard(router, **fsdp_config, reshard_after_forward=reshard_after_forward)
+                fully_shard(
+                    router,
+                    **fsdp_config,
+                    reshard_after_forward=reshard_after_forward,
+                    replicate_params=replicate_params
+                )
+
         shared_experts = getattr(layer.mlp, "shared_experts", None)
         shared_gate = getattr(shared_experts, "shared_experts_gate", None) if shared_experts is not None else None
         if shared_gate is not None:
@@ -899,7 +928,7 @@ def apply_fsdp(
                             replicate_params=_collect_hc_replicate_params(layer.ffn_hc))
 
         # 2d. Wrap the transformer layer (large module)
-        replicate_params = _collect_layer_replicate_params(layer)
+
         with ms.DeviceCtx("meta"):
             fully_shard(
                 layer,

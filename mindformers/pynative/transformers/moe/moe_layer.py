@@ -33,9 +33,11 @@ class MoELayer(nn.Cell):
         config (TransformerConfig): Configuration for the transformer model.
         layer_number (int): The layer index in the transformer stack. Used to
             track per-layer aux loss in MoETracker. Default: 0.
+        is_mtp_layer (bool): Whether this MoE layer belongs to an MTP module.
+            Forwarded to the router so MTP layers never use hash routing. Default: False.
     """
 
-    def __init__(self, config: TransformerConfig, layer_number: int = 0):
+    def __init__(self, config: TransformerConfig, layer_number: int = 0, is_mtp_layer: bool = False):
         super().__init__()
         self.config = config
         self.num_experts = config.num_moe_experts
@@ -43,7 +45,7 @@ class MoELayer(nn.Cell):
         self.layer_number = layer_number
 
         # Router
-        self.router = TopKRouter(config, layer_number=layer_number)
+        self.router = TopKRouter(config, layer_number=layer_number, is_mtp_layer=is_mtp_layer)
 
         # Experts
         self.experts = GroupedMLP(config)
@@ -65,10 +67,13 @@ class MoELayer(nn.Cell):
         # NOTE: tokens_per_expert is accumulated in the model forward pass.
         #       expert_bias is updated outside the model in an optimizer step pre hook
         #       to work with gradient accumulation.
-        self.enable_expert_bias = config.moe_router_enable_expert_bias
+        # NOTE: Megatron disables expert_bias on hash layers; here it is still allocated and
+        #       updated on hash layers. This is benign-redundant (the router ignores expert_bias
+        #       in _hash_routing), so it costs a small buffer/update but does not affect results.
+        self.enable_expert_bias = config.moe_router_enable_expert_bias and not self.router.is_hash_layer
         if self.enable_expert_bias:
             self.expert_bias = Parameter(
-                mint.zeros(self.num_experts, dtype=ms.float32),
+                mint.empty(self.num_experts, dtype=ms.float32),
                 name="expert_bias",
                 requires_grad=False,
             )
@@ -79,7 +84,7 @@ class MoELayer(nn.Cell):
 
         # Buffers for load balancing
         self.tokens_per_expert = Parameter(
-            mint.zeros(self.num_experts, dtype=ms.float32),
+            mint.empty(self.num_experts, dtype=ms.float32),
             name="tokens_per_expert",
             requires_grad=False
         )
@@ -95,16 +100,29 @@ class MoELayer(nn.Cell):
         self.cast = ops.cast
         self.ones_like = mint.ones_like
 
+    def reset_parameter(self):
+        """Reset MoE layer parameters for delayed initialization.
 
-    def construct(self, hidden_states: Tensor):
+        Calls ``reset_parameter`` on sub-modules that support it,and zeroes
+        out load-balancing buffers (``expert_bias``, ``tokens_per_expert``).
+        """
+        if self.enable_expert_bias:
+            self.expert_bias.zero_()
+        self.tokens_per_expert.zero_()
+        if self.shared_experts is not None and hasattr(self.shared_experts, 'reset_parameter'):
+            self.shared_experts.reset_parameter()
+
+    def construct(self, hidden_states: Tensor, input_ids: Tensor = None):
         """
         Forward pass for MoELayer.
         Args:
-            hidden_states (Tensor): Input tensor of shape (bs, seq_length, dim)
+            hidden_states (Tensor): Input tensor of shape [seq, batch, hidden] (sequence-first).
+            input_ids (Tensor, optional): Token IDs of shape (b, s). Forwarded to the router;
+                consumed only on hash layers, ignored otherwise. Default: None.
         """
-        bs, seq_length, dim = hidden_states.shape
+        seq, batch, dim = hidden_states.shape
         top_scores, selected_experts_indices, num_tokens_per_expert = self.router(
-            hidden_states, self.expert_bias
+            hidden_states, self.expert_bias, input_ids
         )
 
         self.tokens_per_expert.add_(num_tokens_per_expert)
@@ -117,7 +135,7 @@ class MoELayer(nn.Cell):
         if self.shared_experts is not None:
             shared_output = self.shared_experts(hidden_states)
 
-        out_experts = self.reshape(routed_output, (bs, seq_length, dim))
+        out_experts = self.reshape(routed_output, (seq, batch, dim))
 
         if shared_output is not None:
             final_out = self.add(shared_output, out_experts)

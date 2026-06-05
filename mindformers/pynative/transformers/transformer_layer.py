@@ -3,14 +3,46 @@
 # Modified to adapt to MindSpore pynative mode.
 # Main changes: PyTorch->MindSpore, removed parallel/BDA/CUDA graph features, simplified forward pass.
 """Transformer Layer"""
+import inspect
 from dataclasses import dataclass
 from typing import Union
 from mindspore import nn, mint
-from mindformers.parallel_core.utils.spec_utils import ModuleSpec, build_module
+from mindformers.parallel_core.utils.spec_utils import ModuleSpec, build_module, get_module
 from mindformers.parallel_core.transformer_config import TransformerConfig
 from mindformers.pynative.layers.dropout import Dropout
 from mindformers.pynative.layers.identity_op import IdentityOp
 from mindformers.pynative.transformers.hyper_connection import HyperConnectionModule, FusedHyperConnectionModule
+
+
+def _accepts_kwarg(spec_or_module, name: str) -> bool:
+    """Return whether the module a spec resolves to declares ``name`` in its ``__init__``.
+
+    ``build_module`` forwards ``**kwargs`` straight into the target ``__init__`` with no
+    filtering, so passing a kwarg to a class that neither names it nor accepts ``**kwargs``
+    raises ``TypeError``. Only DSv4 hybrid attention / MoE declare ``is_mtp_layer``; the many
+    other reachable self-attention and dense-MLP classes do not, so callers must gate the pass.
+    """
+    module = get_module(spec_or_module)
+    if not isinstance(module, type):
+        return False
+    try:
+        params = inspect.signature(module.__init__).parameters
+    except (TypeError, ValueError):
+        return False
+    if name in params:
+        return True
+    return any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
+def _maybe_kwarg(spec_or_module, name: str, value) -> dict:
+    """Build a ``{name: value}`` dict only when the target accepts ``name``, else ``{}``.
+
+    Spread the result into a ``build_module`` call so non-accepting modules are never handed
+    the extra kwarg.
+    """
+    if _accepts_kwarg(spec_or_module, name):
+        return {name: value}
+    return {}
 
 
 @dataclass
@@ -83,9 +115,11 @@ class TransformerLayer(nn.Cell, BaseTransformerLayer):
                  submodules: TransformerLayerSubmodules,
                  layer_number: int = 0,
                  hidden_dropout: float = None,
+                 is_mtp_layer: bool = False,
                  ):
         super().__init__()
         self.config = config
+        self.is_mtp_layer = is_mtp_layer
         self.apply_residual_connection_post_norm = config.apply_residual_connection_post_layernorm
         self.hidden_dropout = config.hidden_dropout if hidden_dropout is None else hidden_dropout
 
@@ -100,6 +134,7 @@ class TransformerLayer(nn.Cell, BaseTransformerLayer):
             submodules.self_attention,
             config=self.config,
             layer_number=layer_number,
+            **_maybe_kwarg(submodules.self_attention, "is_mtp_layer", is_mtp_layer),
         )
 
         # self_attn_bda(BiasDropoutFusion) is not supported.
@@ -128,7 +163,12 @@ class TransformerLayer(nn.Cell, BaseTransformerLayer):
             compute_dtype=config.layernorm_compute_dtype
         )
 
-        self.mlp = build_module(submodules.mlp, config=self.config, layer_number=layer_number)
+        self.mlp = build_module(
+            submodules.mlp,
+            config=self.config,
+            layer_number=layer_number,
+            **_maybe_kwarg(submodules.mlp, "is_mtp_layer", is_mtp_layer),
+        )
 
         # mlp_bda(BiasDropoutFusion) is not supported.
 
@@ -142,7 +182,8 @@ class TransformerLayer(nn.Cell, BaseTransformerLayer):
             context=None,
             rotary_pos_emb=None,
             prefix_keys_values=None,
-            actual_seq_len=None
+            actual_seq_len=None,
+            input_ids=None
     ):
         """
         Perform a forward pass through the transformer layer.
@@ -158,6 +199,8 @@ class TransformerLayer(nn.Cell, BaseTransformerLayer):
             rotary_pos_emb (Tensor, optional): Rotary positional embeddings. Default: None.
             prefix_keys_values (Tensor, optional): Prefix key-value cache for attention. Default: None.
             actual_seq_len (int, optional): Actual sequence length for variable-length sequences. Default: None.
+            input_ids (Tensor, optional): Token IDs of shape [b, s], forwarded to the mlp. Consumed
+                only when the mlp is a hash-routed MoELayer; ignored by dense MLP. Default: None.
 
         Returns:
             Tuple[Tensor, Tensor, float]: A tuple containing:
@@ -200,7 +243,7 @@ class TransformerLayer(nn.Cell, BaseTransformerLayer):
         else:
             residual = norm_input
 
-        mlp_output = self.mlp(pre_mlp_layernorm_output)
+        mlp_output = self.mlp(pre_mlp_layernorm_output, input_ids=input_ids)
 
         # Dropout
         dropout_output = self.hidden_states_dropout(mlp_output)
@@ -219,12 +262,14 @@ class HyperConnectionTransformerLayer(TransformerLayer):
                  submodules: TransformerLayerSubmodules,
                  layer_number: int = 1,
                  hidden_dropout: float = None,
+                 is_mtp_layer: bool = False,
                  ):
         super().__init__(
             config=config,
             submodules=submodules,
             layer_number=layer_number,
             hidden_dropout=hidden_dropout,
+            is_mtp_layer=is_mtp_layer,
         )
         self.n = config.num_residual_streams
         hc_cls = FusedHyperConnectionModule if config.use_fused_mhc else HyperConnectionModule
@@ -244,9 +289,15 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             context=None,
             rotary_pos_emb=None,
             prefix_keys_values=None,
-            actual_seq_len=None
+            actual_seq_len=None,
+            input_ids=None
     ):
-        """mHC forward path."""
+        """mHC forward path.
+
+        Args:
+            input_ids (Tensor, optional): Token IDs of shape [b, s], forwarded to the mlp on the
+                mHC path. Consumed only when the mlp is a hash-routed MoELayer. Default: None.
+        """
 
         streams_before_attn = hidden_states
         aggregated_attn, h_res_attn, h_post_attn = self.attn_hc(hidden_states)
@@ -268,7 +319,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         aggregated_ffn, h_res_ffn, h_post_ffn = self.ffn_hc(hidden_states)
 
         pre_mlp_layernorm_output = self.pre_mlp_layernorm(aggregated_ffn)
-        mlp_output = self.mlp(pre_mlp_layernorm_output)
+        mlp_output = self.mlp(pre_mlp_layernorm_output, input_ids=input_ids)
 
         dropout_output = self.hidden_states_dropout(mlp_output)
         output = self.ffn_hc.output_cell(

@@ -1289,6 +1289,33 @@ class TransformerConfig:
         }
     )
 
+    moe_n_hash_layers: int = field(
+        default=0,
+        metadata={
+            "description": "Number of leading transformer layers that use hash-based MoE routing. "
+                           "Layers with 1-based layer_number <= moe_n_hash_layers use a pre-computed "
+                           "tid2eid lookup table for expert selection instead of learned top-k routing. "
+                           "Default 0 (disabled, all layers use top-k routing).",
+            "usage": ParamUsage.COMMON,
+            "source": ParamSource.MEGATRON,
+            "mode": ParamMode.COMMON
+        }
+    )
+
+    actual_vocab_size: Optional[int] = field(
+        default=None,
+        metadata={
+            "description": "Padded actual vocabulary size, the number of rows of the tid2eid lookup "
+                           "table. Required when moe_n_hash_layers > 0 for hash-based MoE routing. "
+                           "Note: the tid2eid table is sized by actual_vocab_size (aligning Megatron), "
+                           "which differs from mindspeed-llm sizing it by padded_vocab_size; we follow "
+                           "the Megatron convention here.",
+            "usage": ParamUsage.COMMON,
+            "source": ParamSource.MEGATRON,
+            "mode": ParamMode.COMMON
+        }
+    )
+
     rotary_interleaved: bool = field(
         default=False,
         metadata={
@@ -2400,6 +2427,32 @@ class TransformerConfig:
                     "When using bias_swiglu_fusion, hidden_act must be swiglu."
                 )
             self.hidden_act = 'fusedswiglu'
+
+        if self.moe_n_hash_layers > 0:
+            # Hash-based MoE routing validation.
+            # The PP-layout branch is replaced by a NotImplementedError
+            # because the PyNative first version only supports PP=1
+            # (input_ids is available on every stage).
+            # actual_vocab_size (not padded_vocab_size) sizes the tid2eid table.
+            if self.actual_vocab_size is None:
+                raise ValueError(
+                    "actual_vocab_size must be set when moe_n_hash_layers > 0."
+                )
+            if self.num_moe_experts is None:
+                raise ValueError(
+                    "num_moe_experts must be set when moe_n_hash_layers > 0 "
+                    "(hash routing is an MoE feature)."
+                )
+            if self.moe_n_hash_layers > self.num_layers:
+                raise ValueError(
+                    f"moe_n_hash_layers ({self.moe_n_hash_layers}) must not exceed "
+                    f"num_layers ({self.num_layers})."
+                )
+            if self.pipeline_model_parallel_size > 1:
+                raise NotImplementedError(
+                    "Hash MoE (moe_n_hash_layers > 0) with pipeline parallelism (PP > 1) "
+                    "is not supported yet; the PyNative first version requires PP=1."
+                )
 
         if (self.moe_router_load_balancing_type is not None
                 and not isinstance(self.moe_router_load_balancing_type, str)):

@@ -252,9 +252,19 @@ class MultiTokenPredictionLayer(nn.Cell):
             config: TransformerConfig,
             submodules: MultiTokenPredictionLayerSubmodules,
             layer_number: int = 1,
+            is_mtp_layer: bool = False,
     ):
         super().__init__()
+        # MTP + dsv4_hybrid + hash-MoE co-support is not yet validated end-to-end. The router
+        # short-circuit makes MTP layers non-hash, but fail loudly here to document the boundary.
+        if is_mtp_layer and getattr(config, "experimental_attention_variant", None) == "dsv4_hybrid" \
+                and getattr(config, "moe_n_hash_layers", 0) > 0:
+            raise NotImplementedError(
+                "MTP + dsv4_hybrid + hash-MoE co-support is not yet validated; "
+                "set moe_n_hash_layers=0 or disable mtp_num_layers."
+            )
         self.config = config
+        self.is_mtp_layer = is_mtp_layer
         self.submodules = submodules
         self.dtype = config.compute_dtype
         self.layer_number = layer_number
@@ -286,6 +296,8 @@ class MultiTokenPredictionLayer(nn.Cell):
         self.transformer_layer = build_module(
             self.submodules.transformer_layer,
             config=self.config,
+            layer_number=self.layer_number,
+            is_mtp_layer=self.is_mtp_layer,
         )
 
         self.final_layernorm = build_module(
@@ -478,8 +490,13 @@ class MultiTokenPredictionBlock(nn.Cell):
     def _build_layers(self):
         """Building MTP layers."""
         self.layers = nn.CellList()
-        for layer_spec in self.submodules.layer_specs:
-            mtp_layer = build_module(layer_spec, config=self.config)
+        for i, layer_spec in enumerate(self.submodules.layer_specs):
+            mtp_layer = build_module(
+                layer_spec,
+                config=self.config,
+                layer_number=self.config.num_layers + i,
+                is_mtp_layer=True,
+            )
             self.layers.append(mtp_layer)
 
     def construct(

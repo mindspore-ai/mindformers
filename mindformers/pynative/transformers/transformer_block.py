@@ -163,7 +163,8 @@ class TransformerBlock(nn.Cell):
                   attention_mask: Tensor,
                   rotary_pos_emb: Tensor = None,
                   prefix_keys_values=None,
-                  actual_seq_len=None):
+                  actual_seq_len=None,
+                  input_ids=None):
         """
         Construct function of transformer block.
 
@@ -175,6 +176,8 @@ class TransformerBlock(nn.Cell):
             prefix_keys_values (optional): List of prefix key-value tensors for each layer.
                 Each element should be a tuple or list of (key, value) tensors. Default: None.
             actual_seq_len (optional): Actual sequence length for variable-length sequences. Default: None.
+            input_ids (Tensor, optional): Token IDs of shape (B, S), forwarded to each layer for
+                hash-based MoE routing. Consumed only by hash layers. Default: None.
 
         Returns:
             Tuple[Tensor, Tensor]: A tuple containing:
@@ -194,7 +197,8 @@ class TransformerBlock(nn.Cell):
                 attention_mask,
                 rotary_pos_emb=rotary_pos_emb,
                 prefix_keys_values=prefix_kv,
-                actual_seq_len=actual_seq_len
+                actual_seq_len=actual_seq_len,
+                input_ids=input_ids
             )
 
         if self.hc and self.has_final_layernorm_in_this_stage():
