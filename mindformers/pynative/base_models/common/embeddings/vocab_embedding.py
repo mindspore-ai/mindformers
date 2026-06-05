@@ -41,6 +41,7 @@ class VocabEmbedding(nn.Cell):
             num_embeddings,
             embedding_dim,
             init_method: Callable,
+            params_dtype = dtype.float32,
     ):
         super().__init__()
         self.num_embeddings = num_embeddings
@@ -51,7 +52,8 @@ class VocabEmbedding(nn.Cell):
         self.reshape = mint.reshape
 
         self.init_method = init_method
-        self.weight = Parameter(mint.empty([self.num_embeddings, self.embedding_dim]), name="weight")
+        self.weight = Parameter(mint.empty([self.num_embeddings, self.embedding_dim],
+                                           dtype=params_dtype), name="weight")
 
     def reset_parameter(self):
         """Reset embedding weights for delayed initialization."""

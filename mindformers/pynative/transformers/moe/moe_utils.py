@@ -256,6 +256,12 @@ def track_moe_metrics(
 
     tracker = get_moe_layer_wise_logging_tracker()
 
+    # No MoE layer contributed aux losses (e.g. an all-dense model where every layer
+    # is below first_k_dense_replace). The tracker is empty, so there is nothing to
+    # report; returning None makes the loss callback simply omit load_balancing_loss.
+    if "values" not in tracker:
+        return None
+
     # Get number of MoE layers
     if moe_layer_freq is None:
         num_moe_layers = num_layers

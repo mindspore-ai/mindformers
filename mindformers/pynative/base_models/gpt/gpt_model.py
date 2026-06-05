@@ -497,9 +497,10 @@ class GPTModel(nn.Cell):
             full_locals = list(params)
 
         stacked = mint.stack(full_locals, dim=0)
-        result = all_reduce(stacked, op=ops.ReduceOp.MAX)
-        if result is not None:
-            stacked = result
+        if get_world_size() > 1:
+            result = all_reduce(stacked, op=ops.ReduceOp.MAX)
+            if result is not None:
+                stacked = result
         return params, mesh, placements, stacked
 
     def _writeback_synced_max_logits(self, params, mesh, placements, stacked):
@@ -693,7 +694,7 @@ class GPTModel(nn.Cell):
             param_layer.append(layer_idx)
         return tuple(param_layer)
 
-    def apply_qk_clip_scaling(self, logit_threshold, muon_split_fn, muon_merge_fn):
+    def apply_qk_clip_scaling(self, logit_threshold, muon_split_fn, muon_merge_fn, fp32_param_map=None):
         """Apply QK-clip scaling to attention weight parameters.
 
         We collect every layer's mask/scale ops on-device first, then do a
@@ -742,7 +743,8 @@ class GPTModel(nn.Cell):
                 if int(counts[i]) == 0:
                     continue
                 self_attention.try_apply_qk_clip_to_local_weights(
-                    param_prefix, scales_local, muon_split_fn, muon_merge_fn)
+                    param_prefix, scales_local, muon_split_fn, muon_merge_fn,
+                    fp32_param_map=fp32_param_map)
 
         # Phase C: global-clip fallback for layers where local weights can't
         # apply the clip (e.g. TP shards the head dim).  These are rare and
@@ -762,4 +764,6 @@ class GPTModel(nn.Cell):
                 f"clipping {num_clipped}/{logits_full.shape[0]} heads, "
                 f"max_logit={max_logit:.4f}, threshold={threshold_val:.4f}"
             )
-            self_attention.apply_qk_clip_to_weights(param_prefix, scales, muon_split_fn, muon_merge_fn)
+            self_attention.apply_qk_clip_to_weights(
+                param_prefix, scales, muon_split_fn, muon_merge_fn,
+                fp32_param_map=fp32_param_map)

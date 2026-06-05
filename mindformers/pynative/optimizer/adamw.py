@@ -14,13 +14,14 @@
 # ============================================================================
 """AdamW"""
 
-from mindspore import _checkparam as validator, Parameter, Tensor, mint, ParameterTuple
+from mindspore import _checkparam as validator, Parameter, Tensor, ParameterTuple, _no_grad
 from mindspore.common import dtype as mstype
 from mindspore.ops import operations as P
 from mindspore.ops import auto_generate as gen
 from mindspore.nn.optim.optimizer import Optimizer
 
 from hyper_parallel import SkipDTensorDispatch
+from mindformers.tools.logger import logger
 
 op_cast = P.Cast()
 
@@ -82,6 +83,9 @@ def _check_param_value(betas, eps, weight_decay, prim_name):
     validator.check_value_type("weight_decay", weight_decay, [float], prim_name)
 
 
+_LOW_PRECISION_DTYPES = (mstype.float16, mstype.bfloat16)
+
+
 class AdamW(Optimizer):
     """
     This is the implementation of AdamW.
@@ -98,10 +102,10 @@ class AdamW(Optimizer):
 
             - weight_decay: Optional. If "weight_decay" in the keys, the value of corresponding weight decay
               will be used. If not, the `weight_decay` in the optimizer will be used. It should be noted that weight
-              decay can be a constant value or a Cell. It is a Cell only when dynamic weight decay is applied. Dynamic
-              weight decay is similar to dynamic learning rate, users need to customize a weight decay schedule only
-              with global step as input, and during training, the optimizer calls the instance of WeightDecaySchedule
-              to get the weight decay value of current step.
+              decay can be a dynamic value only when dynamic weight decay is applied. Dynamic weight decay is similar
+              to dynamic learning rate, users need to customize a weight decay schedule only with global step as input,
+              and during training, the optimizer calls the instance of WeightDecaySchedule to get the weight decay
+              value of current step.
 
             - order_params: Optional. When parameters is grouped, this usually is used to maintain the order of
               parameters that appeared in the network to improve performance. The value should be parameters whose
@@ -137,6 +141,11 @@ class AdamW(Optimizer):
 
             - Cell: Weight decay is dynamic. During training, the optimizer calls the instance of
               the Cell with step as the input to get the weight decay value of current step.
+
+    Note:
+        fp32 master weight copies are always created for bf16/fp16 parameters; optimizer updates run
+        on the fp32 copies and are synced back to the model parameters, aligning with Megatron's
+        mixed precision optimizer design.
 
     Inputs:
         - **gradients** (tuple[Tensor]) - The gradients of `params`, the shape is the same as `params`.
@@ -177,40 +186,89 @@ class AdamW(Optimizer):
         self.eps = Tensor(eps, dtype=mstype.float32)
         self.one_minus_beta2 = Tensor(1.0 - betas[1], dtype=mstype.float32)
 
-        # init optimizer state
         self.enable_fused_opt = bool(enable_fused_opt or use_fused)
         self.enable_cpu_offload = enable_cpu_offload
         if self.enable_cpu_offload:
             raise ValueError("Not support enable_cpu_offload.")
 
-        self.exp_avg = self._init_state(prefix="exp_avg")
-        self.exp_avg_sq = self._init_state(prefix="exp_avg_sq")
+        self._is_low_precision_param, self.fp32_params = self._init_main_params()
+        self.exp_avg = self._init_state(prefix="adam_m")
+        self.exp_avg_sq = self._init_state(prefix="adam_v")
 
         self.amsgrad = kwargs.get("amsgrad", False)
         self.maximize = kwargs.get("maximize", False)
         if not self.enable_fused_opt:
             self.max_exp_avg_sq = None
         elif self.amsgrad:
-            self.max_exp_avg_sq = self.parameters.clone(prefix="max_exp_avg_sq", init='zeros')
+            self.max_exp_avg_sq = self._init_state(prefix="max_exp_avg_sq")
         else:
             self.max_exp_avg_sq = self.exp_avg_sq
         self.fused_adamw_opt = gen.AdamW() if self.enable_fused_opt else None
 
         if self.enable_fused_opt:
-            # Keep step behavior aligned with static-graph FusedAdamW.
             self.global_step = Parameter(Tensor([-1], mstype.int32), "global_step")
             self.global_step_increase_tensor = Tensor([1], mstype.int32)
         else:
             self.global_step = Parameter(Tensor([0], mstype.int64), "global_step")
             self.global_step_increase_tensor = Tensor([1], mstype.int64)
 
+    def _init_main_params(self):
+        """Create fp32 master weight copies for bf16/fp16 model parameters.
+
+        fp32 parameters are re-used directly (no copy needed).
+        """
+        is_low_precision = []
+        fp32_params = []
+        lp_count = 0
+        for param in self._parameters:
+            if param.dtype in _LOW_PRECISION_DTYPES:
+                is_low_precision.append(True)
+                lp_count += 1
+                main_param = Parameter(param.clone().float(), name=f"main_param.{param.name}")
+                fp32_params.append(main_param)
+            else:
+                is_low_precision.append(False)
+                fp32_params.append(param)
+        logger.info("[MixedPrecision] _init_main_params: %d/%d params with fp32 master copy",
+                    lp_count, len(self._parameters))
+        return tuple(is_low_precision), ParameterTuple(fp32_params)
+
     def _init_state(self, prefix):
-        parameters = []
-        for param in self.parameters:
-            name = param.name
-            optim_param = Parameter(mint.zeros_like(param), name=f"{prefix}_{name}")
-            parameters.append(optim_param)
-        return ParameterTuple(parameters)
+        """Create a zero-initialized fp32 state tuple, named after the model parameters.
+
+        State is cloned from the fp32 master weights (so it matches their shape/dtype)
+        but named with the model parameter name, keeping naming aligned with Muon.
+        """
+        states = []
+        for model_param, fp32_param in zip(self._parameters, self.fp32_params):
+            state = fp32_param.clone('zeros')
+            state.name = f"{prefix}.{model_param.name}"
+            states.append(state)
+        return ParameterTuple(states)
+
+    def _copy_main_params_to_model_params(self):
+        for model_param, fp32_param, is_lp in zip(
+                self._parameters, self.fp32_params, self._is_low_precision_param):
+            if is_lp:
+                model_param.copy_(op_cast(fp32_param, model_param.dtype))
+
+    def reload_main_params_from_model(self):
+        """Refresh fp32 master weights from the model parameters.
+
+        Used on weights-only resume (no_load_optim=True): the model params have just
+        been loaded from checkpoint while the fp32 masters still hold their pre-load
+        init values, so copy model -> master to align their starting points.
+
+        Runs outside the optimizer's construct(), so it must enter SkipDTensorDispatch
+        itself (InplaceCopy has no parallel layout infer func under DTensor dispatch).
+        _no_grad avoids the "leaf tensor that requires grad in an inplace operator"
+        error: the fp32 master is a leaf Parameter and this copy is not an autograd op.
+        """
+        with _no_grad(), SkipDTensorDispatch():
+            for model_param, fp32_param, is_lp in zip(
+                    self._parameters, self.fp32_params, self._is_low_precision_param):
+                if is_lp:
+                    fp32_param.copy_(op_cast(model_param, mstype.float32))
 
     def _increase_global_step(self):
         """Increase global step in PyNative mode without static-graph AssignAdd."""
@@ -237,8 +295,9 @@ class AdamW(Optimizer):
         step = op_cast(self.global_step, mstype.int64)
         is_lr_list = isinstance(lr, list)
         is_wd_list = isinstance(weight_decay, list)
+
         for index, (param, grad, exp_avg, exp_avg_sq, max_exp_avg_sq, optim_filter) in enumerate(zip(
-                self._parameters,
+                self.fp32_params,
                 gradients,
                 self.exp_avg,
                 self.exp_avg_sq,
@@ -264,6 +323,9 @@ class AdamW(Optimizer):
                 exp_avg_sq,
                 max_exp_avg_sq,
             ))
+
+        self._copy_main_params_to_model_params()
+
         return tuple(results)
 
     def forward_opt(self, gradients, lr, weight_decay):
@@ -274,8 +336,9 @@ class AdamW(Optimizer):
         is_lr_list = isinstance(lr, list)
         is_wd_list = isinstance(weight_decay, list)
         one_minus_beta2 = self.one_minus_beta2
+
         for index, (param, grad, exp_avg, exp_avg_sq, optim_filter) in enumerate(zip(
-                self._parameters,
+                self.fp32_params,
                 gradients,
                 self.exp_avg,
                 self.exp_avg_sq,
@@ -296,4 +359,7 @@ class AdamW(Optimizer):
                 bias_correction2,
                 one_minus_beta2,
             ))
+
+        self._copy_main_params_to_model_params()
+
         return tuple(results)

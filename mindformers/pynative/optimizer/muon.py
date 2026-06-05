@@ -24,7 +24,7 @@ import copy as cp
 import math
 from fnmatch import fnmatch
 
-from mindspore import mint, Parameter
+from mindspore import mint, Parameter, _no_grad
 from mindspore.common import dtype as mstype
 from mindspore.common.parameter import ParameterTuple
 from mindspore.ops import functional as F, operations as P
@@ -54,11 +54,14 @@ _HP_PLATFORM = get_platform()
 _FULL_TENSOR_OP_CACHE = {}
 _ALL_CONCAT_GROUP_CACHE = {}
 
+_LOW_PRECISION_DTYPES = (mstype.float16, mstype.bfloat16)
+op_cast = P.Cast()
 
-def _create_state_parameter(old_param, prefix, init='zeros'):
+
+def _create_state_parameter(old_param, prefix, init='zeros', name=None):
     """Create optimizer state parameter with the same shape and dtype as the original parameter."""
     param = old_param.clone(init)
-    param.name = prefix + "." + old_param.name
+    param.name = prefix + "." + (name if name is not None else old_param.name)
     return param
 
 
@@ -956,7 +959,6 @@ def _apply_muon_update(
     update. All other cases (regular Tensor, or non-2D DTensor) operate on the local
     tensor directly and skip the gather/redistribute entirely.
     """
-    op_cast = P.Cast()
     ndim = len(gradient.shape)
 
     if ndim == 2:
@@ -997,11 +999,11 @@ def _apply_muon_update(
         x_ret = distribute_tensor(x_ret, device_mesh, placements).to_local()
 
     with SkipDTensorDispatch():
-        param_fp32 = op_cast(param, mstype.float32) * (1 - lr * weight_decay)
+        param_fp32 = param * (1 - lr * weight_decay)
         next_param = param_fp32 - x_ret.reshape(param_fp32.shape)
-        param.copy_(op_cast(next_param, F.dtype(param)))
-        muon_m.copy_(op_cast(next_m, F.dtype(muon_m)))
-    return op_cast(next_param, F.dtype(param))
+        param.copy_(next_param)
+        muon_m.copy_(next_m)
+    return next_param
 
 
 # ---------------------------------------------------------------------------
@@ -1043,7 +1045,6 @@ def _prepare_muon_input_compute(gradient, muon_m, momentum, use_nesterov):
     ``input + momentum * other`` pattern (was ``other * momentum + input``,
     a separate Mul + Add) — saves one kernel launch per term per weight.
     """
-    op_cast = P.Cast()
     gradient_local = _to_local(gradient)
     muon_m_local = _to_local(muon_m)
 
@@ -1075,7 +1076,6 @@ def _prepare_muon_input_batched(gradients, muon_m_list, momentum, use_nesterov):
     element is a view of the stacked output that stays alive via the views
     themselves (callers store the views in their ``info`` dicts).
     """
-    op_cast = P.Cast()
     n_slots = len(gradients)
     if n_slots == 1:
         ns_input, next_m = _prepare_muon_input_compute(
@@ -1102,7 +1102,7 @@ def _prepare_muon_input_batched(gradients, muon_m_list, momentum, use_nesterov):
     )
 
 
-def _apply_prepared_update_batched(infos, op_cast):
+def _apply_prepared_update_batched(infos):
     """Phase 4 batched apply for ``n_slots`` same-shape weights.
 
     Stacks ``param`` / ``x_ret`` / ``next_m`` across the group, runs one
@@ -1236,7 +1236,6 @@ def _run_muon_batched(
 
     Returns a list of updated parameters (same length as input lists).
     """
-    op_cast = P.Cast()
     n_weights = len(muon_gradients)
 
     def _materialize_full_tensor(info):
@@ -1256,10 +1255,10 @@ def _run_muon_batched(
         param = info['param']
         muon_m = info['muon_m']
         with SkipDTensorDispatch():
-            param_fp32 = op_cast(param, mstype.float32) * (1 - info['lr'] * info['wd'])
+            param_fp32 = param * (1 - info['lr'] * info['wd'])
             next_param = param_fp32 - x_ret.reshape(param_fp32.shape)
-            param.copy_(op_cast(next_param, F.dtype(param)))
-            muon_m.copy_(op_cast(info['next_m'], F.dtype(muon_m)))
+            param.copy_(next_param)
+            muon_m.copy_(info['next_m'])
         return param
 
     # ------------------------------------------------------------------
@@ -1630,7 +1629,7 @@ def _run_muon_batched(
     if phase4_local is not None:
         for slots in phase4_local.values():
             infos = [prepared[s] for s in slots]
-            updated = _apply_prepared_update_batched(infos, op_cast)
+            updated = _apply_prepared_update_batched(infos)
             for s, p in zip(slots, updated):
                 results[s] = p
     else:
@@ -1656,7 +1655,7 @@ def _run_muon_batched(
     if phase4_2d is not None:
         for slots in phase4_2d.values():
             infos = [prepared[s] for s in slots]
-            updated = _apply_prepared_update_batched(infos, op_cast)
+            updated = _apply_prepared_update_batched(infos)
             for s, p in zip(slots, updated):
                 results[s] = p
     else:
@@ -1800,6 +1799,15 @@ class Muon(Optimizer):
             self._muon_buffer_cache = None
             self._muon_runtime_groups = None
 
+        # ---- Always create fp32 master weights ----
+        self._is_low_precision_param, self.fp32_params = self._init_main_params()
+        self._fp32_param_map = {
+            p.name: fp32_p
+            for p, fp32_p, is_lp in zip(
+                self._parameters, self.fp32_params, self._is_low_precision_param)
+            if is_lp
+        }
+
         self._initialize_state()
 
         # ``max_exp_avg_sq`` is required by ``gen.AdamW()`` even when
@@ -1920,8 +1928,52 @@ class Muon(Optimizer):
         if qk_clip_enabled and qk_clip_threshold <= 0:
             raise ValueError(f"qk_clip_threshold must be positive, got {qk_clip_threshold!r}.")
 
+    def _init_main_params(self):
+        """Create fp32 master weight copies for bf16/fp16 model parameters.
+
+        fp32 parameters are re-used directly (no copy needed).
+        """
+        is_low_precision = []
+        fp32_params = []
+        lp_count = 0
+        for param in self._parameters:
+            if param.dtype in _LOW_PRECISION_DTYPES:
+                is_low_precision.append(True)
+                lp_count += 1
+                main_param = Parameter(param.clone().float(), name=f"main_param.{param.name}")
+                fp32_params.append(main_param)
+            else:
+                is_low_precision.append(False)
+                fp32_params.append(param)
+        logger.info("[Muon MixedPrecision] _init_main_params: %d/%d params with fp32 master copy",
+                    lp_count, len(self._parameters))
+        return tuple(is_low_precision), ParameterTuple(fp32_params)
+
+    def _copy_main_params_to_model_params(self):
+        """Sync fp32 master weights back to model parameters (cast to model dtype)."""
+        with SkipDTensorDispatch():
+            for model_param, fp32_param, is_lp in zip(
+                    self._parameters, self.fp32_params, self._is_low_precision_param):
+                if is_lp:
+                    model_param.copy_(op_cast(fp32_param, model_param.dtype))
+
+    def reload_main_params_from_model(self):
+        """Refresh fp32 master weights from the model parameters.
+
+        Used on weights-only resume (no_load_optim=True): the model params have just
+        been loaded from checkpoint while the fp32 masters still hold their pre-load
+        init values, so copy model -> master to align their starting points.
+        _no_grad avoids the "leaf tensor that requires grad in an inplace operator"
+        error: the fp32 master is a leaf Parameter and this copy is not an autograd op.
+        """
+        with _no_grad(), SkipDTensorDispatch():
+            for model_param, fp32_param, is_lp in zip(
+                    self._parameters, self.fp32_params, self._is_low_precision_param):
+                if is_lp:
+                    fp32_param.copy_(op_cast(model_param, mstype.float32))
+
     def _initialize_state(self):
-        """Create Muon momentum and AdamW moment state in one pass over self._parameters."""
+        """Create Muon momentum and AdamW moment state from fp32 master weights."""
         muon_filter = self._muon_filter
 
         muon_m = []
@@ -1930,18 +1982,16 @@ class Muon(Optimizer):
         state_indices = []
         use_muon = []
 
-        for param in self._parameters:
-            if muon_filter(param):
+        for i, _ in enumerate(self._parameters):
+            if muon_filter(self._parameters[i]):
                 state_indices.append(len(muon_m))
-                muon_m.append(_create_state_parameter(param, "muon_m"))
+                muon_m.append(_create_state_parameter(self.fp32_params[i], "muon_m", name=self._parameters[i].name))
                 use_muon.append(True)
-                logger.info(f"Muon apply: {type(param)=}, {param.name=}")
             else:
                 state_indices.append(len(moments1))
-                moments1.append(_create_state_parameter(param, "adam_m"))
-                moments2.append(_create_state_parameter(param, "adam_v"))
+                moments1.append(_create_state_parameter(self.fp32_params[i], "adam_m", name=self._parameters[i].name))
+                moments2.append(_create_state_parameter(self.fp32_params[i], "adam_v", name=self._parameters[i].name))
                 use_muon.append(False)
-                logger.info(f"Adam apply: {type(param)=}, {param.name=}")
 
         self.muon_m = ParameterTuple(muon_m)
         self.moments1 = ParameterTuple(moments1)
@@ -2273,13 +2323,22 @@ class Muon(Optimizer):
 
         # ------- allgather_deredundency: batched path -------
         if self.comm_strategy == "allgather_deredundency":
-            return self._construct_deredundency(
+            optim_result = self._construct_deredundency(
                 gradients, weight_decay, lr,
                 bias_correction1, bias_correction2, one_minus_beta2)
+            if self.qk_clip_enabled and self.model.synced_max_attention_logit_fires(self.logit_threshold):
+                self.model.apply_qk_clip_scaling(
+                    self.logit_threshold,
+                    self.muon_split_fn,
+                    self.muon_merge_fn,
+                    fp32_param_map=self._fp32_param_map,
+                )
+            self._copy_main_params_to_model_params()
+            return optim_result
 
-        # ------- allgather: original sequential path (unchanged) -------
+        # ------- allgather: sequential path -------
         optim_result = []
-        for i, (param, gradient, use_muon) in enumerate(zip(self._parameters, gradients, self.use_muon)):
+        for i, (param, gradient, use_muon) in enumerate(zip(self.fp32_params, gradients, self.use_muon)):
             param_name = self.param_name_tuple[i]
 
             if "max_logits_val" in param_name:
@@ -2322,7 +2381,10 @@ class Muon(Optimizer):
                 self.logit_threshold,
                 self.muon_split_fn,
                 self.muon_merge_fn,
+                fp32_param_map=self._fp32_param_map,
             )
+
+        self._copy_main_params_to_model_params()
 
         return optim_result
 
@@ -2381,7 +2443,7 @@ class Muon(Optimizer):
         optim_result = [None] * len(gradients)
         param_meta = self._muon_param_meta or {}
 
-        for i, (param, gradient, use_muon) in enumerate(zip(self._parameters, gradients, self.use_muon)):
+        for i, (param, gradient, use_muon) in enumerate(zip(self.fp32_params, gradients, self.use_muon)):
             param_name = self.param_name_tuple[i]
 
             if "max_logits_val" in param_name:
@@ -2508,12 +2570,5 @@ class Muon(Optimizer):
                 optim_result[param_idx] = muon_results[slot]
         else:
             run_adamw_tasks()
-
-        if self.qk_clip_enabled and self.model.synced_max_attention_logit_fires(self.logit_threshold):
-            self.model.apply_qk_clip_scaling(
-                self.logit_threshold,
-                self.muon_split_fn,
-                self.muon_merge_fn,
-            )
 
         return optim_result

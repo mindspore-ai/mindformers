@@ -144,8 +144,8 @@ class HyperConnectionModule(nn.Cell):
             input_size=n * hidden_size,
             output_size=dim,
             compute_dtype=self.dtype,
-            params_dtype=config.params_dtype,
-            init_method=init_method_zero(config.params_dtype),
+            params_dtype=mstype.float32,
+            init_method=init_method_zero(mstype.float32),
             bias=False,
         )
         self.alpha_pre = Parameter(mint.empty((1,), dtype=mstype.float32), name='alpha_pre')

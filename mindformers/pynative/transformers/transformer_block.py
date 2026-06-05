@@ -147,7 +147,6 @@ class TransformerBlock(nn.Cell):
             self.final_layernorm = build_module(self.submodules.layer_norm,
                                                 dim=config.hidden_size,
                                                 eps=config.layernorm_epsilon,
-                                                params_dtype=config.params_dtype,
                                                 compute_dtype=config.layernorm_compute_dtype)
         else:
             self.final_layernorm = None

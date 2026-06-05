@@ -55,7 +55,6 @@ class TestFusedNorm:
             norm_cls = get_pynative_norm_cls(normalization=normalization, fused_norm=True)
             norm = norm_cls(
                 dim=hidden_size,
-                params_dtype=config.params_dtype,
                 compute_dtype=config.layernorm_compute_dtype
             )
             norm.reset_parameter()

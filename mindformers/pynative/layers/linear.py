@@ -69,13 +69,13 @@ class Linear(nn.Cell):
         else:
             # Weight is stored as (output_size, input_size) and transposed at runtime
             weight_shape = (output_size, input_size)
-            self.weight = Parameter(mint.empty(weight_shape), name='weight')
+            self.weight = Parameter(mint.empty(weight_shape, dtype=self.params_dtype), name='weight')
 
         if self.has_bias:
             if bias_init is None:
                 bias_init = init_method_zero(self.params_dtype)
             self.bias_init = bias_init
-            self.bias = Parameter(mint.empty((output_size,)), name='bias')
+            self.bias = Parameter(mint.empty((output_size,), dtype=self.params_dtype), name='bias')
         else:
             self.bias_init = None
             self.bias = None
