@@ -723,6 +723,8 @@ class Trainer:
                         micro_loss = self._forward_backward(self.model, micro_inputs)
                     except Exception as e:
                         raise RuntimeError(f"Error in training step {step}.") from e
+                    if isinstance(micro_loss, DTensor):
+                        micro_loss = micro_loss.to_local()
                     loss += micro_loss
 
                     self.monitor.record("local_loss", micro_loss,
@@ -743,8 +745,6 @@ class Trainer:
                         grad_norm = self._optimizer_update()
 
                         if self.enable_parallel:
-                            if isinstance(loss, DTensor):
-                                loss = loss.to_local()
                             all_reduce(loss, op=ops.ReduceOp.SUM)
                             loss /= self.world_size
 
