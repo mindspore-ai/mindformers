@@ -150,10 +150,7 @@ class _MoEAuxLossAutoScaler(_Function):
             scale (Tensor): The scale value to set. Please ensure that the scale passed in
                             matches the scale of the main_loss.
         """
-        if _MoEAuxLossAutoScaler.main_loss_backward_scale is None:
-            _MoEAuxLossAutoScaler.main_loss_backward_scale = scale
-        else:
-            _MoEAuxLossAutoScaler.main_loss_backward_scale.copy_(scale)
+        _MoEAuxLossAutoScaler.main_loss_backward_scale = scale
 
 
 class MoEAuxLossAutoScaler(nn.Cell):
@@ -249,6 +246,8 @@ def track_moe_metrics(
         num_layers: Optional[int] = None,
         moe_layer_freq: Optional[Union[int, List[int]]] = None,
         mtp_num_layers: Optional[int] = None,
+        group=None,
+        group_size=None,
 ):
     """Track and compute average MoE auxiliary loss across all MoE layers."""
     if not loss_scale or loss_scale <= 0.0:
@@ -278,9 +277,11 @@ def track_moe_metrics(
         num_moe_layers += mtp_num_layers
 
     aux_losses = tracker["values"].sum() / num_moe_layers
-    if get_world_size() > 1:
-        all_reduce(aux_losses, op=ops.ReduceOp.SUM)
-        aux_losses /= get_world_size()
+    if group_size is None:
+        group_size = get_world_size()
+    if group_size > 1:
+        all_reduce(aux_losses, op=ops.ReduceOp.SUM, group=group)
+        aux_losses /= group_size
     clear_aux_losses_tracker()
 
     return aux_losses

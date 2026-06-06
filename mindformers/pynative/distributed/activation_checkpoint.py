@@ -357,11 +357,11 @@ def _get_single_layer_whitelist(layer, whitelist, info=''):
         _get_single_layer_whitelist(cell, whitelist, current_path)
 
 
-def _get_modules_and_ops_list(model, num_layers):
+def _get_modules_and_ops_list(model):
     """Get a list of all modules and operators for each layer in the model."""
     layer_configs = []
 
-    for layer_id in range(num_layers):
+    for layer_id in range(model.layer_start, model.layer_end + 1):
         layer = model.layers[layer_id]
         layer_whitelist = []
         _get_single_layer_whitelist(layer, layer_whitelist)
@@ -515,7 +515,6 @@ def apply_recompute(
     model: nn.Cell,
     recompute_config: RecomputeConfig,
     recompute_comm_config: RecomputeCommConfig,
-    num_layers: int,
 ) -> None:
     """Apply ``checkpoint_wrapper`` using recompute and recompute_comm configs."""
     rc = recompute_config
@@ -530,7 +529,7 @@ def apply_recompute(
     if _config_list:
         config_list = _config_list
     else:
-        config_list = _get_modules_and_ops_list(model, num_layers)
+        config_list = _get_modules_and_ops_list(model)
 
     if need_recompute:
         full_target_ids = _parse_layer_ids(rc.full_recompute_layer)
@@ -545,7 +544,7 @@ def apply_recompute(
     if not hasattr(model, "layers"):
         raise ValueError(f"{type(model)} must have 'layers' attribute.")
 
-    for layer_id in range(num_layers):
+    for layer_id in range(model.layer_start, model.layer_end + 1):
         if need_recompute and layer_id in full_target_ids:
             model.layers[layer_id] = checkpoint_wrapper(model.layers[layer_id])
             logger.info(f"Set full recompute at layer {layer_id}")
@@ -676,7 +675,6 @@ def _set_op_swap(layer, layer_id, layer_to_modules, policy_fn):
 def apply_swap(
     model: nn.Cell,
     swap: SwapConfig,
-    num_layers: int,
 ) -> None:
     """Apply ``checkpoint_wrapper`` using ``swap_config``."""
     sc = swap
@@ -686,7 +684,7 @@ def apply_swap(
     if _config_list:
         config_list = _config_list
     else:
-        config_list = _get_modules_and_ops_list(model, num_layers)
+        config_list = _get_modules_and_ops_list(model)
     if sc.op_swap:
         op_swap_list = _expand_op_swap(config_list, parse_op_swap(sc.op_swap))
         layer_to_modules = _clean_and_parse_config(full_target_ids, op_swap_list, label="Swap")
@@ -695,7 +693,7 @@ def apply_swap(
     if not hasattr(model, "layers"):
         raise ValueError(f"{type(model)} must have 'layers' attribute.")
 
-    for layer_id in range(num_layers):
+    for layer_id in range(model.layer_start, model.layer_end + 1):
         if layer_id in full_target_ids:
             model.layers[layer_id] = swap_wrapper(model.layers[layer_id], policy_fn=policy_fn)
             SwapManager().set_forward_prefetch_layer(model.layers[layer_id], model.layers[layer_id + prefetch])
@@ -788,15 +786,15 @@ def apply_ac(
     if not num_layers:
         raise ValueError(f"{type(model)} must have 'config.num_layers' attribute.")
 
-    _config_list = _get_modules_and_ops_list(model, num_layers)
+    _config_list = _get_modules_and_ops_list(model)
 
     if enable_recompute and enable_swap:
         _check_recompute_swap_overlap(recompute, recompute_comm, swap)
 
     if enable_recompute:
         _validate_recompute_config(recompute, recompute_comm, num_layers)
-        apply_recompute(model, recompute, recompute_comm, num_layers)
+        apply_recompute(model, recompute, recompute_comm)
 
     if enable_swap:
         _validate_swap_config(swap, num_layers)
-        apply_swap(model, swap, num_layers)
+        apply_swap(model, swap)

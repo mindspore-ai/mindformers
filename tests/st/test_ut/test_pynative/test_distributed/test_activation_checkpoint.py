@@ -60,6 +60,8 @@ class MockModel(nn.Cell):
         super().__init__()
         self.layers = nn.CellList([MockTransformerLayer() for _ in range(num_layers)])
         self.config = type("Config", (), {"num_layers": num_layers})()
+        self.layer_start = 0
+        self.layer_end = num_layers - 1
 
     def construct(self, x):
         return x
@@ -86,14 +88,14 @@ class TestFullRecompute:
     def test_full_recompute_single_layer(self):
         model = MockModel(num_layers=2)
         rc, rc_comm = _make_recompute_config(mode="full", full_recompute_layer=["0"])
-        apply_recompute(model, rc, rc_comm, num_layers=2)
+        apply_recompute(model, rc, rc_comm)
         assert isinstance(model.layers[0], CheckpointWrapper)
         assert not isinstance(model.layers[1], CheckpointWrapper)
 
     def test_full_recompute_all_layers(self):
         model = MockModel(num_layers=2)
         rc, rc_comm = _make_recompute_config(mode="full", full_recompute_layer=["0-1"])
-        apply_recompute(model, rc, rc_comm, num_layers=2)
+        apply_recompute(model, rc, rc_comm)
         assert isinstance(model.layers[0], CheckpointWrapper)
         assert isinstance(model.layers[1], CheckpointWrapper)
 
@@ -107,21 +109,21 @@ class TestSelectRecompute:
     def test_select_by_wildcard(self):
         model = MockModel(num_layers=2)
         rc, rc_comm = _make_recompute_config(mode="select", select_module={".*\\.proj": ["0"]})
-        apply_recompute(model, rc, rc_comm, num_layers=2)
+        apply_recompute(model, rc, rc_comm)
         assert isinstance(model.layers[0].attention.proj, CheckpointWrapper)
         assert isinstance(model.layers[0].mlp.proj, CheckpointWrapper)
 
     def test_select_parent_covers_children(self):
         model = MockModel(num_layers=2)
         rc, rc_comm = _make_recompute_config(mode="select", select_module={"attention": ["0"], "attention.qkv": ["0"]})
-        apply_recompute(model, rc, rc_comm, num_layers=2)
+        apply_recompute(model, rc, rc_comm)
         assert isinstance(model.layers[0].attention, CheckpointWrapper)
         assert not isinstance(model.layers[0].attention.qkv, CheckpointWrapper)
 
     def test_select_multiple_modules(self):
         model = MockModel(num_layers=2)
         rc, rc_comm = _make_recompute_config(mode="select", select_module={"attention": ["0"], "mlp": ["1"]})
-        apply_recompute(model, rc, rc_comm, num_layers=2)
+        apply_recompute(model, rc, rc_comm)
         assert isinstance(model.layers[0].attention, CheckpointWrapper)
         assert isinstance(model.layers[1].mlp, CheckpointWrapper)
 
@@ -143,7 +145,7 @@ class TestLayerSwap:
     def test_layer_swap_single_layer(self):
         model = MockModel(num_layers=3)
         sc = _make_swap_config(layer_swap=[{"layers": ["0"]}])
-        apply_swap(model, sc, num_layers=3)
+        apply_swap(model, sc)
         assert isinstance(model.layers[0], SwapWrapper)
         assert not isinstance(model.layers[1], SwapWrapper)
         assert not isinstance(model.layers[2], SwapWrapper)
@@ -151,7 +153,7 @@ class TestLayerSwap:
     def test_layer_swap_range(self):
         model = MockModel(num_layers=3)
         sc = _make_swap_config(layer_swap=[{"layers": ["0-1"]}])
-        apply_swap(model, sc, num_layers=3)
+        apply_swap(model, sc)
         assert isinstance(model.layers[0], SwapWrapper)
         assert isinstance(model.layers[1], SwapWrapper)
         assert not isinstance(model.layers[2], SwapWrapper)
@@ -166,7 +168,7 @@ class TestOpSwap:
     def test_op_swap_by_name(self):
         model = MockModel(num_layers=3)
         sc = _make_swap_config(op_swap=[{"op_name": "attention", "layers": ["0"]}])
-        apply_swap(model, sc, num_layers=3)
+        apply_swap(model, sc)
         assert isinstance(model.layers[0].attention, SwapWrapper)
         assert not isinstance(model.layers[0].mlp, SwapWrapper)
 
@@ -176,6 +178,6 @@ class TestOpSwap:
             {"op_name": "attention", "layers": ["0"]},
             {"op_name": "mlp", "layers": ["1"]},
         ])
-        apply_swap(model, sc, num_layers=3)
+        apply_swap(model, sc)
         assert isinstance(model.layers[0].attention, SwapWrapper)
         assert isinstance(model.layers[1].mlp, SwapWrapper)

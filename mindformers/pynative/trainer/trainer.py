@@ -30,6 +30,7 @@ from mindspore.mint.distributed import (
     destroy_process_group,
     get_world_size,
     all_reduce,
+    new_group,
 )
 from mindspore.graph.api import _no_grad
 
@@ -57,7 +58,6 @@ from mindformers.pynative.distributed.parallel_dims import ParallelDims
 from mindformers.pynative.distributed.parallelize import parallelize_model
 
 from mindformers.checkpoint.checkpoint import CommonInfo, get_checkpoint_path
-
 from .train_state import TrainerState
 from ..tools.monitor import MonitorGroup
 from .utils import (
@@ -157,6 +157,10 @@ class Trainer:
         self.world_size = get_world_size()
         logger.info(f"Current world size: {self.world_size}.")
         self.enable_parallel = self.world_size > 1
+        self.pp_enabled = self.config.parallelism.pipeline_parallel > 1
+        self.parallel_dims = None
+        self.metric_reduce_group = None
+        self.metric_reduce_group_size = None
         if self.enable_parallel:
             init_process_group()
             self.communication_init = True
@@ -170,12 +174,21 @@ class Trainer:
         self.model = self._create_model(model, self.config.model)
         if self.enable_parallel:
             # Apply parallelism to model
-            self._apply_parallelism(self.model, self.config.parallelism)
+            self.model, self.schedule, self.has_first, self.has_last = \
+                self._apply_parallelism(self.model, self.config.parallelism)
 
         # After parallelism, parameters will be reset
-        self.model.to_empty()
-        with _no_grad():
-            self.model.init_states()
+        self.model = self.model if isinstance(self.model, list) else [self.model]
+        for m in self.model:
+            m.to_empty()
+            with _no_grad():
+                m.init_states()
+
+        if self.parallel_dims and self.parallel_dims.pp_enabled:
+            loss_mesh = self.parallel_dims.get_mesh("loss_mesh")
+            self.metric_reduce_group_size = loss_mesh.size()
+            if self.metric_reduce_group_size > 1:
+                self.metric_reduce_group = loss_mesh.get_group()
 
         # Create train dataset
         self.train_dataset = self._create_dataset(
@@ -209,7 +222,7 @@ class Trainer:
         self.compute_loss_func = compute_loss_func
 
         # Initialize monitor
-        self.monitor = MonitorGroup(self.config, model=self.model)
+        self.monitor = MonitorGroup(self.config, model=self.model[0])
 
         # Initialize training state
         self.communication_init = False
@@ -285,7 +298,7 @@ class Trainer:
         else:
             dp_replicate = 1
 
-        parallel_dims = ParallelDims(
+        self.parallel_dims = ParallelDims(
             dp_replicate=dp_replicate,
             dp_shard=parallelism.data_parallel,
             cp=parallelism.context_parallel,
@@ -297,9 +310,9 @@ class Trainer:
         )
 
         # Apply unified parallelization
-        model = parallelize_model(
+        model, schedule, has_first, has_last = parallelize_model(
             model=model,
-            parallel_dims=parallel_dims,
+            parallel_dims=self.parallel_dims,
             parallelism=parallelism,
             recompute=self.config.recompute,
             recompute_comm=self.config.recompute_comm,
@@ -308,7 +321,7 @@ class Trainer:
                 self.config.optimizer.accumulate_allreduce_grads_in_fp32
             ),
         )
-        return model
+        return model, schedule, has_first, has_last
 
     def _create_model(self, model, model_config: Optional[Dict]) -> Any:
         """
@@ -385,6 +398,7 @@ class Trainer:
         self.num_accumulation_steps = self.global_batch_size // (
             data_parallel * self.config.training.local_batch_size
         )
+        self.config.parallelism.pipeline_parallel_microbatch_size = self.num_accumulation_steps
         logger.info(
             f"Calculate global_batch_size={self.global_batch_size}, "
             f"num_accumulation_steps={self.num_accumulation_steps}."
@@ -415,7 +429,7 @@ class Trainer:
         dataset = _build_dataset(
             dataset_config,
             self.global_batch_size,
-            self.config.parallelism.data_parallel,
+            self.config.parallelism,
             self.num_accumulation_steps,
         )
 
@@ -528,7 +542,7 @@ class Trainer:
         # Create handler with complete list
         cb_handler = CallbackHandler(
             callbacks=callback_list,
-            model=self.model,
+            model=self.model[0],
             train_dataset=self.train_dataset,
             eval_dataset=self.eval_dataset,
             optimizer=self.optimizer,
@@ -561,10 +575,11 @@ class Trainer:
 
         low_precision_types = (ms.bfloat16, ms.float16)
         hook_count = 0
-        for param in self.model.trainable_params():
-            if param.dtype in low_precision_types:
-                hook_count += 1
-                param.register_hook(_cast_grad_to_fp32)
+        for m in self.model:
+            for param in m.trainable_params():
+                if param.dtype in low_precision_types:
+                    hook_count += 1
+                    param.register_hook(_cast_grad_to_fp32)
 
         if hook_count > 0:
             logger.info(
@@ -597,7 +612,8 @@ class Trainer:
         # Load checkpoint
         checkpoint_path = checkpoint_path or self.config.checkpoint.load_path
         if checkpoint_path:
-            self._load_checkpoint(checkpoint_path, self.model, self.optimizer)
+            for m in self.model:
+                self._load_checkpoint(checkpoint_path, m, self.optimizer)
 
         # Register gradient hooks for fp32 accumulation
         self._register_grad_hooks()
@@ -685,8 +701,9 @@ class Trainer:
         # Create dataset iterator
         dataset_iter = self._create_dataset_iterator(self.train_dataset)
 
-        if hasattr(self.model, "set_train"):
-            self.model.set_train(True)
+        for m in self.model:
+            if hasattr(m, "set_train"):
+                m.set_train(True)
 
         # Training loop
         logger.info("Start training loop...")
@@ -716,40 +733,10 @@ class Trainer:
                 self.monitor.reset()
                 self.monitor.record("moe_tpe_step_begin")
 
-                for micro_step in range(self.num_accumulation_steps):
-                    micro_inputs = self._split_micro_batch(inputs, micro_step)
-
-                    try:
-                        micro_loss = self._forward_backward(self.model, micro_inputs)
-                    except Exception as e:
-                        raise RuntimeError(f"Error in training step {step}.") from e
-                    if isinstance(micro_loss, DTensor):
-                        micro_loss = micro_loss.to_local()
-                    loss += micro_loss
-
-                    self.monitor.record("local_loss", micro_loss,
-                                        context={"micro_step": micro_step})
-                    self.monitor.record("local_norm",
-                                        context={"micro_step": micro_step})
-                    global_micro_step = step * self.num_accumulation_steps + micro_step + 1
-                    self.monitor.record(
-                        "moe_tpe",
-                        context={
-                            "step": step + 1,
-                            "micro_step": micro_step + 1,
-                            "global_micro_step": global_micro_step,
-                        },
-                    )
-
-                    if micro_step >= self.num_accumulation_steps - 1:
-                        grad_norm = self._optimizer_update()
-
-                        if self.enable_parallel:
-                            all_reduce(loss, op=ops.ReduceOp.SUM)
-                            loss /= self.world_size
-
-                        self.monitor.record("device_loss", loss)
-                        self.monitor.record("device_norm")
+                if self.parallel_dims.pp_enabled:
+                    loss, grad_norm = self.training_pp_step(inputs)
+                else:
+                    loss, grad_norm = self.training_step(inputs, loss=loss, grad_norm=grad_norm, step=step)
 
                 # Update state
                 self.state.global_step += 1
@@ -757,7 +744,9 @@ class Trainer:
 
                 # Step end callback (pass loss)
                 self.callback_handler.on_step_end(
-                    self.config, self.state, loss=loss, grad_norm=grad_norm, monitor=self.monitor
+                    self.config, self.state, loss=loss, grad_norm=grad_norm, monitor=self.monitor,
+                    metric_reduce_group=self.metric_reduce_group,
+                    metric_reduce_group_size=self.metric_reduce_group_size,
                 )
 
                 # Epoch end callback (pass loss)
@@ -852,6 +841,60 @@ class Trainer:
         }
         return micro_inputs
 
+    def training_step(self, inputs, loss, grad_norm, step):
+        """
+        Accumulate gradients over multiple micro-batches.
+        """
+        for micro_step in range(self.num_accumulation_steps):
+            micro_inputs = self._split_micro_batch(inputs, micro_step)
+
+            try:
+                micro_loss = self._forward_backward(self.model, micro_inputs)
+            except Exception as e:
+                raise RuntimeError(f"Error in training step {step}.") from e
+            if isinstance(micro_loss, DTensor):
+                micro_loss = micro_loss.to_local()
+            loss += micro_loss
+
+            self.monitor.record("local_loss", micro_loss,
+                                context={"micro_step": micro_step, "model": self.model})
+            self.monitor.record("local_norm",
+                                context={"micro_step": micro_step, "model": self.model})
+
+            # Only perform optimizer step after gradient accumulation
+            if micro_step >= self.num_accumulation_steps - 1:
+                # Compute grad norm and update optimizer
+                grad_norm = self._optimizer_update()
+
+                # Loss reduction for parallel training
+                if self.enable_parallel:
+                    all_reduce(loss, op=ops.ReduceOp.SUM)
+                    loss /= self.world_size
+                self.monitor.record("device_loss", loss)
+                self.monitor.record("device_norm")
+        return loss, grad_norm
+
+    def training_pp_step(self, inputs: Dict[str, Any]):
+        """
+        Perform a training step for pipeline parallelism.
+
+        Args:
+            inputs (Dict[str, Any]): Input data dictionary.
+
+        Returns:
+            Tuple[Tensor, Tensor]: Tuple containing loss and global norm.
+        """
+        loss = self.compute_pp_loss(inputs)
+        global_norm = self._optimizer_update()
+
+        if self.has_last:
+            if isinstance(loss, DTensor):
+                loss = loss.to_local()
+            all_reduce(loss, op=ops.ReduceOp.SUM, group=self.metric_reduce_group)
+            loss /= self.metric_reduce_group_size
+
+        return loss, global_norm
+
     def compute_loss(self, model, inputs: Dict[str, Any]):
         """
         Compute loss for the model.
@@ -864,7 +907,7 @@ class Trainer:
             Tensor: Computed loss value.
         """
         # Forward pass
-        outputs = model(**inputs)
+        outputs = model[0](**inputs)
 
         # Compute loss
         if self.compute_loss_func is not None:
@@ -883,6 +926,48 @@ class Trainer:
             else:
                 # Assume first element is loss
                 loss = outputs[0]
+
+        # return value must be Tensor or DTensor
+        return loss
+
+    def compute_pp_loss(self, inputs: Dict[str, Any]):
+        """
+        Compute loss for the model.
+
+        Args:
+            model (PreTrainedModel): Model instance.
+            inputs (Dict[str, Any]): Input data dictionary.
+
+        Returns:
+            Tensor: Computed loss value.
+        """
+        # Forward pass
+        outputs = self.schedule.run(**inputs) if self.has_first else self.schedule.run()
+
+        # Compute loss
+        loss = 0.0
+        if self.compute_loss_func is not None:
+            # Get labels from inputs
+            labels = inputs.get("labels", None)
+
+            # Use user-defined loss function
+            loss = self.compute_loss_func(outputs, labels)
+        else:
+            # Extract loss from model output
+            # We don't use .loss here since the model may return tuples instead of ModelOutput
+            if isinstance(outputs, dict):
+                loss = outputs["loss"]
+            elif isinstance(outputs, list):
+                # Assume first element is loss
+                if len(outputs) == 0:
+                    loss = None
+                else:
+                    for output in outputs:
+                        if isinstance(output[0], DTensor):
+                            loss += output[0].to_local()
+                        else:
+                            loss += output[0]
+                    loss /= len(outputs)
 
         # return value must be Tensor or DTensor
         return loss
@@ -907,7 +992,6 @@ class Trainer:
 
         if self.num_accumulation_steps > 1:
             loss = loss / self.num_accumulation_steps
-        
         loss.backward(sense)
         return loss
 
@@ -921,17 +1005,19 @@ class Trainer:
         global_norm, grads = _calculate_global_grad_norm(
             self.optimizer.parameters,
             enable_parallel=self.enable_parallel,
-            max_norm=self.config.training.max_norm
+            max_norm=self.config.training.max_norm,
+            parallelism=self.config.parallelism,
         )
 
         with _no_grad():
             self.optimizer(grads)
 
         # zero grad
-        if hasattr(self.model, "zero_grad"):
-            self.model.zero_grad()
-        else:
-            for param in self.model.trainable_params():
-                param.grad = None
+        for m in self.model:
+            if hasattr(m, "zero_grad"):
+                m.zero_grad()
+            else:
+                for param in m.trainable_params():
+                    param.grad = None
 
         return global_norm

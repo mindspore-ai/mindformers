@@ -29,6 +29,7 @@ from mindformers.pynative.distributed.parallelize import (
     register_parallelize_fn,
     register_parallelize,
 )
+from mindformers.pynative.distributed.pipeline_parallel import PpLayerSetting, StageModelBuilder
 
 __all__ = [
     "PrepareModuleInput",
@@ -41,4 +42,6 @@ __all__ = [
     "parallelize_model",
     "register_parallelize_fn",
     "register_parallelize",
+    "PpLayerSetting",
+    "StageModelBuilder"
 ]

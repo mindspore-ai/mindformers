@@ -612,15 +612,17 @@ def process_mtp_loss(
     return hidden_states
 
 
-def track_mtp_metrics():
+def track_mtp_metrics(group=None, group_size=None):
     """Track and aggregate MTP loss metrics across distributed ranks."""
     tracker = get_mtp_layer_wise_logging_tracker()
     if not tracker:
         return None
 
     mtp_losses = tracker["values"]
-    if get_world_size() > 1:
-        all_reduce(mtp_losses, op=ops.ReduceOp.SUM)
-        mtp_losses /= get_world_size()
+    if group_size is None:
+        group_size = get_world_size()
+    if group_size > 1:
+        all_reduce(mtp_losses, op=ops.ReduceOp.SUM, group=group)
+        mtp_losses /= group_size
 
     return mtp_losses

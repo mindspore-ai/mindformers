@@ -32,7 +32,7 @@ from .configuration_deepseek_v3 import DeepseekV3Config
 class PyNativeDeepseekV3ForCausalLM(TrainModelMixin, DeepseekV3PreTrainedModel):
     """DeepseekV3 model for training"""
 
-    def __init__(self, config: DeepseekV3Config):
+    def __init__(self, config: DeepseekV3Config, **kwargs):
         super().__init__(config, auto_prefix=False)
         transformer_config = self.convert_to_transformer_config(config, is_mla_model=True)
         if transformer_config.num_moe_experts:
@@ -52,17 +52,21 @@ class PyNativeDeepseekV3ForCausalLM(TrainModelMixin, DeepseekV3PreTrainedModel):
             rotary_percent=1.0,
             rotary_base=transformer_config.rotary_base,
             rope_scaling=False,
-            mtp_block_spec=mtp_block_spec
+            mtp_block_spec=mtp_block_spec,
+            layer_start=kwargs.get("layer_start", 0),
+            layer_end=kwargs.get("layer_end", None),
+            stage_idx=kwargs.get("stage_idx", 0),
+            vp_size=kwargs.get("vp_size", 1),
         )
 
     def construct(
             self,
             input_ids: Tensor,
-            position_ids: Tensor = None,
-            attention_mask: Tensor = None,
-            decoder_input: Tensor = None,
             labels: Tensor = None,
+            decoder_input: Tensor = None,
+            attention_mask: Tensor = None,
             loss_mask=None,
+            position_ids: Tensor = None,
             actual_seq_len=None
     ):
         """DeepseekV3 construct for training"""

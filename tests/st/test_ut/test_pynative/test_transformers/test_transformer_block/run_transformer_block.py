@@ -147,7 +147,9 @@ class TransformerLayerRunner:
         net = TransformerBlock(
             config=self.config,
             spec=self.submodules_spec,
-            post_layer_norm=self.post_layer_norm
+            post_layer_norm=self.post_layer_norm,
+            layer_end=self.config.num_layers - 1,
+            layer_start=0,
         )
 
         # Load fixed weights into the model

@@ -288,7 +288,7 @@ def _build_lora_model(model, config):
 def _build_dataset(
     config,
     global_batch_size: int,
-    dataset_parallel: int = 1,
+    parallelism,
     num_grad_acc: int = 1,
 ):
     """
@@ -306,6 +306,7 @@ def _build_dataset(
     Raises:
         ValueError: If world size is not divisible by dataset parallel size.
     """
+    dataset_parallel = parallelism.data_parallel
     def _set_ms_dataset_config():
         """
         Apply MindSpore dataset global configurations.
@@ -328,9 +329,9 @@ def _build_dataset(
                 f"the dataset parallel {dataset_parallel}."
             )
 
-        dp_world_size = world_size // dataset_parallel
-        dp_rank = get_rank() // dp_world_size
-        return dataset_parallel, dp_rank
+        shard_id = get_rank() % (world_size // parallelism.pipeline_parallel) // \
+            parallelism.tensor_parallel // parallelism.context_parallel
+        return dataset_parallel, shard_id
 
     def _actual_seq_len_batch_map(*cols, micro_batch_size):
         """
@@ -420,12 +421,15 @@ def _build_optimizer(
     """
     config = config.to_dict()
     optim_type = config.pop("type", None)
-    grouped_params = get_param_groups(
-        model=model,
-        weight_decay=config["weight_decay"],
-        weight_decay_include=config.pop("weight_decay_include", None),
-        weight_decay_exclude=config.pop("weight_decay_exclude", None),
-    )
+    grouped_params = []
+    for m in model:
+        params = get_param_groups(
+            model=m,
+            weight_decay=config["weight_decay"],
+            weight_decay_include=config.pop("weight_decay_include", None),
+            weight_decay_exclude=config.pop("weight_decay_exclude", None),
+        )
+        grouped_params.extend(params)
 
     if optim_type == "AdamW":
         optimizer = AdamW(
@@ -437,7 +441,7 @@ def _build_optimizer(
         optimizer = Muon(
             params=grouped_params,
             learning_rate=learning_rate,
-            model=model,
+            model=model[0],
             **config,
         )
     else:
@@ -540,6 +544,7 @@ def _compute_grad_norm_sq_fused(local_grads, grad_factors):
 
 def _calculate_global_grad_norm(
     parameters,
+    parallelism,
     enable_parallel: bool = False,
     max_norm: float = 1.0,
     eps: float = 1e-6,
@@ -597,6 +602,11 @@ def _calculate_global_grad_norm(
         from mindspore import ops
         from mindspore.mint.distributed import all_reduce
         all_reduce(total_norm_sq, op=ops.ReduceOp.SUM)
+        micro_batch_num = parallelism.pipeline_parallel_microbatch_size
+        if parallelism.pipeline_parallel > 1 and (parallelism.data_parallel > 1 or
+                                                  micro_batch_num > 1):
+            total_norm_sq /= ((get_world_size() // parallelism.tensor_parallel) * 
+                              micro_batch_num * parallelism.context_parallel)
 
     global_norm = mint.sqrt(total_norm_sq)
 
