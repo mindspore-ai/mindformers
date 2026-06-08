@@ -2272,10 +2272,6 @@ class TransformerConfig:
         if self.apply_query_key_layer_scaling:
             self.attention_softmax_in_fp32 = True
 
-        if self.apply_rope_fusion:
-            if self.multi_latent_attention:
-                raise ValueError("multi_latent_attention does not support apply_rope_fusion.")
-
         if self.multi_latent_attention and self.rotary_interleaved:
             raise ValueError("rotary_interleaved does not work with multi_latent_attention.")
 
