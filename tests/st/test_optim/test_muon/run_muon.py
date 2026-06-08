@@ -179,9 +179,39 @@ class MuonRunner:
 
         return networkwithloss, optimizer, mock_model
 
+    @staticmethod
+    def verify_placeholder_naming(optimizer):
+        """Assert optimizer-state Parameter names follow the expected convention.
+
+        Real states are named ``<prefix>.<param.name>``; placeholders (the
+        aligned [1] dummies for params that do not use that branch) must be
+        named ``<prefix>.placeholder.<idx>`` and must NOT embed param.name, so
+        that checkpoint resume never associates them with a real parameter.
+        """
+        # pylint: disable=protected-access
+        params = optimizer._parameters
+        param_names = {p.name for p in params}
+        checks = (("muon_m", optimizer.muon_m, lambda i: optimizer.use_muon[i]),
+                  ("adam_m", optimizer.moments1, lambda i: not optimizer.use_muon[i]),
+                  ("adam_v", optimizer.moments2, lambda i: not optimizer.use_muon[i]))
+        for prefix, state_tuple, is_real in checks:
+            for idx, state in enumerate(state_tuple):
+                if is_real(idx):
+                    expected = f"{prefix}.{params[idx].name}"
+                    assert state.name == expected, (
+                        f"real state name {state.name!r} != expected {expected!r}")
+                else:
+                    assert state.name == f"{prefix}.placeholder.{idx}", (
+                        f"placeholder name {state.name!r} not in expected form")
+                    embedded = [n for n in param_names if n in state.name]
+                    assert not embedded, (
+                        f"placeholder {state.name!r} embeds param name(s) {embedded}; "
+                        f"this causes spurious checkpoint loads")
+
     def run(self):
         """Run the training with Muon optimizer."""
         networkwithloss, optimizer, mock_model = self.build_network()
+        self.verify_placeholder_naming(optimizer)
         trainonestepcell = nn.TrainOneStepCell(networkwithloss, optimizer)
 
         losses = []
