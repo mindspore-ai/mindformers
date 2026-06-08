@@ -811,6 +811,7 @@ def apply_fsdp(
         model: The GPTModel instance.
         parallel_dims: ParallelDims instance.
         parallelism: Parallelism configuration.
+        accumulate_allreduce_grads_in_fp32: Whether to accumulate allreduce grads in fp32.
     """
     logger.info("Applying FSDP/HSDP to GPT model...")
 
@@ -863,38 +864,16 @@ def apply_fsdp(
         "mp_policy": MixedPrecisionPolicy(reduce_dtype=reduce_dtype),
     }
 
-    modules = {
-        "embedding": getattr(gpt_model, "embedding", None),
-        "layers": list(gpt_model.decoder.layers),
-    }
+    embedding = getattr(gpt_model, "embedding", None)
+    layers = list(gpt_model.decoder.layers)
 
-    if getattr(gpt_model, "mtp"):
-        modules.update(
-            {
-                "tail_modules": [
-                    m for m in [
-                        getattr(gpt_model.decoder, "final_layernorm", None),
-                    ] if m is not None
-                ],
-                "mtp": getattr(gpt_model, "mtp", None),
-            }
-        )
-    else:
-        modules.update(
-            {
-                "tail_modules": [
-                    m for m in [
-                        getattr(gpt_model.decoder, "final_layernorm", None),
-                        getattr(gpt_model, "output_layer", None),
-                    ] if m is not None
-                ],
-            }
-        )
-
-    embedding = modules["embedding"]
-    layers = modules["layers"]
-    tail_modules = modules["tail_modules"]
-    mtp = modules.get("mtp")
+    mtp = getattr(gpt_model, "mtp", None)
+    tail_modules = [
+        m for m in [
+            getattr(gpt_model.decoder, "final_layernorm", None),
+            getattr(gpt_model, "output_layer", None) if not mtp else None,
+        ] if m is not None
+    ]
 
     if not layers:
         raise ValueError(f"{type(model).__name__} has no decoder layers")
@@ -970,19 +949,20 @@ def apply_fsdp(
     # --- 3. Wrap final_layernorm and output_layer independently ---
     # Principle: small modules (norms) first, then larger modules (output_layer)
     if tail_modules:
-        with ms.DeviceCtx("meta"):
-            for tm in tail_modules:
-                if isinstance(tm, (FusedLayerNorm, FusedRMSNorm)):
-                    # Small module: wrap norm independently
-                    with ms.DeviceCtx("meta"):
-                        fully_shard(tm, **fsdp_config)
-                else:
-                    # Larger module: output_layer, do not reshard_after_forward by default
-                    # since FSDP would prefetch it immediately after the forward pass.
-                    with ms.DeviceCtx("meta"):
-                        fully_shard(tm,
-                                    **fsdp_config,
-                                    reshard_after_forward=reshard_policy == "always")
+        for tail_module in tail_modules:
+            if isinstance(tail_module, (FusedLayerNorm, FusedRMSNorm)):
+                # Small module: wrap norm independently
+                with ms.DeviceCtx("meta"):
+                    fully_shard(tail_module, **fsdp_config)
+            else:
+                # Larger module: output_layer, do not reshard_after_forward by default
+                # since FSDP would prefetch it immediately after the forward pass.
+                with ms.DeviceCtx("meta"):
+                    fully_shard(
+                        tail_module,
+                        **fsdp_config,
+                        reshard_after_forward=reshard_policy == "always"
+                    )
 
     if mtp:
         for layer in mtp.layers:
