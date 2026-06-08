@@ -13,8 +13,9 @@
 # limitations under the License.
 # ============================================================================
 """Activation functions for transformer."""
-__all__ = ["FusedSwiGlu", "GELU", "SiLU"]
+__all__ = ["FusedSwiGlu", "ClampedSwiGlu", "GELU", "SiLU"]
 
+import mindspore as ms
 from mindspore import nn, Tensor
 from mindspore import mint
 from mindspore import ops
@@ -65,6 +66,46 @@ class FusedSwiGlu(nn.Cell):
     def construct(self, x: Tensor, dim=-1) -> Tensor:
         """Apply the fused SwiGLU activation."""
         return self.swiglu(x, dim)
+
+
+class ClampedSwiGlu(nn.Cell):
+    """Clamped SwiGLU: clamp the gate (upper bound only) and the linear part
+    (two-sided) before applying SwiGLU. Computed in float32, then cast back to
+    the input dtype.
+
+    Args:
+        clamp_value (float): clamp bound; must be > 0 (enforced by config
+            validation). Sunk to an ``__init__`` constant.
+
+    Inputs:
+        - **x** (Tensor) - shape :math:`(\\ast_1, N, \\ast_2)`; the half before
+          ``dim`` is the gate, the half after is the linear part. :math:`N` must
+          be divisible by 2.
+        - **dim** (int) - split axis. Default: ``-1``.
+
+    Outputs:
+        Tensor with the same dtype as ``x`` and last (split) dim halved.
+
+    Supported Platforms:
+        ``Ascend``
+    """
+
+    def __init__(self, clamp_value: float):
+        super().__init__()
+        self.clamp_value = clamp_value
+        self.silu = mint.nn.functional.silu
+        self.chunk = mint.chunk
+        self.clamp = mint.clamp
+
+    def construct(self, x: Tensor, dim: int = -1) -> Tensor:
+        """Apply the clamped SwiGLU activation."""
+        ori_dtype = x.dtype
+        x = x.to(ms.float32)
+        gate, linear = self.chunk(x, 2, dim)
+        gate = self.clamp(gate, None, self.clamp_value)
+        linear = self.clamp(linear, -self.clamp_value, self.clamp_value)
+        out = self.silu(gate) * linear
+        return out.to(ori_dtype)
 
 
 class GELU(nn.Cell):
@@ -189,8 +230,23 @@ ACTIVATION_MAP = {
 }
 
 
-def get_activation(activation_name, *args, **kwargs):
-    """Create and return an activation Cell by name."""
+def get_activation(activation_name, *, clamp_value=None, **kwargs):
+    """Create and return an activation Cell by name.
+
+    When ``activation_name`` is 'fusedswiglu' and ``clamp_value`` is not None,
+    returns a :class:`ClampedSwiGlu` instance instead of :class:`FusedSwiGlu`.
+    This keeps the ClampedSwiGlu selection logic centralized so that callers
+    (MLP, GroupedMLP) use a single entry point.
+
+    Args:
+        activation_name (str): Name of the activation function.
+        clamp_value (float, optional): Clamp bound for SwiGLU. When set on a
+            'fusedswiglu' activation, a :class:`ClampedSwiGlu` is returned.
+            For other activations the value is silently ignored (matching
+            Megatron behaviour). Default: None.
+        **kwargs: Additional keyword arguments forwarded to the activation
+            constructor (e.g. ``approximate`` for GELU).
+    """
     activation_name = activation_name.lower()
     if activation_name not in ACTIVATION_MAP:
         raise ValueError(
@@ -198,6 +254,10 @@ def get_activation(activation_name, *args, **kwargs):
             f"Supported activations are: {list(ACTIVATION_MAP.keys())}"
         )
 
+
+    if activation_name == 'fusedswiglu' and clamp_value is not None:
+        return ClampedSwiGlu(clamp_value)
+
     # activation should be a Cell in Static
     activation = ACTIVATION_MAP[activation_name]
-    return activation(*args, **kwargs)
+    return activation(**kwargs)
