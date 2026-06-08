@@ -595,7 +595,7 @@ class TransformerConfig:
     moe_router_score_function: str = field(
         default="softmax",
         metadata={
-            "description": "Score function for MoE routing. Can be \"softmax\" or \"sigmoid\".",
+            "description": "Score function for MoE routing. Can be \"softmax\" or \"sigmoid\" or \"sqrtsoftplus\".",
             "usage": ParamUsage.TRAINING,
             "source": ParamSource.MEGATRON,
             "mode": ParamMode.COMMON
@@ -2292,10 +2292,10 @@ class TransformerConfig:
         if self.num_moe_experts is not None:
             assert not self.add_bias_linear, "Bias is not supported for MoE"
 
-        if self.moe_router_enable_expert_bias and self.moe_router_score_function != "sigmoid":
+        if self.moe_router_enable_expert_bias and self.moe_router_score_function not in ["sigmoid", "sqrtsoftplus"] :
             raise ValueError(
-                "Expert bias for aux-loss-free routing only supports sigmoid score function."
-                "Please set --moe-router-score-function sigmoid for sigmoid score function."
+                "Expert bias for aux-loss-free routing only supports sigmoid or sqrtsoftplus score function ."
+                "Please set --moe-router-score-function sigmoid or sqrtsoftplus for score function."
             )
 
         if (
