@@ -2891,10 +2891,6 @@ class MLATransformerConfig(TransformerConfig):
                     f"num_attention_heads * v_head_dim ({self.num_attention_heads * self.v_head_dim}) "
                     f"must be divisible by o_groups ({self.o_groups})."
                 )
-            if not self.apply_dsa_kernel_fusion and self.use_eod_attn_mask_compression:
-                raise ValueError(
-                    "CompressedSparseAttention with unfused implement do not support TND layout."
-                )
             if self.apply_dsa_kernel_fusion and self.csa_window_size != 128:
                 raise ValueError(
                     f"CompressedSparseAttention with fused kernels only supports csa_window_size=128, "
