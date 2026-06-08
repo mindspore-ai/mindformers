@@ -129,8 +129,8 @@ class ExpertParallel(ParallelStyle):
         original_shape = routed_input.shape
 
         block_size = cell.hidden_size
-        real_input_splits = [x * block_size for x in input_splits]
-        real_output_splits = [x * block_size for x in output_splits]
+        real_input_splits = (input_splits * block_size).tolist()
+        real_output_splits = (output_splits * block_size).tolist()
 
         global_input_tokens, _ = self.all_to_all_single(
             output=None,
@@ -141,8 +141,8 @@ class ExpertParallel(ParallelStyle):
         )
         global_input_tokens = self.reshape(global_input_tokens, (1, -1, cell.hidden_size))
         routing_map = self.reshape(self.cast(sorted_topk_indices, mstype.float32), (-1,))
-        real_input_splits = [x.item() for x in input_splits]
-        real_output_splits = [x.item() for x in output_splits]
+        real_input_splits = input_splits.tolist()
+        real_output_splits = output_splits.tolist()
         routing_map, _ = self.all_to_all_single(
             output=None,
             input=routing_map,
@@ -269,8 +269,8 @@ class ExpertParallel(ParallelStyle):
 
         # perform expert parallel AlltoAll communication
         block_size = cell.hidden_size
-        real_input_splits = [x * block_size for x in output_splits]
-        real_output_splits = [x * block_size for x in input_splits]
+        real_input_splits = (output_splits * block_size).tolist()
+        real_output_splits = (input_splits * block_size).tolist()
 
         permutated_local_input_tokens, _ = self.all_to_all_single(
             output=None,
@@ -442,8 +442,8 @@ class DeredundancyExpertParallel(ExpertParallel):
 
         # 3. inner alltoallv
         block_size = hidden_size
-        real_input_splits = [x * block_size for x in exsl]
-        real_output_splits = [x * block_size for x in exrl]
+        real_input_splits = (exsl * block_size).tolist()
+        real_output_splits = (exrl * block_size).tolist()
 
         routed_input, _ = self.all_to_all_single(
             output=None,
@@ -453,8 +453,8 @@ class DeredundancyExpertParallel(ExpertParallel):
             group=self.iep_group
         )
         routed_input = self.reshape(routed_input, (-1, hidden_size))
-        real_input_splits = [x.item() for x in exsl]
-        real_output_splits = [x.item() for x in exrl]
+        real_input_splits = exsl.tolist()
+        real_output_splits = exrl.tolist()
         sorted_expert_ids, _ = self.all_to_all_single(
             output=None,
             input=self.reshape(sorted_expert_ids, (-1,)),
@@ -480,8 +480,8 @@ class DeredundancyExpertParallel(ExpertParallel):
         hidden_size = token_orig_shape[-1]
 
         block_size = hidden_size
-        real_input_splits = [x * block_size for x in exrl]
-        real_output_splits = [x * block_size for x in exsl]
+        real_input_splits = (exrl * block_size).tolist()
+        real_output_splits = (exsl * block_size).tolist()
         routed_output, _ = self.all_to_all_single(
             output=None,
             input=self.reshape(routed_output, (-1,)),
