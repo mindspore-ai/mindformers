@@ -30,6 +30,7 @@ from mindformers.models.utils import (
 )
 from mindformers.pynative.transformers.moe.moe_utils import track_moe_metrics
 from mindformers.pynative.transformers.multi_token_prediction import track_mtp_metrics
+from mindformers.pynative.transformers.experimental_attention_variant.utils import track_indexer_metrics
 
 
 class LossCallback(TrainerCallback):
@@ -152,6 +153,11 @@ class LossCallback(TrainerCallback):
                 mtp_loss_values.append(f"mtp_{str(ind + 1)}_loss: {self._to_float(val):10.6f}")
             mtp_loss = ", ".join(mtp_loss_values)
 
+        # process indexer loss
+        indexer_loss = track_indexer_metrics()
+        if indexer_loss:
+            indexer_loss /= state.num_accumulation_steps
+
         # Calculate total FLOPs for the model
         model_config = convert_transformer_config_to_args_for_tflops(model_config)
         state.total_flops = num_floating_point_operations(
@@ -174,6 +180,7 @@ class LossCallback(TrainerCallback):
                 kwargs.get("lr_scheduler"), state.global_step
             ),
             "mtp_loss": mtp_loss,
+            "indexer_loss": self._to_float(indexer_loss)
         }
 
         # Print the collected log information
@@ -208,6 +215,10 @@ class LossCallback(TrainerCallback):
         load_balancing_loss = log_info.get("load_balancing_loss")
         if load_balancing_loss is not None:
             log_parts.append(f"load_balancing_loss: {load_balancing_loss:10.6f}")
+
+        indexer_loss = log_info.get("indexer_loss")
+        if indexer_loss is not None:
+            log_parts.append(f"indexer_loss: {indexer_loss:10.6f}")
 
         mtp_loss = log_info.get("mtp_loss")
         if mtp_loss is not None:

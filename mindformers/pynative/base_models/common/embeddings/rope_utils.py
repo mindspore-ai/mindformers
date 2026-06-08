@@ -73,6 +73,8 @@ class ApplyRotaryPosEmb(nn.Cell):
         super().__init__()
         self.append_eod = config.use_eod_reset
         self.apply_rope_fusion = config.apply_rope_fusion
+        # Accepted but not read inside construct: the K and Q paths behave identically here.
+        # Kept for call-site / API symmetry (call sites pass it); do not remove.
         self.for_k_pos_emb = for_k_pos_emb
         self.rotary_dtype = config.rotary_dtype
 
@@ -96,7 +98,9 @@ class ApplyRotaryPosEmb(nn.Cell):
                   t: Tensor,
                   freqs: tuple,
                   rotary_interleaved: bool = False,
-                  multi_latent_attention: bool = False) -> Tensor:
+                  multi_latent_attention: bool = False,
+                  inverse: bool = False,
+                  mla_output_remove_interleaving: bool = False) -> Tensor:
         """Apply rotary position embedding to input tensor.
 
         Args:
@@ -105,6 +109,13 @@ class ApplyRotaryPosEmb(nn.Cell):
                 of shape [seq_length, ... , dim], mscale is float
             rotary_interleaved (bool, optional): Whether to use interleaved rotary position embedding. Default: False
             multi_latent_attention (bool, optional): Whether to use multi latent attention. Default: False
+            inverse (bool, optional): Whether to apply the inverse rotation (un-rotate).
+                The forward rotation is ``t * cos + rotate_half(t) * sin``; the inverse negates the sine term
+                (``t * cos - rotate_half(t) * sin``), i.e. rotation by ``-theta``. Used by DSv4
+                hybrid attention's inverse-RoPE on the post-core-attention output. Default: False
+            mla_output_remove_interleaving (bool, optional):
+                Whether to re-interleave the rotated lanes back to the original (interleaved) layout after rotation,
+                undoing the ``multi_latent_attention`` de-interleave. Default: False
 
         Returns:
             Tensor: Output tensor after applying rotary position embedding.
@@ -129,12 +140,28 @@ class ApplyRotaryPosEmb(nn.Cell):
         t = self.cast(t, self.rotary_dtype)
         cos_ = self.cast(self.cos(self.mul_mscale(freqs, m_scale)), self.rotary_dtype)
         sin_ = self.cast(self.sin(self.mul_mscale(freqs, m_scale)), self.rotary_dtype)
+        # Negating sin implements the conjugate (inverse) rotation by -theta used for the MLA
+        # output inverse-RoPE; it composes with the forward RoPE (same cos, +sin) to the identity.
+        if inverse:
+            sin_ = self.neg(sin_)
 
-        if self.apply_rope_fusion:
+        if self.apply_rope_fusion and not inverse:
             output = self.rope(t, cos_, sin_, 0)
         else:
             t_rot = self._rotate_half(t, rotary_interleaved)
             output = self.add(self.mul(t, cos_), self.mul(t_rot, sin_))
+
+        # Why this re-interleave branch exists:
+        # DSv4 applies rope on V and O, so we need to uninterleave the tensor.
+        # The existing MLA code is safe because the dot product is permutation-invariant.
+        if multi_latent_attention and mla_output_remove_interleaving:
+            half = output.shape[-1] // 2
+            o_1 = self.narrow(output, dim=-1, start=0, length=half)
+            o_2 = self.narrow(output, dim=-1, start=half, length=half)
+            output = self.reshape(
+                self.stack((o_1, o_2), dim=-1),
+                (seq_len, bs, n_heads, -1),
+            )
 
         if t_not_rotary is not None:
             output = self.cat((output, t_not_rotary), dim=-1)

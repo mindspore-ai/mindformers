@@ -1,0 +1,363 @@
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+#
+# Modification points:
+# 1. Adapted from static graph DSA implementation to pynative mode.
+# 2. Removed parallel sharding (single card only).
+# 3. Custom backward uses _Function (torch.autograd.Function style).
+# 4. Uses pynative Linear and mint/ops instead of aclnn_ops.
+#
+# Copyright 2026 Huawei Technologies Co., Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ============================================================================
+"""DSA/CSA Lightning Indexer for pynative mode."""
+from dataclasses import dataclass
+from typing import Union
+
+import mindspore.common.dtype as mstype
+from mindspore import nn, ops, Tensor, mint, _no_grad
+from mindspore.common._grad_function import _Function
+
+try:
+    from hyper_parallel.custom_ops.experimental import (
+        npu_lightning_indexer_v2,
+        npu_sparse_lightning_indexer_grad_kl_loss_v2
+    )
+except ImportError:
+    npu_lightning_indexer_v2 = None
+    npu_sparse_lightning_indexer_grad_kl_loss_v2 = None
+
+from mindformers.parallel_core.utils.spec_utils import ModuleSpec, build_module
+from mindformers.parallel_core.transformer_config import MLATransformerConfig
+from mindformers.pynative.transformers.experimental_attention_variant.utils import Hadamard
+from mindformers.pynative.base_models.common.embeddings.rope_utils import ApplyRotaryPosEmb
+
+
+@dataclass
+class CSAIndexerSubmodules:
+    """
+    Configuration class for specifying the submodules of a CSA Indexer.
+
+    Args:
+        linear_wq_b: Linear projection for query bottleneck expansion.
+        linear_weights_proj: Linear projection for attention weights.
+        compressor: Compressor for key.
+    """
+
+    linear_wq_b: Union[ModuleSpec, type] = None
+    linear_weights_proj: Union[ModuleSpec, type] = None
+    compressor: Union[ModuleSpec, type] = None
+
+
+class CSAIndexer(nn.Cell):
+    """
+    CSA Lightning Indexer for pynative mode.
+    Computes index scores to select the most relevant compressed KV positions for each query.
+
+    Args:
+        config (MLATransformerConfig): The configuration for the transformer model.
+        submodules (DSAIndexerSubmodules): Indexer submodules specification.
+    """
+
+    def __init__(
+            self,
+            config: MLATransformerConfig,
+            submodules: CSAIndexerSubmodules,
+            compress_ratio: int,
+            rotary_pos_emb: nn.Cell = None
+    ) -> None:
+        super().__init__()
+        self.config = config
+        self.sparse_mode = 3
+        self.compress_ratio = compress_ratio
+        self.rotary_pos_emb = rotary_pos_emb
+
+        self.input_layout = config.input_layout
+        self.is_tnd = self.input_layout == "TND"
+        self.hidden_size = config.hidden_size
+        self.qk_pos_emb_head_dim = config.qk_pos_emb_head_dim
+        self.q_lora_rank = config.q_lora_rank if config.q_lora_rank is not None else config.hidden_size
+        self.index_n_heads = config.dsa_indexer_n_heads
+        self.index_head_dim = config.dsa_indexer_head_dim
+        self.index_topk = config.dsa_indexer_topk
+        self.sparse_loss = config.dsa_indexer_use_sparse_loss
+        self.softmax_scale = self.index_head_dim ** -0.5
+        self.compute_dtype = config.compute_dtype
+        self.apply_dsa_kernel_fusion = config.apply_dsa_kernel_fusion
+        if self.apply_dsa_kernel_fusion and npu_lightning_indexer_v2 is None:
+            raise ValueError(
+                "Fused DSA op 'npu_lightning_indexer_v2' is unavailable in this hyper_parallel build."
+                "set apply_dsa_kernel_fusion=False to use the unfused small-op implement."
+            )
+
+        self.weight_scale = self.index_n_heads ** -0.5 * self.softmax_scale
+
+        self.apply_rope = ApplyRotaryPosEmb(config)
+
+        self.linear_wq_b = build_module(
+            submodules.linear_wq_b,
+            input_size=self.q_lora_rank,
+            output_size=self.index_n_heads * self.index_head_dim,
+            params_dtype=config.params_dtype,
+            compute_dtype=config.compute_dtype,
+            init_method=config.init_method,
+            bias=False,
+        )
+        self.compressor = build_module(
+            submodules.compressor,
+            config=self.config,
+            compress_ratio=self.compress_ratio,
+            head_dim=self.index_head_dim,
+            rotate=True,
+            rotary_pos_emb=rotary_pos_emb
+        )
+        self.linear_weights_proj = build_module(
+            submodules.linear_weights_proj,
+            input_size=self.hidden_size,
+            output_size=self.index_n_heads,
+            params_dtype=config.params_dtype,
+            compute_dtype=config.compute_dtype,
+            init_method=config.init_method,
+            bias=False,
+        )
+
+        self.hadamard = Hadamard(self.index_head_dim)
+
+        self.cast = ops.cast
+        self.reshape = mint.reshape
+        self.split = mint.split
+        self.cat = mint.concat
+        self.permute = mint.permute
+        # operators for unfused implement
+        self.bmm = mint.matmul
+        self.relu = mint.nn.functional.relu
+        self.unsqueeze = mint.unsqueeze
+        self.sum = mint.sum
+        self.topk = mint.topk
+        self.clamp = mint.clamp
+
+    def forward_before_topk(self, x, qr):
+        """
+        Pre-forward pass that computes indexer Q, K and weights.
+
+        Args:
+            x: Hidden states, shape (S, B, hidden_size).
+            qr: Compressed query, shape (S, B, q_lora_rank).
+
+        Returns:
+            q: Indexer query, shape (B, S, n_idx_heads, head_dim).
+            k: Indexer key, shape (B, S, 1, head_dim).
+            weights: Indexer weights, shape (B, S, n_idx_heads).
+        """
+        seqlen, bsz, _ = x.shape
+        freqs, _ = self.rotary_pos_emb(seqlen)
+
+        # Query path: linear -> reshape -> split -> RoPE -> concat -> Hadamard
+        q = self.linear_wq_b(qr)
+        q = self.reshape(q, (seqlen, bsz, self.index_n_heads, self.index_head_dim))
+        q_nope, q_pe = self.split(
+            q, [self.index_head_dim - self.qk_pos_emb_head_dim, self.qk_pos_emb_head_dim], dim=-1
+        )
+        q_pe = self.apply_rope(
+            q_pe, (freqs, 1),
+            rotary_interleaved=self.config.rotary_interleaved,
+            multi_latent_attention=True,
+            mla_output_remove_interleaving=True
+        )
+        q = self.cat([q_nope, q_pe], dim=-1)
+        q = self.hadamard(q)
+        k = self.compressor(x)
+
+        # Weights path: linear -> scale
+        weights = self.linear_weights_proj(x)
+        weights = weights * self.weight_scale
+
+        # Convert from SB* layout to BS* layout
+        weights = self.permute(weights, (1, 0, 2))
+        q = self.permute(q, (1, 0, 2, 3))
+        k = self.permute(k, (1, 0, 2, 3))
+
+        if self.is_tnd:
+            q = self.reshape(q, (seqlen * bsz, self.index_n_heads, self.index_head_dim))
+            k = self.reshape(k, (seqlen * bsz, 1, self.index_head_dim))
+            weights = self.reshape(weights, (seqlen * bsz, self.index_n_heads))
+
+        return q, k, weights
+
+    def construct(self, q, k, weights, mask=None, actual_seq_qlen=None, actual_seq_klen=None):
+        """compute top-k indices using lightning_indexer."""
+        effective_topk = min(self.index_topk, int(k.shape[1]))
+        if self.apply_dsa_kernel_fusion:
+            with _no_grad():
+                q = self.cast(q, self.compute_dtype)
+                k = self.cast(k, self.compute_dtype)
+                topk_indices, index_scores = npu_lightning_indexer_v2(
+                    q, k, weights,
+                    layout=self.input_layout,
+                    cu_seq_lens_q=actual_seq_qlen,
+                    cu_seq_lens_k=actual_seq_klen,
+                    sparse_count=effective_topk,
+                    cmp_ratio=self.compress_ratio,
+                    sparse_mode=self.sparse_mode,
+                )
+        else:
+            q = self.cast(q, mstype.float32)
+            k = self.cast(k, mstype.float32)
+            weights = self.cast(weights, mstype.float32)
+
+            #   q: [b, sq, n, d] -> [b, sq*n, d]
+            #   k: [b, sk, 1, d] -> [b, d, sk]
+            #   bmm -> [b, sq*n, sk] -> [b, sq, n, sk]
+            b, sq, n, d = q.shape
+            sk = k.shape[1]
+            q = self.reshape(q, (b, sq * n, d))
+            k = self.permute(self.reshape(k, (b, sk, d)), (0, 2, 1))
+            index_scores = self.bmm(q, k)
+            index_scores = self.reshape(index_scores, (b, sq, n, sk))
+            index_scores = self.relu(index_scores)
+
+            # Weight each head by attention weights.
+            # [b, sq, n, sk] * [b, sq, n, 1] -> [b, sq, n, sk]
+            index_scores = index_scores * self.unsqueeze(weights, -1)
+
+            # Sum across attention heads. [b, sq, n, sk] -> [b, sq, 1, sk]
+            index_scores = self.sum(index_scores, dim=2, keepdim=True)
+            if mask is not None:
+                mask = self.cast(mask, mstype.float32)
+                index_scores = index_scores + mask
+            _, topk_indices = self.topk(index_scores, k=effective_topk, dim=-1)
+            topk_indices = self.cast(topk_indices, mstype.int32)
+        return topk_indices, index_scores
+
+
+class _IndexerLossAutoScaler(_Function):
+    """AutoScaler that triggers backward + scales the grad for indexer loss."""
+
+    main_loss_backward_scale: Tensor = Tensor(1.0)
+
+    @staticmethod
+    def forward(ctx, output, indexer_loss):
+        """Preserve `indexer_loss` on ctx; return `output` unchanged."""
+        ctx.indexer_loss = indexer_loss
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """Return (grad_output, ones_like(indexer_loss) * scale)."""
+        indexer_loss = ctx.indexer_loss
+        scale = _IndexerLossAutoScaler.main_loss_backward_scale
+        scaled_grad = mint.ones_like(indexer_loss) * scale
+        return grad_output, scaled_grad
+
+    @staticmethod
+    def set_loss_scale(scale):
+        """Set the backward scale (trainer/callback is responsible for reduce)."""
+        _IndexerLossAutoScaler.main_loss_backward_scale = scale
+
+
+class FusedCSAIndexerLoss(_Function):
+    """Fused CSA Indexer loss"""
+
+    @staticmethod
+    def forward(ctx,
+                query, key,
+                query_index, key_index, weights, topk_indices,
+                scale_value, layout, cmp_ratio, loss_coeff,
+                softmax_max=None, softmax_sum=None,
+                actual_seq_qlen=None, actual_seq_klen=None):
+        """Forward pass: call fused op + stash indexer-input gradients on ctx."""
+        d_query_index, d_key_index, d_weights, loss = npu_sparse_lightning_indexer_grad_kl_loss_v2(
+            query, key, query_index, key_index, weights, topk_indices,
+            softmax_max=softmax_max, softmax_sum=softmax_sum, scale_value=scale_value,
+            actual_seq_qlen=actual_seq_qlen, actual_seq_klen=actual_seq_klen,
+            layout=layout, sparse_mode=3,
+            pre_tokens=9223372036854775807, next_tokens=9223372036854775807, cmp_ratio=cmp_ratio,
+        )
+        if layout == "TND":
+            scale = query.shape[0]
+        else:
+            scale = query.shape[0] * query.shape[1]
+        loss = loss * loss_coeff / scale
+        ctx.d_query_index = d_query_index
+        ctx.d_key_index = d_key_index
+        ctx.d_weights = d_weights
+        ctx.loss_coeff = loss_coeff
+        ctx.scale = scale
+        return loss[0] # the loss output has a shape (1,), so get its value.
+
+    @staticmethod
+    def backward(ctx, grad_loss):
+        """Scale the three pre-computed indexer gradients by `grad_loss`."""
+        grad_scale = grad_loss * ctx.loss_coeff / ctx.scale
+        return (
+            None, None,
+            ctx.d_query_index * grad_scale,
+            ctx.d_key_index * grad_scale,
+            ctx.d_weights * grad_scale,
+            None,
+            None, None, None,
+            None, None,
+            None, None,
+        )
+
+
+def compute_unfused_indexer_loss(
+        index_scores, topk_indices, query, key,
+        softmax_scale, loss_coeff, sparse_loss, mask=None):
+    """unfused indexer loss implement"""
+    sq, b, _, _ = query.shape
+    sk, _, _, _ = key.shape
+    query = mint.permute(query, (1, 2, 0, 3)).to(mstype.float32)
+    key = mint.permute(key, (1, 2, 3, 0)).to(mstype.float32)
+    attention_scores = mint.bmm(query, key) * softmax_scale
+    index_scores = mint.reshape(index_scores, (b, sq, sk))
+    topk_indices = mint.reshape(topk_indices, (b, sq, -1))
+
+    if mask is None:
+        causal_mask = mint.triu(mint.full((sq, sk), float("-inf"), dtype=mstype.float32), diagonal=1)
+        causal_mask = mint.reshape(causal_mask, (1, 1, sq, sk))
+    else:
+        causal_mask = mask.to(mstype.float32)
+        causal_mask = mint.reshape(causal_mask, (-1, 1, sq, sk))
+
+    # add mask to attention score
+    attention_scores = attention_scores + causal_mask
+    if sparse_loss:
+        index_mask = mint.full((b, sq, sk), float("-inf"), dtype=mstype.float32)
+        index_mask = mint.scatter(index_mask, -1, topk_indices, 0)
+        index_scores = index_scores + index_mask
+        attention_scores = attention_scores + mint.unsqueeze(index_mask, 1)
+
+    # Zero out fully-masked rows before softmax
+    row_valid = mint.any(causal_mask > float("-inf"), dim=-1)
+    attn_row_mask = mint.reshape(row_valid, (-1, 1, sq, 1))
+    idx_row_mask = mint.reshape(row_valid, (-1, sq, 1))
+    attention_scores = mint.where(attn_row_mask, attention_scores, 0.0)
+    index_scores = mint.where(idx_row_mask, index_scores, 0.0)
+
+    # do softmax and L1-normalize for attention score
+    attention_scores = mint.softmax(attention_scores, dim=-1)
+    attention_scores = mint.sum(attention_scores, dim=1)
+    attention_scores = attention_scores / mint.clamp(mint.sum(attention_scores, -1, keepdim=True), min=1e-10)
+
+    # do softmax for index_scores.
+    index_scores = mint.softmax(index_scores, dim=-1)
+
+    # compute KL divergence loss,  [b, sq, sk] -> [b, sq] -> [1]
+    kl_per_element = attention_scores * (mint.log(attention_scores + 1e-10) - mint.log(index_scores + 1e-10))
+    # Each token has same weight in the loss.
+    kl_div = mint.mean(mint.sum(kl_per_element, -1))
+
+    # Scale by coefficient.
+    indexer_loss = kl_div * loss_coeff
+    return indexer_loss

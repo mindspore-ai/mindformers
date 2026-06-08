@@ -733,7 +733,7 @@ class Trainer:
                 self.monitor.reset()
                 self.monitor.record("moe_tpe_step_begin")
 
-                if self.parallel_dims.pp_enabled:
+                if self.parallel_dims and self.parallel_dims.pp_enabled:
                     loss, grad_norm = self.training_pp_step(inputs)
                 else:
                     loss, grad_norm = self.training_step(inputs, loss=loss, grad_norm=grad_norm, step=step)
