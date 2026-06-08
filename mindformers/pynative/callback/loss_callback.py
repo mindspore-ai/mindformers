@@ -322,7 +322,9 @@ def _update_expert_bias(model):
             expert_bias_delta = module.load_balance_coeff * mint.sign(
                 tokens_per_expert.mean() - tokens_per_expert
             )
-            expert_bias_delta = expert_bias_delta - expert_bias_delta.mean()
+            # NOTE: Megatron-LM does not apply zero-mean correction to the expert bias delta;
+            # Torchtitan applies zero-mean correction here
+
             # pyrefly: ignore [missing-attribute]
             module.expert_bias.add_(expert_bias_delta)
             # pyrefly: ignore [missing-attribute]
