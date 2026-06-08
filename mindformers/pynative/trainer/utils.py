@@ -532,7 +532,7 @@ def _compute_grad_norm_sq_fused(local_grads, grad_factors):
     norm_sqs = []
     for local_grad, factor in zip(local_grads, grad_factors):
         grad_fp32 = local_grad.astype(mstype.float32)
-        norm_sq = mint.sum(mint.square(grad_fp32)) / (factor * factor)
+        norm_sq = mint.sum(mint.square(grad_fp32)) / factor
         norm_sqs.append(norm_sq)
 
     if len(norm_sqs) == 1:
@@ -583,7 +583,6 @@ def _calculate_global_grad_norm(
     if not grads:
         return Tensor(0.0, dtype=mstype.float32), ()
 
-    total_norm_sq = Tensor(0.0, dtype=mstype.float32)
     grouped_grads = _group_grads_by_device_and_dtype(grads)
 
     group_norm_sqs = []

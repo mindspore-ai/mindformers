@@ -36,7 +36,6 @@ from mindspore.graph.api import _no_grad
 
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.platform.mindspore.autograd_compat import enable_mindspore_backward_compat
-from hyper_parallel.core.dtensor.init_weights import init_empty_weights
 
 from mindformers.tools.logger import logger
 from mindformers.pynative.config import TrainConfig
@@ -58,6 +57,7 @@ from mindformers.pynative.distributed.parallel_dims import ParallelDims
 from mindformers.pynative.distributed.parallelize import parallelize_model
 
 from mindformers.checkpoint.checkpoint import CommonInfo, get_checkpoint_path
+
 from .train_state import TrainerState
 from ..tools.monitor import MonitorGroup
 from .utils import (
@@ -157,14 +157,17 @@ class Trainer:
         self.world_size = get_world_size()
         logger.info(f"Current world size: {self.world_size}.")
         self.enable_parallel = self.world_size > 1
-        self.pp_enabled = self.config.parallelism.pipeline_parallel > 1
-        self.parallel_dims = None
-        self.metric_reduce_group = None
-        self.metric_reduce_group_size = None
+
         if self.enable_parallel:
             init_process_group()
             self.communication_init = True
             logger.info("Distributed communication is initialized.")
+        
+        # init states for pipeline parallel
+        self.pp_enabled = self.config.parallelism.pipeline_parallel > 1
+        self.parallel_dims = None
+        self.metric_reduce_group = None
+        self.metric_reduce_group_size = None
 
         self.global_batch_size = self.config.training.global_batch_size
         self.gradient_accumulation_steps = None
@@ -183,12 +186,6 @@ class Trainer:
             m.to_empty()
             with _no_grad():
                 m.init_states()
-
-        if self.parallel_dims and self.parallel_dims.pp_enabled:
-            loss_mesh = self.parallel_dims.get_mesh("loss_mesh")
-            self.metric_reduce_group_size = loss_mesh.size()
-            if self.metric_reduce_group_size > 1:
-                self.metric_reduce_group = loss_mesh.get_group()
 
         # Create train dataset
         self.train_dataset = self._create_dataset(
@@ -292,15 +289,9 @@ class Trainer:
         logger.info("Applying parallelism to model...")
 
         # Build ParallelDims
-        if parallelism.data_parallel_shard > 0:
-            dp_replicate = max(
-                parallelism.data_parallel // parallelism.data_parallel_shard, 1)
-        else:
-            dp_replicate = 1
-
         self.parallel_dims = ParallelDims(
-            dp_replicate=dp_replicate,
-            dp_shard=parallelism.data_parallel,
+            dp_replicate=parallelism.data_parallel_replicate,
+            dp_shard=parallelism.data_parallel_shard,
             cp=parallelism.context_parallel,
             tp=parallelism.tensor_parallel,
             pp=parallelism.pipeline_parallel,
@@ -380,23 +371,31 @@ class Trainer:
             )
 
         self.config.parallelism.data_parallel = data_parallel
+        if parallelism.data_parallel_shard < 0:
+            dp_replicate = 1
+        else:
+            dp_replicate = max(data_parallel // parallelism.data_parallel_shard, 1)
+        parallelism.data_parallel_replicate = dp_replicate
+        parallelism.data_parallel_shard = data_parallel // dp_replicate
+
         logger.info(
-            f"Got parallelism settings: {data_parallel=}, {tensor_parallel=}, "
-            f"{pipeline_parallel=}, {context_parallel=}"
+            f"Got parallelism settings: {data_parallel=}"
+            f"(dp_shard[{parallelism.data_parallel_shard}] * dp_replicate[{dp_replicate}]), "
+            f"{tensor_parallel=}, {pipeline_parallel=}, {context_parallel=}"
         )
 
         # calculate gradient accumulation steps
         if (
-            data_parallel * self.config.training.local_batch_size
+            parallelism.data_parallel_shard * self.config.training.local_batch_size
             > self.global_batch_size
         ):
             raise ValueError(
-                "The product of data_parallel and local_batch_size exceeds global_batch_size, "
+                "The product of data_parallel_shard and local_batch_size exceeds global_batch_size, "
                 "please increase global_batch_size or decrease local_batch_size."
             )
 
         self.num_accumulation_steps = self.global_batch_size // (
-            data_parallel * self.config.training.local_batch_size
+            parallelism.data_parallel_shard * self.config.training.local_batch_size
         )
         self.config.parallelism.pipeline_parallel_microbatch_size = self.num_accumulation_steps
         logger.info(
@@ -609,6 +608,12 @@ class Trainer:
         # Initialize training state
         self.state = self._init_train_state()
 
+        if self.parallel_dims and self.parallel_dims.pp_enabled:
+            loss_mesh = self.parallel_dims.get_mesh("loss_mesh")
+            self.metric_reduce_group_size = loss_mesh.size()
+            if self.metric_reduce_group_size > 1:
+                self.metric_reduce_group = loss_mesh.get_group()
+
         # Load checkpoint
         checkpoint_path = checkpoint_path or self.config.checkpoint.load_path
         if checkpoint_path:
@@ -733,10 +738,11 @@ class Trainer:
                 self.monitor.reset()
                 self.monitor.record("moe_tpe_step_begin")
 
-                if self.parallel_dims.pp_enabled:
+                if self.parallel_dims and self.parallel_dims.pp_enabled:
                     loss, grad_norm = self.training_pp_step(inputs)
                 else:
-                    loss, grad_norm = self.training_step(inputs, loss=loss, grad_norm=grad_norm, step=step)
+                    loss, grad_norm = self.training_step(
+                        inputs, loss=loss, grad_norm=grad_norm, step=step)
 
                 # Update state
                 self.state.global_step += 1
@@ -992,6 +998,7 @@ class Trainer:
 
         if self.num_accumulation_steps > 1:
             loss = loss / self.num_accumulation_steps
+
         loss.backward(sense)
         return loss
 
