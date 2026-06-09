@@ -621,28 +621,3 @@ def _calculate_global_grad_norm(
                     grad.mul_(scale)
 
     return global_norm, tuple(grads)
-
-def _get_loss_sense(parallelism, enable_parallel: bool = False):
-    """
-    Calculate the loss scaling factor for distributed training.
-
-    Args:
-        loss: The loss tensor, either a regular Tensor or a DTensor.
-        parallelism: Parallelism configuration.
-        enable_parallel (bool): Whether to enable parallel training. Default: False.
-
-    Returns:
-        A scalar Tensor containing the loss scaling factor.
-            - Returns [1.0] if loss is not a DTensor (non-distributed case).
-            - Returns [1.0 / (num_devices // pipeline_parallel)] if loss is a DTensor.
-    """
-    if not enable_parallel:
-        return Tensor([1.0,], dtype=mstype.float32)
-
-    num_devices = get_world_size()
-    pipeline_parallel = int(parallelism.pipeline_parallel)
-    sense = 1. / (num_devices // pipeline_parallel)
-    logger.debug(
-        f"Got loss sense({sense}) = 1. / (num_devices({num_devices}) // pipeline_parallel({pipeline_parallel}))"
-    )
-    return Tensor([sense,], dtype=mstype.float32)

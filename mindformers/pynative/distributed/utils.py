@@ -20,7 +20,9 @@ import inspect
 from functools import partial
 from typing import Any, Callable, Dict, Optional
 
-from mindspore import nn
+from mindspore import nn, Tensor
+from mindspore.common import dtype as mstype
+from mindspore.mint.distributed import get_world_size
 
 from hyper_parallel import DeviceMesh, shard_module
 from hyper_parallel.core.dtensor.placement_types import Replicate
@@ -99,3 +101,46 @@ def distribute_module(
 
     setattr(module, "_distribute_module_applied", True)
     return module
+
+
+def get_loss_sense(
+    parallelism,
+    enable_parallel: bool = False,
+    gradient_accumulation_steps: int = 1,
+    apply_gradient_accumulation: bool = False,
+) -> Tensor:
+    """Calculate the backward sense for the main or auxiliary loss.
+
+    Args:
+        parallelism: Parallelism configuration containing ``pipeline_parallel``.
+        enable_parallel: Whether distributed training is enabled.
+        gradient_accumulation_steps: Number of micro-batches accumulated per optimizer step.
+        apply_gradient_accumulation: Whether to include gradient accumulation in the sense.
+
+    Returns:
+        A float32 single-element tensor containing the loss sense.
+    """
+    if gradient_accumulation_steps < 1:
+        raise ValueError(
+            "gradient_accumulation_steps must be greater than or equal to 1, "
+            f"but got {gradient_accumulation_steps}."
+        )
+
+    sense = 1.0
+    if enable_parallel:
+        num_devices = get_world_size()
+        pipeline_parallel = int(parallelism.pipeline_parallel)
+        sense /= num_devices // pipeline_parallel
+
+    if apply_gradient_accumulation:
+        sense /= gradient_accumulation_steps
+
+    logger.debug(
+        "Got loss sense(%s), enable_parallel=%s, gradient_accumulation_steps=%s, "
+        "apply_gradient_accumulation=%s",
+        sense,
+        enable_parallel,
+        gradient_accumulation_steps,
+        apply_gradient_accumulation,
+    )
+    return Tensor([sense], dtype=mstype.float32)
