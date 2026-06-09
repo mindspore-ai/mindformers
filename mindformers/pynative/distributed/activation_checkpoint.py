@@ -43,7 +43,7 @@ __all__ = [
 ]
 
 _LAYER_ID_SPEC_PATTERN = re.compile(r"^(\d+)(?:-(\d+))?$")
-_config_list = []
+_config_list = {}
 
 def _validate_recompute_config(
     recompute,
@@ -358,14 +358,14 @@ def _get_single_layer_whitelist(layer, whitelist, info=''):
 
 
 def _get_modules_and_ops_list(model):
-    """Get a list of all modules and operators for each layer in the model."""
-    layer_configs = []
+    """Get a dict of all modules and operators for each layer in the model."""
+    layer_configs = {}
 
     for layer_id in range(model.layer_start, model.layer_end + 1):
         layer = model.layers[layer_id]
         layer_whitelist = []
         _get_single_layer_whitelist(layer, layer_whitelist)
-        layer_configs.append(layer_whitelist)
+        layer_configs[layer_id] = layer_whitelist
 
     return layer_configs
 
@@ -379,7 +379,8 @@ def _expand_select_module(config_list, select_module):
         matched = False
 
         for layer_id in raw_layer_ids:
-            # Match user pattern against each item in the layer whitelist
+            if layer_id not in config_list:
+                continue
             for item in config_list[layer_id]:
                 if regex_match(module_name, item):
                     matched = True
@@ -596,7 +597,8 @@ def _expand_op_swap(config_list, op_swap):
         matched = False
 
         for layer_id in raw_layer_ids:
-            # Match user pattern against each item in the layer whitelist
+            if layer_id not in config_list:
+                continue
             for item in config_list[layer_id]:
                 if regex_match(module_name, item):
                     matched = True
@@ -772,6 +774,7 @@ def apply_ac(
     recompute,
     recompute_comm,
     swap,
+    pp,
 ):
     """Apply activation checkpointing to the model."""
     global _config_list
@@ -787,6 +790,10 @@ def apply_ac(
         raise ValueError(f"{type(model)} must have 'config.num_layers' attribute.")
 
     _config_list = _get_modules_and_ops_list(model)
+
+    if pp > 1 and enable_swap:
+        logger.error("[Swap Config] swap is not supported with pipeline parallel")
+        raise ValueError("swap is not supported with pipeline parallel")
 
     if enable_recompute and enable_swap:
         _check_recompute_swap_overlap(recompute, recompute_comm, swap)
