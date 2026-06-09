@@ -1197,6 +1197,7 @@ def _apply_spmd_parallelism(
             recompute,
             recompute_comm,
             swap,
+            parallelism.pipeline_parallel,
         )
 
     # Phase 5: FSDP/HSDP
