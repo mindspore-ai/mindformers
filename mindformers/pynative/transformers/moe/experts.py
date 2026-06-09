@@ -62,7 +62,12 @@ class GroupedMLP(nn.Cell):
         self.moe_ffn_hidden_size = self.config.moe_ffn_hidden_size
         self.hidden_size = self.config.hidden_size
         self.activation_type = self.config.hidden_act
-        self.activation_func = get_activation(self.activation_type)
+        # SwiGLU clamp: get_activation returns ClampedSwiGlu when clamp_value is
+        # set (SwiGLU + MoE only per config validation). ClampedSwiGlu shares
+        # ops.swiglu's first-half/second-half chunk semantics, so the call site
+        # self.activation_func(fc1_output, -1) is unchanged.
+        clamp_value = self.config.activation_func_clamp_value
+        self.activation_func = get_activation(self.activation_type, clamp_value=clamp_value)
         self.gated_linear_unit = self.config.gated_linear_unit
         if self.gated_linear_unit:
             self.moe_ffn_hidden_size *= 2

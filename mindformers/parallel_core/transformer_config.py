@@ -1289,6 +1289,18 @@ class TransformerConfig:
         }
     )
 
+    activation_func_clamp_value: Optional[float] = field(
+        default=None,
+        metadata={
+            "description": "Clamp bound applied inside SwiGLU: the gate input is clamped to "
+                           "[-inf, clamp_value] and the linear input to [-clamp_value, clamp_value] "
+                           "before SwiGLU. Only used with SwiGLU and MoE. Default None (no clamping).",
+            "usage": ParamUsage.COMMON,
+            "source": ParamSource.MEGATRON,
+            "mode": ParamMode.COMMON
+        }
+    )
+
     moe_n_hash_layers: int = field(
         default=0,
         metadata={
@@ -2423,6 +2435,27 @@ class TransformerConfig:
                     "When using bias_swiglu_fusion, hidden_act must be swiglu."
                 )
             self.hidden_act = 'fusedswiglu'
+
+        if self.activation_func_clamp_value is not None:
+            # Clamp is only defined for SwiGLU activation (aligns Megatron
+            # transformer_config.py:2199-2205). hidden_act is normalized to
+            # 'fusedswiglu' above when bias_swiglu_fusion is set.
+            if self.hidden_act in ('swiglu', 'fusedswiglu') and self.gated_linear_unit:
+                if self.num_moe_experts is None:
+                    raise ValueError(
+                        "activation_func_clamp_value for SwiGLU is only supported with MoE."
+                    )
+            else:
+                logger.warning(
+                    "activation_func_clamp_value is set to %s but the current activation "
+                    "is '%s' with gated_linear_unit=%s. Clamping only takes effect for "
+                    "SwiGLU (hidden_act='swiglu'/'fusedswiglu') with gated_linear_unit=True. "
+                    "The clamp value will be silently ignored.",
+                    self.activation_func_clamp_value,
+                    self.hidden_act,
+                    self.gated_linear_unit,
+                )
+
 
         if self.moe_n_hash_layers > 0:
             # Hash-based MoE routing validation.
