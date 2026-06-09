@@ -107,7 +107,7 @@ class GPTModel(nn.Cell):
         self.vocab_size = vocab_size
         self.max_sequence_length = max_sequence_length
         self.layer_start = layer_start
-        self.layer_end = layer_end if layer_end else config.num_layers - 1
+        self.layer_end = layer_end if layer_end is not None else config.num_layers - 1
         self.pre_process = pre_process and (self.layer_start == 0)
         self.post_process = post_process and (self.layer_end == config.num_layers - 1)
         self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
