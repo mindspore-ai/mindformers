@@ -26,8 +26,6 @@ class SoftmaxConverter(nn.Cell):
     """convert softmax_max and softmax_sum layout of FlashAttentionScore in TND layout"""
     def __init__(self, config: TransformerConfig):
         super().__init__()
-        if not config.input_layout != "TND":
-            raise ValueError("Only softmax_out in TND layout need to be converted!")
         self.seq_length = config.seq_length
         self.head_num = config.num_attention_heads
         self.is_dryrun = config.is_dryrun

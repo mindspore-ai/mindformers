@@ -20,11 +20,13 @@ import argparse
 from types import MethodType
 
 import mindspore as ms
-from tests.st.training_checker import TrainingChecker
+
 from data_gen_utils import get_tnd_dataset, get_dataset, generate_weight
+from tests.st.training_checker import TrainingChecker
 
 from mindformers import build_context, MindFormerConfig
 from mindformers.trainer import Trainer
+
 
 CUR_DIR = os.path.dirname(__file__)
 
@@ -342,6 +344,76 @@ def moe_eplb_expert_relocation():
     ds3_train(config, dataset, construct_args_key, checker_config)
 
 
+def parallel_train_dsa1_dp2_tp2_pp2_ep4():
+    """test mcore deepseekv3 train in dp=pp=ep=2 with TND layout."""
+    ms.set_seed(0)
+    config = MindFormerConfig(f'{CUR_DIR}/deepseekv32_train.yaml')
+    config.model.model_config.dsa_indexer_use_sparse_loss = False
+    config.train_precision_sync = True
+    config.pretrained_model_dir = CUR_DIR
+    config.parallel.full_batch = False
+    config.parallel_config.context_parallel = 1
+    config.parallel_config.expert_parallel = 4
+    dp = config.parallel_config.data_parallel
+    config.parallel.dataset_strategy = [[dp, 1], [dp, 1]]
+    build_context(config)
+
+    construct_args_key = ['input_ids', 'labels']
+    model_config = config.model.model_config
+    dataset = get_dataset(
+        model_config.seq_length,
+        model_config.vocab_size,
+        batch_size=2, step_num=20
+    )
+
+    loss_std = [13.485958, 13.485899, 13.486027, 13.486504, 13.485969,
+                13.485859, 13.485970, 13.486073, 13.486391, 13.486685,
+                13.487134, 13.486610, 13.485924, 13.486060, 13.485929,
+                13.485996, 13.485893, 13.485982, 13.485970, 13.486531,]
+    checker_config = {
+        'loss_list_std': loss_std,
+        'experiment_mode': False,
+        'micro_batch_num': 2,
+        'micro_batch_interleave_num': 1
+    }
+    ds3_train(config, dataset, construct_args_key, checker_config)
+
+
+def parallel_train_dsa2_dp2_tp2_cp2_ep4():
+    """test mcore deepseekv3 train in dp=pp=ep=2 with TND layout."""
+    ms.set_seed(0)
+    config = MindFormerConfig(f'{CUR_DIR}/deepseekv32_train.yaml')
+    config.model.model_config.dsa_indexer_use_sparse_loss = True
+    config.train_precision_sync = True
+    config.pretrained_model_dir = CUR_DIR
+    config.parallel.full_batch = False
+    config.parallel_config.pipeline_stage = 1
+    config.parallel_config.expert_parallel = 4
+    dp = config.parallel_config.data_parallel
+    config.parallel.dataset_strategy = [[dp, 1], [dp, 1]]
+    build_context(config)
+
+    construct_args_key = ['input_ids', 'labels']
+    model_config = config.model.model_config
+    dataset = get_dataset(
+        model_config.seq_length,
+        model_config.vocab_size,
+        batch_size=1, step_num=20
+    )
+
+    loss_std = [13.486013, 13.485970, 13.485834, 13.485897, 13.486037,
+                13.486030, 13.485880, 13.486004, 13.485953, 13.485997,
+                13.485964, 13.485770, 13.485907, 13.486036, 13.486015,
+                13.486054, 13.486046, 13.486034, 13.485991, 13.486115,]
+    checker_config = {
+        'loss_list_std': loss_std,
+        'experiment_mode': False,
+        'micro_batch_num': 1,
+        'micro_batch_interleave_num': 1
+    }
+    ds3_train(config, dataset, construct_args_key, checker_config)
+
+
 TEST_MAP = {
     'parallel_train_dp2_mp2_cp2_ep2': parallel_train_dp2_mp2_cp2_ep2,
     'parallel_train_dp2_pp2_ep2_tnd': parallel_train_dp2_pp2_ep2_tnd,
@@ -352,7 +424,9 @@ TEST_MAP = {
     'parallel_train_alltoall_zero_redundancy': parallel_train_alltoall_zero_redundancy,
     "moe_token_permute": moe_token_permute,
     "moe_eplb_print_expert_load": moe_eplb_print_expert_load,
-    "moe_eplb_expert_relocation": moe_eplb_expert_relocation
+    "moe_eplb_expert_relocation": moe_eplb_expert_relocation,
+    "parallel_train_dsa1_dp2_tp2_pp2_ep4": parallel_train_dsa1_dp2_tp2_pp2_ep4,
+    "parallel_train_dsa2_dp2_tp2_cp2_ep4": parallel_train_dsa2_dp2_tp2_cp2_ep4
 }
 
 if __name__ == '__main__':
