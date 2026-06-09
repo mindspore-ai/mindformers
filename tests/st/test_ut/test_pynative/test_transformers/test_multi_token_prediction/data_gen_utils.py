@@ -16,91 +16,60 @@
 
 import numpy as np
 
+import mindspore as ms
 
-def get_init_params(config, loc, scale, seq_length, batch_size, vocab_size):
-    """
-    Generates initial parameters for Multi-Token Prediction (MTP).
-    Input shape is (seq_length, batch_size, hidden_size).
-    """
+from mindformers.parallel_core.transformer_config import TransformerConfig
+
+
+def get_init_params(config: TransformerConfig, seq_length=4, batch_size=2):
+    """Generate initialization parameters"""
     rng = np.random.default_rng(42)
     data = list(range(seq_length))
     hidden_size = config.hidden_size
-    mlp_size = config.ffn_hidden_size * 2 if config.gated_linear_unit else config.ffn_hidden_size
+    ffn = config.ffn_hidden_size if config.ffn_hidden_size else 4 * hidden_size
+    vocab = config.vocab_size
+    mlp_size = ffn * 2 if config.gated_linear_unit else ffn
 
     state_dict = {
-        # mtp layer weights
-        "0.enorm.weight": rng.normal(loc=loc, scale=scale, size=hidden_size),
-        "0.hnorm.weight": rng.normal(loc=loc, scale=scale, size=hidden_size),
-        "0.eh_proj.weight": rng.normal(loc=loc, scale=scale, size=(hidden_size, hidden_size * 2)),
-        "0.final_layernorm.weight": rng.normal(loc=loc, scale=scale, size=hidden_size),
-
-        # transformer weights
-        "0.transformer_layer.input_layernorm.weight": rng.normal(loc=loc, scale=scale, size=hidden_size),
-        "0.transformer_layer.self_attention.linear_proj.weight": rng.normal(loc=loc, scale=scale,
-                                                                                   size=(hidden_size, hidden_size)),
-        "0.transformer_layer.self_attention.linear_qkv.weight": rng.normal(loc=loc, scale=scale,
-                                                                                  size=(hidden_size * 3, hidden_size)),
-        "0.transformer_layer.pre_mlp_layernorm.weight": rng.normal(loc=loc, scale=scale, size=hidden_size),
-        "0.transformer_layer.mlp.linear_fc1.weight": rng.normal(loc=loc, scale=scale,
-                                                                       size=(mlp_size, hidden_size)),
-        "0.transformer_layer.mlp.linear_fc2.weight": rng.normal(loc=loc, scale=scale,
-                                                                       size=(hidden_size, mlp_size)),
-        "1.transformer_layer.input_layernorm.weight": rng.normal(loc=loc, scale=scale, size=hidden_size),
-        "1.transformer_layer.self_attention.linear_proj.weight": rng.normal(loc=loc, scale=scale,
-                                                                                   size=(hidden_size, hidden_size)),
-        "1.transformer_layer.self_attention.linear_qkv.weight": rng.normal(loc=loc, scale=scale,
-                                                                                  size=(hidden_size * 3, hidden_size)),
-        "1.transformer_layer.pre_mlp_layernorm.weight": rng.normal(loc=loc, scale=scale, size=hidden_size),
-        "1.transformer_layer.mlp.linear_fc1.weight": rng.normal(loc=loc, scale=scale,
-                                                                       size=(mlp_size, hidden_size)),
-        "1.transformer_layer.mlp.linear_fc2.weight": rng.normal(loc=loc, scale=scale,
-                                                                       size=(hidden_size, mlp_size)),
-        # input layers weights
-        "word_embeddings.weight": rng.normal(loc=loc, scale=scale, size=(vocab_size, hidden_size)),
-        "position_embeddings.weight": rng.normal(loc=loc, scale=scale, size=(seq_length, hidden_size)),
-        "weight": rng.normal(loc=loc, scale=scale, size=(vocab_size, hidden_size)),  # output_layer
+        "layers.0.enorm.weight": rng.normal(0, 0.15, size=hidden_size),
+        "layers.0.hnorm.weight": rng.normal(0, 0.15, size=hidden_size),
+        "layers.0.eh_proj.weight": rng.normal(0, 0.15, size=(hidden_size, hidden_size * 2)),
+        "layers.0.final_layernorm.weight": rng.normal(0, 0.15, size=hidden_size),
+        "layers.0.transformer_layer.input_layernorm.weight": rng.normal(0, 0.15, size=hidden_size),
+        "layers.0.transformer_layer.self_attention.linear_proj.weight": rng.normal(
+            0, 0.15, size=(hidden_size, hidden_size)
+        ),
+        "layers.0.transformer_layer.self_attention.linear_qkv.weight": rng.normal(
+            0, 0.15, size=(hidden_size * 3, hidden_size)
+        ),
+        "layers.0.transformer_layer.pre_mlp_layernorm.weight": rng.normal(0, 0.15, size=hidden_size),
+        "layers.0.transformer_layer.mlp.linear_fc1.weight": rng.normal(0, 0.15, size=(mlp_size, hidden_size)),
+        "layers.0.transformer_layer.mlp.linear_fc2.weight": rng.normal(0, 0.15, size=(hidden_size, mlp_size)),
+        "word_embeddings.weight": rng.normal(0, 0.15, size=(vocab, hidden_size)),
+        "position_embeddings.weight": rng.normal(0, 0.15, size=(seq_length, hidden_size)),
+        "weight": rng.normal(0, 0.15, size=(vocab, hidden_size)),
     }
-    hidden_states = rng.normal(loc=loc, scale=scale, size=(seq_length, batch_size, hidden_size))
+    for k in state_dict:
+        state_dict[k] = ms.Parameter(ms.tensor(state_dict[k], dtype=ms.float32))
 
-    # Will be transposed to [s, b, h] in LanguageModelEmbedding
-    input_ids = np.tile(data, (batch_size, 1))
-    position_ids = np.tile(data, (batch_size, 1))
-
-    labels = (1 + np.tile(data, (batch_size, 1)))
-    loss_mask = np.ones((batch_size, seq_length))
-
-    attention_mask = np.ones((batch_size, 1, seq_length, seq_length), dtype=bool)
-
-    return {
-        'input_ids': input_ids,
-        'labels': labels,
-        'position_ids': position_ids,
-        'attention_mask': attention_mask,
-        'loss_mask': loss_mask,
-        'hidden_states': hidden_states,
-        'state_dict': state_dict
+    input_data = {
+        "input_ids": np.tile(data, (batch_size, 1)).astype(np.int32),
+        "labels": (1 + np.tile(data, (batch_size, 1))).astype(np.int32),
+        "position_ids": np.tile(data, (batch_size, 1)).astype(np.int32),
+        "loss_mask": np.ones((batch_size, seq_length), dtype=np.float32),
+        "attention_mask": np.ones((batch_size, 1, seq_length, seq_length), dtype=bool),
+        "hidden_states": rng.normal(0, 0.15, size=(seq_length, batch_size, hidden_size)),
     }
+    input_data["hidden_states"] = ms.tensor(input_data["hidden_states"], dtype=ms.bfloat16)
+
+    return input_data, state_dict
 
 
-def get_gpu_datas() -> dict[str, np.ndarray]:
-    """Generate gpu data for test."""
-    single_card_baseline = [2.2938010692596436]
-    pe_rope = [2.3010997772216797]
-    return {
-        "single_card_baseline": np.array(single_card_baseline),
-        "pe_rope": np.array(pe_rope),
-    }
-
-
-def get_golden() -> dict[str, np.ndarray]:
+def get_golden_datas():
     """Generate golden data for test."""
-    single_card_baseline = [2.293926239013672]
-    pe_rope = [2.3010616302490234]
-    return {
-        "single_card_baseline": np.array(single_card_baseline),
-        "pe_rope": np.array(pe_rope),
-    }
+    return np.array([2.2798521519], dtype=np.float16)
 
 
-GOLDEN_DATA = get_golden()
-GPU_DATA = get_gpu_datas()
+def get_gpu_datas():
+    """Generate gpu data for test."""
+    return np.array([2.2798521519], dtype=np.float16)
