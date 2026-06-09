@@ -370,7 +370,7 @@ class Trainer:
                 f"context_parallel({context_parallel}) must be less than or equal to world_size({self.world_size})."
             )
 
-        self.config.parallelism.data_parallel = data_parallel
+        parallelism.data_parallel = data_parallel
         if parallelism.data_parallel_shard < 0:
             dp_replicate = 1
         else:
@@ -386,18 +386,18 @@ class Trainer:
 
         # calculate gradient accumulation steps
         if (
-            parallelism.data_parallel_shard * self.config.training.local_batch_size
+            parallelism.data_parallel * self.config.training.local_batch_size
             > self.global_batch_size
         ):
             raise ValueError(
-                "The product of data_parallel_shard and local_batch_size exceeds global_batch_size, "
+                "The product of data_parallel and local_batch_size exceeds global_batch_size, "
                 "please increase global_batch_size or decrease local_batch_size."
             )
 
         self.num_accumulation_steps = self.global_batch_size // (
-            parallelism.data_parallel_shard * self.config.training.local_batch_size
+            parallelism.data_parallel * self.config.training.local_batch_size
         )
-        self.config.parallelism.pipeline_parallel_microbatch_size = self.num_accumulation_steps
+        parallelism.pipeline_parallel_microbatch_size = self.num_accumulation_steps
         logger.info(
             f"Calculate global_batch_size={self.global_batch_size}, "
             f"num_accumulation_steps={self.num_accumulation_steps}."
