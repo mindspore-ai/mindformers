@@ -124,12 +124,12 @@ class ContextParallelModelIOStyle(ParallelStyle):
     """Apply CP input slicing to the root model."""
 
     _INPUT_NAMES = (
-        "input_ids",
-        "position_ids",
-        "attention_mask",
         "decoder_input",
+        "input_ids",
         "labels",
+        "attention_mask",
         "loss_mask",
+        "position_ids",
         "actual_seq_len",
     )
 
