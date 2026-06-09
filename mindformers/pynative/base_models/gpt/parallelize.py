@@ -1212,7 +1212,7 @@ def _apply_spmd_parallelism(
 
     # Phase 6: CP root I/O hooks. Apply after FSDP so the hooks live on the final
     # model boundary called by trainer.
-    if parallel_dims.cp_enabled and model.model.stage_idx == 0:
+    if parallel_dims.cp_enabled:
         apply_context_parallel_model_io(model, parallel_dims, parallelism)
 
     # Set the loss scale for the auxiliary loss of the MoE layer.

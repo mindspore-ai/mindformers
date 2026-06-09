@@ -61,9 +61,9 @@ class PyNativeDeepseekV3ForCausalLM(TrainModelMixin, DeepseekV3PreTrainedModel):
 
     def construct(
             self,
-            input_ids: Tensor,
-            labels: Tensor = None,
             decoder_input: Tensor = None,
+            input_ids: Tensor = None,
+            labels: Tensor = None,
             attention_mask: Tensor = None,
             loss_mask=None,
             position_ids: Tensor = None,

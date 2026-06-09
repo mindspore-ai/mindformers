@@ -330,7 +330,7 @@ class GPTModel(nn.Cell):
             )
 
         if not self.post_process:
-            return input_ids, labels, hidden_states, attention_mask
+            return hidden_states
 
         if self.mtp_process:
             hidden_states = process_mtp_loss(
