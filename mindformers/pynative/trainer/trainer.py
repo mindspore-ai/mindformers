@@ -948,7 +948,7 @@ class Trainer:
             Tensor: Computed loss value.
         """
         # Forward pass
-        outputs = self.schedule.run(**inputs) if self.has_first else self.schedule.run()
+        outputs = self.schedule.run(**inputs)
 
         # Compute loss
         loss = 0.0

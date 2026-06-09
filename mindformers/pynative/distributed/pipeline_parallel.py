@@ -38,12 +38,27 @@ class PpLayerSetting:
             self._init_explicit(self.layers_per_stage)
 
     def _init_explicit(self, layers_per_stage: List[str]):
+        """
+        Parse the layer range string to a tuple of (layer_start, layer_end).
+        """
         after_parse_layer = {}
         for pp_rank, stage_str in enumerate(layers_per_stage):
             ranges = stage_str.split(',')
             for chunk_id, r in enumerate(ranges):
-                start, end = r.strip().split('-')
-                after_parse_layer[str(chunk_id * self.pp + pp_rank)] = ((int(start), int(end)))
+                layer_ids = r.strip().split('-')
+                if len(layer_ids) <= 2:
+                    layer_start, layer_end = layer_ids[0], layer_ids[-1]
+                    if layer_start > layer_end:
+                        raise ValueError(
+                            f"Invalid layer range format: {r}. "
+                            "layer_start must be less than or equal to layer_end."
+                        )
+                else:
+                    raise ValueError(
+                        f"Invalid layer range format: {r}. "
+                        "Expected format is 'start-end' or 'single_layer'."
+                    )
+                after_parse_layer[str(chunk_id * self.pp + pp_rank)] = (int(layer_start), int(layer_end))
 
         self.layers_per_stage = after_parse_layer
 
@@ -59,7 +74,7 @@ class PpLayerSetting:
         if self.avg_layer:
             layer_start_id = stage_id * self.avg_layer
             layer_end_id = (stage_id + 1) * self.avg_layer - 1
-            return (layer_start_id, layer_end_id + 1)
+            return (layer_start_id, layer_end_id)
         return self.layers_per_stage[str(stage_id)]
 
     @property
