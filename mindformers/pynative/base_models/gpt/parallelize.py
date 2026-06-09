@@ -69,7 +69,7 @@ from mindformers.pynative.distributed.expert_parallel import ExpertParallel, Der
 from mindformers.pynative.distributed.pipeline_parallel import PpLayerSetting, StageModelBuilder
 from mindformers.pynative.distributed.parallelize import parallelize_module
 from mindformers.pynative.distributed.activation_checkpoint import apply_ac
-from mindformers.pynative.distributed.utils import distribute_module
+from mindformers.pynative.distributed.utils import distribute_module, get_loss_sense
 from mindformers.pynative.base_models.gpt.gpt_model import GPTModel
 from mindformers.pynative.transformers.moe.moe_utils import _MoEAuxLossAutoScaler
 from mindformers.pynative.transformers.multi_token_prediction import _MTPLossAutoScaler
@@ -819,22 +819,11 @@ def apply_fsdp(
     gpt_model = _unwrap_gptmodel(model)
 
     # --- Resolve dp_mesh ---
-    if parallel_dims.cp_enabled:
-        dp_mesh = parallel_dims.world_mesh["fsdp"]
-        logger.info(
-            "Using FSDP mesh with CP enabled: dp_shard=%s, cp=%s, fsdp=%s, fsdp_rank_list=%s",
-            parallel_dims.dp_shard,
-            parallel_dims.cp,
-            parallel_dims.fsdp,
-            tuple(getattr(dp_mesh, "rank_list", ())),
-        )
-    elif parallel_dims.dp_replicate_enabled:
+    if parallel_dims.dp_replicate_enabled:
         # change `dp_shard` to `fsdp` if hyper-parallel support flatten
-        dp_mesh = parallel_dims.get_mesh(["dp_replicate", "dp_shard"])
-        logger.info("Using HSDP mesh [dp_replicate, fsdp] (2D)")
+        dp_mesh = parallel_dims.world_mesh["dp_replicate", "fsdp"]
     else:
-        dp_mesh = parallel_dims.get_mesh("dp_shard")
-        logger.info("Using FSDP mesh [fsdp] (1D)")
+        dp_mesh = parallel_dims.world_mesh["fsdp"]
 
     edp_mesh = None
     if parallel_dims.ep_enabled:
@@ -1154,6 +1143,7 @@ def _apply_spmd_parallelism(
         recompute_comm: Any,
         swap: Any,
         accumulate_allreduce_grads_in_fp32: bool = True,
+        gradient_accumulation_steps: int = 1,
 ) -> nn.Cell:
     """Unified GPTModel parallelization entry point."""
     logger.info("Starting GPTModel parallelization for MCore architecture...")
@@ -1201,8 +1191,12 @@ def _apply_spmd_parallelism(
         )
 
     # Phase 5: FSDP/HSDP
-    if parallel_dims.fsdp_enabled:
-        apply_fsdp(model, parallel_dims, parallelism, accumulate_allreduce_grads_in_fp32)
+    apply_fsdp(
+        model,
+        parallel_dims,
+        parallelism,
+        accumulate_allreduce_grads_in_fp32
+    )
 
     for param_name, param in model.parameters_and_names():
         if isinstance(param, DTensor):
@@ -1216,7 +1210,12 @@ def _apply_spmd_parallelism(
         apply_context_parallel_model_io(model, parallel_dims, parallelism)
 
     # Set the loss scale for the auxiliary loss of the MoE layer.
-    main_loss_sense = 1. / (get_world_size() / int(parallelism.pipeline_parallel))
+    main_loss_sense = get_loss_sense(
+        parallelism=parallelism,
+        enable_parallel=True,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        apply_gradient_accumulation=True,
+    )
     _MoEAuxLossAutoScaler.set_loss_scale(main_loss_sense)
     _MTPLossAutoScaler.set_loss_scale(main_loss_sense)
 
@@ -1233,6 +1232,7 @@ def apply_pp(
         recompute_comm,
         swap,
         accumulate_allreduce_grads_in_fp32: bool = True,
+        gradient_accumulation_steps: int = 1,
 ):
     """Apply pipeline parallelism to the GPTModel."""
     layer_setting = PpLayerSetting(model.config.num_hidden_layers, parallelism)
@@ -1251,6 +1251,7 @@ def apply_pp(
             recompute_comm,
             swap,
             accumulate_allreduce_grads_in_fp32,
+            gradient_accumulation_steps,
         )
 
     micro_batch_num = parallelism.pipeline_parallel_microbatch_size
@@ -1278,6 +1279,7 @@ def parallelize_gptmodel(
         recompute_comm: Any,
         swap: Any,
         accumulate_allreduce_grads_in_fp32: bool = True,
+        gradient_accumulation_steps: int = 1,
 ) -> List[nn.Cell]:
     """Apply pipeline parallelism to the GPTModel."""
         
@@ -1292,9 +1294,10 @@ def parallelize_gptmodel(
             recompute_comm=recompute_comm,
             swap=swap,
             accumulate_allreduce_grads_in_fp32=accumulate_allreduce_grads_in_fp32,
+            gradient_accumulation_steps=gradient_accumulation_steps,
         )
 
     _apply_spmd_parallelism(model, parallel_dims, parallelism, recompute, recompute_comm, swap,
-                            accumulate_allreduce_grads_in_fp32)
+                            accumulate_allreduce_grads_in_fp32, gradient_accumulation_steps)
 
     return [model], None, False, False

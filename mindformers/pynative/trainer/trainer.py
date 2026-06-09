@@ -55,6 +55,7 @@ import mindformers.tools.register.register as register_module
 import mindformers.dataset.handler.base_handler as handler_module
 from mindformers.pynative.distributed.parallel_dims import ParallelDims
 from mindformers.pynative.distributed.parallelize import parallelize_model
+from mindformers.pynative.distributed.utils import get_loss_sense
 
 from mindformers.checkpoint.checkpoint import CommonInfo, get_checkpoint_path
 
@@ -68,7 +69,6 @@ from .utils import (
     _build_callback,
     _build_lora_model,
     _calculate_global_grad_norm,
-    _get_loss_sense,
     compute_parameters,
 )
 
@@ -311,6 +311,7 @@ class Trainer:
             accumulate_allreduce_grads_in_fp32=(
                 self.config.optimizer.accumulate_allreduce_grads_in_fp32
             ),
+            gradient_accumulation_steps=self.num_accumulation_steps,
         )
         return model, schedule, has_first, has_last
 
@@ -991,9 +992,11 @@ class Trainer:
             Tensor: Unscaled loss value for reporting.
         """
         loss = self.compute_loss(model, inputs)
-        sense = _get_loss_sense(
+        sense = get_loss_sense(
             enable_parallel=self.enable_parallel,
             parallelism=self.config.parallelism,
+            gradient_accumulation_steps=self.num_accumulation_steps,
+            apply_gradient_accumulation=False,
         )
 
         if self.num_accumulation_steps > 1:
