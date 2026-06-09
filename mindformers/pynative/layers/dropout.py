@@ -34,9 +34,9 @@ class Dropout(nn.Cell):
     training with probability `drop_prob`. During evaluation, the input
     is returned unchanged.
 
-    The implementation is a thin wrapper around
-    `mindspore.mint.nn.functional.dropout` and respects the module's
-    `training` state.
+    The implementation skips the dropout computation when dropout is
+    disabled or the module is in evaluation mode. Otherwise, it delegates to
+    `mindspore.mint.nn.functional.dropout`.
 
     Args:
         drop_prob (float, optional):
@@ -82,5 +82,7 @@ class Dropout(nn.Cell):
                 Tensor after applying dropout during training,
                 or the original input during evaluation.
         """
+        if not self.training or not self.use_dropout:
+            return x
         out = self.dropout(x, self.p, self.training)
         return out
