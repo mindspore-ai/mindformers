@@ -13,10 +13,15 @@
 # limitations under the License.
 # ============================================================================
 """Test module for testing dropout for mindformers."""
+import importlib
+
 import pytest
 import mindspore as ms
 from mindspore import context
 from mindformers.pynative.layers.dropout import Dropout
+
+
+dropout_module = importlib.import_module("mindformers.pynative.layers.dropout")
 
 
 # pylint: disable=attribute-defined-outside-init
@@ -78,6 +83,28 @@ class TestDropout:
         output = dropout_0(self.input)
         assert ms.ops.equal(output, self.input).all(), (
             f"Dropout output should be equal to input when training=False.\n"
+            f"Input:\n{self.input}\n"
+            f"Output:\n{output}"
+        )
+
+    @pytest.mark.level0
+    @pytest.mark.platform_arm_ascend910b_training
+    @pytest.mark.env_onecard
+    def test_p_0_skip_dropout_operator(self, monkeypatch):
+        """
+        Feature: Dropout
+        Description: Test drop_prob=0.0 skips underlying dropout operator.
+        Exception: AssertionError
+        """
+        def raise_if_called(*_args, **_kwargs):
+            raise AssertionError("dropout operator should not be called when drop_prob=0.0")
+
+        monkeypatch.setattr(dropout_module, "dropout", raise_if_called)
+        dropout_0 = Dropout(0.)
+        dropout_0.set_train(True)
+        output = dropout_0(self.input)
+        assert ms.ops.equal(output, self.input).all(), (
+            f"Dropout output should be equal to input when drop_prob=0.0.\n"
             f"Input:\n{self.input}\n"
             f"Output:\n{output}"
         )
