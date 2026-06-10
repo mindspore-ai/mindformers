@@ -97,10 +97,9 @@ class FlashAttention(Cell):
         self.next_tokens = 0
         self.scalar_value = 1. / math.sqrt(hidden_size_per_attention_head) if softmax_scale is None else softmax_scale
         self.inner_precise = 0
-        self.fa_head_num = self._resolve_flash_attention_head_num()
 
         self.flash_attention = FlashAttentionScore(
-            head_num=self.fa_head_num,
+            head_num=self.head_num,
             scale_value=self.scalar_value,
             pre_tokens=self.pre_tokens,
             next_tokens=self.next_tokens,
@@ -127,15 +126,11 @@ class FlashAttention(Cell):
         self.track_max_attention_logit = getattr(config, "track_max_attention_logit", False)
         if self.track_max_attention_logit:
             self.max_logits_val = Parameter(
-                mint.empty((self.fa_head_num,), dtype=mstype.float32),
+                mint.empty((self.head_num,), dtype=mstype.float32),
                 requires_grad=False
             )
             self.amax = mint.amax
             self.maximum = mint.maximum
-
-    def _resolve_flash_attention_head_num(self) -> int:
-        """Resolve FlashAttentionScore head_num from a generic runtime hint."""
-        return getattr(self.config, "_mf_runtime_flash_attention_head_num", self.head_num)
 
     def construct(self,
                   query: Tensor,

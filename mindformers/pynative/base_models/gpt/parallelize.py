@@ -1084,7 +1084,6 @@ def apply_context_parallel_attention(
                         f"num_attention_heads ({num_heads}) must be divisible by "
                         f"ulysses_degree ({ulysses_degree})."
                     )
-                setattr(model_config, "_mf_runtime_flash_attention_head_num", num_heads // ulysses_degree)
 
     cp_style = build_context_parallel_attention_style(
         method=method,
