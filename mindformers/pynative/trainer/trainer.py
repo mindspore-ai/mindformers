@@ -612,8 +612,7 @@ class Trainer:
         if self.parallel_dims and self.parallel_dims.pp_enabled:
             loss_mesh = self.parallel_dims.get_mesh("loss_mesh")
             self.metric_reduce_group_size = loss_mesh.size()
-            if self.metric_reduce_group_size > 1:
-                self.metric_reduce_group = loss_mesh.get_group()
+            self.metric_reduce_group = loss_mesh.get_group()
 
         # Load checkpoint
         checkpoint_path = checkpoint_path or self.config.checkpoint.load_path
