@@ -97,7 +97,7 @@ class LayoutAdapter:
         rank_id = get_real_rank()
         if LayoutAdapter.is_pynative_mode():
             return LayoutAdapter._get_layout_from_pynative(network)[rank_id]
-        return LayoutAdapter._get_layout_from_graph(network)[0]
+        return LayoutAdapter._get_layout_from_graph(network)[rank_id]
 
 
     @staticmethod
