@@ -479,6 +479,31 @@ class GPTModel(nn.Cell):
         for _, prefix, self_attn in self._iter_self_attentions():
             yield f"{prefix}.core_attention", self_attn.core_attention
 
+    def set_qk_clip_reduce_group(self, group):
+        """Register the comm group for the qk_clip max-logit all-reduce.
+
+        ``max_logits_val`` is a per-(layer, head) running max that only needs to be
+        max-reduced over the domain where the SAME weight sees DIFFERENT data — the
+        data + context-parallel domain (``dp x cp``, i.e. the ``loss_mesh`` group).
+        tp / pp hold different heads / layers (handled by ``full_tensor()`` and by
+        each stage owning only its layers' params), so they must NOT be folded into
+        this reduce. Set by ``parallelize_gptmodel``; ``None`` falls back to a world
+        all-reduce so unparallelized / legacy call paths keep working.
+        """
+        self._qk_clip_reduce_group = group
+
+    def _all_reduce_max_logits(self, tensor):
+        """AllReduce-Max ``tensor`` over the dp x cp (``loss_mesh``) group when one
+        has been registered, else over the world group (legacy fallback)."""
+        group = getattr(self, "_qk_clip_reduce_group", None)
+        if group is not None:
+            result = all_reduce(tensor, op=ops.ReduceOp.MAX, group=group)
+            return result if result is not None else tensor
+        if get_world_size() > 1:
+            result = all_reduce(tensor, op=ops.ReduceOp.MAX)
+            return result if result is not None else tensor
+        return tensor
+
     def _stacked_synced_max_logits(self):
         """Allreduce every layer's ``max_logits_val`` in one batched op. Returns
         ``(params, mesh, placements, stacked)`` (stacked shape: ``(num_layers,
@@ -501,10 +526,7 @@ class GPTModel(nn.Cell):
             full_locals = list(params)
 
         stacked = mint.stack(full_locals, dim=0)
-        if get_world_size() > 1:
-            result = all_reduce(stacked, op=ops.ReduceOp.MAX)
-            if result is not None:
-                stacked = result
+        stacked = self._all_reduce_max_logits(stacked)
         return params, mesh, placements, stacked
 
     def _writeback_synced_max_logits(self, params, mesh, placements, stacked):
@@ -554,10 +576,7 @@ class GPTModel(nn.Cell):
 
         stacked = mint.stack(locals_list, dim=0)
         local_max = mint.max(stacked).reshape((1,))
-        if get_world_size() > 1:
-            result = all_reduce(local_max, op=ops.ReduceOp.MAX)
-            if result is not None:
-                local_max = result
+        local_max = self._all_reduce_max_logits(local_max)
         return bool(mint.greater_equal(local_max, logit_threshold).asnumpy()[0])
 
     def get_max_attention_logit(self):
@@ -752,8 +771,8 @@ class GPTModel(nn.Cell):
                     fp32_param_map=fp32_param_map)
 
         # Phase C: global-clip fallback for layers where local weights can't
-        # apply the clip (e.g. TP shards the head dim).  These are rare and
-        # already need a per-layer full_tensor() — keep the original logic.
+        # apply the clip (e.g. TP/FSDP shards the head dim — the common case
+        # under context/data parallelism). These need a per-layer full_tensor().
         for layer_idx, param_prefix, self_attention, logits_row in global_pending:
             logits_full = logits_row.full_tensor() if isinstance(logits_row, DTensor) else logits_row
             mask = mint.greater_equal(logits_full, logit_threshold)

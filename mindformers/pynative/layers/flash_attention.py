@@ -21,12 +21,46 @@ from typing import Optional, Union
 import mindspore.common.dtype as mstype
 import mindspore as ms
 from hyper_parallel import SkipDTensorDispatch
+from hyper_parallel import DTensor
+from hyper_parallel.core.dtensor.layout import _infer_slice_area_by_rank
 from mindspore import ops, mint, Parameter
 from mindspore.common.tensor import Tensor
+from mindspore.communication import get_rank
 from mindspore.nn.cell import Cell
 from mindspore.ops.operations.nn_ops import FlashAttentionScore
 
 from mindformers.parallel_core.transformer_config import TransformerConfig, MLATransformerConfig
+
+
+def _local_head_slice(softmax_val, head_dim=1):
+    """Return this rank's ``(begin, end)`` slice of the GLOBAL head dim, or ``None``.
+
+    Under Ulysses (or hybrid) context parallelism the seq->head all-to-all leaves
+    ``softmax_val`` as a DTensor sharded along the head dim across the cp ranks,
+    so the local ``amax`` only covers this rank's heads while ``max_logits_val``
+    holds every head. The slice bounds are derived from the DTensor layout itself
+    (same machinery ``distribute_tensor(...).to_local()`` uses), so any head
+    sharding scheme is handled without knowledge of the CP style internals.
+    Returns ``None`` when ``softmax_val`` is not a DTensor (colossal CP / no CP),
+    where the local head count already equals the parameter length.
+    """
+    if not isinstance(softmax_val, DTensor):
+        return None
+    layout = softmax_val.layout
+    rank_list = tuple(int(r) for r in layout.rank_list)
+    rank = int(get_rank())
+    if rank not in rank_list:
+        return None
+    local_shape = tuple(int(d) for d in softmax_val.to_local().shape)
+    full_shape = tuple(int(d) for d in layout.get_global_shape(local_shape))
+    slice_area = _infer_slice_area_by_rank(
+        tuple(int(d) for d in layout.mesh_shape),
+        list(layout.tensor_map),
+        rank_list.index(rank),
+        full_shape,
+    )
+    begin, end = slice_area[head_dim]
+    return int(begin), int(end)
 
 
 class FlashAttention(Cell):
@@ -162,9 +196,7 @@ class FlashAttention(Cell):
                                                              actual_seq_qlen=actual_seq_qlen,
                                                              actual_seq_kvlen=actual_seq_kvlen)
             if self.track_max_attention_logit:
-                max_logits = self.amax(softmax_val, dim=(0, 2), keepdim=False)
-                with SkipDTensorDispatch():
-                    self.max_logits_val.copy_(max_logits.detach())
+                self._update_max_logits(softmax_val, (0, 2), running=False)
             return output
 
         input_already_in_layout = bool(getattr(self, "_mf_runtime_input_already_in_fa_layout", False))
@@ -212,10 +244,7 @@ class FlashAttention(Cell):
                                                          actual_seq_qlen=actual_seq_qlen,
                                                          actual_seq_kvlen=actual_seq_kvlen)
         if self.track_max_attention_logit:
-            max_logits = self.amax(softmax_val, dim=(0, 2, 3), keepdim=False)
-            max_logits = self.maximum(self.max_logits_val, max_logits)
-            with SkipDTensorDispatch():
-                self.max_logits_val.copy_(max_logits.detach())
+            self._update_max_logits(softmax_val, (0, 2, 3), running=True)
 
         if self.input_layout == "BNSD":
             if input_already_in_layout:
@@ -243,6 +272,42 @@ class FlashAttention(Cell):
         x_merge = self.reshape(x, new_shape)
         x_merge = self.fa_out_transpose(x_merge, (1, 0, 2))
         return x_merge
+
+    def _update_max_logits(self, softmax_val, reduce_dims, running):
+        """Track per-head max attention logits for qk_clip; context-parallel aware.
+
+        Colossal CP shards the SEQ dim: ``amax`` inside ``SkipDTensorDispatch``
+        yields this rank's local chunk-max for EVERY head (same length as
+        ``max_logits_val``) — the plain path below. Ulysses / hybrid CP instead
+        shard the HEAD dim (seq->head all-to-all), so the local ``amax`` covers
+        only this rank's heads; those are written into the matching slice of
+        ``max_logits_val`` (slice bounds derived from ``softmax_val``'s DTensor
+        layout). In both cases the dp x cp ``all_reduce(MAX)`` in
+        ``synced_max_attention_logit_fires`` later merges the per-rank values
+        (non-owned head entries stay at their reset value 0, and 0 never exceeds
+        the clip threshold) into the full per-head vector, so the fire check and
+        clip scales always see every head.
+        """
+        head_slice = _local_head_slice(softmax_val)
+        with SkipDTensorDispatch():
+            max_logits = self.amax(softmax_val, dim=reduce_dims, keepdim=False)
+            n_local = int(max_logits.shape[0])
+            n_param = int(self.max_logits_val.shape[0])
+            if n_local == n_param:
+                if running:
+                    max_logits = self.maximum(self.max_logits_val, max_logits)
+                self.max_logits_val.copy_(max_logits.detach())
+                return
+            if head_slice is None or head_slice[1] - head_slice[0] != n_local:
+                raise ValueError(
+                    f"max_logits tracking: local head count ({n_local}) does not match "
+                    f"max_logits_val length ({n_param}), and softmax_val carries no "
+                    f"matching head-shard layout (head_slice={head_slice})."
+                )
+            begin, end = head_slice
+            if running:
+                max_logits = self.maximum(self.max_logits_val[begin:end], max_logits)
+            self.max_logits_val[begin:end] = max_logits.detach()
 
     def reset_parameter(self):
         """Reset FlashAttention parameters for delayed initialization."""
