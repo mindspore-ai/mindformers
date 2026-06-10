@@ -24,7 +24,7 @@ from dataclasses import dataclass
 import threading
 from multiprocessing import active_children
 
-from mindspore import Tensor, Parameter, load_param_into_net
+from mindspore import Tensor, Parameter, load_param_into_net, DeviceCtx
 from mindspore.common import dtype as mstype
 from mindspore.nn import Cell
 from mindspore.nn.optim.optimizer import Optimizer
@@ -510,20 +510,21 @@ def load_checkpoint(
     # Load using ReshardLoader
     # Self-trained weights do not require a template;
     #   the parameter names are directly the same as `dst_sharded_tensor_metas`.
-    reshard_loader = ReshardLoader(
-        checkpoint_dir=checkpoint_dir,
-        # Format of `dst_sharded_tensor_metas` is: `{param_name: ShardedTensor}`.
-        dst_sharded_tensor_metas=dst_sharded_tensor_metas,
-        # Format of `src_sharded_tensor_metas` is: `{param_name: [ShardedTensor, ...]}`.
-        src_sharded_tensor_metas=src_sharded_tensor_metas,
-        # Format of `param_file_mappings` is: `{(param_name, global_offset): [...]}`.
-        param_file_mappings=param_file_mappings,
-        reshard_worker_num=reshard_worker_num,
-        template=None
-    )
+    with DeviceCtx("CPU"):
+        reshard_loader = ReshardLoader(
+            checkpoint_dir=checkpoint_dir,
+            # Format of `dst_sharded_tensor_metas` is: `{param_name: ShardedTensor}`.
+            dst_sharded_tensor_metas=dst_sharded_tensor_metas,
+            # Format of `src_sharded_tensor_metas` is: `{param_name: [ShardedTensor, ...]}`.
+            src_sharded_tensor_metas=src_sharded_tensor_metas,
+            # Format of `param_file_mappings` is: `{(param_name, global_offset): [...]}`.
+            param_file_mappings=param_file_mappings,
+            reshard_worker_num=reshard_worker_num,
+            template=None
+        )
 
-    # The first level of resharding, yields `{param_name: Parameter}`.
-    state_dict = reshard_loader.load()
+        # The first level of resharding, yields `{param_name: Parameter}`.
+        state_dict = reshard_loader.load()
 
     # Handle global_step for optimizer if needed
     if optimizer and "global_step" not in state_dict:
@@ -618,27 +619,28 @@ def load_hf_checkpoint(
     #      - dst_to_src_mapping: {dst_name: [src_names]}, e.g., {qkv: [q_proj, k_proj, v_proj]}
     #   (2) Iterate through dst_metas, for each target parameter, get all related source parameters via dst_to_src_mapping
     #   (3) For each source parameter (e.g., q, k, v), calculate offset and perform slicing separately
-    reshard_loader = ReshardLoader(
-        checkpoint_dir=pretrained_model_dir,
-        dst_sharded_tensor_metas=dst_sharded_tensor_metas,  # {mf_param_name: ShardedTensor}
-        src_sharded_tensor_metas=src_sharded_tensor_metas,  # {hf_param_name: [ShardedTensor]}
-        param_file_mappings=param_file_mappings,  # {(hf_param_name, global_offset): [...]}
-        reshard_worker_num=reshard_worker_num,
-        template=template  # HF weights need template for parameter name mapping
-    )
+    with DeviceCtx("CPU"):
+        reshard_loader = ReshardLoader(
+            checkpoint_dir=pretrained_model_dir,
+            dst_sharded_tensor_metas=dst_sharded_tensor_metas,  # {mf_param_name: ShardedTensor}
+            src_sharded_tensor_metas=src_sharded_tensor_metas,  # {hf_param_name: [ShardedTensor]}
+            param_file_mappings=param_file_mappings,  # {(hf_param_name, global_offset): [...]}
+            reshard_worker_num=reshard_worker_num,
+            template=template  # HF weights need template for parameter name mapping
+        )
 
-    # Get Reshard output: `{hf_param_name: tensor}`.
-    # Returned keys are HF original parameter names (e.g., q_proj.weight, k_proj.weight, v_proj.weight)
-    # Each source parameter has been sliced (only loading the part needed by current card)
-    reshard_output = reshard_loader.load()
+        # Get Reshard output: `{hf_param_name: tensor}`.
+        # Returned keys are HF original parameter names (e.g., q_proj.weight, k_proj.weight, v_proj.weight)
+        # Each source parameter has been sliced (only loading the part needed by current card)
+        reshard_output = reshard_loader.load()
 
-    # 5. Convert:
-    # Use template.get_mf_state_dict() to convert `{hf_param_name: weight}` to `{mf_param_name: Parameter}.`
-    # Internally iterates through parameters, calling add_hf_weight() for conversion:
-    #   - Single-source weights (e.g., embed_tokens): directly rename
-    #   - Multi-source weights (e.g., QKV): temporarily store q, k, v, then concatenate after all are ready
-    # Since Reshard stage has completed slicing, no need to slice again during conversion
-    state_dict = template.get_mf_state_dict(reshard_output)
+        # 5. Convert:
+        # Use template.get_mf_state_dict() to convert `{hf_param_name: weight}` to `{mf_param_name: Parameter}.`
+        # Internally iterates through parameters, calling add_hf_weight() for conversion:
+        #   - Single-source weights (e.g., embed_tokens): directly rename
+        #   - Multi-source weights (e.g., QKV): temporarily store q, k, v, then concatenate after all are ready
+        # Since Reshard stage has completed slicing, no need to slice again during conversion
+        state_dict = template.get_mf_state_dict(reshard_output)
 
     # 6. Load into network
     logger.info("..........Loading State Dict into Network..........")
