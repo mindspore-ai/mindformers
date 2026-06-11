@@ -142,12 +142,8 @@ class FusedRMSNorm(nn.Cell):
 
     def construct(self, x):
         """Apply fused RMS Normalization."""
-        original_type = x.dtype
-        compute_type = self.compute_type
-        x = self.cast(x, compute_type)
-        weight = self.cast(self.weight, compute_type) if self.weight.dtype != compute_type else self.weight
-        output = self.norm(x, weight, self.eps)[0]
-        return self.cast(output, original_type)
+        output = self.norm(x, self.weight, self.eps)[0]
+        return output
 
     def reset_parameter(self):
         """Reset RMSNorm parameters for delayed initialization."""
