@@ -1208,6 +1208,18 @@ def _apply_spmd_parallelism(
     if parallel_dims.cp_enabled:
         apply_context_parallel_model_io(model, parallel_dims, parallelism)
 
+    # Scope the qk_clip max-logit all-reduce to the dp x cp (loss_mesh) domain
+    # instead of the whole world: tp/pp hold different heads/layers, so reducing
+    # over loss_mesh is both correct and far cheaper than a world all-reduce.
+    gpt_model = _unwrap_gptmodel(model)
+    if parallel_dims.dp_cp_enabled and hasattr(gpt_model, "set_qk_clip_reduce_group"):
+        try:
+            gpt_model.set_qk_clip_reduce_group(parallel_dims.world_mesh.get_group("loss_mesh"))
+        except (RuntimeError, ValueError, KeyError) as exc:
+            logger.warning(
+                "[QK-Clip] could not resolve loss_mesh reduce group (%s); "
+                "falling back to world all-reduce.", exc)
+
     # Set the loss scale for the auxiliary loss of the MoE layer.
     main_loss_sense = get_loss_sense(
         parallelism=parallelism,
