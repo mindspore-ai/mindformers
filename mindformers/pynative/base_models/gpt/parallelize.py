@@ -71,6 +71,7 @@ from mindformers.pynative.distributed.parallelize import parallelize_module
 from mindformers.pynative.distributed.activation_checkpoint import apply_ac
 from mindformers.pynative.distributed.utils import distribute_module, get_loss_sense
 from mindformers.pynative.base_models.gpt.gpt_model import GPTModel
+from mindformers.pynative.transformers.experimental_attention_variant.indexer import _IndexerLossAutoScaler
 from mindformers.pynative.transformers.moe.moe_utils import _MoEAuxLossAutoScaler
 from mindformers.pynative.transformers.multi_token_prediction import _MTPLossAutoScaler
 from mindformers.tools.logger import logger
@@ -1229,6 +1230,7 @@ def _apply_spmd_parallelism(
     )
     _MoEAuxLossAutoScaler.set_loss_scale(main_loss_sense)
     _MTPLossAutoScaler.set_loss_scale(main_loss_sense)
+    _IndexerLossAutoScaler.set_loss_scale(main_loss_sense)
 
     logger.info("GPTModel parallelization completed.")
     return model

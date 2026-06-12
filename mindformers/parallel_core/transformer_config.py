@@ -1416,11 +1416,11 @@ class TransformerConfig:
     experimental_attention_variant: str = field(
         default=None,
         metadata={
-            "description": "Type of attention variant to use. Currently support ['dsa']."
+            "description": "Type of attention variant to use. Currently support ['dsa', 'dsv4_hybrid']."
                            "Defaults: `None`, which means that no attention variant will be applied.",
             "usage": ParamUsage.TRAINING,
             "source": ParamSource.MEGATRON,
-            "mode": ParamMode.GRAPH
+            "mode": ParamMode.COMMON
         }
     )
 
@@ -1430,7 +1430,7 @@ class TransformerConfig:
             "description": "Number of DSA indexer heads.",
             "usage": ParamUsage.TRAINING,
             "source": ParamSource.MEGATRON,
-            "mode": ParamMode.GRAPH
+            "mode": ParamMode.COMMON
         }
     )
 
@@ -1440,7 +1440,7 @@ class TransformerConfig:
             "description": "Dimension per DSA indexer head.",
             "usage": ParamUsage.TRAINING,
             "source": ParamSource.MEGATRON,
-            "mode": ParamMode.GRAPH
+            "mode": ParamMode.COMMON
         }
     )
 
@@ -1450,7 +1450,7 @@ class TransformerConfig:
             "description": "Number of top-k tokens to select in DSA indexer.",
             "usage": ParamUsage.TRAINING,
             "source": ParamSource.MEGATRON,
-            "mode": ParamMode.GRAPH
+            "mode": ParamMode.COMMON
         }
     )
 
@@ -1460,7 +1460,7 @@ class TransformerConfig:
             "description": "Coefficient for the DSA indexer KL divergence loss. Set to 0 to disable indexer loss.",
             "usage": ParamUsage.TRAINING,
             "source": ParamSource.MEGATRON,
-            "mode": ParamMode.GRAPH
+            "mode": ParamMode.COMMON
         }
     )
 
@@ -1471,7 +1471,7 @@ class TransformerConfig:
                            "If True, the indexer loss will be computed using the top-k indices.",
             "usage": ParamUsage.TRAINING,
             "source": ParamSource.MEGATRON,
-            "mode": ParamMode.GRAPH
+            "mode": ParamMode.COMMON
         }
     )
 
@@ -2218,7 +2218,7 @@ class TransformerConfig:
                 if self.attention_dropout != 0:
                     logger.warning("When use TND layout of flash attention, attention_dropout is ignored. Set to 0.")
                     self.attention_dropout = 0.
-            elif self.experimental_attention_variant == 'dsa':
+            elif self.experimental_attention_variant in ["dsa", "dsv4_hybrid"]:
                 self.input_layout = "BSND"
             elif self.context_parallel_size > 1:
                 self.input_layout = "BSH"
@@ -2778,6 +2778,80 @@ class MLATransformerConfig(TransformerConfig):
         }
     )
 
+    csa_window_size: int = field(
+        default=128,
+        metadata={
+            "description": "Sliding window size for DeepSeek-V4 hybrid attention's ori_kv branch.",
+            "usage": ParamUsage.COMMON,
+            "source": ParamSource.MEGATRON,
+            "mode": ParamMode.PYNATIVE
+        }
+    )
+
+    csa_compress_ratios: Optional[List[int]] = field(
+        default=None,
+        metadata={
+            "description": "Per-layer compression ratio list for DSv4 hybrid "
+                           "(each in {0, 4, 128}, length = num_layers + mtp_num_layers).",
+            "usage": ParamUsage.COMMON,
+            "source": ParamSource.MEGATRON,
+            "mode": ParamMode.PYNATIVE
+        }
+    )
+
+    csa_compress_rotary_base: float = field(
+        default=40000.0,
+        metadata={
+            "description": "Rotary embedding base for the compressed KV branch in DSv4 hybrid.",
+            "usage": ParamUsage.COMMON,
+            "source": ParamSource.MEGATRON,
+            "mode": ParamMode.PYNATIVE
+        }
+    )
+
+    csa_dense_mode: bool = field(
+        default=False,
+        metadata={
+            "description": "If True, disable CSAIndexer and let all compressed positions participate in attention. "
+                           "Equivalent to ratio=128 dense path.",
+            "usage": ParamUsage.COMMON,
+            "source": ParamSource.MEGATRON,
+            "mode": ParamMode.PYNATIVE
+        }
+    )
+
+    o_groups: int = field(
+        default=8,
+        metadata={
+            "description": "Number of groups for DSv4 hybrid output grouped low-rank projection (wo_a). "
+                           "Constraint: num_attention_heads * v_head_dim must be divisible by o_groups.",
+            "usage": ParamUsage.COMMON,
+            "source": ParamSource.MEGATRON,
+            "mode": ParamMode.COMMON
+        }
+    )
+
+    o_lora_rank: int = field(
+        default=1024,
+        metadata={
+            "description": "Per-group low-rank dimension for DSv4 hybrid output projection (wo_a).",
+            "usage": ParamUsage.COMMON,
+            "source": ParamSource.MEGATRON,
+            "mode": ParamMode.COMMON
+        }
+    )
+
+    apply_dsa_kernel_fusion: bool = field(
+        default=True,
+        metadata={
+            "description": "If True, use fused DSA sparse-attention kernels (requires hyper-parallel)."
+                           "When False, falls back to unfused implementations.",
+            "usage": ParamUsage.COMMON,
+            "source": ParamSource.MEGATRON,
+            "mode": ParamMode.PYNATIVE
+        }
+    )
+
     def __post_init__(self):
         """
         Python dataclass method that is used to modify attributes after initialization.
@@ -2793,5 +2867,43 @@ class MLATransformerConfig(TransformerConfig):
                                  "`kv_lora_rank` only supports 512, `qk_pos_emb_head_dim` only supports 64, "
                                  "`dsa_indexer_head_dim` only supports 128, `dsa_indexer_n_heads` only supports 64.")
 
+        if self.experimental_attention_variant == 'dsv4_hybrid':
+            if not self.multi_latent_attention:
+                raise ValueError("When experimental_attention_variant == 'dsv4_hybrid', "
+                                 "multi_latent_attention must be True.")
+            if self.csa_compress_ratios is None:
+                raise ValueError("When experimental_attention_variant == 'dsv4_hybrid', "
+                                 "csa_compress_ratios must be provided.")
+            expected_len = self.num_layers + (self.mtp_num_layers or 0)
+            if len(self.csa_compress_ratios) != expected_len:
+                raise ValueError(
+                    f"csa_compress_ratios length must equal num_layers + (mtp_num_layers or 0) = {expected_len}, "
+                    f"got {len(self.csa_compress_ratios)}."
+                )
+            if any(r not in (0, 4, 128) for r in self.csa_compress_ratios):
+                raise ValueError("Each entry in csa_compress_ratios must be one of {0, 4, 128}, "
+                                 f"got {self.csa_compress_ratios}.")
+            if self.tensor_model_parallel_size > 1:
+                raise ValueError("DSv4 hybrid currently does not support tensor_model_parallel_size > 1, "
+                                 f"got {self.tensor_model_parallel_size}.")
+            if (self.num_attention_heads * self.v_head_dim) % self.o_groups != 0:
+                raise ValueError(
+                    f"num_attention_heads * v_head_dim ({self.num_attention_heads * self.v_head_dim}) "
+                    f"must be divisible by o_groups ({self.o_groups})."
+                )
+            if not self.apply_dsa_kernel_fusion and self.use_eod_attn_mask_compression:
+                raise ValueError(
+                    "CompressedSparseAttention with unfused implement do not support TND layout."
+                )
+            if self.apply_dsa_kernel_fusion and self.csa_window_size != 128:
+                raise ValueError(
+                    f"CompressedSparseAttention with fused kernels only supports csa_window_size=128, "
+                    f"but got csa_window_size={self.csa_window_size}."
+                )
+            if self.qk_head_dim + self.qk_pos_emb_head_dim != self.v_head_dim:
+                raise ValueError(
+                    "DSv4 hybrid requires qk_head_dim + qk_pos_emb_head_dim == v_head_dim, "
+                    f"got {self.qk_head_dim} + {self.qk_pos_emb_head_dim} != {self.v_head_dim}"
+                )
 
 default_transformer_config = TransformerConfig(num_attention_heads=1, num_layers=1)
