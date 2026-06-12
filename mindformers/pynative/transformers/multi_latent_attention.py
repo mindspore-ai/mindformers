@@ -384,8 +384,8 @@ class MLASelfAttention(MultiLatentAttention):
         self.split = mint.split
         self.tile_kv = mint.tile
         self.cat = mint.cat
-        self.apply_rotary_emb = ApplyRotaryPosEmb(config)
-        self.apply_rotary_emb2 = ApplyRotaryPosEmb(config, for_k_pos_emb=True)
+        self.apply_rotary_emb_q = ApplyRotaryPosEmb(config)
+        self.apply_rotary_emb_k = ApplyRotaryPosEmb(config, for_k_pos_emb=True)
         self.reshape = mint.reshape
 
         if self.config.q_lora_rank is None:
@@ -454,10 +454,7 @@ class MLASelfAttention(MultiLatentAttention):
             bias=self.config.add_bias_linear,
         )
 
-    def get_query_key_value_tensors(self,
-                                    hidden_states,
-                                    rotary_pos_emb=None
-                                    ):
+    def get_query_key_value_tensors(self, hidden_states, rotary_pos_emb=None):
         """
         Derive query, key, and value tensors from hidden states.
 
@@ -505,7 +502,7 @@ class MLASelfAttention(MultiLatentAttention):
             )
 
         if rotary_pos_emb is not None:
-            q_pe = self.apply_rotary_emb(
+            q_pe = self.apply_rotary_emb_q(
                 q_pe,
                 rotary_pos_emb,
                 rotary_interleaved=self.config.rotary_interleaved,
@@ -535,7 +532,7 @@ class MLASelfAttention(MultiLatentAttention):
         value = self.v_handoff(value)
 
         if rotary_pos_emb is not None:
-            k_pe = self.apply_rotary_emb2(
+            k_pe = self.apply_rotary_emb_k(
                 k_pe,
                 rotary_pos_emb,
                 rotary_interleaved=self.config.rotary_interleaved,
