@@ -119,10 +119,11 @@ class Profiler:
             mstx=mstx
         )
 
-        activities = [
-            ProfilerActivity.CPU,
-            ProfilerActivity.NPU,
-        ]
+        profile_cpu = getattr(self.config, 'profile_cpu', True)
+
+        activities = [ProfilerActivity.NPU]
+        if profile_cpu:
+            activities.append(ProfilerActivity.CPU)
 
         self.profiler = profile(
             activities=activities,

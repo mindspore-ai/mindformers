@@ -18,6 +18,7 @@ import os
 from unittest.mock import patch, MagicMock
 
 import pytest
+from mindspore.profiler import ProfilerActivity
 from mindspore.profiler.common.constant import ProfilerLevel
 
 from mindformers.pynative.tools.profiler import Profiler, _DummyProfiler
@@ -135,3 +136,65 @@ class TestOutputPath:
         profiler = Profiler(config)
         result = profiler._get_output_path()
         assert result.endswith(os.path.join("profile", "rank_0"))
+
+
+class TestProfileCpu:
+    """Test profile_cpu configuration."""
+
+    @pytest.mark.level0
+    @pytest.mark.platform_x86_cpu
+    @pytest.mark.env_onecard
+    @patch("mindformers.pynative.tools.profiler.profile")
+    def test_profile_cpu_true_includes_cpu_activity(self, mock_profile):
+        """profile_cpu=True should include CPU and NPU activities."""
+        mock_profile.return_value = MagicMock()
+
+        config = ProfilerConfig(
+            enable_profiling=True, start_step=1, end_step=5,
+            output_path="./profile", profile_cpu=True,
+        )
+        with Profiler(config):
+            pass
+
+        activities = mock_profile.call_args[1]["activities"]
+        assert ProfilerActivity.CPU in activities
+        assert ProfilerActivity.NPU in activities
+
+    @pytest.mark.level0
+    @pytest.mark.platform_x86_cpu
+    @pytest.mark.env_onecard
+    @patch("mindformers.pynative.tools.profiler.profile")
+    def test_profile_cpu_false_excludes_cpu_activity(self, mock_profile):
+        """profile_cpu=False should only include NPU activity."""
+        mock_profile.return_value = MagicMock()
+
+        config = ProfilerConfig(
+            enable_profiling=True, start_step=1, end_step=5,
+            output_path="./profile", profile_cpu=False,
+        )
+        with Profiler(config):
+            pass
+
+        activities = mock_profile.call_args[1]["activities"]
+        assert ProfilerActivity.CPU not in activities
+        assert ProfilerActivity.NPU in activities
+        assert len(activities) == 1
+
+    @pytest.mark.level0
+    @pytest.mark.platform_x86_cpu
+    @pytest.mark.env_onecard
+    @patch("mindformers.pynative.tools.profiler.profile")
+    def test_profile_cpu_default_is_true(self, mock_profile):
+        """Default profile_cpu should be True for backward compatibility."""
+        mock_profile.return_value = MagicMock()
+
+        config = ProfilerConfig(
+            enable_profiling=True, start_step=1, end_step=5,
+            output_path="./profile",
+        )
+        with Profiler(config):
+            pass
+
+        activities = mock_profile.call_args[1]["activities"]
+        assert ProfilerActivity.CPU in activities
+        assert ProfilerActivity.NPU in activities
