@@ -59,6 +59,10 @@ from mindformers.pynative.distributed.style import (
     RowwiseParallel,
     SequenceParallel,
 )
+from mindformers.pynative.distributed.mc2_style import (
+    MC2ColwiseParallel,
+    MC2RowwiseParallel,
+)
 from mindformers.pynative.distributed.context_parallel import (
     apply_context_parallel_model_io,
     build_context_parallel_attention_style,
@@ -439,6 +443,7 @@ def _apply_layers_tp(
     tp_mesh,
     enable_ep,
     shard_plans,
+    enable_mc2=False,
 ):
     """Apply tensor-parallel sharding to a single GPT transformer layer."""
 
@@ -449,6 +454,16 @@ def _apply_layers_tp(
         PrepareModuleOutput,
         PrepareModuleInputOutput,
     )
+
+    # MC2 fuses sequence-sharded all-gather into the column-parallel matmul. It
+    # only applies when the module's input is sequence-sharded (sp_layout). In
+    # this layer, MLP linear_fc1 is the qualifying entry: its input is sharded
+    # and the all-gather can be folded into the matmul. Attention's linear_qkv
+    # is NoParallel here (no TP weight shard) and linear_qb consumes a
+    # replicated LoRA path, so neither path benefits from MC2.
+    mc2_mlp_colwise_input = sp_layout if enable_mc2 else None
+    mc2_mlp_colwise_parallel = MC2ColwiseParallel if enable_mc2 else colwise_parallel
+    mlp_desired_input = sp_layout if enable_mc2 else Replicate()
 
     has_q_lora = transformer_layer.self_attention.config.q_lora_rank is not None
     q_pre_attn_layout = Shard(2) if has_q_lora else Replicate()
@@ -534,10 +549,11 @@ def _apply_layers_tp(
             {
                 "mlp": prepare_module_input(
                     input_layouts=(sp_layout,),
-                    desired_input_layouts=(Replicate(),),
+                    desired_input_layouts=(mlp_desired_input,),
                     use_local_output=False,
                 ),
-                "mlp.linear_fc1": colwise_parallel(use_local_output=False),
+                "mlp.linear_fc1": mc2_mlp_colwise_parallel(
+                    input_layouts=mc2_mlp_colwise_input, use_local_output=False),
                 "mlp.linear_fc2": rowwise_output_plan,
             }
         )
@@ -621,8 +637,13 @@ def apply_non_moe_tp(
         enable_float8_tensorwise_tp: bool = False,
         enable_sp: bool = True,
         enable_ep: bool = False,
+        enable_mc2: bool = False,
 ):
     """Apply tensor parallelism."""
+    # MC2 (all_gather_matmul / matmul_reduce_scatter) fuses the tensor-parallel
+    # collective into the matmul and is only meaningful when the sequence is
+    # sharded (sequence parallel). Disable it otherwise to keep semantics correct.
+    enable_mc2 = enable_mc2 and enable_sp
     # 1. Parallelize the embedding and shard its outputs (which are the first
     # transformer block's inputs)
     # 2. Parallelize the root norm layer over the sequence dim
@@ -636,7 +657,7 @@ def apply_non_moe_tp(
     )
 
     rowwise_parallel, prepare_module_output = (
-        RowwiseParallel,
+        MC2RowwiseParallel if enable_mc2 else RowwiseParallel,
         PrepareModuleOutput,
     )
 
@@ -708,6 +729,7 @@ def apply_non_moe_tp(
             tp_mesh,
             enable_ep,
             (sp_layout, norm_plan, rowwise_output_plan, attn_qkv_shard,),
+            enable_mc2=enable_mc2,
         )
 
     if getattr(model.model, "mtp"):
@@ -737,6 +759,7 @@ def apply_non_moe_tp(
                 tp_mesh,
                 enable_ep,
                 (sp_layout, norm_plan, rowwise_output_plan, attn_qkv_shard,),
+                enable_mc2=enable_mc2,
             )
 
     if hasattr(model.model, "loss") and (hasattr(model.model.loss, "log_softmax") and
@@ -769,7 +792,7 @@ def apply_non_moe_tp(
 
     logger.info(
         f"Applied {'Float8 tensorwise ' if enable_float8_tensorwise_tp else ''}"
-        "Tensor Parallelism to the model"
+        f"Tensor Parallelism to the model (MC2 fusion {'ENABLED' if enable_mc2 else 'disabled'})"
     )
 
 
@@ -1301,6 +1324,7 @@ def _apply_spmd_parallelism(
                 model,
                 tp_mesh=tp_mesh,
                 enable_ep=parallel_dims.ep_enabled,
+                enable_mc2=getattr(parallelism, "enable_mc2", False),
             )
 
     # Phase 2: EP
