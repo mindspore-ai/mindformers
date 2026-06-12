@@ -182,19 +182,26 @@ class TopKRouter(nn.Cell):
             self.ga_steps.zero_()
 
     def _debug_force_load_balance_routing(
-            self, scores: Tensor
+            self, scores: Tensor, selected_experts_indices: Tensor
     ) -> Tuple[Tensor, Tensor]:
         """Balanced round-robin expert assignment.
         Returns (selected_experts_indices [N, K] LongTensor, top_scores [N, K] FloatTensor).
         """
         n_tokens = scores.shape[0]
         # Round-robin indices with exact balance
-        selected_experts_indices = (
+        round_robin_indices = (
                 self.reshape(
                     self.arange(n_tokens * self.top_k, dtype=mstype.int64),
                     (n_tokens, self.top_k),
                 )
                 % self.num_experts
+        )
+        # Overwrite the values of the normal top-k indices instead of using the
+        # locally built round-robin table directly: the top-k indices carry
+        # scores' (possibly distributed) layout under TP, while a standalone
+        # arange-based index has no layout and breaks the gather below.
+        selected_experts_indices = self.cast(
+            selected_experts_indices * 0 + round_robin_indices, mstype.int64
         )
         top_scores = self.gather(scores, dim=1, index=selected_experts_indices)  # [N,K]
         return selected_experts_indices, top_scores
@@ -374,7 +381,7 @@ class TopKRouter(nn.Cell):
             (
                 selected_experts_indices,
                 top_scores,
-            ) = self._debug_force_load_balance_routing(scores)
+            ) = self._debug_force_load_balance_routing(scores, selected_experts_indices)
 
         if self.route_norm:
             denominator = self.sum(top_scores, dim=-1, keepdim=True) + 1e-20
