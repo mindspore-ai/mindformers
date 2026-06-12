@@ -420,12 +420,44 @@ def _apply_layers_tp(
 ):
     """Apply tensor-parallel sharding to a single GPT transformer layer."""
 
-    sp_layout, attention_kernel_plan, norm_plan, rowwise_output_plan, rotary_emb_plan = shard_plans
+    sp_layout, norm_plan, rowwise_output_plan, attn_qkv_shard = shard_plans
     colwise_parallel, prepare_module_input, prepare_module_output, prepare_module_input_output = (
         ColwiseParallel,
         PrepareModuleInput,
         PrepareModuleOutput,
         PrepareModuleInputOutput,
+    )
+
+    has_q_lora = transformer_layer.self_attention.config.q_lora_rank is not None
+    q_pre_attn_layout = Shard(2) if has_q_lora else Replicate()
+    attn_input_shard = attn_qkv_shard if has_q_lora else Replicate()
+
+    # Rotary embedding for q_pe (head-structured tensor from linear_qb when LoRA is
+    # on, otherwise from linear_qkv's replicated slice).
+    q_rotary_emb_plan = prepare_module_input_output(
+        input_layouts=(q_pre_attn_layout, None),
+        desired_input_layouts=(q_pre_attn_layout, None),
+        output_layouts=(q_pre_attn_layout,),
+        desired_output_layouts=(q_pre_attn_layout,),
+        use_local_output=False,
+    )
+    # Rotary embedding for k_pe (pre-tile 1-head tensor from linear_qkv, stays Replicate).
+    # k_pe comes from linear_qkv whose all-reduce is necessary, so k_pe remains Replicate.
+    k_rotary_emb_plan = prepare_module_input_output(
+        input_layouts=(Replicate(), None),
+        desired_input_layouts=(Replicate(), None),
+        output_layouts=(Replicate(),),
+        desired_output_layouts=(Replicate(),),
+        use_local_output=False,
+    )
+
+    # Q arrives at core_attention as attn_input_shard (= attn_qkv_shard when LoRA
+    # produces a head-sharded Q, otherwise Replicate). K/V come in as Replicate and
+    # get reduce-scattered here to attn_qkv_shard.
+    attention_kernel_plan = prepare_module_input(
+        input_layouts=(attn_input_shard, Replicate(), Replicate(), None),
+        desired_input_layouts=(attn_qkv_shard, attn_qkv_shard, attn_qkv_shard, None),
+        use_local_output=False,
     )
 
     distribute_param_plan = []
@@ -438,18 +470,19 @@ def _apply_layers_tp(
             ),
             use_local_output=False,
         ),
-        # NOTE: NoParallel() without local_output_grad_placements keeps the output as a
-        # DTensor so that the intermediate results k is generated as a DTensor and its
-        # gradient is correctly handled by the autograd engine.
-        "self_attention.linear_qkv": colwise_parallel(output_layouts=Replicate(), use_local_output=False),
+        # linear_qkv is kept replicated so its output (which is split into q_a /
+        # compressed_kv / k_pe along the last dim) needs no AllGather. The
+        # downstream up-projections (linear_qb / linear_kvb) carry the actual TP
+        # weight sharding for this attention block.
+        "self_attention.linear_qkv": NoParallel(use_local_output=False),
         "self_attention.linear_kvb": colwise_parallel(output_layouts=Replicate(), use_local_output=False),
         "self_attention.k_layernorm": NoParallel(use_local_output=False),
         # NOTE: use_local_output=True so that the inputs to FlexAttention are plain Tensors
         "self_attention.core_attention": attention_kernel_plan,
         "self_attention.linear_proj": rowwise_output_plan,
         "pre_mlp_layernorm": norm_plan,
-        "self_attention.apply_rotary_emb": rotary_emb_plan,
-        "self_attention.apply_rotary_emb2": rotary_emb_plan,
+        "self_attention.apply_rotary_emb_q": q_rotary_emb_plan,
+        "self_attention.apply_rotary_emb_k": k_rotary_emb_plan,
     }
 
     if transformer_layer.self_attention.q_rank == 0:
@@ -460,7 +493,8 @@ def _apply_layers_tp(
     if transformer_layer.self_attention.config.q_lora_rank is not None:
         layer_plan.update(
             {
-                "self_attention.linear_qb": colwise_parallel(output_layouts=Replicate(), use_local_output=False),
+                "self_attention.linear_qb": colwise_parallel(
+                    output_layouts=Shard(2), use_local_output=False),
                 "self_attention.q_layernorm": NoParallel(use_local_output=False),
             }
         )
@@ -579,11 +613,9 @@ def apply_non_moe_tp(
         use_local_output=False,
     )
 
-    rowwise_parallel, prepare_module_input, prepare_module_output, prepare_module_input_output = (
+    rowwise_parallel, prepare_module_output = (
         RowwiseParallel,
-        PrepareModuleInput,
         PrepareModuleOutput,
-        PrepareModuleInputOutput,
     )
 
     model_plan = {}
@@ -634,13 +666,12 @@ def apply_non_moe_tp(
     decoder_layers = model.model.decoder.layers
     attn_input_layout = getattr(
         decoder_layers.get_first_cell().self_attention.config, "input_layout", None
-        ) if decoder_layers else None 
-    attn_qkv_shard = Shard(1) if attn_input_layout == "TND" else Shard(2)
-    attention_kernel_plan = prepare_module_input(
-        input_layouts=(Replicate(), Replicate(), Replicate(), None),
-        desired_input_layouts=(attn_qkv_shard, attn_qkv_shard, attn_qkv_shard, None),
-        use_local_output=False,
-    )
+        ) if decoder_layers else None
+    if attn_input_layout == "TND":
+        attn_qkv_shard = Shard(1)
+    else:
+        attn_qkv_shard = Shard(2)
+
     # Apply tensor + sequence parallelism to every transformer block
     # NOTE: At the cost of model code change, we can accelerate Sequence Parallel
     #       by folding (and unfolding) the batch dimension and the sequence dimension.
@@ -648,20 +679,13 @@ def apply_non_moe_tp(
     rowwise_output_plan = rowwise_parallel(
         output_layouts=sp_layout, use_local_output=False,  # use_local_output=enable_sp
     )
-    rotary_emb_plan = prepare_module_input_output(
-        input_layouts=(Replicate(), None),
-        desired_input_layouts=(Replicate(), None),
-        output_layouts=(Replicate(),),
-        desired_output_layouts=(Replicate(),),
-        use_local_output=False,
-    )
 
     for transformer_layer in model.model.decoder.layers:
         _apply_layers_tp(
             transformer_layer,
             tp_mesh,
             enable_ep,
-            (sp_layout, attention_kernel_plan, norm_plan, rowwise_output_plan, rotary_emb_plan,),
+            (sp_layout, norm_plan, rowwise_output_plan, attn_qkv_shard,),
         )
 
     if getattr(model.model, "mtp"):
@@ -690,7 +714,7 @@ def apply_non_moe_tp(
                 layer.transformer_layer,
                 tp_mesh,
                 enable_ep,
-                (sp_layout, attention_kernel_plan, norm_plan, rowwise_output_plan, rotary_emb_plan,),
+                (sp_layout, norm_plan, rowwise_output_plan, attn_qkv_shard,),
             )
 
     if hasattr(model.model, "loss") and (hasattr(model.model.loss, "log_softmax") and
@@ -741,6 +765,8 @@ def apply_moe_ep_tp(
         model (nn.Cell): The model to be parallelized.
         tp_mesh (DeviceMesh): The device mesh for tensor parallelism.
         ep_mesh (DeviceMesh): The device mesh for expert parallelism.
+        moe_token_dispatcher_type (str): The type of token dispatcher for MoE.
+        npu_nums_per_device (int): The number of NPUs per device.
 
  	MoE layer structure:
         - mlp.experts.weight1: Expert FFN first layer weights
