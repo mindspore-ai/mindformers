@@ -29,6 +29,7 @@ Applies parallelism strategies in TorchTitan order:
 This module is the single source of truth for GPT-family model parallelization.
 """
 
+import os
 from typing import Any, List
 
 import mindspore as ms
@@ -66,6 +67,7 @@ from mindformers.pynative.distributed.context_parallel import (
 from mindformers.pynative.layers.layer_norm import FusedLayerNorm, FusedRMSNorm
 from mindformers.pynative.distributed.tensor_parallel import NoParallel
 from mindformers.pynative.distributed.expert_parallel import ExpertParallel, DeredundancyExpertParallel
+from mindformers.pynative.distributed.ep_overlap import OverlapExpertParallel
 from mindformers.pynative.distributed.pipeline_parallel import PpLayerSetting, StageModelBuilder
 from mindformers.pynative.distributed.parallelize import parallelize_module
 from mindformers.pynative.distributed.activation_checkpoint import apply_ac
@@ -793,6 +795,91 @@ def apply_moe_ep_tp(
     return model
 
 
+def apply_moe_ep_overlap_tp(
+        model,
+        overlap,
+        tp_mesh=None,
+        ep_mesh=None,
+        moe_token_dispatcher_type: str = "alltoall",
+):
+    """Apply EP with comm/compute overlap hooks to MoE layers in all pipeline model parts.
+
+    Wraps every MoE layer's ``experts`` module with :class:`OverlapExpertParallel`
+    (instead of plain :class:`ExpertParallel`) and tags the **last MoE layer in
+    each pipeline stage** with ``is_last_layer=True`` so its closing D hook is
+    ``"D_LAST"``.  The CHUNK_START / CHUNK_END bracketing happens at the
+    OVERLAP_B_F callback level (:func:`_make_overlap_b_f_callback`), covering
+    the whole ``forward_one_chunk`` record including embedding and lm-head/loss.
+
+    This function is called once per call to :func:`apply_pp` when
+    ``parallelism.pipeline_parallel_overlap_b_f`` is ``True`` and
+    ``moe_token_dispatcher_type`` is ``"alltoall"``.
+
+    Args:
+        model:     Single pipeline-stage model (``nn.Cell``).
+        overlap:   Shared
+                   :class:`~hyper_parallel.core.pipeline_parallel.comm_compute_overlap.CommComputeOverlap`
+                   instance for this rank (one per rank, shared across all chunks).
+        tp_mesh:   TP device mesh (passed through to EP mesh selection).
+        ep_mesh:   EP device mesh.
+        moe_token_dispatcher_type: Must be ``"alltoall"``; overlap is only
+                   supported for the standard all-to-all dispatcher.
+
+    Returns:
+        ``model`` (mutated in place).
+    """
+    if moe_token_dispatcher_type != "alltoall":
+        raise ValueError(
+            f"EP comm/compute overlap only supports moe_token_dispatcher_type='alltoall', "
+            f"got '{moe_token_dispatcher_type}'."
+        )
+
+    if ep_mesh is None and tp_mesh is None:
+        raise ValueError("At least one of ep_mesh or tp_mesh must be provided.")
+
+    experts_mesh = ep_mesh if ep_mesh is not None else tp_mesh
+    coordinator = overlap.coordinator
+
+    transformer_layers = list(model.model.decoder.layers)
+    if getattr(model.model, "mtp", None) is not None:
+        transformer_layers.extend(
+            mtp_layer.transformer_layer for mtp_layer in model.model.mtp.layers
+        )
+
+    # Collect MoE layers to apply overlap strategy
+    moe_layers = [
+        layer for layer in transformer_layers
+        if hasattr(layer.mlp, "experts")
+    ]
+    last_idx = len(moe_layers) - 1
+
+    # Expert weights live on the meta device during model build; sharding them
+    # into DTensors must happen under the meta DeviceCtx (same as the baseline
+    # apply_moe_ep_tp path). The CHUNK hook registration below is Python-level
+    # and must stay OUTSIDE the meta context.
+    with ms.DeviceCtx("meta"):
+        for idx, layer in enumerate(moe_layers):
+            is_last = idx == last_idx
+            strategy = OverlapExpertParallel(
+                coordinator=coordinator,
+                is_last_layer=is_last,
+                moe_permute_fusion=False,  # overlap path always uses manual permute
+            )
+            parallelize_module(
+                module=layer.mlp.experts,
+                device_mesh=experts_mesh,
+                parallelize_plan=strategy,
+            )
+
+    # CHUNK_START / CHUNK_END bracketing is done at the OVERLAP_B_F callback
+    # level (see _make_overlap_b_f_callback) rather than via decoder Cell
+    # hooks: the decoder boundary leaves preprocess/embedding (entry) and
+    # lm-head/loss (exit) recording OUTSIDE the bracket, concurrent with the
+    # BWD thread's loss.bwd/lm-head.bwd replay — MS PyNative does not support
+    # concurrent FWD-record + BWD-replay and corrupts memory/grads.
+    return model
+
+
 # ---------------------------------------------------------------------------
 # GPT FSDP implementation
 # ---------------------------------------------------------------------------
@@ -1144,8 +1231,19 @@ def _apply_spmd_parallelism(
         swap: Any,
         accumulate_allreduce_grads_in_fp32: bool = True,
         gradient_accumulation_steps: int = 1,
+        overlap=None,
 ) -> nn.Cell:
-    """Unified GPTModel parallelization entry point."""
+    """Unified GPTModel parallelization entry point.
+
+    Args:
+        overlap: Optional
+            :class:`~hyper_parallel.core.pipeline_parallel.comm_compute_overlap.CommComputeOverlap`
+            instance.  When provided (and ``ep_enabled`` is ``True`` with
+            ``moe_token_dispatcher_type='alltoall'``), replaces the plain
+            :class:`ExpertParallel` strategy with
+            :class:`OverlapExpertParallel` and registers
+            ``CHUNK_START``/``CHUNK_END`` hooks on the model.
+    """
     logger.info("Starting GPTModel parallelization for MCore architecture...")
 
     # Phase 1: TP
@@ -1162,14 +1260,26 @@ def _apply_spmd_parallelism(
     # Phase 2: EP
     if parallel_dims.ep_enabled:
         ep_mesh = parallel_dims.get_mesh("ep")
-        with ms.DeviceCtx("meta"):
-            apply_moe_ep_tp(
+        if overlap is not None and parallelism.moe_token_dispatcher_type == "alltoall":
+            # Overlap path: OverlapExpertParallel + CHUNK_START/END hooks.
+            # apply_moe_ep_overlap_tp wraps its own weight sharding in
+            # ms.DeviceCtx("meta") internally and registers hooks outside it.
+            apply_moe_ep_overlap_tp(
                 model,
+                overlap=overlap,
                 tp_mesh=tp_mesh,
                 ep_mesh=ep_mesh,
                 moe_token_dispatcher_type=parallelism.moe_token_dispatcher_type,
-                npu_nums_per_device=parallelism.npu_nums_per_device,
             )
+        else:
+            with ms.DeviceCtx("meta"):
+                apply_moe_ep_tp(
+                    model,
+                    tp_mesh=tp_mesh,
+                    ep_mesh=ep_mesh,
+                    moe_token_dispatcher_type=parallelism.moe_token_dispatcher_type,
+                    npu_nums_per_device=parallelism.npu_nums_per_device,
+                )
 
     # Phase 3: CP
     if parallel_dims.cp_enabled:
@@ -1236,6 +1346,104 @@ def _apply_spmd_parallelism(
     return model
 
 
+def _make_overlap_b_f_callback(overlap):
+    """Build the OVERLAP_B_F schedule callback for PP+EP comm/compute overlap.
+
+    The callback drives :meth:`CommComputeOverlap.run` with the forward and
+    backward closures for a paired ``OVERLAP_B_F`` schedule step.  It mirrors
+    the PoC's ``_make_overlap_b_f_callback`` for the mindformers trainer.
+
+    MindSpore PyNative notes:
+    - ``_pynative_executor.set_enable_grad(True)`` must be called explicitly
+      on the daemon BWD thread because the grad-enable flag is thread-local
+      and the daemon does not inherit the main thread's enabled state.
+    - MindSpore's current device is process-wide (not thread-local like
+      PyTorch), so the BWD thread inherits the correct device automatically.
+    - After ``backward_one_chunk``, one explicit
+      ``coordinator.rendezvous(HookRole.COMPUTE)`` is called out-of-band to
+      pair with ``CHUNK_END.fwd`` because MS autograd may skip
+      ``CHUNK_START.bwd`` when the chunk input lacks ``requires_grad``.
+    """
+
+    def _callback(step, ctx):
+        from mindspore.common.api import _pynative_executor  # pylint: disable=C0415
+        from hyper_parallel.core.pipeline_parallel.hook_coordinator import HookRole  # pylint: disable=C0415
+
+        bwd_step, fwd_step = step.sub_steps
+        schedule = ctx.schedule
+        fwd_stage = schedule._stage_dict[fwd_step.stage_index]  # pylint: disable=W0212
+        bwd_stage = schedule._stage_dict[bwd_step.stage_index]  # pylint: disable=W0212
+        fwd_mi, bwd_mi = fwd_step.micro_index, bwd_step.micro_index
+
+        def fwd_fn():
+            # CHUNK_START equivalent, at callback level so the bracket covers
+            # the WHOLE chunk record — including preprocess/embedding/rotary
+            # (entry) and lm-head/loss (exit), which live outside the decoder.
+            # MS PyNative does not support concurrent FWD-record + BWD-replay;
+            # decoder-level Cell hooks left those segments recording while the
+            # BWD thread replayed loss.bwd / lm-head.bwd (its pre-D_LAST tail),
+            # corrupting memory and grads. Pairing is unchanged: this COMPUTE
+            # rendezvous pairs with D_LAST.bwd, parking FWD until the BWD
+            # thread has passed its first hook.
+            if overlap.coordinator.is_enabled():
+                overlap.coordinator.rendezvous(HookRole.COMPUTE)
+            # wait_fwd_recv pops the cached recv handle (overlap_p2p) and waits;
+            # no-op when nothing is cached. fwd_handle_cache is touched only by
+            # the main thread here, bwd_handle_cache only by the daemon below.
+            schedule.wait_fwd_recv(fwd_stage.stage_index, fwd_mi)
+            out = fwd_stage.forward_one_chunk(
+                fwd_mi, ctx.arg_mbs[fwd_mi], ctx.kwarg_mbs[fwd_mi],
+            )
+            schedule.update_losses(fwd_stage, out, ctx.losses)
+            # CHUNK_END equivalent: release the C_last comm event, then pair
+            # with the bwd_fn out-of-band rendezvous below.
+            if overlap.coordinator.is_enabled():
+                overlap.coordinator.notify_dispatched(HookRole.COMM)
+                overlap.coordinator.rendezvous(HookRole.COMPUTE)
+
+        def bwd_fn():
+            # MS PyNative grad-enable is thread-local; enable explicitly on
+            # the daemon BWD thread so value_and_grad does not raise.
+            _pynative_executor.set_enable_grad(True)
+            schedule.wait_bwd_recv(bwd_stage.stage_index, bwd_mi)
+            bwd_stage.backward_one_chunk(bwd_mi)
+            # Pair-8 BWD partner taken out-of-band: MS autograd may skip
+            # CHUNK_START.bwd when the chunk input has no requires_grad.
+            # One explicit rendezvous(COMPUTE) here matches CHUNK_END.fwd.
+            if overlap.coordinator.is_enabled():
+                overlap.coordinator.rendezvous(HookRole.COMPUTE)
+
+        # Activation-recompute compatibility: fire the BWD chunk's forward
+        # re-run serially on THIS (main) thread, BEFORE overlap.run enables the
+        # coordinator and spawns the BWD daemon. Two reasons it must be here:
+        #   1. The coordinator is still disabled, so the re-run's A/B/C/D sync
+        #      hooks are no-ops (the is_enabled() gate) — no stray rendezvous to
+        #      desync the protocol.
+        #   2. backward_one_chunk then reuses the cached recomputed activations
+        #      instead of re-running the forward on the daemon thread, which
+        #      would be concurrent FWD-record + BWD-replay (unsupported by MS
+        #      PyNative) and would re-fire the hooks, deadlocking the coordinator.
+        # No-op when the chunk has no checkpoint_wrapper'd blocks (recompute
+        # off). Mirrors the reference PoC's recompute path.
+        bwd_stage.recompute_one_chunk(bwd_mi)
+
+        # Diagnostic: EP_OVERLAP_SEQ=1 runs bwd then fwd sequentially on the main
+        # thread WITHOUT enabling the coordinator (all A/B/C/D/CHUNK sync hooks
+        # stay passthrough). This isolates the OverlapExpertParallel dispatch/
+        # combine math from the dual-thread synchronization: if grads match the
+        # baseline here, the math is correct and the bug is in the threading.
+        if os.environ.get("EP_OVERLAP_SEQ") == "1":
+            # Diagnostic isolation: run bwd then fwd sequentially with the
+            # coordinator disabled (sync hooks passthrough). Validates the
+            # OverlapExpertParallel dispatch/combine math without dual-threading.
+            bwd_fn()
+            fwd_fn()
+        else:
+            overlap.run(fwd_fn=fwd_fn, bwd_fn=bwd_fn)
+
+    return _callback
+
+
 def apply_pp(
         model,
         pp_mesh,
@@ -1247,13 +1455,38 @@ def apply_pp(
         accumulate_allreduce_grads_in_fp32: bool = True,
         gradient_accumulation_steps: int = 1,
 ):
-    """Apply pipeline parallelism to the GPTModel."""
+    """Apply pipeline parallelism to the GPTModel.
+
+    When ``parallelism.pipeline_parallel_overlap_b_f`` is ``True`` and
+    ``parallel_dims.ep_enabled`` is ``True`` with
+    ``moe_token_dispatcher_type='alltoall'``, creates a single
+    :class:`~hyper_parallel.core.pipeline_parallel.comm_compute_overlap.CommComputeOverlap`
+    orchestrator per rank, passes it to :func:`_apply_spmd_parallelism` so
+    :func:`apply_moe_ep_overlap_tp` installs :class:`OverlapExpertParallel` on
+    every MoE layer, and registers it on the schedule for the
+    ``OVERLAP_B_F`` callback.
+    """
     layer_setting = PpLayerSetting(model.config.num_hidden_layers, parallelism)
 
     model_cls = type(model)
     builder = StageModelBuilder(layer_setting)
     stages, model_parts = builder.build_stages(model_cls, model.config, pp_mesh)
     del model
+
+    # Create one CommComputeOverlap orchestrator per rank when B/F EP overlap
+    # is requested.  One orchestrator is shared across ALL chunks on this rank
+    # so that the coordinator's barrier/event state is consistent across the
+    # interleaved chunk sequence.
+    use_ep_overlap = (
+        getattr(parallelism, "pipeline_parallel_overlap_b_f", False)
+        and parallel_dims.ep_enabled
+        and getattr(parallelism, "moe_token_dispatcher_type", "alltoall") == "alltoall"
+    )
+    overlap = None
+    if use_ep_overlap:
+        from hyper_parallel.core.pipeline_parallel.comm_compute_overlap import CommComputeOverlap  # pylint: disable=C0415
+        overlap = CommComputeOverlap()
+        logger.info("PP+EP overlap enabled: created CommComputeOverlap orchestrator")
 
     for part in model_parts:
         _apply_spmd_parallelism(
@@ -1265,6 +1498,7 @@ def apply_pp(
             swap,
             accumulate_allreduce_grads_in_fp32,
             gradient_accumulation_steps,
+            overlap=overlap,
         )
 
     micro_batch_num = parallelism.pipeline_parallel_microbatch_size
@@ -1274,6 +1508,15 @@ def apply_pp(
         overlap_b_f=parallelism.pipeline_parallel_overlap_b_f,
     )
     logger.info(f"schedule.exec_oder: {schedule.exec_order}")
+
+    # Register the OVERLAP_B_F callback when EP overlap is active.
+    if use_ep_overlap and overlap is not None:
+        from hyper_parallel.core.pipeline_parallel.scheduler import MetaStepType  # pylint: disable=C0415
+        schedule.register_custom_function(
+            MetaStepType.OVERLAP_B_F,
+            _make_overlap_b_f_callback(overlap),
+        )
+        logger.info("Registered OVERLAP_B_F callback on schedule")
 
     has_first = any(s.stage_index == 0 for s in stages)
     has_last = any(s.stage_index == layer_setting.num_virtual_stages - 1 for s in stages)
