@@ -60,7 +60,7 @@ class ExpertParallel(ParallelStyle):
         self.sort = mint.sort
         self.fmod = mint.fmod
         self.index_select = mint.index_select
-        self.one_hot = mint.nn.functional.one_hot
+        self.histc = mint.histc
         self.sum = mint.sum
         self.cumsum = mint.cumsum
         self.mul = mint.mul
@@ -154,8 +154,8 @@ class ExpertParallel(ParallelStyle):
         return global_input_tokens
 
     def _count_tokens_per_expert(self, topk_indices, num_experts):
-        """One-hot count of tokens assigned to each expert (float32)."""
-        num_tokens_per_expert = self.sum(self.one_hot(self.cast(topk_indices, mstype.int32), num_experts), dim=0)
+        """Histogram count of tokens assigned to each expert (float32)."""
+        num_tokens_per_expert = self.histc(topk_indices, bins=num_experts, min=0, max=num_experts)
         return self.cast(num_tokens_per_expert, mstype.float32)
 
     # ---- a2a primitives (small, single-collective; overridden for overlap) ----
@@ -482,7 +482,7 @@ class DeredundancyExpertParallel(ExpertParallel):
         iepones = [node_expert_num // inter_ep for i in range(inter_ep)]
         expert_ids, _ = self.all_gather(output_tensor=None, input_tensor=topk_indices, group=self.oep_group)
         expert_ids = self.reshape(expert_ids, (-1, top_k))
-        excounter = self.sum(self.one_hot(self.cast(self.reshape(expert_ids, (-1,)), mstype.int32), num_experts), dim=0)
+        excounter = self.histc(self.reshape(expert_ids, (-1,)), bins=num_experts, min=0, max=num_experts)
         excounter = excounter[self.local_expert_start_index: self.local_expert_end_index]
         excounter_reshaped = self.reshape(excounter, (inter_ep, -1))
         local_excounter, _ = self.all_to_all_single(
