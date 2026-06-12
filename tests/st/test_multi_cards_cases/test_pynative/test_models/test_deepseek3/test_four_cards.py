@@ -28,7 +28,7 @@ _LEVEL_1_TASK_TIME = 0
 _TASK_TYPE = TaskType.FOUR_CARDS_TASK
 
 CUR_DIR = os.path.dirname(os.path.abspath(__file__))
-BASE_CONFIG = os.path.join(CUR_DIR, "pynarive_ds3.yaml")
+BASE_CONFIG = os.path.join(CUR_DIR, "pynative_ds3.yaml")
 DATASET_PATH = os.path.join(CUR_DIR, "train_dataset")
 
 
@@ -89,7 +89,7 @@ def test_fsdp_tp2_gbs2():
         cmd, shell=False, capture_output=True, text=True, check=False,
     )
     assert result.returncode == 0, (
-        f"PrepareModuleOO script failed with non-zero exit code: "
+        f"DeepSeek3 training (run_deepseek3.py, config={local_config_path}) failed with non-zero exit code: "
         f"{result.returncode}.\n"
         f"Stdout:\n{result.stdout}\nStderr:\n{result.stderr}"
     )
@@ -137,7 +137,153 @@ def test_fsdp_tp2_ep2_gbs2():
         cmd, shell=False, capture_output=True, text=True, check=False,
     )
     assert result.returncode == 0, (
-        f"PrepareModuleOO script failed with non-zero exit code: "
+        f"DeepSeek3 training (run_deepseek3.py, config={local_config_path}) failed with non-zero exit code: "
+        f"{result.returncode}.\n"
+        f"Stdout:\n{result.stdout}\nStderr:\n{result.stderr}"
+    )
+
+
+@pytest.mark.level1
+def test_fsdp_cp2_colossal_gbs2():
+    """
+    Feature: DeepSeek3 FSDP + Context Parallel (colossal) training
+    Description: Test DeepSeek3 training with FSDP and context parallel 2 using the
+                 colossal method on 4 cards, global batch size 2.
+    Expectation: msrun script exits with code 0.
+    """
+    generate_dataset()
+    with open(BASE_CONFIG, "r") as fp:
+        configs = yaml.safe_load(fp)
+
+    configs["train_dataset"]["dataloader"]["dataset_files"] = [DATASET_PATH]
+    configs["training"]["local_batch_size"] = 1
+    configs["parallelism"]["context_parallel"] = 2
+    configs["parallelism"]["context_parallel_method"] = "colossal"
+    configs["training"]["steps"] = 10
+
+    local_config_path = f"{CUR_DIR}/ds3_fsdp_cp2_colossal_gbs2.yaml"
+    with open(local_config_path, "w") as fp:
+        yaml.dump(configs, fp, indent=2)
+
+    run_script_path = os.path.join(CUR_DIR, "run_deepseek3.py")
+    port_id = int(os.environ.get("ASCEND_PORT_ID", random.randint(50000, 65535)))
+    assert os.path.exists(
+        run_script_path
+    ), f"Run script not found: {run_script_path}"
+    cmd = [
+        "msrun",
+        "--worker_num=4",
+        "--local_worker_num=4",
+        f"--master_port={port_id}",
+        f"--log_dir={CUR_DIR}/log_fsdp_cp2_colossal_gbs2",
+        "--join=True",
+        f"{run_script_path}",
+        "--config",
+        f"{local_config_path}",
+    ]
+    result = subprocess.run(
+        cmd, shell=False, capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 0, (
+        f"DeepSeek3 training (run_deepseek3.py, config={local_config_path}) failed with non-zero exit code: "
+        f"{result.returncode}.\n"
+        f"Stdout:\n{result.stdout}\nStderr:\n{result.stderr}"
+    )
+
+
+@pytest.mark.level1
+def test_fsdp_cp2_ulysses_gbs2():
+    """
+    Feature: DeepSeek3 FSDP + Context Parallel (ulysses) training
+    Description: Test DeepSeek3 training with FSDP and context parallel 2 using the
+                 ulysses method on 4 cards, global batch size 2.
+    Expectation: msrun script exits with code 0.
+    """
+    generate_dataset()
+    with open(BASE_CONFIG, "r") as fp:
+        configs = yaml.safe_load(fp)
+
+    configs["train_dataset"]["dataloader"]["dataset_files"] = [DATASET_PATH]
+    configs["training"]["local_batch_size"] = 1
+    configs["parallelism"]["context_parallel"] = 2
+    configs["parallelism"]["context_parallel_method"] = "ulysses"
+    configs["training"]["steps"] = 10
+
+    local_config_path = f"{CUR_DIR}/ds3_fsdp_cp2_ulysses_gbs2.yaml"
+    with open(local_config_path, "w") as fp:
+        yaml.dump(configs, fp, indent=2)
+
+    run_script_path = os.path.join(CUR_DIR, "run_deepseek3.py")
+    port_id = int(os.environ.get("ASCEND_PORT_ID", random.randint(50000, 65535)))
+    assert os.path.exists(
+        run_script_path
+    ), f"Run script not found: {run_script_path}"
+    cmd = [
+        "msrun",
+        "--worker_num=4",
+        "--local_worker_num=4",
+        f"--master_port={port_id}",
+        f"--log_dir={CUR_DIR}/log_fsdp_cp2_ulysses_gbs2",
+        "--join=True",
+        f"{run_script_path}",
+        "--config",
+        f"{local_config_path}",
+    ]
+    result = subprocess.run(
+        cmd, shell=False, capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 0, (
+        f"DeepSeek3 training (run_deepseek3.py, config={local_config_path}) failed with non-zero exit code: "
+        f"{result.returncode}.\n"
+        f"Stdout:\n{result.stdout}\nStderr:\n{result.stderr}"
+    )
+
+
+@pytest.mark.level1
+def test_fsdp_cp2_ulysses_async_gbs2():
+    """
+    Feature: DeepSeek3 FSDP + Async Context Parallel (ulysses) training
+    Description: Test DeepSeek3 training with FSDP and context parallel 2 using the
+                 ulysses method with async context parallel enabled on 4 cards,
+                 global batch size 2.
+    Expectation: msrun script exits with code 0.
+    """
+    generate_dataset()
+    with open(BASE_CONFIG, "r") as fp:
+        configs = yaml.safe_load(fp)
+
+    configs["train_dataset"]["dataloader"]["dataset_files"] = [DATASET_PATH]
+    configs["training"]["local_batch_size"] = 1
+    configs["parallelism"]["context_parallel"] = 2
+    configs["parallelism"]["context_parallel_method"] = "ulysses"
+    configs["parallelism"]["context_parallel_async"] = True
+    configs["training"]["steps"] = 10
+
+    local_config_path = f"{CUR_DIR}/ds3_fsdp_cp2_ulysses_async_gbs2.yaml"
+    with open(local_config_path, "w") as fp:
+        yaml.dump(configs, fp, indent=2)
+
+    run_script_path = os.path.join(CUR_DIR, "run_deepseek3.py")
+    port_id = int(os.environ.get("ASCEND_PORT_ID", random.randint(50000, 65535)))
+    assert os.path.exists(
+        run_script_path
+    ), f"Run script not found: {run_script_path}"
+    cmd = [
+        "msrun",
+        "--worker_num=4",
+        "--local_worker_num=4",
+        f"--master_port={port_id}",
+        f"--log_dir={CUR_DIR}/log_fsdp_cp2_ulysses_async_gbs2",
+        "--join=True",
+        f"{run_script_path}",
+        "--config",
+        f"{local_config_path}",
+    ]
+    result = subprocess.run(
+        cmd, shell=False, capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 0, (
+        f"DeepSeek3 training (run_deepseek3.py, config={local_config_path}) failed with non-zero exit code: "
         f"{result.returncode}.\n"
         f"Stdout:\n{result.stdout}\nStderr:\n{result.stderr}"
     )
@@ -187,7 +333,7 @@ def test_fsdp_tp2_ep2_deredundancy_gbs2():
         cmd, shell=False, capture_output=True, text=True, check=False,
     )
     assert result.returncode == 0, (
-        f"PrepareModuleOO script failed with non-zero exit code: "
+        f"DeepSeek3 training (run_deepseek3.py, config={local_config_path}) failed with non-zero exit code: "
         f"{result.returncode}.\n"
         f"Stdout:\n{result.stdout}\nStderr:\n{result.stderr}"
     )
