@@ -17,6 +17,7 @@
 import time
 from typing import Dict, Any
 from copy import deepcopy
+import os
 
 from mindspore import ops
 from mindspore.nn.learning_rate_schedule import LearningRateSchedule
@@ -115,6 +116,20 @@ class LossCallback(TrainerCallback):
                 - lr_scheduler: The learning rate scheduler (optional).
         """
         loss = kwargs.get("loss")
+        model = kwargs.get("model")
+        metric_group = kwargs.get("metric_reduce_group")
+        metric_group_size = kwargs.get("metric_reduce_group_size")
+
+        # Update auxiliary-loss-free expert_bias on every step, regardless of
+        # log interval or loss availability. Non-last PP stages return loss=None
+        # but still hold MoE layers whose ``tokens_per_expert`` accumulators must
+        # be drained and converted into a bias delta to keep the router in sync
+        # with the rest of the pipeline.
+
+        if model is not None:
+            cfg = model.get_gpt_transformer_config()
+            if getattr(cfg, "moe_router_enable_expert_bias", False):
+                _update_expert_bias(model, metric_group, metric_group_size)
         if loss is None or state.global_step % self.log_interval != 0:
             return
 
@@ -124,10 +139,7 @@ class LossCallback(TrainerCallback):
         cur_time = time.time()
         step_time_cost = int((cur_time - self.step_time) * 1000)
 
-        model = kwargs.get("model")
         model_config = deepcopy(model.get_gpt_transformer_config())
-        metric_group = kwargs.get("metric_reduce_group")
-        metric_group_size = kwargs.get("metric_reduce_group_size")
         reset_model_temporary_tensors(model_config, model)
 
         # process aux loss
@@ -141,8 +153,6 @@ class LossCallback(TrainerCallback):
         )
         if load_balancing_loss is not None:
             load_balancing_loss /= state.num_accumulation_steps
-        if model_config.moe_router_enable_expert_bias:
-            _update_expert_bias(model)
 
         # process mtp loss
         mtp_loss = track_mtp_metrics(group=metric_group, group_size=metric_group_size,)
@@ -305,14 +315,33 @@ def reset_model_temporary_tensors(config, model):
         module.reset_global_aux_loss_tracker()
 
 
-def _update_expert_bias(model):
+def _update_expert_bias(model, metric_reduce_group=None, metric_reduce_group_size=None):
     """
     Update expert bias for load-balanced routing and reset per-step token counters.
 
     Uses cached module list to avoid full cell tree traversal on every step.
+    Args:
+       model: Root model module to walk for MoE layers.
+       metric_reduce_group: Process group spanning the dp x cp domain
+          (``loss_mesh``). Each rank in this group sees a different sample
+          shard of the global batch, so its local ``tokens_per_expert``
+          histogram is only a partial count. We all-reduce SUM over this
+          group to recover the global-batch histogram, otherwise the bias
+          delta diverges from the single-card baseline. ``None`` (or
+          single-rank group) skips the all-reduce. TP is intentionally
+          excluded: the MoE plan replicates router inputs across TP ranks,
+          so each TP rank already sees the same tokens; reducing over TP
+          would multiply the count by ``tp_size``.
+       metric_reduce_group_size: Size of ``metric_reduce_group`` (skip
+          all-reduce when ``<= 1``).
     """
     from mindspore import mint
     from mindspore.graph.api import _no_grad
+
+    try:
+        from hyper_parallel.core.dtensor.dtensor import DTensor
+    except ImportError:
+        DTensor = None
 
     cache = getattr(_update_expert_bias, '_cache', None)
     if cache is None:
@@ -329,6 +358,16 @@ def _update_expert_bias(model):
     # default compute stream. Need to assess if this is OK performance-wise.
     tokens_per_expert_list = [module.tokens_per_expert for module in cache]
     tokens_per_expert_by_layer = ops.vstack(tokens_per_expert_list)
+
+    # All-reduce the per-rank token counts over the dp x cp domain so the
+    # bias delta is computed from global-batch statistics, matching the
+    # single-card path (which has no group to reduce over).
+
+    if metric_reduce_group is not None and (
+            metric_reduce_group_size is None or metric_reduce_group_size > 1):
+        if DTensor is not None and isinstance(tokens_per_expert_by_layer, DTensor):
+            tokens_per_expert_by_layer = tokens_per_expert_by_layer.to_local()
+        all_reduce(tokens_per_expert_by_layer, group=metric_reduce_group)
 
     with _no_grad():
         for moe_layer_idx, module in enumerate(cache):

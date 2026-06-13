@@ -609,7 +609,15 @@ class Trainer:
         # Initialize training state
         self.state = self._init_train_state()
 
-        if self.parallel_dims and self.parallel_dims.pp_enabled:
+        # ``loss_mesh`` is the dp x cp domain and is the right group to all-reduce
+        # per-step metric statistics over (loss, MoE aux loss, MoE tokens_per_expert
+        # for the auxiliary-loss-free expert_bias update). It must be set even when
+        # PP is disabled, otherwise multi-card DP / CP runs would compute the
+        # expert_bias delta from per-rank local token counts instead of the
+        # global-batch counts, diverging from the single-card baseline.
+
+        if self.parallel_dims is not None and (
+                self.parallel_dims.pp_enabled or self.parallel_dims.dp_cp_enabled):
             loss_mesh = self.parallel_dims.get_mesh("loss_mesh")
             self.metric_reduce_group_size = loss_mesh.size()
             self.metric_reduce_group = loss_mesh.get_group()
