@@ -64,6 +64,7 @@ def test_fsdp_cp2_ulysses_tp2_gbs2():
     configs["train_dataset"]["dataloader"]["dataset_files"] = [DATASET_PATH]
     configs["training"]["local_batch_size"] = 1
     configs["parallelism"]["context_parallel"] = 2
+    configs["model"]["use_attn_mask_compression"] = True
     configs["parallelism"]["context_parallel_method"] = "ulysses"
     configs["parallelism"]["tensor_parallel"] = 2
     configs["training"]["steps"] = 10
@@ -113,6 +114,7 @@ def test_fsdp_cp2_ulysses_tp2_ep2_gbs2():
     configs["train_dataset"]["dataloader"]["dataset_files"] = [DATASET_PATH]
     configs["training"]["local_batch_size"] = 1
     configs["parallelism"]["context_parallel"] = 2
+    configs["model"]["use_attn_mask_compression"] = True
     configs["parallelism"]["context_parallel_method"] = "ulysses"
     configs["parallelism"]["tensor_parallel"] = 2
     configs["parallelism"]["expert_parallel"] = 2
@@ -163,6 +165,7 @@ def test_fsdp_cp4_hybrid4_gbs2():
     configs["train_dataset"]["dataloader"]["dataset_files"] = [DATASET_PATH]
     configs["training"]["local_batch_size"] = 1
     configs["parallelism"]["context_parallel"] = 4
+    configs["model"]["use_attn_mask_compression"] = True
     configs["parallelism"]["context_parallel_method"] = "hybrid"
     configs["parallelism"]["ulysses_degree_in_cp"] = 2
     configs["training"]["steps"] = 10
