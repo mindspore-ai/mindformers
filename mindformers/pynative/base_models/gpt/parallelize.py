@@ -412,6 +412,29 @@ def _collect_hc_replicate_params(hc_module):
     return replicate_params
 
 
+def _wrap_hc_modules(host, fsdp_config, reshard_after_forward):
+    """Independently FSDP-wrap a host's mHC sub-modules (attn_hc/ffn_hc).
+
+    Their params are tiny and must be replicated rather than swept into the host's
+    generic wrap and sharded on dim 0 (their shapes do not allow it): 1-D params
+    shard on dim 0, the rest on dim 1. Shared by the main decoder layers and the
+    MTP transformer layers so both get the same treatment.
+    """
+    def shard_plan(param):
+        if len(param.shape) == 1:
+            return Shard(0)
+        return Shard(1)
+
+    for hc_attr in ("attn_hc", "ffn_hc"):
+        hc_module = getattr(host, hc_attr, None)
+        if hc_module is None:
+            continue
+        with ms.DeviceCtx("meta"):
+            fully_shard(hc_module, **fsdp_config, shard_placement_fn=shard_plan,
+                        reshard_after_forward=reshard_after_forward,
+                        replicate_params=_collect_hc_replicate_params(hc_module))
+
+
 def _apply_layers_tp(
     transformer_layer,
     tp_mesh,
@@ -997,21 +1020,7 @@ def apply_fsdp(
                 fully_shard(norm, **fsdp_config)
 
         # 2c. Wrap HC modules independently (small modules, all params replicated)
-        def shard_plan(param):
-            if len(param.shape) == 1:
-                return Shard(0)
-            return Shard(1)
-
-        if hasattr(layer, "attn_hc"):
-            with ms.DeviceCtx("meta"):
-                fully_shard(layer.attn_hc, **fsdp_config, shard_placement_fn=shard_plan,
-                            reshard_after_forward=reshard_after_forward,
-                            replicate_params=_collect_hc_replicate_params(layer.attn_hc))
-        if hasattr(layer, "ffn_hc"):
-            with ms.DeviceCtx("meta"):
-                fully_shard(layer.ffn_hc, **fsdp_config, shard_placement_fn=shard_plan,
-                            reshard_after_forward=reshard_after_forward,
-                            replicate_params=_collect_hc_replicate_params(layer.ffn_hc))
+        _wrap_hc_modules(layer, fsdp_config, reshard_after_forward)
 
         # 2d. Wrap the transformer layer (large module)
 
@@ -1083,6 +1092,12 @@ def apply_fsdp(
                 if norm is not None:
                     with ms.DeviceCtx("meta"):
                         fully_shard(norm, **fsdp_config)
+
+            # HC modules inside transformer_layer — same independent wrap as the
+            # main decoder layers (2c); otherwise the tiny mHC params get swept into
+            # the generic MTP layer wrap and sharded on dim 0, which their shapes
+            # do not allow.
+            _wrap_hc_modules(layer.transformer_layer, fsdp_config, reshard_after_forward)
 
             # Wrap the MTP layer (remaining: eh_proj + transformer_layer residual, all bf16)
             with ms.DeviceCtx("meta"):

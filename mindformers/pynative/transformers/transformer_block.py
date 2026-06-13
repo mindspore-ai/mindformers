@@ -15,6 +15,29 @@ from mindformers.pynative.transformers.transformer_layer import BaseTransformerL
 from mindformers.tools.logger import logger
 
 
+def expand_hyper_connection_streams(hidden_states: Tensor, num_streams: int, hidden_size: int) -> Tensor:
+    """Expand (s, b, h) hidden states into n packed mHC residual streams (s, b, n*h).
+
+    Shared by TransformerBlock (main decoder) and the MTP layer so both feed the inner
+    transformer layers the packed residual-stream layout their attn_hc/ffn_hc expect.
+    """
+    seq_len = hidden_states.shape[0]
+    hidden_states = mint.unsqueeze(hidden_states, 2)
+    hidden_states = mint.tile(hidden_states, (1, 1, num_streams, 1))
+    return mint.reshape(hidden_states, (seq_len, -1, num_streams * hidden_size))
+
+
+def collapse_hyper_connection_streams(hidden_states: Tensor, num_streams: int, hidden_size: int) -> Tensor:
+    """Collapse n packed mHC residual streams (s, b, n*h) back to (s, b, h) by averaging.
+
+    Inverse of :func:`expand_hyper_connection_streams`; shared by TransformerBlock and
+    the MTP layer before their final layernorm.
+    """
+    seq_len = hidden_states.shape[0]
+    hidden_states = mint.reshape(hidden_states, (seq_len, -1, num_streams, hidden_size))
+    return mint.mean(hidden_states, dim=2)
+
+
 @dataclass
 class TransformerBlockSubmodules:
     """
@@ -144,10 +167,6 @@ class TransformerBlock(nn.Cell):
         if config.enable_hyper_connections:
             self.n = config.num_residual_streams
             self.hidden_size = config.hidden_size
-            self.unsqueeze = mint.unsqueeze
-            self.tile = mint.tile
-            self.reshape = mint.reshape
-            self.mean = mint.mean
         cp = config.context_parallel_size if config.context_parallel_size is not None else 1
         if config.sequence_parallel and cp > 1:
             logger.warning("The context parallel way conflicts with sequence parallel way. "
@@ -215,10 +234,7 @@ class TransformerBlock(nn.Cell):
                 - hidden_states (Tensor): Output tensor of shape (S, B, H).
         """
         if self.hc and self.pre_process:
-            s = hidden_states.shape[0]
-            hidden_states = self.unsqueeze(hidden_states, 2)
-            hidden_states = self.tile(hidden_states, (1, 1, self.n, 1))
-            hidden_states = self.reshape(hidden_states, (s, -1, self.n * self.hidden_size))
+            hidden_states = expand_hyper_connection_streams(hidden_states, self.n, self.hidden_size)
 
         for index in range(self.layer_start, self.layer_end + 1):
             layer = self._get_layer(index)
@@ -233,9 +249,7 @@ class TransformerBlock(nn.Cell):
             )
 
         if self.hc and self.has_final_layernorm_in_this_stage():
-            s = hidden_states.shape[0]
-            hidden_states = self.reshape(hidden_states, (s, -1, self.n, self.hidden_size))
-            hidden_states = self.mean(hidden_states, dim=2)
+            hidden_states = collapse_hyper_connection_streams(hidden_states, self.n, self.hidden_size)
 
         # final layernorm.
         if self.post_layer_norm and self.post_process:
