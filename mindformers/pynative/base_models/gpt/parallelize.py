@@ -1183,8 +1183,13 @@ def apply_fsdp(
     # Extend the prefetch chain with MTP layers so their FSDP all-gathers overlap
     # with the preceding layer's forward/backward compute.
     if mtp:
+        if tail_modules:
+            layers.extend(tail_modules)
         for mtp_layer in mtp.layers:
             layers.append(mtp_layer)
+        _setup_gpt_prefetch(embedding, layers, [])
+    else:
+        _setup_gpt_prefetch(embedding, layers, tail_modules)
 
     _setup_gpt_prefetch(embedding, layers, tail_modules)
 
@@ -1371,12 +1376,14 @@ def _apply_spmd_parallelism(
 
     # Phase 4: AC
     if recompute.mode != "None" or recompute_comm.enable or swap.enable:
+        gptmodel = _unwrap_gptmodel(model)
         apply_ac(
-            _unwrap_gptmodel(model).decoder,
+            gptmodel.decoder,
             recompute,
             recompute_comm,
             swap,
             parallelism.pipeline_parallel,
+            mtp_block=getattr(gptmodel, "mtp", None),
         )
 
     # Phase 5: FSDP/HSDP
