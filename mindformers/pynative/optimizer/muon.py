@@ -2491,12 +2491,20 @@ class Muon(Optimizer):
                                     param_lr_f, param_wd_f,
                                     state_idx))
 
-        # ``self.global_step`` is already incremented at the entry of
-        # ``construct()`` (see line 2138).  Reuse it for the fused TBE step
-        # so resume from checkpoint restores the correct step value.
+        # ``gen.AdamW()`` increments ``step`` INTERNALLY before computing bias
+        # correction.  Both pynative ``AdamW`` (adamw.py) and graph-mode
+        # ``fused_adamw.py`` initialise their counter to -1 and feed the
+        # post-increment value, so the operator sees t=1 on the first step.
+        # Muon reuses the base ``Optimizer.global_step`` (initialised to 0 and
+        # incremented to 1 at the entry of ``construct()``), so it must feed
+        # ``global_step - 1`` to land on t=1 on the first step.  Feeding the raw
+        # ``global_step`` made the operator compute t=2 (bias_correction
+        # 1 - beta**2 instead of 1 - beta**1), inconsistent with both the
+        # non-fused Muon AdamW path and standalone AdamW.  Reusing the base
+        # counter still keeps resume-from-checkpoint correct.
         adamw_step_int64 = None
         if self.use_fused_adamw and adamw_tasks:
-            adamw_step_int64 = P.Cast()(self.global_step, mstype.int64)
+            adamw_step_int64 = P.Cast()(self.global_step - 1, mstype.int64)
 
         adamw_done = False
 
