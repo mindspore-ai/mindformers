@@ -146,12 +146,19 @@ class LossCallback(TrainerCallback):
 
         # process mtp loss
         mtp_loss = track_mtp_metrics(group=metric_group, group_size=metric_group_size,)
-        if mtp_loss:
+        # mtp_loss_scaling_factor == 0 means the MTP params are frozen (not updated),
+        # so the tracked loss carries no signal and is not worth logging. Guarding on
+        # the config value also avoids the element-wise truthiness of the Tensor
+        # returned by track_mtp_metrics, which crashed the previous `if mtp_loss:`
+        # check by leaking a raw Tensor into _print_log's join.
+        if mtp_loss is not None and model_config.mtp_loss_scaling_factor:
             mtp_loss_values = []
             for ind, val in enumerate(mtp_loss):
                 val /= state.num_accumulation_steps
                 mtp_loss_values.append(f"mtp_{str(ind + 1)}_loss: {self._to_float(val):10.6f}")
             mtp_loss = ", ".join(mtp_loss_values)
+        else:
+            mtp_loss = None
 
         # process indexer loss
         indexer_loss = track_indexer_metrics()

@@ -37,6 +37,10 @@ from mindspore.mint.distributed import get_world_size, all_reduce
 
 from mindformers.pynative.loss import CrossEntropyLoss
 from mindformers.pynative.layers.layer_norm import get_norm_cls
+from mindformers.pynative.transformers.transformer_block import (
+    expand_hyper_connection_streams,
+    collapse_hyper_connection_streams,
+)
 from mindformers.parallel_core.utils.spec_utils import ModuleSpec, build_module
 from mindformers.parallel_core.transformer_config import TransformerConfig
 from mindformers.pynative.layers.linear import Linear
@@ -311,6 +315,15 @@ class MultiTokenPredictionLayer(nn.Cell):
         self.cast = ops.cast
         self.reshape = mint.reshape
 
+        # Mirror TransformerBlock's hyper-connection handling: with mHC enabled
+        # the inner transformer_layer computes on packed residual streams
+        # (s, b, n*h), so the MTP layer must expand its (s, b, h) input into n
+        # streams before the layer and collapse them back afterwards.
+        self.hc = config.enable_hyper_connections
+        if self.hc:
+            self.hc_num_streams = config.num_residual_streams
+            self.hc_hidden_size = config.hidden_size
+
     def construct(
             self,
             input_ids: Tensor,
@@ -350,12 +363,24 @@ class MultiTokenPredictionLayer(nn.Cell):
         # and the (i + K)-th token's embedding, and combine them with linear projection.
         hidden_states = mint.cat((decoder_input, hidden_states), -1)
         hidden_states = self.eh_proj(hidden_states)
+        if self.hc:
+            # Expand (s, b, h) -> (s, b, n*h) packed residual streams,
+            # same as TransformerBlock does for the main decoder.
+            hidden_states = expand_hyper_connection_streams(
+                hidden_states, self.hc_num_streams, self.hc_hidden_size
+            )
         hidden_states, _ = self.transformer_layer(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             rotary_pos_emb=rotary_pos_emb,
             actual_seq_len=actual_seq_len
         )
+        if self.hc:
+            # Collapse the streams back to (s, b, h) by averaging,
+            # same as TransformerBlock does before its final layernorm.
+            hidden_states = collapse_hyper_connection_streams(
+                hidden_states, self.hc_num_streams, self.hc_hidden_size
+            )
 
         # Layer norm before shared head layer.
         hidden_states = self.final_layernorm(hidden_states)
