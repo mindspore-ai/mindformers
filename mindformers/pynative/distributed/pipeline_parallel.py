@@ -20,6 +20,43 @@ from mindspore import nn
 
 from hyper_parallel import PipelineStage
 
+class ScaledLossPipelineStage(PipelineStage):
+    """PipelineStage that scales the last-stage main-loss backward seed.
+
+    In the base ``PipelineStage``, ``get_last_stage_sens`` returns ``1.0``
+    (or ``1.0 / repeat_num`` for replicated DTensor outputs) as the backward
+    seed, which causes gradients to be **summed** across micro-batches.
+
+    However, the single-card training path divides
+    ``loss / num_accumulation_steps`` before calling backward. To keep the
+    pipeline-parallel path consistent with this behavior -- and to align with
+    the scaling already applied to MoE-aux / MTP losses via
+    ``main_loss_sense`` -- the framework sets ``loss_scale`` on every stage
+    to::
+
+        loss_scale = 1 / (dp * tp * cp) / grad_accum_steps
+
+    and this class multiplies the backward seed by that factor.
+
+    **Scope of scaling:**
+    Only the main-loss seed is scaled here. MoE-aux and MTP gradients are
+    already scaled at backward time by their respective auto-scalers, so
+    they must **not** be scaled again (doing so on ``param.grad`` would
+    double-scale them).
+    """
+
+    loss_scale = 1.0
+
+    def get_last_stage_sens(self, last_stage_outputs):
+        p_sens = super().get_last_stage_sens(last_stage_outputs)
+        scale = self.loss_scale
+        if scale == 1.0:
+            return p_sens
+        if isinstance(p_sens, list):
+            return [s * scale for s in p_sens]
+        return p_sens * scale
+
+
 class PpLayerSetting:
     """
     Layer setting for pipeline parallelism.
@@ -47,7 +84,13 @@ class PpLayerSetting:
             for chunk_id, r in enumerate(ranges):
                 layer_ids = r.strip().split('-')
                 if len(layer_ids) <= 2:
-                    layer_start, layer_end = layer_ids[0], layer_ids[-1]
+                    try:
+                        layer_start, layer_end = int(layer_ids[0]), int(layer_ids[-1])
+                    except ValueError as exc:
+                        raise ValueError(
+                            f"Invalid layer range format: {r}. "
+                            f"Layer IDs must be integers, got '{layer_ids[0]}' and '{layer_ids[-1]}'"
+                        ) from exc
                     if layer_start > layer_end:
                         raise ValueError(
                             f"Invalid layer range format: {r}. "
@@ -58,7 +101,7 @@ class PpLayerSetting:
                         f"Invalid layer range format: {r}. "
                         "Expected format is 'start-end' or 'single_layer'."
                     )
-                after_parse_layer[str(chunk_id * self.pp + pp_rank)] = (int(layer_start), int(layer_end))
+                after_parse_layer[str(chunk_id * self.pp + pp_rank)] = (layer_start, layer_end)
 
         self.layers_per_stage = after_parse_layer
 
@@ -120,7 +163,7 @@ class StageModelBuilder:
                 )
             model_parts.append(stage_model)
             
-            stage = PipelineStage(
+            stage = ScaledLossPipelineStage(
                 submodule=stage_model,
                 stage_index=stage_idx,
                 stage_num=num_virtual_stages,

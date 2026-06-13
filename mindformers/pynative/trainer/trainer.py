@@ -1015,7 +1015,6 @@ class Trainer:
             self.optimizer.parameters,
             enable_parallel=self.enable_parallel,
             max_norm=self.config.training.max_norm,
-            parallelism=self.config.parallelism,
         )
 
         with _no_grad():

@@ -34,7 +34,6 @@ from typing import Any, List
 
 import mindspore as ms
 from mindspore import nn, Parameter
-from mindspore.mint.distributed import get_world_size
 from mindspore.ops.communication import set_comm_ops_inplace
 
 from hyper_parallel import DeviceMesh
@@ -1541,6 +1540,21 @@ def apply_pp(
             gradient_accumulation_steps,
             overlap=overlap,
         )
+
+    # Scale the last-stage main-loss backward seed by the same factor used for the
+    # MoE-aux / MTP losses (1/(dp*tp*cp) / grad_accum). Without this, gradients are
+    # summed across micro-batches instead of averaged, making PP gradients
+    # ``num_accumulation_steps`` times larger than the single-card path, which
+    # divides ``loss / num_accumulation_steps`` before backward.
+    main_loss_sense = get_loss_sense(
+        parallelism=parallelism,
+        enable_parallel=True,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        apply_gradient_accumulation=True,
+        )
+    loss_scale = float(main_loss_sense.asnumpy().item())
+    for stage in stages:
+        stage.loss_scale = loss_scale
 
     micro_batch_num = parallelism.pipeline_parallel_microbatch_size
     schedule = ScheduleInterleaved1F1B(
