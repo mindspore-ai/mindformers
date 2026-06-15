@@ -48,6 +48,7 @@ from hyper_parallel.platform import get_platform
 from mindformers.core import context as core_context
 from mindformers.tools.logger import logger
 from mindformers.pynative.optimizer.adamw import _run_adamw_opt, _run_fused_adamw_opt
+from mindformers.pynative.dtensor_compat import inplace_copy
 
 
 _HP_PLATFORM = get_platform()
@@ -506,7 +507,7 @@ def _build_full_tensor_p2p_gather_ops(
             can_prealloc = False
         else:
             start_row = int(my_pos) * shard_rows
-            prealloc_full[start_row:start_row + shard_rows].copy_(local_tensor)
+            inplace_copy(prealloc_full[start_row:start_row + shard_rows], local_tensor)
             for pos, src_rank in enumerate(local_rank_list):
                 if pos == my_pos:
                     continue
@@ -723,7 +724,7 @@ def _start_full_tensor_p2p_gather_async(
         if not test_slice.is_contiguous():
             can_prealloc = False
         else:
-            prealloc_full[start_row:start_row + shard_rows].copy_(local_tensor)
+            inplace_copy(prealloc_full[start_row:start_row + shard_rows], local_tensor)
             handles = []
             for pos, src_rank in enumerate(local_rank_list):
                 if pos == my_pos:
@@ -1001,8 +1002,8 @@ def _apply_muon_update(
     with SkipDTensorDispatch():
         param_fp32 = param * (1 - lr * weight_decay)
         next_param = param_fp32 - x_ret.reshape(param_fp32.shape)
-        param.copy_(next_param)
-        muon_m.copy_(next_m)
+        inplace_copy(param, next_param)
+        inplace_copy(muon_m, next_m)
     return next_param
 
 
@@ -1128,8 +1129,8 @@ def _apply_prepared_update_batched(infos):
         with SkipDTensorDispatch():
             param_fp32 = op_cast(param, mstype.float32) * (1 - info['lr'] * info['wd'])
             next_param = param_fp32 - x_ret.reshape(param_fp32.shape)
-            param.copy_(op_cast(next_param, F.dtype(param)))
-            muon_m.copy_(op_cast(info['next_m'], F.dtype(muon_m)))
+            inplace_copy(param, op_cast(next_param, F.dtype(param)))
+            inplace_copy(muon_m, op_cast(info['next_m'], F.dtype(muon_m)))
         return [param]
 
     params = [info['param'] for info in infos]
@@ -1181,8 +1182,8 @@ def _apply_prepared_update_batched(infos):
         next_m_cast = op_cast(stacked_next_m, m_dtype)
 
         for k in range(n_slots):
-            params[k].copy_(next_param_cast[k])
-            muon_ms[k].copy_(next_m_cast[k])
+            inplace_copy(params[k], next_param_cast[k])
+            inplace_copy(muon_ms[k], next_m_cast[k])
     return params
 
 
@@ -1257,8 +1258,8 @@ def _run_muon_batched(
         with SkipDTensorDispatch():
             param_fp32 = param * (1 - info['lr'] * info['wd'])
             next_param = param_fp32 - x_ret.reshape(param_fp32.shape)
-            param.copy_(next_param)
-            muon_m.copy_(info['next_m'])
+            inplace_copy(param, next_param)
+            inplace_copy(muon_m, info['next_m'])
         return param
 
     # ------------------------------------------------------------------
@@ -1955,7 +1956,7 @@ class Muon(Optimizer):
             for model_param, fp32_param, is_lp in zip(
                     self._parameters, self.fp32_params, self._is_low_precision_param):
                 if is_lp:
-                    model_param.copy_(op_cast(fp32_param, model_param.dtype))
+                    inplace_copy(model_param, op_cast(fp32_param, model_param.dtype))
 
     def reload_main_params_from_model(self):
         """Refresh fp32 master weights from the model parameters.
@@ -1970,7 +1971,7 @@ class Muon(Optimizer):
             for model_param, fp32_param, is_lp in zip(
                     self._parameters, self.fp32_params, self._is_low_precision_param):
                 if is_lp:
-                    fp32_param.copy_(op_cast(model_param, mstype.float32))
+                    inplace_copy(fp32_param, op_cast(model_param, mstype.float32))
 
     def _initialize_state(self):
         """Create Muon momentum and AdamW moment state from fp32 master weights."""

@@ -22,6 +22,7 @@ from mindspore.nn.optim.optimizer import Optimizer
 
 from hyper_parallel import SkipDTensorDispatch
 from mindformers.tools.logger import logger
+from mindformers.pynative.dtensor_compat import inplace_copy
 
 op_cast = P.Cast()
 
@@ -40,15 +41,15 @@ def _run_adamw_opt(
     grads_fp32 = op_cast(gradients, mstype.float32)
     next_param = param_fp32 * (1.0 - lr * weight_decay)
 
-    exp_avg.copy_(exp_avg.mul(beta1).add(grads_fp32.mul(1.0 - beta1)))
-    exp_avg_sq.copy_(exp_avg_sq.mul(beta2).addcmul(grads_fp32, grads_fp32, one_minus_beta2))
+    inplace_copy(exp_avg, exp_avg.mul(beta1).add(grads_fp32.mul(1.0 - beta1)))
+    inplace_copy(exp_avg_sq, exp_avg_sq.mul(beta2).addcmul(grads_fp32, grads_fp32, one_minus_beta2))
 
     step_size = lr / bias_correction1
 
     denom = (exp_avg_sq / bias_correction2).sqrt().add(eps)
     return_param = op_cast(next_param - (exp_avg / denom).mul(step_size), params_dtype)
 
-    parameters.copy_(return_param)
+    inplace_copy(parameters, return_param)
     return op_cast(gradients, params_dtype)
 
 
@@ -250,7 +251,7 @@ class AdamW(Optimizer):
         for model_param, fp32_param, is_lp in zip(
                 self._parameters, self.fp32_params, self._is_low_precision_param):
             if is_lp:
-                model_param.copy_(op_cast(fp32_param, model_param.dtype))
+                inplace_copy(model_param, op_cast(fp32_param, model_param.dtype))
 
     def reload_main_params_from_model(self):
         """Refresh fp32 master weights from the model parameters.
@@ -268,11 +269,11 @@ class AdamW(Optimizer):
             for model_param, fp32_param, is_lp in zip(
                     self._parameters, self.fp32_params, self._is_low_precision_param):
                 if is_lp:
-                    fp32_param.copy_(op_cast(model_param, mstype.float32))
+                    inplace_copy(fp32_param, op_cast(model_param, mstype.float32))
 
     def _increase_global_step(self):
         """Increase global step in PyNative mode without static-graph AssignAdd."""
-        self.global_step.copy_(self.global_step + self.global_step_increase_tensor)
+        inplace_copy(self.global_step, self.global_step + self.global_step_increase_tensor)
 
     def construct(self, gradients):
         """Forward AdamW algorithm."""

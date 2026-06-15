@@ -20,6 +20,7 @@ from mindspore.common._grad_function import _Function
 from mindspore import log as logger
 
 from mindformers.tools.logger import _LogActionOnce
+from mindformers.pynative.dtensor_compat import inplace_copy
 
 
 class _LogSoftmax(_Function):
@@ -320,6 +321,6 @@ class _ChunkCrossEntropyLoss(_Function):
             grad_scale = mint.div(mint.mul(seq_mask, grads), ctx.denominator)
             grad = mint.mul(grad, mint.unsqueeze(grad_scale, -1))
             grad = ops.cast(mint.reshape(grad, seq_shape), ctx.logits_dtype)
-            grad_logits.narrow(1, start_idx, chunk_size).copy_(grad)
+            inplace_copy(grad_logits.narrow(1, start_idx, chunk_size), grad)
             start_idx = end_idx
         return grad_logits, mint.zeros_like(labels), mint.zeros_like(input_mask), None
