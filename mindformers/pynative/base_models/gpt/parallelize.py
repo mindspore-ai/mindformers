@@ -114,6 +114,16 @@ def _unwrap_gptmodel(model: nn.Cell) -> nn.Cell:
     return gpt_models[0]
 
 
+def is_norm_module(module):
+    """Return True when module is a norm or an activation wrapper around a norm."""
+    if isinstance(module, (FusedLayerNorm, FusedRMSNorm)):
+        return True
+    unwrapped = getattr(module, "unwrap_cell", None)
+    if unwrapped is not None:
+        return isinstance(unwrapped, (FusedLayerNorm, FusedRMSNorm))
+    return False
+
+
 def _layer_inner_hsdp_modules(layer: nn.Cell) -> List[nn.Cell]:
     """Return all FSDP-wrapped sub-modules nested inside a layer (excluding the layer itself)."""
     if not layer:
@@ -363,14 +373,13 @@ def _apply_mtp_concat_tp(
 def _collect_layer_norms(layer):
     """Collect independent norm submodules from a transformer layer for separate FSDP wrapping."""
     norms = {}
-    norm_cls = (FusedLayerNorm, FusedRMSNorm)
     for attr_name in ("input_layernorm", "pre_mlp_layernorm", "pre_cross_attn_layernorm"):
         norm = getattr(layer, attr_name, None)
-        if isinstance(norm, norm_cls):
+        if is_norm_module(norm):
             norms[attr_name] = norm
     for attr_name in ("q_layernorm", "k_layernorm"):
         norm = getattr(layer.self_attention, attr_name, None)
-        if isinstance(norm, norm_cls):
+        if is_norm_module(norm):
             norms[attr_name] = norm
     return norms
 
@@ -1090,7 +1099,7 @@ def apply_fsdp(
     # Principle: small modules (norms) first, then larger modules (output_layer)
     if tail_modules:
         for tail_module in tail_modules:
-            if isinstance(tail_module, (FusedLayerNorm, FusedRMSNorm)):
+            if is_norm_module(tail_module):
                 # Small module: wrap norm independently
                 with ms.DeviceCtx("meta"):
                     fully_shard(tail_module, **fsdp_config)
