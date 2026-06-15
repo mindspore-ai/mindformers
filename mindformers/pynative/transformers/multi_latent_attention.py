@@ -27,6 +27,7 @@ from mindformers.parallel_core.transformer_config import MLATransformerConfig
 from mindformers.pynative.base_models.common.embeddings.rope_utils import ApplyRotaryPosEmb
 from mindformers.pynative.base_models.common.embeddings.yarn_rotary_pos_embedding import _yarn_get_mscale
 from mindformers.pynative.layers.identity_op import IdentityOp
+from mindformers.pynative.dtensor_compat import inplace_copy
 
 
 @dataclass
@@ -242,7 +243,7 @@ class MultiLatentAttention(nn.Cell):
             return
 
         with SkipDTensorDispatch():
-            param.copy_(weights)
+            inplace_copy(param, weights)
 
     def apply_qk_clip_to_weights(self, param_prefix, scales, split_fn, merge_fn,
                                  fp32_param_map=None):
@@ -286,7 +287,7 @@ class MultiLatentAttention(nn.Cell):
 
         weights = self._restore_tensor_layout(weights, param_layout)
         with SkipDTensorDispatch():
-            param.copy_(weights)
+            inplace_copy(param, weights)
 
     def construct(self, x: Tensor, attention_mask=None, rotary_pos_emb=None,
                   prefix_keys_values=None, pad_zeros=None, actual_seq_len=None):

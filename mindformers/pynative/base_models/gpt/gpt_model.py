@@ -42,6 +42,7 @@ from mindformers.pynative.transformers.multi_token_prediction import MultiTokenP
 from mindformers.pynative.layers.linear import Linear
 from mindformers.pynative.optimizer.muon_utils import make_muon_fns
 from mindformers.pynative.transformers.multi_token_prediction import process_mtp_loss
+from mindformers.pynative.dtensor_compat import inplace_copy
 
 
 class GPTModel(nn.Cell):
@@ -549,7 +550,7 @@ class GPTModel(nn.Cell):
                 row = stacked[i]
                 if mesh is not None:
                     row = distribute_tensor(row, mesh, placements).to_local()
-                p.copy_(row)
+                inplace_copy(p, row)
 
     def allreduce_max_attention_logit(self):
         """AllReduce-Max of every layer's ``max_logits_val`` in a single batched

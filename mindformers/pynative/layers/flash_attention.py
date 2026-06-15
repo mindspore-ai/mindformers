@@ -30,6 +30,7 @@ from mindspore.nn.cell import Cell
 from mindspore.ops.operations.nn_ops import FlashAttentionScore
 
 from mindformers.parallel_core.transformer_config import TransformerConfig, MLATransformerConfig
+from mindformers.pynative.dtensor_compat import inplace_copy
 
 
 def _local_head_slice(softmax_val, head_dim=1):
@@ -305,7 +306,7 @@ class FlashAttention(Cell):
             if n_local == n_param:
                 if running:
                     max_logits = self.maximum(self.max_logits_val, max_logits)
-                self.max_logits_val.copy_(max_logits.detach())
+                inplace_copy(self.max_logits_val, max_logits.detach())
                 return
             if head_slice is None or head_slice[1] - head_slice[0] != n_local:
                 raise ValueError(
