@@ -686,6 +686,9 @@ class ProfilerConfig(BaseConfig):
     profile_memory: bool = False
     """Whether to collect Tensor memory data."""
 
+    profile_cpu: bool = True
+    """Whether to include CPU profiling activities."""
+
     with_stack: bool = True
     """Whether to collect Python-side stack trace data."""
 
