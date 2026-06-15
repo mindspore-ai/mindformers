@@ -231,6 +231,7 @@ def test_fsdp_cp2_colossal_gbs2():
     configs["train_dataset"]["dataloader"]["dataset_files"] = [DATASET_PATH]
     configs["training"]["local_batch_size"] = 1
     configs["parallelism"]["context_parallel"] = 2
+    configs["model"]["use_attn_mask_compression"] = True
     configs["parallelism"]["context_parallel_method"] = "colossal"
     configs["training"]["steps"] = 10
 
@@ -279,6 +280,7 @@ def test_fsdp_cp2_ulysses_gbs2():
     configs["train_dataset"]["dataloader"]["dataset_files"] = [DATASET_PATH]
     configs["training"]["local_batch_size"] = 1
     configs["parallelism"]["context_parallel"] = 2
+    configs["model"]["use_attn_mask_compression"] = True
     configs["parallelism"]["context_parallel_method"] = "ulysses"
     configs["training"]["steps"] = 10
 
@@ -328,6 +330,7 @@ def test_fsdp_cp2_ulysses_async_gbs2():
     configs["train_dataset"]["dataloader"]["dataset_files"] = [DATASET_PATH]
     configs["training"]["local_batch_size"] = 1
     configs["parallelism"]["context_parallel"] = 2
+    configs["model"]["use_attn_mask_compression"] = True
     configs["parallelism"]["context_parallel_method"] = "ulysses"
     configs["parallelism"]["context_parallel_async"] = True
     configs["training"]["steps"] = 10
