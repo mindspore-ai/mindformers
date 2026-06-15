@@ -17,10 +17,7 @@ from mindspore import Tensor
 
 from mindformers.models.deepseek3.utils import DeepseekV3PreTrainedModel
 from mindformers.pynative.base_models.gpt.gpt_model import GPTModel
-from mindformers.pynative.base_models.gpt.gpt_layer_specs import (
-        get_gpt_decoder_block_spec,
-        get_gpt_mtp_block_spec,
-    )
+from mindformers.pynative.base_models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
 from mindformers.pynative.base_models.gpt.parallelize import parallelize_gptmodel
 from mindformers.pynative.distributed.parallelize import register_parallelize
 from mindformers.parallel_core.utils.model_mixin import TrainModelMixin
@@ -39,10 +36,6 @@ class PyNativeDeepseekV3ForCausalLM(TrainModelMixin, DeepseekV3PreTrainedModel):
             transformer_layer_spec = get_gpt_decoder_block_spec(transformer_config)
         else:
             raise ValueError("Only MoE model is supported in PyNativeDeepseekV3ForCausalLM.")
-        mtp_block_spec = None
-        if transformer_config.mtp_num_layers:
-            mtp_block_spec = get_gpt_mtp_block_spec(transformer_config, transformer_layer_spec)
-
         self.model = GPTModel(
             config=transformer_config,
             transformer_layer_spec=transformer_layer_spec,
@@ -52,7 +45,6 @@ class PyNativeDeepseekV3ForCausalLM(TrainModelMixin, DeepseekV3PreTrainedModel):
             rotary_percent=1.0,
             rotary_base=transformer_config.rotary_base,
             rope_scaling=False,
-            mtp_block_spec=mtp_block_spec,
             layer_start=kwargs.get("layer_start", 0),
             layer_end=kwargs.get("layer_end", None),
             stage_idx=kwargs.get("stage_idx", 0),
