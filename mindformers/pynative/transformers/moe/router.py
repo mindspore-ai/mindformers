@@ -445,18 +445,59 @@ class TopKRouter(nn.Cell):
             self.score_func,
         )
 
-        if self.aux_loss_type == "seq_aux_loss":
-            top_scores = self._apply_seq_aux_loss(
-                top_scores, scores_for_aux_loss, routing_map_for_aux_loss, seq_length, bsz
-            )
-        elif self.aux_loss_type == "global_aux_loss":
-            top_scores = self._apply_global_aux_loss(
-                top_scores, scores_for_aux_loss, routing_map_for_aux_loss
-            )
-        else:
+        aux_loss_func_map = {
+            "aux_loss": self._apply_aux_loss,
+            "seq_aux_loss": self._apply_seq_aux_loss,
+            "global_aux_loss": self._apply_global_aux_loss,
+        }
+
+        aux_loss_func = aux_loss_func_map.get(self.aux_loss_type)
+        if aux_loss_func is None:
             raise ValueError(f"Unknown aux_loss_type {self.aux_loss_type}")
 
+        top_scores = aux_loss_func(
+            top_scores, scores_for_aux_loss, routing_map_for_aux_loss,
+            seq_length, bsz,
+        )
+
         return top_scores
+
+    def _apply_aux_loss(
+            self,
+            top_scores: Tensor,
+            scores_for_aux_loss: Tensor,
+            routing_map: Tensor,
+            seq_length: int = 0,
+            bsz: int = 0,
+    ) -> Tensor:
+        """
+        Compute auxiliary load-balancing loss for Switch Transformer.
+
+        Args:
+            top_scores (Tensor): Top-K routing scores, shape ``[T, K]``.
+            scores_for_aux_loss (Tensor): Router probabilities, shape ``[T, E]``.
+            routing_map (Tensor): Token-expert assignment map (detached), shape ``[T, E]``.
+            seq_length (int): Unused. Present for unified dispatch signature.
+            bsz (int): Unused. Present for unified dispatch signature.
+
+        Returns:
+            Tensor: top_scores with aux loss gradient injected.
+        """
+        _ = seq_length, bsz
+        tokens_per_expert = routing_map.sum(dim=0)
+        total_num_tokens = scores_for_aux_loss.shape[0]
+
+        aux_loss = switch_load_balancing_loss_func(
+            probs=scores_for_aux_loss,
+            tokens_per_expert=tokens_per_expert,
+            total_num_tokens=total_num_tokens,
+            topk=self.top_k,
+            num_experts=self.num_experts,
+            moe_aux_loss_coeff=self.moe_aux_loss_coeff,
+        )
+        return self._attach_and_log_aux_loss(
+            top_scores, aux_loss, self.moe_aux_loss_coeff
+        )
 
     def _apply_seq_aux_loss(
             self,
@@ -506,6 +547,8 @@ class TopKRouter(nn.Cell):
             top_scores: Tensor,
             scores_for_aux_loss: Tensor,
             routing_map: Tensor,
+            seq_length: int = 0,
+            bsz: int = 0,
     ) -> Tensor:
         """
         Compute global-batch auxiliary loss with EMA accumulation and inject gradient.
@@ -514,10 +557,13 @@ class TopKRouter(nn.Cell):
             top_scores (Tensor): Top-K routing scores, shape ``[T, K]``.
             scores_for_aux_loss (Tensor): Router probabilities, shape ``[T, E]``.
             routing_map (Tensor): Token-expert assignment map (detached), shape ``[T, E]``.
+            seq_length (int): Unused. Present for unified dispatch signature.
+            bsz (int): Unused. Present for unified dispatch signature.
 
         Returns:
             Tensor: top_scores with aux loss gradient injected.
         """
+        _ = seq_length, bsz
         tokens_per_expert = routing_map.sum(dim=0)
         self.global_tokens_per_expert += tokens_per_expert
         self.ga_steps += 1
