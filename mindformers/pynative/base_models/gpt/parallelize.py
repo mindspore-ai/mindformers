@@ -1516,7 +1516,10 @@ def apply_pp(
 
     model_cls = type(model)
     builder = StageModelBuilder(layer_setting)
-    stages, model_parts = builder.build_stages(model_cls, model.config, pp_mesh)
+    # tp_mesh lets each stage resolve the rank group for TP/SP-sharded activations
+    # crossing the PP boundary (the pp_mesh's flat world root can't resolve "tp").
+    tp_mesh = parallel_dims.get_optional_mesh("tp")
+    stages, model_parts = builder.build_stages(model_cls, model.config, pp_mesh, tp_mesh)
     del model
 
     # Create one CommComputeOverlap orchestrator per rank when B/F EP overlap

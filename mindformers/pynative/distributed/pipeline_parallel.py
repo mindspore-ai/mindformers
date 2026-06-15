@@ -47,6 +47,36 @@ class ScaledLossPipelineStage(PipelineStage):
 
     loss_scale = 1.0
 
+    def __init__(self, *args, tp_mesh=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        # ``tp_mesh`` (and any future per-axis within-stage submesh) is captured
+        # here and NOT forwarded to the base ``PipelineStage``, which has no such
+        # parameter. Used by ``_get_layout_rank_list`` below.
+        self._axis_meshes = {"tp": tp_mesh} if tp_mesh is not None else {}
+
+    def _get_layout_rank_list(self, layout):
+        """Resolve a received activation's submesh ranks from explicit axis meshes.
+
+        The base impl resolves the sender's submesh from ``self.mesh.root_mesh``
+        by name (e.g. ``root["tp"]``). But mindformers builds ``pp_mesh`` as
+        ``dataloading_mesh["pp"]`` whose ``root_mesh`` collapses to the flat 1-D
+        ``("world",)`` mesh — that root's flatten-mapping has no ``tp`` axis, so
+        the base hits its ``root.ndim <= 1`` "PP-only" guard and wrongly returns
+        a single rank, crashing the subsequent ``reshape`` for a TP/SP-sharded
+        activation (``mesh_shape=(2,)``).
+
+        We instead resolve any axis present in ``self._axis_meshes`` directly
+        from the current rank's submesh, whose ``rank_list`` is exactly this
+        rank's group along that axis. Anything else falls back to the base.
+        """
+        pp_dim_names = set(self.mesh.mesh_dim_names or ()) if self.mesh is not None else set()
+        layout_dim_names = tuple(
+            name for name in (getattr(layout, "alias_name", None) or ()) if name not in pp_dim_names
+        )
+        if len(layout_dim_names) == 1 and layout_dim_names[0] in self._axis_meshes:
+            return tuple(self._axis_meshes[layout_dim_names[0]].rank_list)
+        return super()._get_layout_rank_list(layout)
+
     def get_last_stage_sens(self, last_stage_outputs):
         p_sens = super().get_last_stage_sens(last_stage_outputs)
         scale = self.loss_scale
@@ -136,6 +166,7 @@ class StageModelBuilder:
         model_cls: type,
         model_config,
         pp_mesh,
+        tp_mesh=None,
     ) -> tuple[list[PipelineStage], list[nn.Cell]]:
         """
         Build pipeline parallel stages.
@@ -170,6 +201,7 @@ class StageModelBuilder:
                 device=pp_mesh.device_type,
                 group=pp_mesh.get_group(),
                 mesh=pp_mesh,
+                tp_mesh=tp_mesh,
             )
             stages.append(stage)
         
