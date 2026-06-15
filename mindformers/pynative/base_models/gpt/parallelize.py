@@ -955,11 +955,17 @@ def apply_fsdp(
     gpt_model = _unwrap_gptmodel(model)
 
     # --- Resolve dp_mesh ---
+    # The ``fsdp`` axis already folds ``cp`` (fsdp = dp_shard * cp), so CP needs
+    # no special-casing here: when dp_replicate is on we shard over the 2D
+    # [dp_replicate, fsdp] HSDP mesh, otherwise over the 1D fsdp mesh. Folding CP
+    # into a single ``cp_enabled`` branch would have dropped dp_replicate on
+    # HSDP+CP runs (sharding only over dp_shard*cp instead of the full domain).
     if parallel_dims.dp_replicate_enabled:
-        # change `dp_shard` to `fsdp` if hyper-parallel support flatten
-        dp_mesh = parallel_dims.world_mesh["dp_replicate", "fsdp"]
+        dp_mesh = parallel_dims.get_mesh(["dp_replicate", "fsdp"])
+        logger.info("Using HSDP mesh [dp_replicate, fsdp] (2D)")
     else:
-        dp_mesh = parallel_dims.world_mesh["fsdp"]
+        dp_mesh = parallel_dims.get_mesh("fsdp")
+        logger.info("Using FSDP mesh [fsdp] (1D)")
 
     edp_mesh = None
     if parallel_dims.ep_enabled:
@@ -1325,7 +1331,7 @@ def _apply_spmd_parallelism(
     if parallel_dims.cp_enabled:
         apply_context_parallel_attention(
             model=model,
-            cp_mesh=parallel_dims.world_mesh["cp"],
+            cp_mesh=parallel_dims.get_mesh("cp"),
             parallel_dims=parallel_dims,
             parallelism=parallelism,
         )

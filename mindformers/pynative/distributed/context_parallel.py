@@ -185,7 +185,7 @@ def apply_context_parallel_model_io(model: nn.Cell, parallel_dims, parallelism) 
     if not getattr(parallel_dims, "cp_enabled", False):
         return model
     return ContextParallelModelIOStyle(
-        cp_mesh=parallel_dims.world_mesh["cp"],
+        cp_mesh=parallel_dims.get_mesh("cp"),
         cp_method=getattr(parallelism, "context_parallel_method", "colossal"),
         ulysses_degree_in_cp=getattr(parallelism, "ulysses_degree_in_cp", None),
         mask_type=getattr(parallelism, "context_parallel_mask_type", "causal"),
