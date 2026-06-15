@@ -621,7 +621,7 @@ def process_mtp_loss(
 
         mtp_loss_scale = config.mtp_loss_scaling_factor / config.mtp_num_layers
         save_to_mtp_losses_tracker(
-            mtp_loss_scale * mtp_loss_sum / num_tokens,
+            mtp_loss_sum / num_tokens,
             mtp_layer_number,
             config.mtp_num_layers,
         )
