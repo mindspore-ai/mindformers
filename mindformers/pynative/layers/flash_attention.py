@@ -284,10 +284,24 @@ class FlashAttention(Cell):
         clip scales always see every head.
         """
         head_slice = _local_head_slice(softmax_val)
+        # ``max_logits_val`` may be head-sharded over the tensor-parallel group
+        # (parallelize.py:562) or replicated. Everything inside the
+        # ``SkipDTensorDispatch`` block below operates on the LOCAL shard, but
+        # ``.shape[0]`` is the GLOBAL head count when the parameter is sharded.
+        # Comparing the local ``amax`` head count against the global length made
+        # the TP-sharded case wrongly take the head-slice path and index the
+        # local shard with GLOBAL coordinates -> ``max_logits_val[16:32]`` on a
+        # length-16 local shard = empty ``[0]`` -> ``Maximum`` broadcast crash.
+        # Compare against the LOCAL length (a sharded parameter exposes its
+        # per-rank shard via ``local_shape``) so the TP-sharded case (local heads
+        # == local amax) takes the safe local-to-local path; the replicated /
+        # context-parallel head-shard case is unchanged (local length == global).
+        mlv_local_shape = getattr(self.max_logits_val, "local_shape", None)
+        n_param = int(mlv_local_shape[0]) if mlv_local_shape is not None \
+            else int(self.max_logits_val.shape[0])
         with SkipDTensorDispatch():
             max_logits = self.amax(softmax_val, dim=reduce_dims, keepdim=False)
             n_local = int(max_logits.shape[0])
-            n_param = int(self.max_logits_val.shape[0])
             if n_local == n_param:
                 if running:
                     max_logits = self.maximum(self.max_logits_val, max_logits)
