@@ -405,6 +405,10 @@ class ParallelismConfig(BaseConfig):
     sequence_parallel: bool = False
     """Enable sequence parallelism"""
 
+    enable_mc2: bool = False
+    """Enable MC2 (matmul + communication fusion) via all_gather_matmul /
+    matmul_reduce_scatter. Requires tensor parallelism with sequence parallelism."""
+
     expert_parallel: int = 1
     """Expert parallelism degree"""
 
