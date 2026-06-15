@@ -544,7 +544,6 @@ def _compute_grad_norm_sq_fused(local_grads, grad_factors):
 
 def _calculate_global_grad_norm(
     parameters,
-    parallelism,
     enable_parallel: bool = False,
     max_norm: float = 1.0,
     eps: float = 1e-6,
@@ -601,11 +600,6 @@ def _calculate_global_grad_norm(
         from mindspore import ops
         from mindspore.mint.distributed import all_reduce
         all_reduce(total_norm_sq, op=ops.ReduceOp.SUM)
-        micro_batch_num = parallelism.pipeline_parallel_microbatch_size
-        if parallelism.pipeline_parallel > 1 and (parallelism.data_parallel > 1 or
-                                                  micro_batch_num > 1):
-            total_norm_sq /= ((get_world_size() // parallelism.tensor_parallel) * 
-                              micro_batch_num * parallelism.context_parallel)
 
     global_norm = mint.sqrt(total_norm_sq)
 

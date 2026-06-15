@@ -381,7 +381,7 @@ class ParallelismConfig(BaseConfig):
     pipeline_parallel: int = 1
     """Pipeline parallelism degree"""
 
-    pipeline_parallel_layers_per_stage: Optional[Union[List[List[int]], List[str], str]] = None
+    pipeline_parallel_layers_per_stage: Optional[Union[List[List[int]], List[str], str]] = "auto"
     """Layers assigned to each pipeline stage"""
 
     pipeline_parallel_schedule: str = "1f1b"
