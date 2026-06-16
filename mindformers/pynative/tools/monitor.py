@@ -158,7 +158,7 @@ class TrainStateMonitor(Monitor):
 
     def _record_local_norm(self, value, context):  # pylint: disable=W0613
         """Record local gradient norms for parameters matching the config filter."""
-        from mindformers.pynative.trainer.utils import _get_grad_factor
+        from mindformers.pynative.trainer.utils import _get_grad_factor, get_grad
         model = self._resolve_model()
         if model is None:
             return
@@ -167,13 +167,13 @@ class TrainStateMonitor(Monitor):
         if self._record_config.get("local_norm", False):
             self._records.append({"micro_step": micro_step + 1})
         for param in model.trainable_params():
-            if param.grad is None:
+            grad = get_grad(param)
+            if grad is None:
                 continue
             record_local_norm = self._should_record_norm(param.name, "local_norm")
             record_device_norm = self._should_record_norm(param.name, "device_norm")
             if not record_local_norm and not record_device_norm:
                 continue
-            grad = param.grad
             local_grad = grad.to_local() if DTensor and isinstance(grad, DTensor) else grad
             accumulated_norm = (float(local_grad.pow(2).sum().sqrt().asnumpy())
                                 / _get_grad_factor(grad))

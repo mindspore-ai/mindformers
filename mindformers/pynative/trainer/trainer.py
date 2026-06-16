@@ -299,9 +299,6 @@ class Trainer:
             recompute=self.config.recompute,
             recompute_comm=self.config.recompute_comm,
             swap=self.config.swap,
-            accumulate_allreduce_grads_in_fp32=(
-                self.config.optimizer.accumulate_allreduce_grads_in_fp32
-            ),
             gradient_accumulation_steps=self.num_accumulation_steps,
         )
         return model, schedule, has_first, has_last
@@ -555,13 +552,16 @@ class Trainer:
         )
 
     def _register_grad_hooks(self):
-        """Register backward hooks to cast low-precision gradients to fp32.
+        """Register backward hooks to cast low-precision gradients to fp32 (single-card only).
 
-        When enabled, bf16/fp16 parameter gradients are cast to fp32 during backward
-        so that gradient accumulation and all-reduce operate in fp32 precision,
-        aligning with Megatron-LM's accumulate_allreduce_grads_in_fp32 behavior.
+        bf16/fp16 parameter gradients are cast to fp32 during backward so that
+        gradient accumulation operates in fp32 precision, aligning with Megatron-LM.
+
+        Multi-card runs go through ``fully_shard`` instead, where HSDP's
+        ``apply_grad_on_fp32_main_grad`` policy accumulates the reduced gradient onto
+        a fp32 ``param.main_grad`` buffer, so these hooks are unnecessary there.
         """
-        if not self.config.optimizer.accumulate_allreduce_grads_in_fp32:
+        if self.enable_parallel:
             return
 
         low_precision_types = (ms.bfloat16, ms.float16)
