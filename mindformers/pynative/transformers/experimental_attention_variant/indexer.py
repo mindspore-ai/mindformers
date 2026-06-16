@@ -83,7 +83,7 @@ class CSAIndexer(nn.Cell):
         self.rotary_pos_emb = rotary_pos_emb
 
         self.input_layout = config.input_layout
-        self.is_tnd = self.input_layout == "TND"
+        self.is_tnd = self.input_layout == "TND" and config.apply_dsa_kernel_fusion
         self.hidden_size = config.hidden_size
         self.qk_pos_emb_head_dim = config.qk_pos_emb_head_dim
         self.q_lora_rank = config.q_lora_rank if config.q_lora_rank is not None else config.hidden_size
@@ -190,7 +190,7 @@ class CSAIndexer(nn.Cell):
         if self.is_tnd:
             q = self.reshape(q, (seqlen * bsz, self.index_n_heads, self.index_head_dim))
             k = self.reshape(k, (seqlen * bsz, 1, self.index_head_dim))
-            weights = self.reshape(weights, (seqlen * bsz, self.index_n_heads))
+            weights = self.reshape(weights, (-1, self.index_n_heads))
 
         return q, k, weights
 
@@ -230,8 +230,8 @@ class CSAIndexer(nn.Cell):
             # [b, sq, n, sk] * [b, sq, n, 1] -> [b, sq, n, sk]
             index_scores = index_scores * self.unsqueeze(weights, -1)
 
-            # Sum across attention heads. [b, sq, n, sk] -> [b, sq, 1, sk]
-            index_scores = self.sum(index_scores, dim=2, keepdim=True)
+            # Sum across attention heads. [b, sq, n, sk] -> [b, sq, sk]
+            index_scores = self.sum(index_scores, dim=2)
             if mask is not None:
                 mask = self.cast(mask, mstype.float32)
                 index_scores = index_scores + mask
@@ -319,9 +319,7 @@ def compute_unfused_indexer_loss(
     sk, _, _, _ = key.shape
     query = mint.permute(query, (1, 2, 0, 3)).to(mstype.float32)
     key = mint.permute(key, (1, 2, 3, 0)).to(mstype.float32)
-    attention_scores = mint.bmm(query, key) * softmax_scale
-    index_scores = mint.reshape(index_scores, (b, sq, sk))
-    topk_indices = mint.reshape(topk_indices, (b, sq, -1))
+    attention_scores = mint.matmul(query, key) * softmax_scale
 
     if mask is None:
         causal_mask = mint.triu(mint.full((sq, sk), float("-inf"), dtype=mstype.float32), diagonal=1)

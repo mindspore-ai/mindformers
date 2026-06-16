@@ -18,6 +18,7 @@
 # limitations under the License.
 # ============================================================================
 """GPT LayerSpec."""
+import dataclasses
 from typing import Optional, Union
 
 from mindformers.pynative.layers.linear import Linear
@@ -35,6 +36,9 @@ from mindformers.pynative.transformers.transformer_layer import (
 from mindformers.parallel_core.transformer_config import TransformerConfig
 from mindformers.parallel_core.utils.spec_utils import ModuleSpec
 from mindformers.pynative.base_models.gpt.moe_module_specs import get_moe_module_spec
+from mindformers.pynative.base_models.gpt.experimental_attention_variant_module_specs import (
+    get_dsv4_hybrid_module_spec,
+)
 from mindformers.pynative.transformers.multi_latent_attention import (
     MLASelfAttention,
     MLASelfAttentionSubmodules
@@ -72,6 +76,7 @@ def get_gpt_layer_local_spec(
         enable_hyper_connections: Optional[bool] = False,
         fused_norm: Optional[bool] = True,
         normalization: Optional[str] = "RMSNorm",
+        is_dsv4_hybrid: Optional[bool] = False
 ) -> ModuleSpec:
     """Use this spec for an implementation using only modules in Megatron-Core.
 
@@ -94,6 +99,19 @@ def get_gpt_layer_local_spec(
         moe_grouped_gemm=moe_grouped_gemm,
     )
     layer_cls = HyperConnectionTransformerLayer if enable_hyper_connections else TransformerLayer
+
+    # DSv4 hybrid attention selects its self-attention spec directly here, rather than rebuilding a base layer
+    # and swapping the self_attention slot afterwards.
+    if is_dsv4_hybrid:
+        return ModuleSpec(
+            module=layer_cls,
+            submodules=TransformerLayerSubmodules(
+                input_layernorm=get_norm_cls(normalization, fused_norm),
+                self_attention=get_dsv4_hybrid_module_spec(qk_layernorm, fused_norm, normalization),
+                pre_mlp_layernorm=get_norm_cls(normalization, fused_norm),
+                mlp=mlp,
+            ),
+        )
 
     if multi_latent_attention:
         self_attention = ModuleSpec(
@@ -151,6 +169,7 @@ def get_gpt_decoder_block_spec(
         multi_latent_attention=config.multi_latent_attention,
         enable_hyper_connections=config.enable_hyper_connections,
         fused_norm=config.fused_norm,
+        is_dsv4_hybrid=config.experimental_attention_variant == "dsv4_hybrid",
     )
 
     moe_layer_spec = get_gpt_layer_local_spec(
@@ -160,7 +179,9 @@ def get_gpt_decoder_block_spec(
         multi_latent_attention=config.multi_latent_attention,
         enable_hyper_connections=config.enable_hyper_connections,
         fused_norm=config.fused_norm,
+        is_dsv4_hybrid=config.experimental_attention_variant == "dsv4_hybrid",
     )
+
     # Parse config.moe_layer_freq to determine the pattern of expert/dense layers.
     # 0 stands for dense layers, 1 stands for expert layers.
     # For integer N: Creates a pattern with one expert layer every N layers.
