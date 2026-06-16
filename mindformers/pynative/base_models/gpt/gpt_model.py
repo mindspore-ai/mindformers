@@ -130,8 +130,10 @@ class GPTModel(nn.Cell):
 
         self.rotary_scaling = rope_scaling
         self.rope_scaling_factor = rope_scaling_factor
-        self.rotary_seq_len_interpolation_factor = seq_len_interpolation_factor \
-            if seq_len_interpolation_factor is not None else config.rotary_seq_len_interpolation_factor
+        if seq_len_interpolation_factor is not None:
+            self.rotary_seq_len_interpolation_factor = seq_len_interpolation_factor
+        else:
+            self.rotary_seq_len_interpolation_factor = config.rotary_seq_len_interpolation_factor
         self.seq_length = config.seq_length
         mtp_block_spec = None
         if config.mtp_num_layers:
@@ -184,7 +186,11 @@ class GPTModel(nn.Cell):
                 self.rotary_pos_emb = RotaryEmbedding(
                     kv_channels=config.qk_pos_emb_head_dim,
                     rotary_percent=config.rotary_percent,
+                    rotary_interleaved=self.config.rotary_interleaved,
+                    seq_len_interpolation_factor=seq_len_interpolation_factor,
                     rotary_base=config.rotary_base,
+                    rope_scaling=rope_scaling,
+                    rope_scaling_factor=rope_scaling_factor,
                     use_eod_reset=config.use_eod_reset,
                     use_position_ids=use_rotary_position_ids
                 )
@@ -203,6 +209,9 @@ class GPTModel(nn.Cell):
         elif self.position_embedding_type == 'yarn':
             self.rotary_pos_emb = YarnRotaryEmbedding(
                 kv_channels=config.qk_pos_emb_head_dim,
+                rotary_percent=config.rotary_percent,
+                rotary_interleaved=self.config.rotary_interleaved,
+                seq_len_interpolation_factor=seq_len_interpolation_factor,
                 rotary_base=config.rotary_base,
                 scaling_factor=config.rotary_scaling_factor,
                 original_max_position_embeddings=config.max_position_embeddings,

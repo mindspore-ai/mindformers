@@ -63,19 +63,12 @@ class ApplyRotaryPosEmb(nn.Cell):
 
     Args:
         config (TransformerConfig): The transformer configuration
-        for_k_pos_emb (bool, optional): Whether this instance is used for key embeddings. Defaults to False.
     """
 
-    def __init__(self,
-                 config: TransformerConfig,
-                 for_k_pos_emb: bool = False
-                 ):
+    def __init__(self, config: TransformerConfig,):
         super().__init__()
         self.append_eod = config.use_eod_reset
         self.apply_rope_fusion = config.apply_rope_fusion
-        # Accepted but not read inside construct: the K and Q paths behave identically here.
-        # Kept for call-site / API symmetry (call sites pass it); do not remove.
-        self.for_k_pos_emb = for_k_pos_emb
         self.rotary_dtype = config.rotary_dtype
 
         self.add = mint.add
@@ -131,13 +124,19 @@ class ApplyRotaryPosEmb(nn.Cell):
             t_not_rotary = self.narrow(t, dim=-1, start=rot_dim, length=head_dim - rot_dim)
             t = t_rotary
 
-        if multi_latent_attention:
+        deinterleave_mla = multi_latent_attention and not rotary_interleaved
+        fused_interleaved_mla = (
+            self.apply_rope_fusion and deinterleave_mla and not inverse and not mla_output_remove_interleaving
+        )
+        if deinterleave_mla and not fused_interleaved_mla:
             t_reshaped = self.reshape(t, (seq_len, bs, n_heads, rot_dim // 2, 2))
             t_1 = t_reshaped[..., 0]
             t_2 = t_reshaped[..., 1]
             t = self.cat((t_1, t_2), dim=-1)
 
         t = self.cast(t, self.rotary_dtype)
+        if fused_interleaved_mla:
+            freqs = self._to_interleaved_freqs(freqs)
         cos_ = self.cast(self.cos(self.mul_mscale(freqs, m_scale)), self.rotary_dtype)
         sin_ = self.cast(self.sin(self.mul_mscale(freqs, m_scale)), self.rotary_dtype)
         # Negating sin implements the conjugate (inverse) rotation by -theta used for the MLA
@@ -146,7 +145,8 @@ class ApplyRotaryPosEmb(nn.Cell):
             sin_ = self.neg(sin_)
 
         if self.apply_rope_fusion and not inverse:
-            output = self.rope(t, cos_, sin_, 0)
+            mode = 1 if rotary_interleaved or fused_interleaved_mla else 0
+            output = self.rope(t, cos_, sin_, mode)
         else:
             t_rot = self._rotate_half(t, rotary_interleaved)
             output = self.add(self.mul(t, cos_), self.mul(t_rot, sin_))
@@ -154,7 +154,7 @@ class ApplyRotaryPosEmb(nn.Cell):
         # Why this re-interleave branch exists:
         # DSv4 applies rope on V and O, so we need to uninterleave the tensor.
         # The existing MLA code is safe because the dot product is permutation-invariant.
-        if multi_latent_attention and mla_output_remove_interleaving:
+        if deinterleave_mla and mla_output_remove_interleaving:
             half = output.shape[-1] // 2
             o_1 = self.narrow(output, dim=-1, start=0, length=half)
             o_2 = self.narrow(output, dim=-1, start=half, length=half)
@@ -166,6 +166,15 @@ class ApplyRotaryPosEmb(nn.Cell):
         if t_not_rotary is not None:
             output = self.cat((output, t_not_rotary), dim=-1)
         return self.cast(output, origin_dtype)
+
+    def _to_interleaved_freqs(self, freqs: Tensor) -> Tensor:
+        """Convert NeoX-style duplicated frequencies to GPT-J interleaved layout."""
+        rot_dim = freqs.shape[-1]
+        freqs_half = self.narrow(freqs, dim=-1, start=0, length=rot_dim // 2)
+        return self.reshape(
+            self.stack((freqs_half, freqs_half), dim=-1),
+            (*freqs.shape[:-1], rot_dim),
+        )
 
     def _rotate_half(self, t: Tensor, rotary_interleaved: bool = False) -> Tensor:
         """Rotates half of the input tensor for rotary position embeddings.

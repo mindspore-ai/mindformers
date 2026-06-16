@@ -134,9 +134,11 @@ class RotaryEmbedding(nn.Cell):
         freqs = self.outer(seq, self.inv_freq)
 
         if self.rotary_interleaved:
-            freqs_new_shape = (freqs.shape[0], -1)
-            emb = self.reshape(self.stack([self.reshape(freqs, (-1, 1)), self.reshape(freqs, (-1, 1))], dim=-1),
-                               freqs_new_shape)
+            freqs_rotary_shape = (freqs.shape[0], -1)
+            emb = self.reshape(
+                self.stack(
+                    [self.reshape(freqs, (-1, 1)), self.reshape(freqs, (-1, 1))], dim=-1
+                ), freqs_rotary_shape)
         else:
             emb = self.cat((freqs, freqs), dim=-1)
 

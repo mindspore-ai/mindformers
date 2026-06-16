@@ -127,7 +127,14 @@ class YarnRotaryEmbedding(RotaryEmbedding):
 
         freqs = self.outer(seq, self.freqs)
 
-        emb = self.cat((freqs, freqs), dim=-1)
+        if self.rotary_interleaved:
+            freqs_rotary_shape = (freqs.shape[0], -1)
+            emb = self.reshape(
+                self.stack(
+                    [self.reshape(freqs, (-1, 1)), self.reshape(freqs, (-1, 1))], dim=-1
+                ), freqs_rotary_shape)
+        else:
+            emb = self.cat((freqs, freqs), dim=-1)
 
         if not explicit_position_ids:
             out = self.reshape(emb, (-1, bs, 1, emb.shape[1]))

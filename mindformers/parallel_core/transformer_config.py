@@ -2284,9 +2284,6 @@ class TransformerConfig:
         if self.apply_query_key_layer_scaling:
             self.attention_softmax_in_fp32 = True
 
-        if self.multi_latent_attention and self.rotary_interleaved:
-            raise ValueError("rotary_interleaved does not work with multi_latent_attention.")
-
         if self.init_method is None:
             self.init_method = init_method_normal(self.init_method_std, self.params_dtype)
 
