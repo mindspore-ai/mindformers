@@ -37,6 +37,7 @@ from mindformers.parallel_core.transformer_config import TransformerConfig
 from mindformers.pynative.base_models.common.embeddings.language_model_embedding import LanguageModelEmbedding
 from mindformers.pynative.base_models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from mindformers.pynative.base_models.common.embeddings.yarn_rotary_pos_embedding import YarnRotaryEmbedding
+from mindformers.pynative.base_models.gpt.gpt_layer_specs import get_gpt_mtp_block_spec
 from mindformers.pynative.transformers.transformer_block import TransformerBlock, TransformerBlockSubmodules
 from mindformers.pynative.transformers.multi_token_prediction import MultiTokenPredictionBlock, MTPLossAutoScaler
 from mindformers.pynative.layers.linear import Linear
@@ -77,7 +78,6 @@ class GPTModel(nn.Cell):
         seq_len_interpolation_factor (Optional[float], optional):
             scale of linearly interpolating RoPE for longer sequences.
             The value must be a float larger than 1.0. Defaults to None.
-        mtp_block_spec (ModuleSpec): A mtp block spec. Defaults to None.
     """
 
     def __init__(
@@ -95,7 +95,6 @@ class GPTModel(nn.Cell):
             rope_scaling: bool = False,
             rope_scaling_factor: float = 8.0,
             seq_len_interpolation_factor: Optional[float] = None,
-            mtp_block_spec: ModuleSpec = None,
             layer_start: int = 0,
             layer_end: int = None,
             vp_size: int = 1,
@@ -134,6 +133,9 @@ class GPTModel(nn.Cell):
         self.rotary_seq_len_interpolation_factor = seq_len_interpolation_factor \
             if seq_len_interpolation_factor is not None else config.rotary_seq_len_interpolation_factor
         self.seq_length = config.seq_length
+        mtp_block_spec = None
+        if config.mtp_num_layers:
+            mtp_block_spec = get_gpt_mtp_block_spec(config, transformer_layer_spec)
         self.mtp_process = mtp_block_spec is not None and self.post_process
         self.stage_idx = stage_idx
         self.vp_size = vp_size
