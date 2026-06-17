@@ -129,7 +129,7 @@ class TopKRouter(nn.Cell):
                 requires_grad=False,
             )
             self.ga_steps = Parameter(
-                mint.empty((), dtype=mstype.float32),
+                mint.empty(1, dtype=mstype.float32),
                 name="ga_steps",
                 requires_grad=False,
             )

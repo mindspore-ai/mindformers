@@ -125,10 +125,10 @@ class LossCallback(TrainerCallback):
         # but still hold MoE layers whose ``tokens_per_expert`` accumulators must
         # be drained and converted into a bias delta to keep the router in sync
         # with the rest of the pipeline.
-
+        model_config = None
         if model is not None:
-            cfg = model.get_gpt_transformer_config()
-            if getattr(cfg, "moe_router_enable_expert_bias", False):
+            model_config = deepcopy(model.get_gpt_transformer_config())
+            if getattr(model_config, "moe_router_enable_expert_bias", False):
                 _update_expert_bias(model, metric_group, metric_group_size)
         if loss is None or state.global_step % self.log_interval != 0:
             return
@@ -139,7 +139,6 @@ class LossCallback(TrainerCallback):
         cur_time = time.time()
         step_time_cost = int((cur_time - self.step_time) * 1000)
 
-        model_config = deepcopy(model.get_gpt_transformer_config())
         reset_model_temporary_tensors(model_config, model)
 
         # process aux loss
