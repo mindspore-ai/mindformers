@@ -328,6 +328,11 @@ class ColwiseParallel(ParallelStyle):
             raise NotImplementedError(
                 "ColwiseParallel currently only support nn.Linear and nn.Embedding!"
             )
+        # Caller-supplied per-parameter layout overrides, applied only to params the module
+        # actually has, so this style stays agnostic of what those extra params are.
+        for name, layout in getattr(self, "extra_param_layouts", {}).items():
+            if getattr(module, name, None) is not None:
+                sharding_plan[name] = layout
         return sharding_plan
 
     def _apply(self, module: nn.Cell, device_mesh: DeviceMesh) -> nn.Cell:
@@ -435,6 +440,11 @@ class RowwiseParallel(ParallelStyle):
             raise NotImplementedError(
                 "RowwiseParallel currently only support nn.Linear and nn.Embedding!"
             )
+        # Caller-supplied per-parameter layout overrides, applied only to params the module
+        # actually has, so this style stays agnostic of what those extra params are.
+        for name, layout in getattr(self, "extra_param_layouts", {}).items():
+            if getattr(module, name, None) is not None:
+                sharding_plan[name] = layout
         return sharding_plan
 
     def _apply(self, module: nn.Cell, device_mesh: DeviceMesh) -> nn.Cell:

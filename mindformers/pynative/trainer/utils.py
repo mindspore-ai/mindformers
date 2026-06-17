@@ -40,6 +40,7 @@ from mindformers.dataset.dataloader.utils import _get_mindrecord_files
 from mindformers.pynative.optimizer.adamw import AdamW
 from mindformers.pynative.optimizer import Muon
 from mindformers.pynative.distributed.context_parallel import attach_context_parallel_runtime_hints
+from mindformers.pynative.pet.lora_adapter import build_lora_model
 
 
 def get_grad(param):
@@ -285,17 +286,20 @@ def _build_model(config, parallelism_config=None, dataset_config=None):
 
 def _build_lora_model(model, config):
     """
-    Build LoRA wrapped model.
+    Inject LoRA adapters into the base model in place (PyNative, FSDP-only first version).
+
+    Replaces target ``Linear`` layers with ``LinearWithLoRA`` and reuses the original
+    weights. Base-parameter freezing is performed separately by the trainer, after
+    parallelism + ``init_states`` (see ``freeze_base_params``).
 
     Args:
-        model: Base model instance.
-        config: LoRA configuration.
+        model: Base model instance (built on meta device).
+        config: LoRA configuration (``target_modules`` regex required).
 
-    Raises:
-        NotImplementedError: LoRA is not supported yet.
+    Returns:
+        The same model instance, mutated in place.
     """
-    _, _ = model, config
-    raise NotImplementedError("Lora model is not implemented yet.")
+    return build_lora_model(model, config)
 
 
 def _build_dataset(

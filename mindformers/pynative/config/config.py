@@ -783,6 +783,37 @@ class SwapConfig(BaseConfig):
 
 
 @dataclass
+class LoraConfig(BaseConfig):
+    """
+    Configuration for LoRA (Low-Rank Adaptation) fine-tuning of Linear layers.
+    """
+
+    target_modules: str = ""
+    """Regex matched against module dotted paths to select Linear layers to adapt (required)."""
+
+    exclude_layers: Optional[str] = None
+    """Optional regex; matching modules are excluded even if ``target_modules`` matches."""
+
+    lora_rank: int = 8
+    """Rank ``r`` of the low-rank adapter."""
+
+    lora_alpha: int = 16
+    """Scaling numerator; the effective adapter scale is ``lora_alpha / lora_rank``."""
+
+    lora_dropout: float = 0.0
+    """Dropout probability applied to the adapter-branch input."""
+
+    lora_a_std: float = 0.01
+    """Std of the normal initialisation for ``lora_a``."""
+
+    lora_b_std: float = 0.0
+    """Std of the normal init for ``lora_b``. Default 0.0 = exact B=0, the standard LoRA
+    identity start (Delta W = 0 at step 0); trains normally once a checkpoint is loaded.
+    Only set > 0 when training an un-checkpointed model (zero base weight), where a zero
+    Linear output would otherwise get a zero gradient through the SwiGLU/ReLU gate."""
+
+
+@dataclass
 class TrainConfig(BaseConfig):
     """
     Top-level Pynative training configuration.
@@ -820,3 +851,4 @@ class TrainConfig(BaseConfig):
     recompute_comm: RecomputeCommConfig = field(default_factory=RecomputeCommConfig)
     swap: SwapConfig = field(default_factory=SwapConfig)
     callbacks: List[CallbackConfig] = field(default_factory=list)
+    lora_config: Optional[LoraConfig] = None

@@ -94,10 +94,17 @@ class NoParallel(ParallelStyle):
         output_fn = partial(
             self._prepare_output_fn, self.output_layouts, self.use_local_output
         )
+        # Caller-supplied per-parameter layout overrides, applied only to params the module
+        # actually has (e.g. a frozen weight that is otherwise absent from any plan and would
+        # stay a plain Tensor); this style stays agnostic of what those extra params are.
+        parameter_shard_plan = {
+            name: layout for name, layout in getattr(self, "extra_param_layouts", {}).items()
+            if getattr(module, name, None) is not None
+        }
         return distribute_module(
             module=module,
             device_mesh=device_mesh,
-            parameter_shard_plan={},
+            parameter_shard_plan=parameter_shard_plan,
             input_fn=input_fn,
             output_fn=output_fn
         )

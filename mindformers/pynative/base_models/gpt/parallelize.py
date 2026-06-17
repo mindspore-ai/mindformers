@@ -72,6 +72,7 @@ from mindformers.pynative.distributed.tensor_parallel import NoParallel
 from mindformers.pynative.distributed.expert_parallel import ExpertParallel, DeredundancyExpertParallel
 from mindformers.pynative.distributed.ep_overlap import OverlapExpertParallel
 from mindformers.pynative.distributed.pipeline_parallel import PpLayerSetting, StageModelBuilder
+from mindformers.pynative.pet.lora_adapter import build_lora_model
 from mindformers.pynative.distributed.parallelize import parallelize_module
 from mindformers.pynative.distributed.activation_checkpoint import apply_ac
 from mindformers.pynative.distributed.utils import distribute_module, get_loss_sense
@@ -447,6 +448,40 @@ def _wrap_hc_modules(host, fsdp_config, reshard_after_forward):
                         replicate_params=_collect_hc_replicate_params(hc_module))
 
 
+# LoRA adapter layouts keyed by the target module's base TP role. Only the non-default
+# placement is listed: distribute_module replicates every other (trainable) param, so a
+# colwise base needs only lora_b sharded on the out-dim, a rowwise base only lora_a on the
+# in-dim, and a NoParallel base only its frozen weight pinned to Replicate (else, being
+# frozen and absent from any plan, it would stay a plain Tensor). Centralising this here
+# keeps the generic ParallelStyle LoRA-agnostic.
+_LORA_ROLE_LAYOUTS = {
+    "self_attention.linear_qkv": {"weight": (Replicate(),)},
+    "self_attention.linear_kvb": {"lora_b": (Shard(0),)},
+    "self_attention.linear_qb": {"lora_b": (Shard(0),)},
+    "self_attention.linear_proj": {"lora_a": (Shard(1),)},
+    "mlp.linear_fc1": {"lora_b": (Shard(0),)},
+    "mlp.linear_fc2": {"lora_a": (Shard(1),)},
+    "mlp.shared_experts.linear_fc1": {"lora_b": (Shard(0),)},
+    "mlp.shared_experts.linear_fc2": {"lora_a": (Shard(1),)},
+}
+
+
+def _attach_lora_layouts(transformer_layer, layer_plan):
+    """Attach LoRA adapter layouts to each target module's ParallelStyle (model-side).
+
+    Sets a generic ``extra_param_layouts`` on the style so the style itself stays
+    LoRA-agnostic; the style merges it into its sharding plan only for params the module
+    actually has. No-op for a module without an adapter (non-LoRA run).
+    """
+    for name, extra in _LORA_ROLE_LAYOUTS.items():
+        style = layer_plan.get(name)
+        sub = transformer_layer
+        for part in name.split("."):
+            sub = getattr(sub, part, None)
+        if style is not None and getattr(sub, "lora_a", None) is not None:
+            style.extra_param_layouts = extra
+
+
 def _apply_layers_tp(
     transformer_layer,
     tp_mesh,
@@ -631,6 +666,9 @@ def _apply_layers_tp(
                 device_mesh=tp_mesh,
                 placements=sub_plan
             )
+
+    # LoRA: attach adapter layouts to the target styles (model-side; styles stay generic).
+    _attach_lora_layouts(transformer_layer, layer_plan)
 
     parallelize_module(
         module=transformer_layer,
@@ -1565,7 +1603,15 @@ def apply_pp(
     # crossing the PP boundary (the pp_mesh's flat world root can't resolve "tp").
     tp_mesh = parallel_dims.get_optional_mesh("tp")
     stages, model_parts = builder.build_stages(model_cls, model.config, pp_mesh, tp_mesh)
+    # PP rebuilds fresh per-stage models from config, discarding any LoRA injected into
+    # the original model. Re-inject into each stage on meta device BEFORE SPMD parallelism
+    # so the adapters pick up TP/FSDP layouts. strict=False: an embedding-only stage may
+    # hold no target layer; the "no adapters anywhere" guard is in the Trainer.
+    lora_cfg = getattr(model.config, "_mf_lora_config", None)
     del model
+    if lora_cfg is not None:
+        for part in model_parts:
+            build_lora_model(part, lora_cfg, strict=False)
 
     # Create one CommComputeOverlap orchestrator per rank when B/F EP overlap
     # is requested.  One orchestrator is shared across ALL chunks on this rank
