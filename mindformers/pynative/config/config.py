@@ -457,11 +457,6 @@ class OptimizerConfig(BaseConfig):
     weight_decay_exclude: Optional[List[str]] = None
     """Parameter name rules that force weight decay off"""
 
-    accumulate_allreduce_grads_in_fp32: bool = True
-    """When True, register backward hooks on bf16/fp16 parameters to cast gradients to fp32
-    before storage, so gradient accumulation and optimizer step operate in fp32 precision.
-    Aligns with Megatron-LM's accumulate_allreduce_grads_in_fp32 behavior."""
-
 
 @dataclass
 class LrSchedulerConfig(BaseConfig):

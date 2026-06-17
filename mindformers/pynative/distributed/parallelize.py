@@ -138,15 +138,12 @@ def parallelize_model(
     recompute: Any,
     recompute_comm: Any,
     swap: Any,
-    accumulate_allreduce_grads_in_fp32: bool = True,
     gradient_accumulation_steps: int = 1,
 ) -> nn.Cell:
     """Route to the correct model-specific parallelization function.
 
     Args:
         model: The model to parallelize.
-        accumulate_allreduce_grads_in_fp32: If True, FSDP reduce-scatter and all-reduce
-            use fp32 precision. Aligns with Megatron-LM.
         gradient_accumulation_steps: Number of micro-batches accumulated per optimizer step.
 
     Returns:
@@ -160,7 +157,6 @@ def parallelize_model(
         logger.info("Parallelizing %s", model_cls.__name__)
         return _PARALLELIZE_FN[model_cls](
             model, parallel_dims, parallelism, recompute, recompute_comm, swap,
-            accumulate_allreduce_grads_in_fp32=accumulate_allreduce_grads_in_fp32,
             gradient_accumulation_steps=gradient_accumulation_steps,
         )
     registered = [c.__name__ for c in _PARALLELIZE_FN]

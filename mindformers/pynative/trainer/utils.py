@@ -42,6 +42,19 @@ from mindformers.pynative.optimizer import Muon
 from mindformers.pynative.distributed.context_parallel import attach_context_parallel_runtime_hints
 
 
+def get_grad(param):
+    """Return the gradient to consume for optimizer update / norm / monitoring.
+
+    Multi-card (fully_shard) runs route the reduced gradient onto a fp32
+    ``param.main_grad`` buffer and leave ``param.grad`` at None (HSDP
+    ``apply_grad_on_fp32_main_grad`` policy); single-card runs accumulate fp32
+    gradients directly on ``param.grad`` via backward hooks. This accessor hides
+    the difference from callers.
+    """
+    main_grad = getattr(param, "main_grad", None)
+    return main_grad if main_grad is not None else param.grad
+
+
 def compute_parameters(model: nn.Cell) -> None:
     """
     Compute and log the number of total and trainable parameters in the model.
@@ -576,8 +589,9 @@ def _calculate_global_grad_norm(
     """
     grads = []
     for param in parameters:
-        if param.grad is not None:
-            grads.append(param.grad)
+        grad = get_grad(param)
+        if grad is not None:
+            grads.append(grad)
 
     if not grads:
         return Tensor(0.0, dtype=mstype.float32), ()

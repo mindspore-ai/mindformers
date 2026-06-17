@@ -968,18 +968,21 @@ def apply_fsdp(
         model: nn.Cell,
         parallel_dims: Any,
         parallelism: Any,
-        accumulate_allreduce_grads_in_fp32: bool = True,
 ) -> None:
     """Apply FSDP/HSDP to a GPT model.
 
     Directly operates on GPT model structure (embedding -> decoder.layers ->
     final_layernorm + output_layer -> root).
 
+    Gradients are always accumulated and reduced in fp32: the HSDP mixed-precision
+    policy reduces in fp32 (``reduce_dtype=float32``) and accumulates the reduced
+    gradient onto a fp32 ``param.main_grad`` buffer
+    (``apply_grad_on_fp32_main_grad=True``), aligning with Megatron-LM.
+
     Args:
         model: The GPTModel instance.
         parallel_dims: ParallelDims instance.
         parallelism: Parallelism configuration.
-        accumulate_allreduce_grads_in_fp32: Whether to accumulate allreduce grads in fp32.
     """
     logger.info("Applying FSDP/HSDP to GPT model...")
 
@@ -1015,16 +1018,21 @@ def apply_fsdp(
     )
 
     cpu_offload = getattr(parallelism, "cpu_offload", False)
-    reduce_dtype = ms.float32 if accumulate_allreduce_grads_in_fp32 else None
+    # Always accumulate + reduce gradients in fp32: reduce-scatter / all-reduce run in
+    # fp32 and the reduced gradient is accumulated onto a fp32 ``param.main_grad`` buffer
+    # (Megatron-LM main_grad semantics), keeping ``param.grad`` at None.
+    mp_policy = MixedPrecisionPolicy(
+        reduce_dtype=ms.float32, apply_grad_on_fp32_main_grad=True
+    )
     fsdp_config = {
         "mesh": dp_mesh,
         "offload_policy": CPUOffloadPolicy() if cpu_offload else OffloadPolicy(),
-        "mp_policy": MixedPrecisionPolicy(reduce_dtype=reduce_dtype),
+        "mp_policy": mp_policy,
     }
     efsdp_config = {
         "mesh": edp_mesh,
         "offload_policy": CPUOffloadPolicy() if cpu_offload else OffloadPolicy(),
-        "mp_policy": MixedPrecisionPolicy(reduce_dtype=reduce_dtype),
+        "mp_policy": mp_policy,
     }
 
     embedding = getattr(gpt_model, "embedding", None)
@@ -1307,7 +1315,6 @@ def _apply_spmd_parallelism(
         recompute: Any,
         recompute_comm: Any,
         swap: Any,
-        accumulate_allreduce_grads_in_fp32: bool = True,
         gradient_accumulation_steps: int = 1,
         overlap=None,
 ) -> nn.Cell:
@@ -1384,7 +1391,6 @@ def _apply_spmd_parallelism(
         model,
         parallel_dims,
         parallelism,
-        accumulate_allreduce_grads_in_fp32
     )
 
     for param_name, param in model.parameters_and_names():
@@ -1531,7 +1537,6 @@ def apply_pp(
         recompute,
         recompute_comm,
         swap,
-        accumulate_allreduce_grads_in_fp32: bool = True,
         gradient_accumulation_steps: int = 1,
 ):
     """Apply pipeline parallelism to the GPTModel.
@@ -1578,7 +1583,6 @@ def apply_pp(
             recompute,
             recompute_comm,
             swap,
-            accumulate_allreduce_grads_in_fp32,
             gradient_accumulation_steps,
             overlap=overlap,
         )
@@ -1631,11 +1635,10 @@ def parallelize_gptmodel(
         recompute: Any,
         recompute_comm: Any,
         swap: Any,
-        accumulate_allreduce_grads_in_fp32: bool = True,
         gradient_accumulation_steps: int = 1,
 ) -> List[nn.Cell]:
     """Apply pipeline parallelism to the GPTModel."""
-        
+
     if parallel_dims.pp_enabled:
         pp_mesh = parallel_dims.get_mesh("pp")
         return apply_pp(
@@ -1646,11 +1649,10 @@ def parallelize_gptmodel(
             recompute=recompute,
             recompute_comm=recompute_comm,
             swap=swap,
-            accumulate_allreduce_grads_in_fp32=accumulate_allreduce_grads_in_fp32,
             gradient_accumulation_steps=gradient_accumulation_steps,
         )
 
     _apply_spmd_parallelism(model, parallel_dims, parallelism, recompute, recompute_comm, swap,
-                            accumulate_allreduce_grads_in_fp32, gradient_accumulation_steps)
+                            gradient_accumulation_steps)
 
     return [model], None, False, False
