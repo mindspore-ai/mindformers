@@ -420,7 +420,7 @@ def get_sharded_tensor_from_cell(
 
 
 def get_all_sharded_tensor(
-        network: Cell,
+        network: Union[Cell, List[Cell]],
         filter_func: Callable[[str], bool] = None
 ) -> Dict[int, Dict[str, ShardedTensor]]:
     """

@@ -31,6 +31,12 @@ from mindspore.nn.optim.optimizer import Optimizer
 from mindspore.communication import comm_func
 from mindspore import save_checkpoint as ms_save_checkpoint
 
+try:
+    from hyper_parallel.core.distributed_checkpoint import get_global_layout
+except ImportError as e:
+    get_global_layout = None
+    logger.warning(f"Import get_global_layout failed: {e}.")
+
 from mindformers.checkpoint.layout_adapter import LayoutAdapter
 from mindformers.tools.logger import logger
 from mindformers.checkpoint.reshard import ReshardLoader
@@ -264,7 +270,7 @@ class AsyncSaveManager:
         return ten[0] == 0
 
 
-def save_checkpoint(iteration: int, network: Cell, optimizer: Optimizer = None,
+def save_checkpoint(iteration: int, network: Union[Cell, List[Cell]], optimizer: Optimizer = None,
                     async_save_manager: AsyncSaveManager = None, common_info: CommonInfo = None,
                     keep_max_num: int = 5, user_prefix: str = None, save_checkpoint_path: str = None,
                     sharded_tensor_metas: Dict = None, remove_redundancy: bool = False,
@@ -349,7 +355,19 @@ def save_checkpoint(iteration: int, network: Cell, optimizer: Optimizer = None,
 
     # Save model weight.
     logger.info("....... Start to save model weight .......")
-    model_keys = network.parameters_dict().keys()
+    if LayoutAdapter.is_pynative_mode() and get_real_group_size() > 1:
+        # Get global model keys.
+        network = network if isinstance(network, list) else [network]
+        model_keys = set()
+        for net in network:
+            global_layout_dict = get_global_layout(net)
+            for _, val in global_layout_dict.items():
+                model_keys.update(val.keys())
+    elif LayoutAdapter.is_pynative_mode():
+        network = network if isinstance(network, list) else [network]
+        model_keys = network[0].parameters_dict().keys()
+    else:
+        model_keys = network.parameters_dict().keys()
     start_save_ckpt_time = time()
 
     if remove_redundancy and sharded_tensor_metas is not None:

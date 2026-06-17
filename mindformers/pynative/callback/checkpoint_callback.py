@@ -14,6 +14,13 @@
 # ============================================================================
 """Checkpoint callback for saving model checkpoints during training."""
 import os
+
+try:
+    from hyper_parallel.core.distributed_checkpoint import get_global_layout
+except ImportError as e:
+    get_global_layout = None
+    logger.warning(f"Import get_global_layout failed: {e}.")
+
 from mindformers.pynative.callback.callback import TrainerCallback
 from mindformers.tools.logger import logger
 from mindformers.tools.utils import get_real_group_size
@@ -153,11 +160,18 @@ class CheckpointCallback(TrainerCallback):
         common_info = self._create_common_info(state)
 
         if self.sharded_tensor_metas is None and get_real_group_size() > 1:
+            # Get global model keys.
+            model_keys = set()
+            for net in model:
+                global_layout_dict = get_global_layout(net)
+                for _, val in global_layout_dict.items():
+                    model_keys.update(val.keys())
+
             self.sharded_tensor_metas = get_all_sharded_tensor(
                 network=model,
-                filter_func=(lambda x: x in list(
-                    model.parameters_dict().keys())) if self.no_save_optim else None
+                filter_func=(lambda x: x in list(model_keys)) if self.no_save_optim else None
             ) if get_real_group_size() > 1 else None
+
         if self.opt_sharded_tensor_metas is None and get_real_group_size() > 1:
             self.opt_sharded_tensor_metas = get_all_sharded_tensor(
                 network=optimizer,
@@ -166,7 +180,7 @@ class CheckpointCallback(TrainerCallback):
             ) if get_real_group_size() > 1 else None
 
         if self.sharded_tensor_metas is not None and self.opt_sharded_tensor_metas is not None:
-            for rank_id, _ in self.sharded_tensor_metas.items():
+            for rank_id in self.sharded_tensor_metas:
                 self.sharded_tensor_metas[rank_id].update(self.opt_sharded_tensor_metas[rank_id])
 
         try:

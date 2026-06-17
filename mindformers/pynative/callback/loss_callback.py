@@ -119,6 +119,11 @@ class LossCallback(TrainerCallback):
         model = kwargs.get("model")
         metric_group = kwargs.get("metric_reduce_group")
         metric_group_size = kwargs.get("metric_reduce_group_size")
+        grad_norm = kwargs.get("grad_norm")
+
+        # Calculate the time cost for the current step in milliseconds
+        cur_time = time.time()
+        step_time_cost = int((cur_time - self.step_time) * 1000)
 
         # Update auxiliary-loss-free expert_bias on every step, regardless of
         # log interval or loss availability. Non-last PP stages return loss=None
@@ -127,19 +132,16 @@ class LossCallback(TrainerCallback):
         # with the rest of the pipeline.
         model_config = None
         if model is not None:
-            model_config = deepcopy(model.get_gpt_transformer_config())
-            if getattr(model_config, "moe_router_enable_expert_bias", False):
-                _update_expert_bias(model, metric_group, metric_group_size)
+            model = model if isinstance(model, list) else [model]
+            for m in model:
+                cfg = m.get_gpt_transformer_config()
+                if getattr(cfg, "moe_router_enable_expert_bias", False):
+                    _update_expert_bias(m, metric_group, metric_group_size)
+                model_config = deepcopy(m.get_gpt_transformer_config())
+                reset_model_temporary_tensors(model_config, m)
+
         if loss is None or state.global_step % self.log_interval != 0:
             return
-
-        grad_norm = kwargs.get("grad_norm")
-
-        # Calculate the time cost for the current step in milliseconds
-        cur_time = time.time()
-        step_time_cost = int((cur_time - self.step_time) * 1000)
-
-        reset_model_temporary_tensors(model_config, model)
 
         # process aux loss
         load_balancing_loss = track_moe_metrics(

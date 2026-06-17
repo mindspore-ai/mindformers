@@ -530,7 +530,7 @@ class Trainer:
         # Create handler with complete list
         cb_handler = CallbackHandler(
             callbacks=callback_list,
-            model=self.model[0],
+            model=self.model,
             train_dataset=self.train_dataset,
             eval_dataset=self.eval_dataset,
             optimizer=self.optimizer,

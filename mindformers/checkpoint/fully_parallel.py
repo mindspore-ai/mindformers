@@ -15,7 +15,7 @@
 """save / load parallelization strategy."""
 import os
 from collections import defaultdict
-from typing import Callable
+from typing import Callable, List
 
 from mindspore import save_checkpoint
 from mindspore.nn import Cell
@@ -380,7 +380,7 @@ def distribute_shards(shard_coverage, shard_sizes, total_ranks):
     return shard_assignment
 
 
-def apply_balance_shard_strategy(network: Cell, filter_func: Callable[[str], bool] = None):
+def apply_balance_shard_strategy(network: List[Cell], filter_func: Callable[[str], bool] = None):
     """
     Distributes and balances sharded tensor storage across ranks in a parallel group,
     generating rank-specific shard assignments.

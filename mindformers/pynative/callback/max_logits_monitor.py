@@ -65,17 +65,18 @@ class MaxLogitsMonitor(TrainerCallback):
             _reset_max_attention_logit(model)
             return
 
-        # 1) collect per-layer Parameter values.
-        params = model.get_max_attention_logit()
-        if not params:
-            _reset_max_attention_logit(model)
-            return
+        for m in model:
+            # 1) collect per-layer Parameter values.
+            params = m.get_max_attention_logit()
+            if not params:
+                _reset_max_attention_logit(m)
+                return
 
-        # 2) dump.
-        self._dump(params, state)
+            # 2) dump.
+            self._dump(params, state)
 
-        # 3) reset for the next step.
-        _reset_max_attention_logit(model)
+            # 3) reset for the next step.
+            _reset_max_attention_logit(m)
 
     @staticmethod
     def _fmt(v):
