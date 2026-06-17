@@ -54,7 +54,7 @@ class ScaledLossPipelineStage(PipelineStage):
         # parameter. Used by ``_get_layout_rank_list`` below.
         self._axis_meshes = {"tp": tp_mesh} if tp_mesh is not None else {}
 
-    def _get_layout_rank_list(self, layout):
+    def _get_layout_rank_list(self, layout, sender_rank=None):
         """Resolve a received activation's submesh ranks from explicit axis meshes.
 
         The base impl resolves the sender's submesh from ``self.mesh.root_mesh``
@@ -75,7 +75,7 @@ class ScaledLossPipelineStage(PipelineStage):
         )
         if len(layout_dim_names) == 1 and layout_dim_names[0] in self._axis_meshes:
             return tuple(self._axis_meshes[layout_dim_names[0]].rank_list)
-        return super()._get_layout_rank_list(layout)
+        return super()._get_layout_rank_list(layout, sender_rank)
 
     def get_last_stage_sens(self, last_stage_outputs):
         p_sens = super().get_last_stage_sens(last_stage_outputs)
