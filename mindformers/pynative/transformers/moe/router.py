@@ -403,6 +403,7 @@ class TopKRouter(nn.Cell):
                 top_scores,
                 seq_length,
                 bsz,
+                selected_experts_indices,
             )
 
         return top_scores, selected_experts_indices, num_tokens_per_expert
@@ -414,6 +415,7 @@ class TopKRouter(nn.Cell):
             top_scores: Tensor,
             seq_length: int,
             bsz: int,
+            selected_experts_indices: Optional[Tensor] = None,
     ) -> Tensor:
         """
         Compute auxiliary load-balancing loss and inject its gradient into top_scores.
@@ -444,6 +446,15 @@ class TopKRouter(nn.Cell):
             self.top_k,
             self.score_func,
         )
+
+        # Keep the aux loss consistent with the routing that is actually used: when
+        # force-balance overrides the dispatch (round-robin), the load-balancing loss
+        # must reflect that balanced assignment, not the router's natural top-k.
+        # Rebuild routing_map from the (forced) selected_experts_indices so f_i is
+        # uniform; scores_for_aux_loss (P_i) stays as the router's own probabilities.
+        if self._debug_force_load_balance and selected_experts_indices is not None:
+            routing_map_for_aux_loss = mint.zeros_like(logits).int()
+            routing_map_for_aux_loss.scatter_(1, selected_experts_indices, 1)
 
         aux_loss_func_map = {
             "aux_loss": self._apply_aux_loss,

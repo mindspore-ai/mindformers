@@ -14,6 +14,7 @@
 # ============================================================================
 """Pynative transformer helpers (recompute)."""
 
+import contextlib
 import inspect
 import re
 from typing import Sequence, Tuple
@@ -44,6 +45,47 @@ __all__ = [
 
 _LAYER_ID_SPEC_PATTERN = re.compile(r"^(\d+)(?:-(\d+))?$")
 _config_list = {}
+
+# Generic activation-recompute marker. During recompute the wrapped forward re-runs in
+# the backward pass; any per-forward side effect that must happen once (MoE aux-loss
+# logging today; reused as-is by other aux losses / modules later) has to be skipped on
+# that re-run. ``recompute_context_fn`` is a context_fn for ms.recompute /
+# checkpoint_wrapper whose recompute_ctx is entered only on the backward re-run;
+# ``is_in_recompute`` lets callers detect and skip it. A context_fn is used rather than
+# the selective-checkpoint policy_fn because policy_fn is a per-op save/recompute
+# decision hook present only for `select` mode, whereas this context_fn brackets the
+# whole recompute re-run uniformly for both full and select modes.
+# ``_RECOMPUTE_DEPTH`` is a nesting depth (not per-layer state): the guard only needs
+# "are we inside any recompute". PyNative runs forward/recompute sequentially and each
+# marker brackets one recompute via try/finally, so depth is balanced and never leaks
+# across layers; nested recompute simply keeps depth > 0.
+_RECOMPUTE_DEPTH = 0
+
+
+@contextlib.contextmanager
+def recompute_marker():
+    """Mark the enclosed region as a backward-time recompute re-run."""
+    global _RECOMPUTE_DEPTH
+    _RECOMPUTE_DEPTH += 1
+    try:
+        yield
+    finally:
+        _RECOMPUTE_DEPTH -= 1
+
+
+def recompute_context_fn():
+    """``context_fn`` factory for ms.recompute(use_reentrant=False) / checkpoint_wrapper.
+
+    Returns ``(forward_ctx, recompute_ctx)``: the original forward runs under a no-op
+    context (side effects happen normally) while the backward-time recompute runs under
+    the marker, so the re-run is detected and skipped.
+    """
+    return contextlib.nullcontext(), recompute_marker()
+
+
+def is_in_recompute() -> bool:
+    """Return True while inside a backward-time activation recompute re-run."""
+    return _RECOMPUTE_DEPTH > 0
 
 def _validate_recompute_config(
     recompute,
@@ -483,7 +525,7 @@ def _set_pattern_recompute(layer, p_list, add_prim_attr=False, info=''):
                                 "is expected to be operation but got cell, "
                                 "this configuration will not be effective.")
                     continue
-                setattr(layer, name, checkpoint_wrapper(cell))
+                setattr(layer, name, checkpoint_wrapper(cell, context_fn=recompute_context_fn))
                 log = f"{info}.{name}"
         for attr in dir(layer):
             if p == attr:
@@ -547,7 +589,9 @@ def apply_recompute(
 
     for layer_id in range(model.layer_start, model.layer_end + 1):
         if need_recompute and layer_id in full_target_ids:
-            model.layers[layer_id] = checkpoint_wrapper(model.layers[layer_id])
+            model.layers[layer_id] = checkpoint_wrapper(
+                model.layers[layer_id], context_fn=recompute_context_fn
+            )
             logger.info(f"Set full recompute at layer {layer_id}")
 
         if need_recompute and rc.mode == "select":

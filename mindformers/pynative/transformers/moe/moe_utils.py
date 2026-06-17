@@ -26,6 +26,8 @@ from mindspore.mint.distributed import get_world_size, all_reduce
 
 from hyper_parallel.core.dtensor.dtensor import DTensor
 
+from mindformers.pynative.distributed.activation_checkpoint import is_in_recompute
+
 # MOE logging
 _MOE_LAYER_WISE_LOGGING_TRACKER: dict = {}
 
@@ -220,6 +222,12 @@ def save_to_aux_losses_tracker(
     """
     # Skip aux loss logging if layer_number is None.
     if layer_number is None:
+        return
+
+    # Skip during activation recompute: the recomputed forward would otherwise add
+    # this layer's aux loss to the tracker a second time, doubling load_balancing_loss
+    # for recomputed layers.
+    if is_in_recompute():
         return
 
     tracker = get_moe_layer_wise_logging_tracker()
