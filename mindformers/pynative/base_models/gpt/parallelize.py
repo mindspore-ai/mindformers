@@ -77,6 +77,9 @@ from mindformers.pynative.distributed.parallelize import parallelize_module
 from mindformers.pynative.distributed.activation_checkpoint import apply_ac
 from mindformers.pynative.distributed.utils import distribute_module, get_loss_sense
 from mindformers.pynative.base_models.gpt.gpt_model import GPTModel
+from mindformers.pynative.transformers.experimental_attention_variant.deepseek_v4_hybrid_attention import (
+    DSv4HybridSelfAttention,
+)
 from mindformers.tools.logger import logger
 
 __all__ = ["parallelize_gptmodel"]
@@ -578,81 +581,140 @@ def _apply_layers_tp(
     has_q_lora = transformer_layer.self_attention.config.q_lora_rank is not None
     q_pre_attn_layout = Shard(2) if has_q_lora else Replicate()
     attn_input_shard = attn_qkv_shard if has_q_lora else Replicate()
-
+    distribute_param_plan = []
     # The fused RoPE kernel is dispatched as a distributed op and requires its cos/sin
     # (derived from the rotary freqs) to be DTensors, so the freqs input is replicated at
     # the module boundary. The non-fused mul/add path instead broadcasts plain freqs and
     # must keep them as plain tensors (None) to preserve q_pe's head sharding, so the freqs
     # slot is only converted when apply_rope_fusion is enabled.
     rope_freqs_layout = Replicate() if transformer_layer.self_attention.config.apply_rope_fusion else None
-
-    # Rotary embedding for q_pe (head-structured tensor from linear_qb when LoRA is
-    # on, otherwise from linear_qkv's replicated slice). The second positional input is
-    # the rotary freqs tensor (mscale is passed as a kwarg and stays a Python scalar).
-    q_rotary_emb_plan = prepare_module_input_output(
-        input_layouts=(q_pre_attn_layout, rope_freqs_layout),
-        desired_input_layouts=(q_pre_attn_layout, rope_freqs_layout),
-        output_layouts=(q_pre_attn_layout,),
-        desired_output_layouts=(q_pre_attn_layout,),
-        use_local_output=False,
-    )
-    # Rotary embedding for k_pe (pre-tile 1-head tensor from linear_qkv, stays Replicate).
-    # k_pe comes from linear_qkv whose all-reduce is necessary, so k_pe remains Replicate.
-    k_rotary_emb_plan = prepare_module_input_output(
-        input_layouts=(Replicate(), rope_freqs_layout),
-        desired_input_layouts=(Replicate(), rope_freqs_layout),
-        output_layouts=(Replicate(),),
-        desired_output_layouts=(Replicate(),),
-        use_local_output=False,
-    )
-
-    # Q arrives at core_attention as attn_input_shard (= attn_qkv_shard when LoRA
-    # produces a head-sharded Q, otherwise Replicate). K/V come in as Replicate and
-    # get reduce-scattered here to attn_qkv_shard.
-    attention_kernel_plan = prepare_module_input(
-        input_layouts=(attn_input_shard, Replicate(), Replicate(), None),
-        desired_input_layouts=(attn_qkv_shard, attn_qkv_shard, attn_qkv_shard, None),
-        use_local_output=False,
-    )
-
-    distribute_param_plan = []
-    layer_plan = {
-        "input_layernorm": norm_plan,
-        "self_attention": prepare_module_input(
-            input_layouts=(sp_layout),
-            desired_input_layouts=(
-                Replicate()
-            ),
+    if isinstance(transformer_layer.self_attention, DSv4HybridSelfAttention):
+        # Fused CSA kernel has CANN shape constraints and no TP benefit from head-sharding
+        # non-fused small-op path does benefit.
+        core_attn = transformer_layer.self_attention.core_attention
+        csa_q_layout = Replicate() if getattr(core_attn, "apply_dsa_kernel_fusion", False) else Shard(2)
+        attn_sink_plan = Replicate() if getattr(core_attn, "apply_dsa_kernel_fusion", False) else Shard(0)
+        dsv4_core_attn_plan = prepare_module_input_output(
+            # q, key, x, q_compressed
+            input_layouts=(Replicate(), Replicate(), Replicate(), Replicate()),
+            desired_input_layouts=(csa_q_layout, Replicate(), Replicate(), Replicate()),
+            output_layouts=(csa_q_layout,),
+            desired_output_layouts=(Replicate(),),
+            use_local_input=True,
             use_local_output=False,
-        ),
-        # linear_qkv is kept replicated so its output (which is split into q_a /
-        # compressed_kv / k_pe along the last dim) needs no AllGather. The
-        # downstream up-projections (linear_qb / linear_kvb) carry the actual TP
-        # weight sharding for this attention block.
-        "self_attention.linear_qkv": NoParallel(use_local_output=False),
-        "self_attention.linear_kvb": colwise_parallel(output_layouts=Replicate(), use_local_output=False),
-        "self_attention.k_layernorm": NoParallel(use_local_output=False),
-        # NOTE: use_local_output=True so that the inputs to FlexAttention are plain Tensors
-        "self_attention.core_attention": attention_kernel_plan,
-        "self_attention.linear_proj": rowwise_output_plan,
-        "pre_mlp_layernorm": norm_plan,
-        "self_attention.apply_rotary_emb_q": q_rotary_emb_plan,
-        "self_attention.apply_rotary_emb_k": k_rotary_emb_plan,
-    }
-
-    if transformer_layer.self_attention.q_rank == 0:
-        raise ValueError(
-            "q_rank should be greater than 0, but got 0!"
+        )
+        unfused_indexer_loss_plan = prepare_module_input_output(
+            input_layouts=(Shard(1),),
+            desired_input_layouts=(Replicate(),),
+            output_layouts=(Replicate(),),
+            desired_output_layouts=(Replicate(),),
+            use_local_output=False,
+        )
+        layer_plan = {
+            "input_layernorm": norm_plan,
+            # Input: SP Shard(0) → Replicate (attention internals)
+            # Output: Replicate → SP Shard(0) (so output_cell h_post/x dims match)
+            "self_attention": prepare_module_input_output(
+                input_layouts=(sp_layout,),
+                desired_input_layouts=(Replicate(),),
+                output_layouts=(Replicate(),),
+                desired_output_layouts=(sp_layout,),
+                use_local_output=False,
+            ),
+            # --- Q path ---
+            "self_attention.linear_q_down_proj": NoParallel(use_local_output=False),
+            "self_attention.q_layernorm": NoParallel(use_local_output=False),
+            "self_attention.linear_q_up_proj": colwise_parallel(
+                output_layouts=Replicate(), use_local_output=False,
+            ),
+            # --- KV path (single shared head) ---
+            "self_attention.linear_kv_proj": NoParallel(use_local_output=False),
+            "self_attention.kv_layernorm": NoParallel(use_local_output=False),
+            # --- Core attention ---
+            "self_attention.core_attention": dsv4_core_attn_plan,
+            # --- Output projection ---
+            "self_attention.linear_proj": NoParallel(use_local_output=False),
+            "pre_mlp_layernorm": norm_plan,
+            "self_attention.apply_rotary_emb": prepare_module_input_output(
+                input_layouts=(Replicate(), rope_freqs_layout, None),
+                desired_input_layouts=(Replicate(), rope_freqs_layout, None),
+                output_layouts=(Replicate(),),
+                desired_output_layouts=(Replicate(),),
+                use_local_output=False,
+            ),
+        }
+        if getattr(core_attn, "unfused_indexer_loss", None) is not None:
+            layer_plan["self_attention.core_attention.unfused_indexer_loss.pre_head_sum"] = unfused_indexer_loss_plan
+        distribute_param_plan.append([transformer_layer.self_attention.core_attention, "attn_sink", (attn_sink_plan,)])
+        distribute_param_plan.append([transformer_layer.self_attention, "linear_o_group_proj", (Replicate(),)])
+        distribute_param_plan.append([transformer_layer.self_attention, "q_rms_gamma", (Replicate(),)])
+    else:
+        # Rotary embedding for q_pe (head-structured tensor from linear_qb when LoRA is
+        # on, otherwise from linear_qkv's replicated slice). The second positional input is
+        # the rotary freqs tensor (mscale is passed as a kwarg and stays a Python scalar).
+        q_rotary_emb_plan = prepare_module_input_output(
+            input_layouts=(q_pre_attn_layout, rope_freqs_layout),
+            desired_input_layouts=(q_pre_attn_layout, rope_freqs_layout),
+            output_layouts=(q_pre_attn_layout,),
+            desired_output_layouts=(q_pre_attn_layout,),
+            use_local_output=False,
+        )
+        # Rotary embedding for k_pe (pre-tile 1-head tensor from linear_qkv, stays Replicate).
+        # k_pe comes from linear_qkv whose all-reduce is necessary, so k_pe remains Replicate.
+        k_rotary_emb_plan = prepare_module_input_output(
+            input_layouts=(Replicate(), rope_freqs_layout),
+            desired_input_layouts=(Replicate(), rope_freqs_layout),
+            output_layouts=(Replicate(),),
+            desired_output_layouts=(Replicate(),),
+            use_local_output=False,
         )
 
-    if transformer_layer.self_attention.config.q_lora_rank is not None:
-        layer_plan.update(
-            {
-                "self_attention.linear_qb": colwise_parallel(
-                    output_layouts=Shard(2), use_local_output=False),
-                "self_attention.q_layernorm": NoParallel(use_local_output=False),
-            }
+        # Q arrives at core_attention as attn_input_shard (= attn_qkv_shard when LoRA
+        # produces a head-sharded Q, otherwise Replicate). K/V come in as Replicate and
+        # get reduce-scattered here to attn_qkv_shard.
+        attention_kernel_plan = prepare_module_input(
+            input_layouts=(attn_input_shard, Replicate(), Replicate(), None),
+            desired_input_layouts=(attn_qkv_shard, attn_qkv_shard, attn_qkv_shard, None),
+            use_local_output=False,
         )
+
+        layer_plan = {
+            "input_layernorm": norm_plan,
+            "self_attention": prepare_module_input(
+                input_layouts=(sp_layout,),
+                desired_input_layouts=(
+                    Replicate()
+                ),
+                use_local_output=False,
+            ),
+            # linear_qkv is kept replicated so its output (which is split into q_a /
+            # compressed_kv / k_pe along the last dim) needs no AllGather. The
+            # downstream up-projections (linear_qb / linear_kvb) carry the actual TP
+            # weight sharding for this attention block.
+            "self_attention.linear_qkv": NoParallel(use_local_output=False),
+            "self_attention.linear_kvb": colwise_parallel(output_layouts=Replicate(), use_local_output=False),
+            "self_attention.k_layernorm": NoParallel(use_local_output=False),
+            # NOTE: use_local_output=True so that the inputs to FlexAttention are plain Tensors
+            "self_attention.core_attention": attention_kernel_plan,
+            "self_attention.linear_proj": rowwise_output_plan,
+            "pre_mlp_layernorm": norm_plan,
+            "self_attention.apply_rotary_emb_q": q_rotary_emb_plan,
+            "self_attention.apply_rotary_emb_k": k_rotary_emb_plan,
+        }
+
+        if transformer_layer.self_attention.q_rank == 0:
+            raise ValueError(
+                "q_rank should be greater than 0, but got 0!"
+            )
+
+        if has_q_lora:
+            layer_plan.update(
+                {
+                    "self_attention.linear_qb": colwise_parallel(
+                        output_layouts=Shard(2), use_local_output=False),
+                    "self_attention.q_layernorm": NoParallel(use_local_output=False),
+                }
+            )
 
     if hasattr(transformer_layer, "attn_hc"):
         layer_plan.update(

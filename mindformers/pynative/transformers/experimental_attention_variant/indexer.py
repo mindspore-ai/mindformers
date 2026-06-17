@@ -42,6 +42,7 @@ from mindformers.parallel_core.utils.spec_utils import ModuleSpec, build_module
 from mindformers.parallel_core.transformer_config import MLATransformerConfig
 from mindformers.pynative.transformers.experimental_attention_variant.utils import Hadamard
 from mindformers.pynative.base_models.common.embeddings.rope_utils import ApplyRotaryPosEmb
+from mindformers.pynative.layers.identity_op import IdentityOp
 
 
 @dataclass
@@ -313,51 +314,101 @@ class FusedCSAIndexerLoss(_Function):
         )
 
 
-def compute_unfused_indexer_loss(
-        index_scores, topk_indices, query, key,
-        softmax_scale, loss_coeff, sparse_loss, mask=None):
-    """unfused indexer loss implement"""
-    sq, b, _, _ = query.shape
-    sk, _, _, _ = key.shape
-    query = mint.permute(query, (1, 2, 0, 3)).to(mstype.float32)
-    key = mint.permute(key, (1, 2, 3, 0)).to(mstype.float32)
-    attention_scores = mint.matmul(query, key) * softmax_scale
+class UnfusedCSAIndexerLoss(nn.Cell):
+    """Indexer KL-divergence loss for the unfused CSA path."""
 
-    if mask is None:
-        causal_mask = mint.triu(mint.full((sq, sk), float("-inf"), dtype=mstype.float32), diagonal=1)
-        causal_mask = mint.reshape(causal_mask, (1, 1, sq, sk))
-    else:
-        causal_mask = mask.to(mstype.float32)
-        causal_mask = mint.reshape(causal_mask, (-1, 1, sq, sk))
+    def __init__(self, softmax_scale, loss_coeff=1.0, sparse_loss=True):
+        super().__init__()
+        self.softmax_scale = softmax_scale
+        self.loss_coeff = loss_coeff
+        self.sparse_loss = sparse_loss
 
-    # add mask to attention score
-    attention_scores = attention_scores + causal_mask
-    if sparse_loss:
-        index_mask = mint.full((b, sq, sk), float("-inf"), dtype=mstype.float32)
-        index_mask = mint.scatter(index_mask, -1, topk_indices, 0)
-        index_scores = index_scores + index_mask
-        attention_scores = attention_scores + mint.unsqueeze(index_mask, 1)
+        self.pre_head_sum = IdentityOp()
 
-    # Zero out fully-masked rows before softmax
-    row_valid = mint.any(causal_mask > float("-inf"), dim=-1)
-    attn_row_mask = mint.reshape(row_valid, (-1, 1, sq, 1))
-    idx_row_mask = mint.reshape(row_valid, (-1, sq, 1))
-    attention_scores = mint.where(attn_row_mask, attention_scores, 0.0)
-    index_scores = mint.where(idx_row_mask, index_scores, 0.0)
+        self.permute = mint.permute
+        self.matmul = mint.matmul
+        self.softmax = mint.softmax
+        self.sum = mint.sum
+        self.mean = mint.mean
+        self.log = mint.log
+        self.reshape = mint.reshape
+        self.unsqueeze = mint.unsqueeze
+        self.full = mint.full
+        self.triu = mint.triu
+        self.scatter = mint.scatter
+        self.where = mint.where
+        self.any = mint.any
+        self.max = mint.maximum
+        self.cast = ops.cast
 
-    # do softmax and L1-normalize for attention score
-    attention_scores = mint.softmax(attention_scores, dim=-1)
-    attention_scores = mint.sum(attention_scores, dim=1)
-    attention_scores = attention_scores / mint.clamp(mint.sum(attention_scores, -1, keepdim=True), min=1e-10)
+    def construct(
+        self,
+        index_scores,
+        topk_indices,
+        query,
+        key,
+        mask=None,
+    ):
+        """Compute the unfused indexer KL loss.
 
-    # do softmax for index_scores.
-    index_scores = mint.softmax(index_scores, dim=-1)
+        Args:
+            index_scores: ``[b, sq, sk]`` raw logits from the indexer.
+            topk_indices: ``[b, sq, topk]`` selected compressed positions.
+            query: ``[sq, b, np, v_head_dim]`` multi-head query (SBND).
+            key: ``[sk, b, 1, v_head_dim]`` compressed KV (TND, single head).
+            mask: optional ``[1, sq, sk]`` causal mask.  When ``None`` a
+                standard upper-triangular causal mask is built.
 
-    # compute KL divergence loss,  [b, sq, sk] -> [b, sq] -> [1]
-    kl_per_element = attention_scores * (mint.log(attention_scores + 1e-10) - mint.log(index_scores + 1e-10))
-    # Each token has same weight in the loss.
-    kl_div = mint.mean(mint.sum(kl_per_element, -1))
+        Returns:
+            Scalar KL loss.
+        """
+        sq, b, _, _ = query.shape
+        sk, _, _, _ = key.shape
+        query = self.permute(query, (1, 2, 0, 3)).to(mstype.float32)   # [b, np, sq, d]
+        key = self.permute(key, (1, 2, 3, 0)).to(mstype.float32)       # [b, 1, d, sk]
+        attention_scores = self.matmul(query, key) * self.softmax_scale      # [b, np, sq, sk]
 
-    # Scale by coefficient.
-    indexer_loss = kl_div * loss_coeff
-    return indexer_loss
+        # Causal mask
+        if mask is None:
+            causal_mask = self.triu(
+                self.full((sq, sk), float("-inf"), dtype=mstype.float32), diagonal=1
+            )
+            causal_mask = self.reshape(causal_mask, (1, 1, sq, sk))
+        else:
+            causal_mask = mask.to(mstype.float32)
+            causal_mask = self.reshape(causal_mask, (-1, 1, sq, sk))
+
+        attention_scores = attention_scores + causal_mask
+
+        # Sparse index mask (optional)
+        if self.sparse_loss:
+            index_mask = self.full((b, sq, sk), float("-inf"), dtype=mstype.float32)
+            index_mask = self.scatter(index_mask, -1, topk_indices, 0)
+            index_scores = index_scores + index_mask
+            attention_scores = attention_scores + self.unsqueeze(index_mask, 1)
+
+        # Zero out fully-masked rows before softmax
+        row_valid = self.any(causal_mask > float("-inf"), dim=-1)
+        attn_row_mask = self.reshape(row_valid, (-1, 1, sq, 1))
+        idx_row_mask = self.reshape(row_valid, (-1, sq, 1))
+        attention_scores = self.where(attn_row_mask, attention_scores, 0.0)
+        index_scores = self.where(idx_row_mask, index_scores, 0.0)
+
+        # Per-head softmax → sum over heads
+        attention_scores = self.softmax(attention_scores, dim=-1)
+        attention_scores = self.pre_head_sum(attention_scores)
+        attention_scores = self.sum(attention_scores, dim=1)   # [b, sq, sk] — partial under TP
+
+        # L1-normalize the pooled attention scores
+        attention_scores = attention_scores / self.max(self.sum(attention_scores, -1, keepdim=True), 1e-10)
+
+        # Indexer softmax
+        index_scores = self.softmax(index_scores, dim=-1)
+
+        # KL divergence  [b, sq, sk] → [b, sq] → [1]
+        kl_per_element = attention_scores * (
+            self.log(attention_scores + 1e-10) - self.log(index_scores + 1e-10)
+        )
+        kl_div = self.mean(self.sum(kl_per_element, -1))
+
+        return kl_div * self.loss_coeff

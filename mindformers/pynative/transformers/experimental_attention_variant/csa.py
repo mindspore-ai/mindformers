@@ -37,7 +37,7 @@ from mindformers.parallel_core.transformer_config import MLATransformerConfig
 from mindformers.pynative.transformers.experimental_attention_variant.indexer import (
     _IndexerLossAutoScaler,
     FusedCSAIndexerLoss,
-    compute_unfused_indexer_loss
+    UnfusedCSAIndexerLoss,
 )
 from mindformers.pynative.transformers.experimental_attention_variant.utils import  save_to_indexer_losses_tracker
 
@@ -196,12 +196,16 @@ def unfused_compressed_sparse_attn(query, kv_full, attn_sink, topk_indices, soft
 
     safe_indices = ops.cast(mint.clamp(topk_indices, min=0), mstype.int64)  # [b, sq, topk]
     topk = safe_indices.shape[-1]
-    # Expand index over the d dim:  [b, sq, topk] -> [b, sq, topk, d]
-    safe_indices_exp = mint.tile(mint.unsqueeze(safe_indices, -1), (1, 1, 1, d))
-    # Expand kv over sq:  [b, sk, d] -> [b, 1, sk, d] -> [b, sq, sk, d]
-    kv_expanded = mint.tile(kv_t, (1, sq, 1, 1))
-    # gather along the sk axis (dim=2 of the 4D layout) -> [b, sq, topk, d]
-    kv_gathered = mint.gather(kv_expanded, 2, safe_indices_exp)
+
+    # Flatten KV to [b*sk, d] and gather via flat index lookup.
+    # This avoids materializing kv_expanded [b, sq, sk, d] (up to 40 GB fp32 at sq=4096, ratio=4)
+    # and safe_indices_exp [b, sq, topk, d].
+    # Uses only fundamental tensor indexing — no deprecated APIs.
+    sk = kv_full.shape[0]
+    kv_flat = mint.reshape(kv_t, (b * sk, d))                     # [b*sk, d]
+    batch_offset = mint.arange(b, dtype=mstype.int64).unsqueeze(1).unsqueeze(2) * sk
+    flat_indices = mint.reshape(safe_indices + batch_offset, (-1,))
+    kv_gathered = mint.reshape(kv_flat[flat_indices], (b, sq, topk, d))
 
     # --- Attention scores
     # query: [sq, b, n, d] -> [b, n, sq, d]
@@ -239,9 +243,8 @@ def unfused_compressed_sparse_attn(query, kv_full, attn_sink, topk_indices, soft
     output = mint.permute(output, (0, 2, 1, 3))
     output = ops.cast(output, query.dtype)
 
-    # [b, n, sq, d] -> [sq, b, n, d] -> [sq, b, n * d]
+    # [b, n, sq, d] -> [sq, b, n, d]
     output = mint.permute(output, (2, 0, 1, 3))
-    output = mint.reshape(output, (sq, b, n * d))
     return output
 
 
@@ -327,10 +330,16 @@ class CompressedSparseAttention(nn.Cell):
                 rotary_pos_emb=self.rotary_pos_emb,
             )
             self.indexer_loss_auto_scaler = _IndexerLossAutoScaler()
+            self.unfused_indexer_loss = UnfusedCSAIndexerLoss(
+                softmax_scale=self.softmax_scale,
+                loss_coeff=config.dsa_indexer_loss_coeff,
+                sparse_loss=config.dsa_indexer_use_sparse_loss,
+            )
         else:
             self.enable_indexer = False
             self.indexer = None
             self.indexer_loss_auto_scaler = None
+            self.unfused_indexer_loss = None
 
         # Alias the non-trivial mint ops used in construct/forward per the
         # fine-grained-recompute convention (RFC §3.1 #9).
@@ -358,7 +367,7 @@ class CompressedSparseAttention(nn.Cell):
             qr: optional ``[sq, b, q_lora_rank]`` for indexer.
 
         Returns:
-            ``[sq, b, np * v_head_dim]`` core attention output.
+            ``[sq, b, np, v_head_dim]`` core attention output.
         """
         if self.apply_dsa_kernel_fusion:
             return self._construct_fused(query, key, x, qr, actual_seq_len)
@@ -387,12 +396,15 @@ class CompressedSparseAttention(nn.Cell):
             key = self.bsnd_to_tnd(key)
             compressed_kv = self.bsnd_to_tnd(compressed_kv)
             topk_indices = self.bsnd_to_tnd(topk_indices)
+        attn_sink = self.attn_sink
+        if hasattr(attn_sink, "to_local"):
+            attn_sink = attn_sink.to_local()
         output = npu_sparse_attn_shared_kv(
             query,
             ori_kv=key,
             cmp_kv=compressed_kv,
             cmp_sparse_indices=topk_indices,
-            sinks=self.attn_sink,
+            sinks=attn_sink,
             softmax_scale=self.softmax_scale,
             cmp_ratio=self.compress_ratio,
             ori_win_left=self.ori_win_left,
@@ -402,9 +414,9 @@ class CompressedSparseAttention(nn.Cell):
         )
         # npu_sparse_attn_shared_kv returns BSND/TND [b, sq, np, vd]/[b * sq, np, vd];
         # reshape to [b, sq, np * vd]
-        # then transpose back to [sq, b, np * vd]
-        output = self.reshape(output, (b, s, n * d))
-        output = self.permute(output, (1, 0, 2))
+        # then transpose back to [sq, b, np, vd]
+        output = self.reshape(output, (b, s, n, d))
+        output = self.permute(output, (1, 0, 2, 3))
 
         # --- Attach indexer KL loss to the output graph -------------
         if self.enable_indexer and self.training:
@@ -483,14 +495,11 @@ class CompressedSparseAttention(nn.Cell):
                 )
                 # Indexer KL loss (small-op) — training only.
                 if self.training:
-                    indexer_loss = compute_unfused_indexer_loss(
+                    indexer_loss = self.unfused_indexer_loss(
                         index_scores,
                         topk_indices_compressed,
                         ops.stop_gradient(query),
                         ops.stop_gradient(compressed_kv),
-                        self.softmax_scale,
-                        self.dsa_indexer_loss_coeff,
-                        self.sparse_loss,
                         mask=causal_mask,
                     )
                     if self.dsa_indexer_loss_coeff > 0:

@@ -194,10 +194,12 @@ class DSv4HybridSelfAttention(MultiLatentAttention):
             "'rope' and 'yarn'"
         )
 
-    def _apply_forward_rope(self, t: Tensor, freqs: Tensor, mscale: float = 1.0) -> Tensor:
+    def _apply_forward_rope(self, t: Tensor, freqs: Tensor, mscale: float = 1.0, inverse=False) -> Tensor:
         """Forward-RoPE the trailing ``qk_pos_emb_head_dim`` lanes of ``t``."""
+        if freqs is None:
+            return t
         pos_dim = self.config.qk_pos_emb_head_dim
-        nope_dim = int(t.shape[-1]) - pos_dim
+        nope_dim = self.config.v_head_dim - pos_dim
         t_nope, t_pe = self.split(t, [nope_dim, pos_dim], dim=-1)
         t_pe = self.apply_rotary_emb(
             t_pe,
@@ -206,40 +208,17 @@ class DSv4HybridSelfAttention(MultiLatentAttention):
             rotary_interleaved=self.config.rotary_interleaved,
             multi_latent_attention=self.config.multi_latent_attention,
             mla_output_remove_interleaving=True,
+            inverse=inverse
         )
         return self.cat([t_nope, t_pe], dim=-1)
 
-    def _apply_inverse_rope(self, core_attn_out: Tensor, sq: int, bsz: int) -> Tensor:
-        """Inverse-RoPE the trailing ``qk_pos_emb_head_dim`` lanes of each head."""
-        if self.rotary_pos_emb is None:
-            return core_attn_out
-        n_heads = self.config.num_attention_heads
-        pos_dim = self.config.qk_pos_emb_head_dim
-        v_head_dim = self.config.v_head_dim
-        nope_dim = v_head_dim - pos_dim
-        # [sq, b, n_heads * v_head_dim] -> [sq, b, n_heads, v_head_dim].
-        out_4d = self.reshape(core_attn_out, (sq, bsz, n_heads, v_head_dim))
-        content_part, rot_part = self.split(out_4d, [nope_dim, pos_dim], dim=-1)
-        # rotary_pos_emb(seq_len) -> (freqs, mscale); force mscale = 1.0.
-        freqs, _ = self.rotary_pos_emb(sq)
-        rot_part = self.apply_rotary_emb(
-            rot_part,
-            freqs,
-            1.0,
-            rotary_interleaved=self.config.rotary_interleaved,
-            multi_latent_attention=self.config.multi_latent_attention,
-            inverse=True,
-            mla_output_remove_interleaving=True,
-        )
-        out_4d = self.cat([content_part, rot_part], dim=-1)
-        return self.reshape(out_4d, (sq, bsz, n_heads * v_head_dim))
-
-    # pylint: disable=arguments-differ,unused-argument
     def construct(self, x: Tensor, attention_mask=None, rotary_pos_emb=None,
-                  prefix_keys_values=None, actual_seq_len=None, mscale=1.0) -> Tensor:
+                  prefix_keys_values=None, pad_zeros=None, actual_seq_len=None, mscale=1.0) -> Tensor:
         """DeepSeek-V4 hybrid attention forward."""
         if prefix_keys_values is not None:
             raise NotImplementedError("prefix_keys_values is not supported for now.")
+        if pad_zeros:
+            raise NotImplementedError("pad_zeros is not supported for now.")
 
         ori_dtype = x.dtype
         sq, bsz, _ = self.shape(x)
@@ -270,19 +249,20 @@ class DSv4HybridSelfAttention(MultiLatentAttention):
         # ---- Main Q / K pe-lane RoPE ---------------------------------
         if self.rotary_pos_emb is not None:
             freqs, _ = self.rotary_pos_emb(sq)
-            q = self._apply_forward_rope(q, freqs, 1.0)
-            kv_4d = self._apply_forward_rope(kv_4d, freqs, 1.0)
-        key = kv_4d
+        else:
+            freqs = None
+        q = self._apply_forward_rope(q, freqs, 1.0)
+        key = self._apply_forward_rope(kv_4d, freqs, 1.0)
 
         # ---- Core attention ------------------------------------------
-        # core_out: [sq, b, num_attention_heads * v_head_dim]
+        # core_out: [sq, b, num_attention_heads, v_head_dim]
         core_out = self.core_attention(
             q, key, x, q_compressed,
             actual_seq_len=actual_seq_len
         )
 
         # ---- Inverse-RoPE on the post-core-attention output ----------
-        core_out = self._apply_inverse_rope(core_out, sq, bsz)
+        core_out = self._apply_forward_rope(core_out, freqs, 1.0, inverse=True)
 
         # ---- Grouped wo_a --------------------------------------------
         o_groups = self.config.o_groups
