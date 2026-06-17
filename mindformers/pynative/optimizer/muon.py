@@ -1567,6 +1567,19 @@ def _run_muon_batched(
     if gather_shared is not None:
         gather_shared.wait()
 
+    # Drain any gather handle that was NOT consumed by the owner-NS pass above.
+    # ``_start_full_tensor_async`` issues a *collective* ``all_gather`` — every
+    # shard-holding rank launches it and gets a CommHandle, but only the owner
+    # rank materializes (and thus ``wait()``s) the full tensor in Pass A.  A
+    # non-owner rank's ``_AsyncAllConcatTensor.handle`` would otherwise be
+    # destroyed without ``wait()``, leaving a dangling HCCL event that crashes
+    # the next stream sync (e.g. the checkpoint-save ``barrier()``) with
+    # "The event ... has been destroyed, cannot query it".
+    for info in prepared:
+        pending_full = info.pop('pending_full_tensor', None)
+        if pending_full is not None:
+            pending_full.wait()
+
     # Pass B — build every weight's scatter P2POps; one batched HCCL call.
     scatter_p2p_ops = []
     scatter_pending_infos = []
