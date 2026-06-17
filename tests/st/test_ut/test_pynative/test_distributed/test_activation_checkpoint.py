@@ -22,7 +22,16 @@ from mindformers.pynative.config.config import (
     RecomputeConfig,
     SwapConfig,
 )
-from mindformers.pynative.distributed.activation_checkpoint import apply_recompute, apply_swap
+import mindformers.pynative.distributed.activation_checkpoint as ac_mod
+from mindformers.pynative.distributed.activation_checkpoint import apply_ac, apply_recompute, apply_swap
+
+
+@pytest.fixture(autouse=True)
+def _reset_config_list():
+    """Isolate the module-global whitelist cache between tests."""
+    ac_mod._config_list = {}
+    yield
+    ac_mod._config_list = {}
 
 
 class MockAttention(nn.Cell):
@@ -65,6 +74,42 @@ class MockModel(nn.Cell):
 
     def construct(self, x):
         return x
+
+
+class MockMtpLayer(nn.Cell):
+    """Mirrors MultiTokenPredictionLayer: the heavy transformer is nested under
+    ``transformer_layer`` (alongside enorm/hnorm/eh_proj/final_layernorm)."""
+
+    def __init__(self):
+        super().__init__()
+        self.enorm = nn.Cell()
+        self.hnorm = nn.Cell()
+        self.eh_proj = nn.Cell()
+        self.transformer_layer = MockTransformerLayer()
+        self.final_layernorm = nn.Cell()
+
+    def construct(self, x):
+        return x
+
+
+class MockMtpBlock(nn.Cell):
+    """Mirrors MultiTokenPredictionBlock: a plain (local-indexed) CellList."""
+
+    def __init__(self, mtp_num_layers=1):
+        super().__init__()
+        self.layers = nn.CellList([MockMtpLayer() for _ in range(mtp_num_layers)])
+
+    def construct(self, x):
+        return x
+
+
+class MockMtpDecoder(MockModel):
+    """Decoder mock whose config also advertises ``mtp_num_layers``."""
+
+    def __init__(self, num_layers=2, mtp_num_layers=1):
+        super().__init__(num_layers=num_layers)
+        self.config = type("Config", (), {"num_layers": num_layers,
+                                           "mtp_num_layers": mtp_num_layers})()
 
 
 def _make_recompute_config(mode="None", full_recompute_layer=None,
@@ -181,3 +226,65 @@ class TestOpSwap:
         apply_swap(model, sc)
         assert isinstance(model.layers[0].attention, SwapWrapper)
         assert isinstance(model.layers[1].mlp, SwapWrapper)
+
+
+# ======================== MTP recompute ========================
+
+
+@pytest.mark.level0
+@pytest.mark.platform_x86_cpu
+@pytest.mark.env_onecard
+class TestMtpRecompute:
+    """MTP layers are addressable as the last layers (MTP layer i == layer num_layers + i)."""
+
+    def test_full_recompute_mtp_layer_only(self):
+        decoder = MockMtpDecoder(num_layers=2, mtp_num_layers=1)
+        mtp = MockMtpBlock(mtp_num_layers=1)
+        rc, rc_comm = _make_recompute_config(mode="full", full_recompute_layer=["2"])
+        apply_ac(decoder, rc, rc_comm, _make_swap_config(enable=False), 1, mtp_block=mtp)
+        assert not isinstance(decoder.layers[0], CheckpointWrapper)
+        assert not isinstance(decoder.layers[1], CheckpointWrapper)
+        assert isinstance(mtp.layers[0], CheckpointWrapper)
+
+    def test_full_recompute_decoder_and_mtp(self):
+        decoder = MockMtpDecoder(num_layers=2, mtp_num_layers=2)
+        mtp = MockMtpBlock(mtp_num_layers=2)
+        rc, rc_comm = _make_recompute_config(mode="full", full_recompute_layer=["0-3"])
+        apply_ac(decoder, rc, rc_comm, _make_swap_config(enable=False), 1, mtp_block=mtp)
+        assert isinstance(decoder.layers[0], CheckpointWrapper)
+        assert isinstance(decoder.layers[1], CheckpointWrapper)
+        assert isinstance(mtp.layers[0], CheckpointWrapper)
+        assert isinstance(mtp.layers[1], CheckpointWrapper)
+
+    def test_select_recompute_mtp_transformer_layer(self):
+        decoder = MockMtpDecoder(num_layers=2, mtp_num_layers=1)
+        mtp = MockMtpBlock(mtp_num_layers=1)
+        rc, rc_comm = _make_recompute_config(mode="select", select_module={"transformer_layer": ["2"]})
+        apply_ac(decoder, rc, rc_comm, _make_swap_config(enable=False), 1, mtp_block=mtp)
+        assert isinstance(mtp.layers[0].transformer_layer, CheckpointWrapper)
+        # decoder layers are untouched
+        assert not isinstance(decoder.layers[0].attention, CheckpointWrapper)
+
+    def test_select_recompute_mtp_nested_attention(self):
+        decoder = MockMtpDecoder(num_layers=2, mtp_num_layers=1)
+        mtp = MockMtpBlock(mtp_num_layers=1)
+        rc, rc_comm = _make_recompute_config(
+            mode="select", select_module={"transformer_layer.attention": ["2"]})
+        apply_ac(decoder, rc, rc_comm, _make_swap_config(enable=False), 1, mtp_block=mtp)
+        assert isinstance(mtp.layers[0].transformer_layer.attention, CheckpointWrapper)
+        assert not isinstance(mtp.layers[0].transformer_layer.mlp, CheckpointWrapper)
+
+    def test_mtp_layer_id_out_of_range_raises(self):
+        decoder = MockMtpDecoder(num_layers=2, mtp_num_layers=1)
+        mtp = MockMtpBlock(mtp_num_layers=1)
+        # valid ids are 0,1 (decoder) and 2 (MTP); 3 is out of range
+        rc, rc_comm = _make_recompute_config(mode="full", full_recompute_layer=["3"])
+        with pytest.raises(ValueError):
+            apply_ac(decoder, rc, rc_comm, _make_swap_config(enable=False), 1, mtp_block=mtp)
+
+    def test_no_mtp_block_keeps_decoder_only_namespace(self):
+        # Without an MTP block, layer id 2 (== the would-be MTP layer) is out of range.
+        decoder = MockMtpDecoder(num_layers=2, mtp_num_layers=0)
+        rc, rc_comm = _make_recompute_config(mode="full", full_recompute_layer=["2"])
+        with pytest.raises(ValueError):
+            apply_ac(decoder, rc, rc_comm, _make_swap_config(enable=False), 1, mtp_block=None)

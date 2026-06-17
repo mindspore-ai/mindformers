@@ -555,11 +555,15 @@ def _set_select_recompute(layer, layer_id, layer_to_modules, add_prim_attr=False
 
 
 def apply_recompute(
-    model: nn.Cell,
+    model,
     recompute_config: RecomputeConfig,
     recompute_comm_config: RecomputeCommConfig,
 ) -> None:
-    """Apply ``checkpoint_wrapper`` using recompute and recompute_comm configs."""
+    """Apply ``checkpoint_wrapper`` using recompute and recompute_comm configs.
+
+    ``model`` may be a bare decoder ``TransformerBlock`` or a ``_MtpLayerView``
+    that also exposes the MTP layers as the last global layer ids.
+    """
     rc = recompute_config
     rc_comm = recompute_comm_config
     need_recompute = rc.mode != "None"
@@ -750,67 +754,47 @@ def apply_swap(
             SwapManager().set_forward_prefetch_layer(model.layers[layer_id], model.layers[layer_id + prefetch])
 
 
-def _check_recompute_swap_overlap(recompute, recompute_comm, swap):
-    """Check if recompute and swap configs overlap on the same modules."""
-    rc = recompute
-    rc_comm = recompute_comm
-    sc = swap
+class _MtpLayerIndex:
+    """Global-layer-id indexer over decoder layers plus MTP layers.
 
-    recompute_layers = set()
-    if rc.mode != "None":
-        recompute_layers = _parse_layer_ids(rc.full_recompute_layer)
-    swap_layers = set()
-    if sc.enable and sc.layer_swap:
-        swap_layers = _parse_layer_ids(sc.layer_swap[0].get("layers", []))
+    Decoder layers keep their global ids (``id < num_layers``); MTP layer ``i``
+    is exposed as global id ``num_layers + i`` (local index ``id - num_layers``
+    in the MTP block's plain ``nn.CellList``). Supports get/set so full-recompute
+    can replace a layer cell with its ``checkpoint_wrapper``.
+    """
 
-    recompute_select = {}
-    if rc.mode == "select" and rc.select_module:
-        recompute_select = _expand_select_module(_config_list, rc.select_module)
-    if rc_comm.enable and rc_comm.select_module:
-        comm_select = _expand_select_module(_config_list, rc_comm.select_module)
-        for layer_id, mods in comm_select.items():
-            if layer_id in recompute_select:
-                recompute_select[layer_id] = list(set(recompute_select[layer_id]) | set(mods))
-            else:
-                recompute_select[layer_id] = list(mods)
-    if recompute_select:
-        recompute_select = _clean_and_parse_config(recompute_layers, recompute_select)
-    swap_select = {}
-    if sc.op_swap:
-        swap_select = _expand_op_swap(_config_list, parse_op_swap(sc.op_swap))
+    def __init__(self, decoder_layers, mtp_layers, num_layers):
+        self._decoder_layers = decoder_layers
+        self._mtp_layers = mtp_layers
+        self._num_layers = num_layers
 
-    overlap = swap_layers & (recompute_layers | set(recompute_select.keys()))
-    if overlap:
-        logger.error(f"[Recompute/Swap Config] layers {sorted(overlap)} are configured for "
-                     "both recompute and layer swap, which is not allowed")
-        raise ValueError(
-            f"layers {sorted(overlap)} are configured for both recompute "
-            "and layer swap, which is not allowed"
-        )
+    def __getitem__(self, idx):
+        if idx < self._num_layers:
+            return self._decoder_layers[idx]
+        return self._mtp_layers[idx - self._num_layers]
 
-    layer_overlap_errors = []
-    for layer_id, sw_mods in swap_select.items():
-        if layer_id in recompute_layers:
-            layer_overlap_errors.append(
-                f"layer {layer_id}: layer is configured for full recompute, op swap is not allowed"
-            )
-            continue
-        if layer_id not in recompute_select:
-            continue
-        overlap_pairs = []
-        for sw_mod in sw_mods:
-            for rc_mod in recompute_select[layer_id]:
-                if sw_mod == rc_mod or sw_mod.startswith(rc_mod + ".") or rc_mod.startswith(sw_mod + "."):
-                    overlap_pairs.append((sw_mod, rc_mod))
-        if overlap_pairs:
-            pairs_str = ", ".join(f"'{sw}'/'{rc}'" for sw, rc in overlap_pairs)
-            layer_overlap_errors.append(
-                f"layer {layer_id}: modules {pairs_str} have parent-child overlap"
-            )
-    if layer_overlap_errors:
-        error_detail = "; ".join(layer_overlap_errors)
-        logger.error(f"[Recompute/Swap Config] {error_detail}, which is not allowed")
-        raise ValueError(f"{error_detail}, which is not allowed")
+    def __setitem__(self, idx, cell):
+        if idx < self._num_layers:
+            self._decoder_layers[idx] = cell
+        else:
+            self._mtp_layers[idx - self._num_layers] = cell
+
+
+class _MtpLayerView:
+    """Read/write view presenting the decoder block and the MTP block as a single
+    global-indexed layer container for the recompute and swap machinery.
+
+    MTP layers are treated as the *last* layers: MTP layer ``i`` is addressable
+    as global layer ``num_layers + i`` in the config, so users target them with
+    the same layer-id namespace as the decoder.
+    """
+
+    def __init__(self, decoder, mtp_block):
+        num_layers = decoder.config.num_layers
+        self.config = decoder.config
+        self.layer_start = decoder.layer_start
+        self.layer_end = num_layers + len(mtp_block.layers) - 1
+        self.layers = _MtpLayerIndex(decoder.layers, mtp_block.layers, num_layers)
 
 
 def apply_ac(
@@ -819,8 +803,15 @@ def apply_ac(
     recompute_comm,
     swap,
     pp,
+    mtp_block=None,
 ):
-    """Apply activation checkpointing to the model."""
+    """Apply activation checkpointing to the model.
+
+    ``model`` is the decoder ``TransformerBlock``. When ``mtp_block`` is provided
+    (DeepSeek-V3 MTP, only on the last PP stage), its layers extend the
+    layer-id namespace as the *last* layers: MTP layer ``i`` is addressable as
+    global layer ``num_layers + i``.
+    """
     global _config_list
     enable_recompute = (recompute.mode != "None" or recompute_comm.enable)
     enable_swap = swap.enable
@@ -833,19 +824,24 @@ def apply_ac(
     if not num_layers:
         raise ValueError(f"{type(model)} must have 'config.num_layers' attribute.")
 
-    _config_list = _get_modules_and_ops_list(model)
+    mtp_num_layers = getattr(model.config, "mtp_num_layers", 0) or 0
+    total_num_layers = num_layers + mtp_num_layers
+
+    if mtp_block is not None:
+        ac_model = _MtpLayerView(model, mtp_block)
+    else:
+        ac_model = model
+
+    _config_list = _get_modules_and_ops_list(ac_model)
 
     if pp > 1 and enable_swap:
         logger.error("[Swap Config] swap is not supported with pipeline parallel")
         raise ValueError("swap is not supported with pipeline parallel")
 
-    if enable_recompute and enable_swap:
-        _check_recompute_swap_overlap(recompute, recompute_comm, swap)
-
     if enable_recompute:
-        _validate_recompute_config(recompute, recompute_comm, num_layers)
-        apply_recompute(model, recompute, recompute_comm)
+        _validate_recompute_config(recompute, recompute_comm, total_num_layers)
+        apply_recompute(ac_model, recompute, recompute_comm)
 
     if enable_swap:
-        _validate_swap_config(swap, num_layers)
-        apply_swap(model, swap)
+        _validate_swap_config(swap, total_num_layers)
+        apply_swap(ac_model, swap)

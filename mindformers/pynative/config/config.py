@@ -718,10 +718,21 @@ class RecomputeConfig(BaseConfig):
     """Recompute mode: ``'None'`` , ``'full'``, or ``'select'``."""
 
     full_recompute_layer: Optional[Union[list, tuple]] = None
-    """Layer ranges for full recomputation."""
+    """Layer ranges for full recomputation.
+
+    When the model has MTP layers (DeepSeek-V3 ``mtp_num_layers > 0``), MTP layers
+    extend the layer-id namespace as the last layers: MTP layer ``i`` is layer
+    ``num_layers + i``. E.g. with 61 decoder layers and 1 MTP layer, ``'61'`` selects
+    the MTP layer."""
 
     select_module: Optional[Union[dict, list]] = None
-    """Module paths and their layer ranges for selective recomputation. Only effective when ``mode`` is ``'select'``."""
+    """Module paths and their layer ranges for selective recomputation. Only effective when ``mode`` is ``'select'``.
+
+    MTP layers are addressable as the last layers (MTP layer ``i`` == layer
+    ``num_layers + i``). Note an MTP layer's heavy transformer is nested under
+    ``transformer_layer`` (the MTP layer is enorm/hnorm/eh_proj/transformer_layer/
+    final_layernorm), so target e.g. ``transformer_layer`` or
+    ``transformer_layer.self_attention`` for those layer ids."""
 
     def __post_init__(self):
         """Post-initialization validation."""
