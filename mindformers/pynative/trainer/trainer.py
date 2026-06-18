@@ -22,7 +22,7 @@ import numpy as np
 
 # mindspore modules
 import mindspore as ms
-from mindspore import Tensor, ops, manual_seed, set_deterministic, nn
+from mindspore import Tensor, ops, manual_seed, set_deterministic
 from mindspore.dataset import Dataset
 from mindspore.common import set_seed
 from mindspore.mint.distributed import (
@@ -107,16 +107,16 @@ class Trainer:
     """
 
     def __init__(
-        self,
-        config: Optional[Union[str, dict]] = None,
-        model: PreTrainedModel = None,
-        run_mode: Optional[str] = "train",
-        train_dataset: Optional[Dataset] = None,
-        eval_dataset: Optional[Dataset] = None,
-        optimizer: Optional[Any] = None,
-        lr_scheduler: Optional[Any] = None,
-        callbacks: Optional[List] = None,
-        compute_loss_func: Optional[Callable] = None,
+            self,
+            config: Optional[Union[str, dict]] = None,
+            model: PreTrainedModel = None,
+            run_mode: Optional[str] = "train",
+            train_dataset: Optional[Dataset] = None,
+            eval_dataset: Optional[Dataset] = None,
+            optimizer: Optional[Any] = None,
+            lr_scheduler: Optional[Any] = None,
+            callbacks: Optional[List] = None,
+            compute_loss_func: Optional[Callable] = None,
     ):
         """
         Initialize the Trainer.
@@ -136,7 +136,7 @@ class Trainer:
         """
         # Verify instance validity when config is yaml file
         if isinstance(config, str) and any(
-            [model, train_dataset, eval_dataset, optimizer, lr_scheduler, callbacks]
+                [model, train_dataset, eval_dataset, optimizer, lr_scheduler, callbacks]
         ):
             logger.warning(
                 "When config is a yaml file, (model, dataset, optimizer, lr_scheduler, callbacks) "
@@ -159,16 +159,23 @@ class Trainer:
         logger.info(f"Current world size: {self.world_size}.")
         self.enable_parallel = self.world_size > 1
 
+        self.communication_init = False
         if self.enable_parallel:
             init_process_group()
             self.communication_init = True
             logger.info("Distributed communication is initialized.")
-        
+
         # init states for pipeline parallel
-        self.pp_enabled = self.config.parallelism.pipeline_parallel > 1
-        self.parallel_dims = None
+        self.schedule = None
         self.metric_reduce_group = None
         self.metric_reduce_group_size = None
+        self.pp_metric_reduce_group = None
+        self.pp_metric_reduce_group_size = None
+        # On the single-card / non-PP path there is no pipeline split, so the
+        # only stage is also the last stage. ``_apply_parallelism`` overwrites
+        # these when PP is enabled.
+        self.has_first = True
+        self.has_last = True
 
         self.global_batch_size = self.config.training.global_batch_size
         self.gradient_accumulation_steps = None
@@ -176,10 +183,10 @@ class Trainer:
 
         # Create model
         self.model = self._create_model(model, self.config.model)
+        self.parallel_dims = None
         if self.enable_parallel:
             # Apply parallelism to model
-            self.model, self.schedule, self.has_first, self.has_last = \
-                self._apply_parallelism(self.model, self.config.parallelism)
+            self._apply_parallelism(self.model, self.config.parallelism)
 
         # After parallelism, parameters will be reset
         self.model = self.model if isinstance(self.model, list) else [self.model]
@@ -242,9 +249,7 @@ class Trainer:
         self.monitor = MonitorGroup(self.config, model=self.model[0])
 
         # Initialize training state
-        self.communication_init = False
         self.state = None
-        self._model_states_initialized = False
 
     @staticmethod
     def _init_config(config: Union[str, dict], run_mode: str = "train") -> TrainConfig:
@@ -312,7 +317,7 @@ class Trainer:
         self.parallel_dims = ParallelDims.from_config(parallelism, self.world_size)
 
         # Apply unified parallelization
-        model, schedule, has_first, has_last = parallelize_model(
+        self.model, self.schedule, self.has_first, self.has_last = parallelize_model(
             model=model,
             parallel_dims=self.parallel_dims,
             parallelism=parallelism,
@@ -321,7 +326,6 @@ class Trainer:
             swap=self.config.swap,
             gradient_accumulation_steps=self.num_accumulation_steps,
         )
-        return model, schedule, has_first, has_last
 
     def _create_model(self, model, model_config: Optional[Dict]) -> Any:
         """
@@ -371,7 +375,7 @@ class Trainer:
         context_parallel = parallelism.context_parallel
 
         data_parallel = self.world_size // (
-            tensor_parallel * pipeline_parallel * context_parallel
+                tensor_parallel * pipeline_parallel * context_parallel
         )
         if data_parallel <= 0:
             raise ValueError(
@@ -395,8 +399,8 @@ class Trainer:
 
         # calculate gradient accumulation steps
         if (
-            parallelism.data_parallel * self.config.training.local_batch_size
-            > self.global_batch_size
+                parallelism.data_parallel * self.config.training.local_batch_size
+                > self.global_batch_size
         ):
             raise ValueError(
                 "The product of data_parallel and local_batch_size exceeds global_batch_size, "
@@ -404,7 +408,7 @@ class Trainer:
             )
 
         self.num_accumulation_steps = self.global_batch_size // (
-            parallelism.data_parallel * self.config.training.local_batch_size
+                parallelism.data_parallel * self.config.training.local_batch_size
         )
         parallelism.pipeline_parallel_microbatch_size = self.num_accumulation_steps
         logger.info(
@@ -456,11 +460,11 @@ class Trainer:
         raise ValueError("Unable to determine dataset size from the provided dataset.")
 
     def _create_optimizer_and_scheduler(
-        self,
-        optimizer,
-        lr_scheduler,
-        optim_config: Optional[Dict],
-        lr_config: Optional[Dict],
+            self,
+            optimizer,
+            lr_scheduler,
+            optim_config: Optional[Dict],
+            lr_config: Optional[Dict],
     ) -> tuple:
         """
         Create optimizer and learning rate scheduler.
@@ -520,7 +524,7 @@ class Trainer:
         ]
 
     def _create_callback_handler(
-        self, callbacks: Optional[List], config: Any
+            self, callbacks: Optional[List], config: Any
     ) -> CallbackHandler:
         """
         Create callback handler.
@@ -599,9 +603,9 @@ class Trainer:
             )
 
     def train(
-        self,
-        checkpoint_path: Optional[str] = None,
-        mode: str = "pretrain",
+            self,
+            checkpoint_path: Optional[str] = None,
+            mode: str = "pretrain",
     ):
         """
         Execute the training loop.
@@ -620,13 +624,17 @@ class Trainer:
         # Initialize training state
         self.state = self._init_train_state()
 
+        if self.parallel_dims is not None and self.parallel_dims.pp_enabled:
+            pp_mesh = self.parallel_dims.get_mesh("pp")
+            self.pp_metric_reduce_group_size = pp_mesh.size()
+            self.pp_metric_reduce_group = pp_mesh.get_group()
+
         # ``loss_mesh`` is the dp x cp domain and is the right group to all-reduce
         # per-step metric statistics over (loss, MoE aux loss, MoE tokens_per_expert
         # for the auxiliary-loss-free expert_bias update). It must be set even when
         # PP is disabled, otherwise multi-card DP / CP runs would compute the
         # expert_bias delta from per-rank local token counts instead of the
         # global-batch counts, diverging from the single-card baseline.
-
         if self.parallel_dims is not None and (
                 self.parallel_dims.pp_enabled or self.parallel_dims.dp_cp_enabled):
             loss_mesh = self.parallel_dims.get_mesh("loss")
@@ -655,11 +663,11 @@ class Trainer:
             destroy_process_group()
 
     def _load_checkpoint(
-        self,
-        checkpoint_path: str,
-        model,
-        optimizer=None,
-        global_step: Optional[int] = None,
+            self,
+            checkpoint_path: str,
+            model,
+            optimizer=None,
+            global_step: Optional[int] = None,
     ):
         """
         Load checkpoint from file.
@@ -772,6 +780,9 @@ class Trainer:
                     self.config, self.state, loss=loss, grad_norm=grad_norm, monitor=self.monitor,
                     metric_reduce_group=self.metric_reduce_group,
                     metric_reduce_group_size=self.metric_reduce_group_size,
+                    pp_metric_reduce_group=self.pp_metric_reduce_group,
+                    pp_metric_reduce_group_size=self.pp_metric_reduce_group_size,
+                    has_last=self.has_last,
                 )
 
                 # Epoch end callback (pass loss)
@@ -845,7 +856,7 @@ class Trainer:
     def _get_batch_naive(self, dataset_iter):
         """Fetch next batch in naive loading mode (simplified)."""
         return next(dataset_iter)
-    
+
     def _split_micro_batch(self, inputs: Dict[str, Any], acc_step: int):
         """
         Split a batch of data into a micro-batch for gradient accumulation.

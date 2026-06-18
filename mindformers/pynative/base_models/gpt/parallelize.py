@@ -33,8 +33,9 @@ import os
 from typing import Any, List
 
 import mindspore as ms
-from mindspore import nn, Parameter
+from mindspore import nn, Parameter, Tensor
 from mindspore.ops.communication import set_comm_ops_inplace
+from mindspore.mint.distributed import get_rank, all_gather, new_group
 
 from hyper_parallel import DeviceMesh
 from hyper_parallel.core.pipeline_parallel import ScheduleInterleaved1F1B
@@ -113,6 +114,75 @@ def _unwrap_gptmodel(model: nn.Cell) -> nn.Cell:
         )
 
     return gpt_models[0]
+
+
+def _setup_mtp_embedding_grad_sync(model, parallel_dims):
+    """Tag the MTP-shared input embedding for cross-PP-stage gradient sync.
+
+    Under pipeline parallelism with MTP enabled, the input embedding is
+    replicated on two PP stages: stage 0 (the main forward) and the last stage
+    (which hosts the MTP block and reuses the embedding to embed the shifted MTP
+    tokens). The single-card baseline keeps ONE embedding tensor that receives
+    ``main_grad + mtp_grad``; under PP the stage-0 copy only sees ``main_grad``
+    and the MTP-stage copy only sees ``mtp_grad``. With no gradient sync the two
+    copies drift apart and the MTP loss diverges from single-card (a slow,
+    one-sided, compounding error).
+
+    This builds a process group over the embedding-owning PP ranks (per
+    dp/tp/cp/ep coordinate) and tags the local ``word_embeddings.weight`` with
+    ``_embedding_grad_sync_group`` / ``_pp_replica_count``. The grad-norm helper
+    (`_calculate_global_grad_norm` -> `_get_grad_factor`) then all-reduces the
+    tagged gradient before computing the norm/step and counts the replicated
+    embedding exactly once, with no changes required in the trainer.
+    """
+    if parallel_dims is None or not parallel_dims.pp_enabled:
+        return
+
+    gpt_model = _unwrap_gptmodel(model)
+    cfg = gpt_model.get_gpt_transformer_config()
+    if not getattr(cfg, "mtp_num_layers", 0):
+        return
+
+    # Locate this rank's input-embedding weight (present on stage 0 and the MTP
+    # stage). At most one on a non-interleaved run.
+    embed_weights = [
+        param for name, param in model.parameters_and_names()
+        if name.endswith("embedding.word_embeddings.weight")
+    ]
+
+    pp_mesh = parallel_dims.get_mesh("pp")
+    pp_ranks = pp_mesh.get_rank_list_along_axis("pp")  # global ranks on this PP line
+    local_rank = get_rank()
+    owns_embedding = 1 if embed_weights else 0
+
+    # Exchange the ownership flag over the PP group so every rank on the line
+    # derives the SAME ``embed_ranks`` (required for a consistent ``new_group``).
+    flag = Tensor([owns_embedding], dtype=ms.int32)
+    gathered = [Tensor([0], dtype=ms.int32) for _ in pp_ranks]
+    all_gather(gathered, flag, group=pp_mesh.get_group())
+    embed_ranks = [
+        int(r) for r, g in zip(pp_ranks, gathered) if int(g.asnumpy()[0]) == 1
+    ]
+
+    if len(embed_ranks) <= 1:
+        # Single embedding owner on this line (MTP stage == stage 0, or MTP
+        # disabled): nothing to sync.
+        return
+
+    # Only member ranks create/join the communicator; middle PP stages must NOT
+    # call ``new_group`` with these ranks or HCCL raises "group doesn't contain
+    # the global rank".
+    if local_rank not in embed_ranks:
+        return
+
+    group = new_group(ranks=embed_ranks)
+    for weight in embed_weights:
+        weight._embedding_grad_sync_group = group
+        weight._embedding_grad_sync_size = len(embed_ranks)
+    logger.info(
+        "[MTP-EmbedSync] rank %d tagged embedding for grad-sync group %s",
+        local_rank, embed_ranks,
+    )
 
 
 def is_norm_module(module):
@@ -1237,8 +1307,6 @@ def apply_fsdp(
     else:
         _setup_gpt_prefetch(embedding, layers, tail_modules)
 
-    _setup_gpt_prefetch(embedding, layers, tail_modules)
-
     if parallel_dims.dp_replicate_enabled:
         logger.info("Successfully applied HSDP (Hybrid Sharded Data Parallel)")
     else:
@@ -1472,6 +1540,11 @@ def _apply_spmd_parallelism(
     _MTPLossAutoScaler.set_loss_scale(main_loss_sense)
     _IndexerLossAutoScaler.set_loss_scale(main_loss_sense)
 
+    # Tag the MTP-shared input embedding so its gradient is summed across the
+    # embedding-owning PP stages before the optimizer step (handled in the
+    # grad-norm helper), keeping the embedding identical to the single-card run.
+    _setup_mtp_embedding_grad_sync(model, parallel_dims)
+
     logger.info("GPTModel parallelization completed.")
     return model
 
@@ -1640,18 +1713,20 @@ def apply_pp(
             overlap=overlap,
         )
 
-    # Scale the last-stage main-loss backward seed by the same factor used for the
-    # MoE-aux / MTP losses (1/(dp*tp*cp) / grad_accum). Without this, gradients are
-    # summed across micro-batches instead of averaged, making PP gradients
-    # ``num_accumulation_steps`` times larger than the single-card path, which
-    # divides ``loss / num_accumulation_steps`` before backward.
+    # Adjust the last-stage loss backward scaling so PP gradients match the single-card case (loss / grad_accum).
+    # Note: DP/TP/CP are already included in get_loss_sense as 1/(dp*tp*cp)/grad_accum.
+    # However, PipelineStage.get_last_stage_sens also divides the loss DTensor by repeat_num.
+    # (repeat_num equals TP for a TP-replicated scalar loss.)
+    # To avoid double-scaling TP, we multiply TP back here.
+    # This yields an effective scale of 1/(dp*cp)/grad_accum.
+    # MoE/MTP losses are scaled separately by their own auto-scalers and are not affected here.
     main_loss_sense = get_loss_sense(
         parallelism=parallelism,
         enable_parallel=True,
         gradient_accumulation_steps=gradient_accumulation_steps,
         apply_gradient_accumulation=True,
         )
-    loss_scale = float(main_loss_sense.asnumpy().item())
+    loss_scale = float(main_loss_sense.asnumpy().item()) * int(parallel_dims.tp)
     for stage in stages:
         stage.loss_scale = loss_scale
 

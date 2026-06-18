@@ -81,6 +81,7 @@ class _MTPLossAutoScaler(_Function):
         """
         mtp_loss = ctx.mtp_loss
         mtp_loss_backward_scale = _MTPLossAutoScaler.main_loss_backward_scale
+        mtp_loss = mtp_loss.to_local() if isinstance(mtp_loss, DTensor) else mtp_loss
         scaled_mtp_loss_grad = mint.ones_like(mtp_loss) * mtp_loss_backward_scale
         return grad_output, scaled_mtp_loss_grad
 
@@ -123,10 +124,16 @@ def save_to_mtp_losses_tracker(
         tracker["values"] = mint.zeros(num_layers)
     if isinstance(loss, DTensor):
         loss = loss.to_local()
+    # Accumulate (not overwrite) the loss for the layer so that all micro-batches
+    # within a gradient-accumulation / pipeline step are summed. The callback then
+    # divides by ``num_accumulation_steps`` to recover the per-step average. Without
+    # this, only the final micro-batch survived and the logged value was off by a
+    # factor of ``num_accumulation_steps`` under pipeline parallelism. Mirrors
+    # ``save_to_aux_losses_tracker`` in moe_utils.
     if hasattr(loss, "detach"):
-        tracker["values"][layer_number] = loss.detach()  # Aggregate the loss for the layer.
+        tracker["values"][layer_number] = tracker["values"][layer_number] + loss.detach()
     else:
-        tracker["values"][layer_number] = loss
+        tracker["values"][layer_number] = tracker["values"][layer_number] + loss
 
 
 class MTPLossAutoScaler(nn.Cell):
@@ -655,11 +662,21 @@ def track_mtp_metrics(group=None, group_size=None):
     if not tracker:
         return None
 
-    mtp_losses = tracker["values"]
+    mtp_losses = tracker["values"].clone()
     if group_size is None:
         group_size = get_world_size()
     if group_size > 1:
         all_reduce(mtp_losses, op=ops.ReduceOp.SUM, group=group)
         mtp_losses /= group_size
 
+    clear_mtp_losses_tracker()
     return mtp_losses
+
+
+def clear_mtp_losses_tracker() -> None:
+    """Clear the accumulated MTP losses after they have been logged for a step."""
+    tracker = get_mtp_layer_wise_logging_tracker()
+    if "values" not in tracker:
+        return
+    for value in tracker["values"]:
+        value.zero_()

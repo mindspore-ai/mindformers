@@ -141,6 +141,7 @@ class _MoEAuxLossAutoScaler(_Function):
             )
 
         aux_loss_backward_scale = _MoEAuxLossAutoScaler.main_loss_backward_scale
+        aux_loss = aux_loss.to_local() if isinstance(aux_loss, DTensor) else aux_loss
         scaled_aux_loss_grad = mint.ones_like(aux_loss) * aux_loss_backward_scale
         return grad_output, scaled_aux_loss_grad
 
@@ -256,12 +257,49 @@ def track_moe_metrics(
         mtp_num_layers: Optional[int] = None,
         group=None,
         group_size=None,
+        pp_group=None,
+        pp_group_size=None,
+        has_last: bool = True,
 ):
-    """Track and compute average MoE auxiliary loss across all MoE layers."""
+    """Track and compute average MoE auxiliary loss across all MoE layers.
+
+    Pipeline-parallel combine
+    -------------------------
+    The aux-loss metric is tracked per GLOBAL layer index, but each PP stage
+    only fills the slots for the layers it owns (forward runs that stage's
+    routers). Summing the tracker and dividing by the GLOBAL MoE-layer count
+    (below) would make the last stage under-report ``load_balancing_loss`` by
+    ``local_moe_layers / global_moe_layers``. So when ``pp_group_size > 1`` we
+    first all-reduce the per-layer tracker over the PP group to give every
+    stage the full per-layer vector.
+
+    This all-reduce is a PP-group collective: **every** stage must reach it
+    every step, so this function must be called on every stage every step
+    (the ``loss_scale`` guard is config-driven and identical across ranks, so
+    all stages skip or run it together — deadlock-free). Non-last stages then
+    clear their tracker (they never run the reporting path below, which is what
+    normally clears it) and return ``None`` to avoid double-counting on the
+    next step. Only the last stage keeps the combined values to report.
+    """
     if not loss_scale or loss_scale <= 0.0:
         return None
 
     tracker = get_moe_layer_wise_logging_tracker()
+
+    # Combine the per-layer tracker across PP stages (collective; see docstring).
+    if pp_group_size and pp_group_size > 1:
+        if "values" not in tracker:
+            # This stage owns no MoE layers that contributed aux losses yet.
+            # Seed a zero vector sized to the global layer count so the
+            # all_reduce shape matches the stages that do hold values.
+            num_pp_layers = num_layers
+            if mtp_num_layers:
+                num_pp_layers += mtp_num_layers
+            tracker["values"] = mint.zeros(num_pp_layers)
+        all_reduce(tracker["values"], op=ops.ReduceOp.SUM, group=pp_group)
+        if not has_last:
+            clear_aux_losses_tracker()
+            return None
 
     # No MoE layer contributed aux losses (e.g. an all-dense model where every layer
     # is below first_k_dense_replace). The tracker is empty, so there is nothing to

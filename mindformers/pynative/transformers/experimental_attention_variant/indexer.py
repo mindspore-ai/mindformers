@@ -27,6 +27,7 @@ from typing import Union
 import mindspore.common.dtype as mstype
 from mindspore import nn, ops, Tensor, mint, _no_grad
 from mindspore.common._grad_function import _Function
+from hyper_parallel.core.dtensor.dtensor import DTensor
 
 try:
     from hyper_parallel.custom_ops.experimental import (
@@ -256,6 +257,7 @@ class _IndexerLossAutoScaler(_Function):
         """Return (grad_output, ones_like(indexer_loss) * scale)."""
         indexer_loss = ctx.indexer_loss
         scale = _IndexerLossAutoScaler.main_loss_backward_scale
+        indexer_loss = indexer_loss.to_local() if isinstance(indexer_loss, DTensor) else indexer_loss
         scaled_grad = mint.ones_like(indexer_loss) * scale
         return grad_output, scaled_grad
 

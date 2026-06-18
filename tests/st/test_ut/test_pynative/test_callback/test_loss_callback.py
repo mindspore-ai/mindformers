@@ -111,7 +111,7 @@ class TestLossCallback:
         model = self._make_model_mock()
 
         # Case 1: loss is None
-        self.callback.on_step_end(self.args, self.state, loss=None)
+        self.callback.on_step_end(self.args, self.state, loss=None, model=model)
         mock_logger.info.assert_not_called()
 
         # Case 2: step not in log interval
