@@ -55,6 +55,11 @@ def get_grad(param):
     return main_grad if main_grad is not None else param.grad
 
 
+def _is_dtensor_like(value):
+    """Return whether value behaves like a DTensor gradient."""
+    return isinstance(value, DTensor) or hasattr(value, "to_local")
+
+
 def compute_parameters(model: nn.Cell) -> None:
     """
     Compute and log the number of total and trainable parameters in the model.
@@ -505,7 +510,7 @@ def _get_grad_factor(grad) -> float:
     """
     from hyper_parallel.core.dtensor.placement_types import Replicate
     # Non-DTensor gradients do not need scaling
-    if not isinstance(grad, DTensor):
+    if not _is_dtensor_like(grad):
         return 1.0
     # Gradients without mesh/placement metadata cannot be analyzed
     if not hasattr(grad, 'device_mesh') or not hasattr(grad, 'placements'):
@@ -529,7 +534,7 @@ def _group_grads_by_device_and_dtype(grads):
     """Group gradients by device and dtype for batched processing."""
     groups = {}
     for grad in grads:
-        local_grad = grad.to_local() if isinstance(grad, DTensor) else grad
+        local_grad = grad.to_local() if _is_dtensor_like(grad) else grad
         key = (local_grad.device, local_grad.dtype)
         if key not in groups:
             groups[key] = []
@@ -623,7 +628,7 @@ def _calculate_global_grad_norm(
         scale = clip_coef.item()
         for (_, _), grad_list in grouped_grads.items():
             for grad, local_grad in grad_list:
-                if isinstance(grad, DTensor):
+                if _is_dtensor_like(grad):
                     local_grad.mul_(scale)
                 else:
                     grad.mul_(scale)

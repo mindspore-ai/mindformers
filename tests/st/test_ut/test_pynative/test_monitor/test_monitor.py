@@ -41,6 +41,39 @@ def _make_config(local_loss=False, local_norm="", device_loss=False, device_norm
     return config
 
 
+class _FakeHookHandle:
+    """Fake hook handle used by monitor unit tests."""
+
+    def __init__(self):
+        self.removed = False
+
+    def remove(self):
+        self.removed = True
+
+
+class _FakeParam:
+    """Fake trainable parameter with register_hook support."""
+
+    def __init__(self, name, grad=None):
+        self.name = name
+        self.grad = grad
+        self.hooks = []
+
+    def register_hook(self, hook):
+        self.hooks.append(hook)
+        return _FakeHookHandle()
+
+
+class _FakeModel:
+    """Fake model that exposes trainable_params."""
+
+    def __init__(self, params):
+        self._params = params
+
+    def trainable_params(self):
+        return self._params
+
+
 class TestMonitorConfigRecognition:
     """Test that TrainStateMonitor correctly reads config."""
 
@@ -69,6 +102,19 @@ class TestMonitorConfigRecognition:
         monitor = TrainStateMonitor(config)
         assert monitor._record_config == {}
         assert monitor.active is False
+
+    @pytest.mark.level0
+    @pytest.mark.platform_x86_cpu
+    @pytest.mark.env_onecard
+    def test_norm_monitor_registers_hooks_by_default(self):
+        """Norm monitor should register hooks when a model is bound."""
+        param = _FakeParam("embedding.weight", grad=100.0)
+        model = _FakeModel([param])
+        config = _make_config(local_norm="embedding")
+        monitor = TrainStateMonitor(config, model=model)
+        assert monitor._record_config["local_norm"] is True
+        assert monitor._local_norm_config == ["embedding"]
+        assert len(param.hooks) == 1
 
     @pytest.mark.level0
     @pytest.mark.platform_x86_cpu
@@ -153,6 +199,26 @@ class TestMonitorRecordEffect:
         monitor.record("device_loss", 2.0)
         monitor.record("device_norm")
         assert monitor._records == []
+
+    @pytest.mark.level0
+    @pytest.mark.platform_x86_cpu
+    @pytest.mark.env_onecard
+    def test_hook_local_norm_uses_hook_value(self):
+        """hook mode should record the norm captured by register_hook."""
+        param = _FakeParam("embedding.weight", grad=100.0)
+        model = _FakeModel([param])
+        config = _make_config(local_norm="embedding")
+        monitor = TrainStateMonitor(config, model=model)
+        monitor._compute_grad_norm = float
+
+        assert len(param.hooks) == 1
+        assert param.hooks[0](3.5) == 3.5
+        monitor.record("local_norm", context={"micro_step": 0})
+
+        assert monitor._records == [
+            {"micro_step": 1},
+            {"local_norm": "embedding.weight:   3.500000"},
+        ]
 
 
 class TestMonitorReset:

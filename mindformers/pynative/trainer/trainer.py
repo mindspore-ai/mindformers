@@ -479,7 +479,7 @@ class Trainer:
         """
         checkpoint = self.config.checkpoint
         if not checkpoint.enable_save:
-            return [LossCallback(), MonitorCallback()]
+            return [MonitorCallback(), LossCallback()]
 
         # build checkpoint callback
         checkpoint_callback = CheckpointCallback(
@@ -494,8 +494,8 @@ class Trainer:
         )
 
         return [
-            LossCallback(),
             MonitorCallback(),
+            LossCallback(),
             checkpoint_callback,
         ]
 
