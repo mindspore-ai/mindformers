@@ -508,21 +508,56 @@ def _build_callback(config):
     )
 
 
+def _maybe_sync_embedding_grad(param, grad) -> None:
+    """All-reduce the MTP-shared embedding gradient across PP stages, in place.
+
+    When MTP runs under pipeline parallelism the input embedding is replicated
+    on stage 0 and the MTP stage; each copy only receives half of the gradient
+    the single-card baseline would (``main_grad`` vs ``mtp_grad``). The embedding
+    weight is tagged during parallelization (``_embedding_grad_sync_group`` /
+    ``_embedding_grad_sync_size``) when this applies. Here we sum the gradient
+    over the owning ranks so every copy ends up with ``main_grad + mtp_grad``,
+    matching single-card, then stamp ``_pp_replica_count`` on the gradient so the
+    global grad-norm counts the now-identical embedding exactly once.
+
+    Called once per optimizer step (from ``_calculate_global_grad_norm``), before
+    the norm/clip/step, so no trainer changes are required.
+    """
+    group = getattr(param, "_embedding_grad_sync_group", None)
+    if group is None:
+        return
+
+    from mindspore import ops
+    from mindspore.mint.distributed import all_reduce
+
+    local_grad = grad.to_local() if isinstance(grad, DTensor) else grad
+    all_reduce(local_grad, op=ops.ReduceOp.SUM, group=group)
+    grad._pp_replica_count = getattr(param, "_embedding_grad_sync_size", 1)
+
+
 def _get_grad_factor(grad) -> float:
     """
     Compute the scaling factor for a gradient based on its distributed tensor placements.
     """
     from hyper_parallel.core.dtensor.placement_types import Replicate
-    # Non-DTensor gradients do not need scaling
+    # MTP-shared embedding gradients are all-reduced (summed) across the PP
+    # stages that hold a copy, so the SAME gradient is present on
+    # ``_pp_replica_count`` ranks. All of those ranks contribute to the world
+    # grad-norm all-reduce, so without compensation the embedding would be
+    # counted ``_pp_replica_count`` times. Dividing its norm_sq by that count
+    # (the factor divides norm_sq downstream) counts it exactly once, matching
+    # the single-card baseline.
+    replica_factor = float(getattr(grad, "_pp_replica_count", 1) or 1)
+    # Non-DTensor gradients do not need placement scaling
     if not _is_dtensor_like(grad):
-        return 1.0
+        return replica_factor
     # Gradients without mesh/placement metadata cannot be analyzed
     if not hasattr(grad, 'device_mesh') or not hasattr(grad, 'placements'):
-        return 1.0
+        return replica_factor
 
     mesh = grad.device_mesh
     placements = grad.placements
-    factor = 1.0
+    factor = replica_factor
     # Accumulate the product of mesh sizes along all replicated dimensions
     for dim, p in enumerate(placements):
         # Direct isinstance check when Replicate is importable
@@ -600,6 +635,7 @@ def _calculate_global_grad_norm(
     for param in parameters:
         grad = get_grad(param)
         if grad is not None:
+            _maybe_sync_embedding_grad(param, grad)
             grads.append(grad)
 
     if not grads:
