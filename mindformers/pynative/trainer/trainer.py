@@ -56,6 +56,7 @@ import mindformers.dataset.handler.base_handler as handler_module
 from mindformers.pynative.distributed.parallel_dims import ParallelDims
 from mindformers.pynative.distributed.parallelize import parallelize_model
 from mindformers.pynative.distributed.utils import get_loss_sense
+from mindformers.pynative.pet.lora_adapter import freeze_base_params
 
 from mindformers.checkpoint.checkpoint import CommonInfo, get_checkpoint_path
 
@@ -186,6 +187,25 @@ class Trainer:
             m.to_empty()
             with _no_grad():
                 m.init_states()
+
+        # LoRA: freeze base params AFTER parallelism + init_states. During distribute_module
+        # all params must be trainable so they materialise as DTensors (including frozen
+        # norms/biases and NoParallel base weights, whose TP layout inference needs DTensor
+        # gamma); freezing earlier leaves them as plain Tensors and breaks TP. Only
+        # lora_a/lora_b stay trainable, so the optimizer (built below) sees adapters only.
+        if getattr(self.config, "lora_config", None) is not None:
+            # Under pipeline parallelism freeze runs per stage; a stage may legitimately hold
+            # no adapters, so aggregate the trainable count and only error if NO stage has any.
+            total_trainable = 0
+            for m in self.model:
+                trainable, _ = freeze_base_params(m)
+                total_trainable += trainable
+            if total_trainable == 0:
+                raise RuntimeError(
+                    "LoRA enabled but no trainable adapters were found across any pipeline "
+                    "stage. Check lora_config.target_modules against the model's module names."
+                )
+            compute_parameters(self.model[0])
 
         # Create train dataset
         self.train_dataset = self._create_dataset(
