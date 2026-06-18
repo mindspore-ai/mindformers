@@ -104,6 +104,25 @@ def _validate_recompute_config(
     if need_comm:
         _validate_recompute_comm_structure(rc_comm)
         _validate_recompute_comm_layer_specs(rc_comm, num_layers)
+    _validate_exclude_op(rc)
+
+
+def _validate_exclude_op(recompute_cfg: RecomputeConfig) -> None:
+    """Validate the ``exclude_op`` op-name list."""
+    pfx = "TrainConfig.recompute.exclude_op"
+    names = recompute_cfg.exclude_op
+    if names is None:
+        return
+    if not isinstance(names, (list, tuple)):
+        logger.error(f"[Recompute Config] {pfx} must be a list/tuple of op-name strings, "
+                     f"got {type(names).__name__}")
+        raise TypeError(
+            f"{pfx} must be a list/tuple of op-name strings, got {type(names).__name__}"
+        )
+    for i, name in enumerate(names):
+        if not isinstance(name, str) or not name.strip():
+            logger.error(f"[Recompute Config] {pfx}[{i}]: must be a non-empty string, got {name!r}")
+            raise ValueError(f"{pfx}[{i}]: must be a non-empty string, got {name!r}")
 
 
 def _validate_recompute_structure(recompute_cfg: RecomputeConfig) -> None:
@@ -499,7 +518,40 @@ def _clean_and_parse_comm_config(full_target_ids, select_layer_to_modules, comm_
     return layer_to_modules
 
 
-def _set_pattern_recompute(layer, p_list, add_prim_attr=False, info=''):
+def _build_exclude_op_policy(exclude_op):
+    """Build a selective-checkpoint ``policy_fn`` that keeps (does NOT recompute) any op -- compute
+    or communication -- whose name contains one of ``exclude_op`` as a case-insensitive substring;
+    every other op is recomputed.
+
+    A matched op returns ``CheckpointPolicy.MUST_SAVE`` -- its forward output is cached and reused
+    in the backward pass instead of being re-executed (e.g. ``['matmul']`` keeps matmul outputs;
+    ``['allgather', ...]`` avoids re-issuing collectives like ``InnerCommAllGather`` during
+    recompute). Matching is on the dispatched op name only, so it is global within the recomputed
+    cell -- not scoped to a module path. Note: the MindSpore selective-checkpoint dispatch only
+    accepts ``MUST_SAVE`` / ``PREFER_SAVE`` / ``MUST_SWAP`` / ``MUST_RECOMPUTE``; ``PREFER_RECOMPUTE``
+    raises at dispatch time, so the non-matching branch returns ``MUST_RECOMPUTE``.
+    """
+    needles = tuple(name.lower() for name in exclude_op)
+
+    def _policy_fn(ctx, func, *args, **kwargs):  # pylint: disable=W0613
+        op_name = (getattr(func, "name", "") or "").lower()
+        if any(needle in op_name for needle in needles):
+            return CheckpointPolicy.MUST_SAVE
+        return CheckpointPolicy.MUST_RECOMPUTE
+
+    return _policy_fn
+
+
+def _wrap_cell_recompute(cell, policy_fn):
+    """``checkpoint_wrapper`` a cell under the recompute marker, attaching the exclude-op SAC
+    policy when provided. ``checkpoint`` composes ``policy_fn`` and ``context_fn``, so the
+    per-op MUST_SAVE decision and the backward-re-run marker stay active together."""
+    if policy_fn is not None:
+        return checkpoint_wrapper(cell, policy_fn=policy_fn, context_fn=recompute_context_fn)
+    return checkpoint_wrapper(cell, context_fn=recompute_context_fn)
+
+
+def _set_pattern_recompute(layer, p_list, add_prim_attr=False, policy_fn=None, info=''):
     """Recursively traverse layer cells along p_list path and apply checkpoint_wrapper."""
     log_list = []
     log = ''
@@ -513,7 +565,7 @@ def _set_pattern_recompute(layer, p_list, add_prim_attr=False, info=''):
         # pylint: disable=W0212
         for name, cell in layer._cells.items():
             if p == name:
-                log = _set_pattern_recompute(cell, p_list, add_prim_attr, info + f'.{name}')
+                log = _set_pattern_recompute(cell, p_list, add_prim_attr, policy_fn, info + f'.{name}')
                 if log:
                     log_list.append(log[1:])
     else:
@@ -525,7 +577,7 @@ def _set_pattern_recompute(layer, p_list, add_prim_attr=False, info=''):
                                 "is expected to be operation but got cell, "
                                 "this configuration will not be effective.")
                     continue
-                setattr(layer, name, checkpoint_wrapper(cell, context_fn=recompute_context_fn))
+                setattr(layer, name, _wrap_cell_recompute(cell, policy_fn))
                 log = f"{info}.{name}"
         for attr in dir(layer):
             if p == attr:
@@ -540,12 +592,12 @@ def _set_pattern_recompute(layer, p_list, add_prim_attr=False, info=''):
     return log
 
 
-def _set_select_recompute(layer, layer_id, layer_to_modules, add_prim_attr=False):
+def _set_select_recompute(layer, layer_id, layer_to_modules, add_prim_attr=False, policy_fn=None):
     """Set select recompute or comm recompute for a layer."""
     if layer_id in layer_to_modules:
         log_ops = []
         for pattern in layer_to_modules[layer_id]:
-            log = _set_pattern_recompute(layer, pattern.split(r'.'), add_prim_attr)
+            log = _set_pattern_recompute(layer, pattern.split(r'.'), add_prim_attr, policy_fn)
             if log:
                 log_ops.append(log[1:])
         log_ops_str = ', '.join(log_ops)
@@ -568,6 +620,12 @@ def apply_recompute(
     rc_comm = recompute_comm_config
     need_recompute = rc.mode != "None"
     need_comm = rc_comm.enable
+
+    # SAC policy that keeps the configured ops' outputs (MUST_SAVE) instead of recomputing
+    # them; ``None`` when ``exclude_op`` is unset, so the recompute path is unchanged.
+    policy_fn = _build_exclude_op_policy(rc.exclude_op) if rc.exclude_op else None
+    if policy_fn is not None:
+        logger.info(f"Ops excluded from recompute (MUST_SAVE): {list(rc.exclude_op)}")
 
     full_target_ids = set()
     layer_to_modules = {}
@@ -593,13 +651,12 @@ def apply_recompute(
 
     for layer_id in range(model.layer_start, model.layer_end + 1):
         if need_recompute and layer_id in full_target_ids:
-            model.layers[layer_id] = checkpoint_wrapper(
-                model.layers[layer_id], context_fn=recompute_context_fn
-            )
+            model.layers[layer_id] = _wrap_cell_recompute(model.layers[layer_id], policy_fn)
             logger.info(f"Set full recompute at layer {layer_id}")
 
         if need_recompute and rc.mode == "select":
-            _set_select_recompute(model.layers[layer_id], layer_id, layer_to_modules, add_prim_attr=False)
+            _set_select_recompute(model.layers[layer_id], layer_id, layer_to_modules,
+                                  add_prim_attr=False, policy_fn=policy_fn)
 
         if need_comm:
             _set_select_recompute(model.layers[layer_id], layer_id, comm_layer_to_modules, add_prim_attr=True)

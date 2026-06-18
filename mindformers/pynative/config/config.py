@@ -734,6 +734,18 @@ class RecomputeConfig(BaseConfig):
     final_layernorm), so target e.g. ``transformer_layer`` or
     ``transformer_layer.self_attention`` for those layer ids."""
 
+    exclude_op: Optional[Union[list, tuple]] = None
+    """Operator names to exclude from recomputation (any op -- compute or communication). When a
+    cell is recomputed (``mode`` is ``'full'`` or ``'select'``), any op whose name contains one of
+    these entries as a case-insensitive substring is kept -- its forward output is saved via a
+    selective-checkpoint ``MUST_SAVE`` policy and reused in the backward pass instead of being
+    recomputed; every other op is recomputed as usual. Examples: ``['matmul']`` keeps matmul
+    outputs; ``['AllGather', 'ReduceScatter', 'AllToAll']`` keeps collectives (matching
+    ``InnerCommAllGather`` / ``InnerCommReduceScatter`` / ``InnerCommAllToAllV``) to avoid
+    re-issuing them during recompute. Matching is global by op name -- it is not scoped to a
+    module path, so e.g. ``['matmul']`` keeps every matmul in the recomputed cell. Trades device
+    memory for backward recompute time. No effect when ``mode`` is ``'None'``."""
+
     def __post_init__(self):
         """Post-initialization validation."""
         if self.mode not in ["None", "full", "select"]:
