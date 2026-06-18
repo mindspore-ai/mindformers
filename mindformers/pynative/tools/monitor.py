@@ -50,10 +50,48 @@ class Monitor(ABC):
         self._flush_tensorboard(self._records, step)
         self._records = []
 
-    def _flush_logger(self, records: List[Dict[str, Any]], step: int):  # pylint: disable=W0613
+    def _flush_logger(self, records: List[Dict[str, Any]], step: int):
+        """Output collected records to logger with step/micro_step context."""
+        cur_micro_step = None
+        pending_norms: List[str] = []
+        pending_type: Optional[str] = None
+
+        def flush_pending():
+            nonlocal pending_type
+            if not pending_norms:
+                return
+            header_parts = [f'"step": {step}']
+            if pending_type == "local_norm" and cur_micro_step is not None:
+                header_parts.append(f'"micro_step": {cur_micro_step}')
+            logger.info(f'{{ {", ".join(header_parts)} }}')
+            for norm_val in pending_norms:
+                logger.info(f'{{ "{pending_type}": {norm_val} }}')
+            pending_norms.clear()
+            pending_type = None
+
         for rec in records:
-            parts = [f"{k}: {v}" for k, v in rec.items()]
-            logger.info(f"{{ {', '.join(parts)} }}")
+            micro_step = rec.pop("micro_step", None)
+            if micro_step is not None:
+                cur_micro_step = micro_step
+            if not rec:
+                continue
+
+            norm_key = next((k for k in rec if k in ("local_norm", "device_norm")), None)
+
+            if norm_key is not None:
+                if norm_key != pending_type:
+                    flush_pending()
+                    pending_type = norm_key
+                pending_norms.append(rec[norm_key])
+            else:
+                flush_pending()
+                rec_with_ctx = {"step": step}
+                if cur_micro_step is not None:
+                    rec_with_ctx["micro_step"] = cur_micro_step
+                rec_with_ctx.update(rec)
+                logger.info(json.dumps(rec_with_ctx))
+
+        flush_pending()
 
     def _flush_tensorboard(self, records: List[Dict[str, Any]], step: int):  # pylint: disable=W0613
         pass
@@ -106,6 +144,8 @@ class TrainStateMonitor(Monitor):
         self._local_norm_config: List[str] = []
         self._device_norm_config: List[str] = []
         self._prev_local_norms: Dict[str, float] = {}
+        self._hook_handles: List[Any] = []
+        self._hook_local_norms: Dict[str, float] = {}
 
         if train_state:
             if getattr(train_state, 'local_loss', False):
@@ -134,6 +174,7 @@ class TrainStateMonitor(Monitor):
             "device_loss": self._record_device_loss,
             "device_norm": self._record_device_norm,
         }
+        self._register_grad_hooks()
 
     @property
     def active(self):
@@ -142,6 +183,13 @@ class TrainStateMonitor(Monitor):
     def reset(self):
         super().reset()
         self._prev_local_norms = {}
+        self._hook_local_norms = {}
+
+    def set_model(self, model):
+        """Bind a model instance to the monitor and refresh parameter hooks."""
+        self._remove_grad_hooks()
+        super().set_model(model)
+        self._register_grad_hooks()
 
     def record(self, key: str = None, value: Any = None, context: Optional[Dict[str, Any]] = None):
         collect_for_device_norm = key == "local_norm" and self._record_config.get("device_norm", False)
@@ -174,14 +222,10 @@ class TrainStateMonitor(Monitor):
             record_device_norm = self._should_record_norm(param.name, "device_norm")
             if not record_local_norm and not record_device_norm:
                 continue
-            local_grad = grad.to_local() if DTensor and isinstance(grad, DTensor) else grad
-            accumulated_norm = (float(local_grad.pow(2).sum().sqrt().asnumpy())
-                                / _get_grad_factor(grad))
-            if micro_step == 0:
-                actual_norm = accumulated_norm
-            else:
-                actual_norm = accumulated_norm - self._prev_local_norms.get(param.name, 0.0)
-            self._prev_local_norms[param.name] = accumulated_norm
+            if param.name not in self._hook_local_norms:
+                continue
+            actual_norm = self._hook_local_norms.pop(param.name)
+            self._prev_local_norms[param.name] = actual_norm
             if record_local_norm:
                 self._records.append({"local_norm": f"{param.name}: {actual_norm:10.6f}"})
 
@@ -214,6 +258,45 @@ class TrainStateMonitor(Monitor):
             return False
         norm_config = self._local_norm_config if key == "local_norm" else self._device_norm_config
         return not norm_config or any(p in param_name for p in norm_config if p)
+
+    def _register_grad_hooks(self):
+        """Register backward hooks for parameters monitored by local/device norm."""
+        if not (self._record_config.get("local_norm") or self._record_config.get("device_norm")):
+            return
+        model = self._resolve_model()
+        if model is None:
+            return
+
+        for param in model.trainable_params():
+            if not (self._should_record_norm(param.name, "local_norm") or
+                    self._should_record_norm(param.name, "device_norm")):
+                continue
+            if not hasattr(param, "register_hook"):
+                logger.warning(
+                    "Parameter %s does not support register_hook, skip hook local_norm.",
+                    param.name
+                )
+                continue
+
+            def hook_fn(grad, param_name=param.name):
+                self._hook_local_norms[param_name] = self._compute_grad_norm(grad)
+                return grad
+
+            self._hook_handles.append(param.register_hook(hook_fn))
+
+    def _remove_grad_hooks(self):
+        """Remove previously registered backward hooks."""
+        for handle in self._hook_handles:
+            if hasattr(handle, "remove"):
+                handle.remove()
+        self._hook_handles = []
+
+    @staticmethod
+    def _compute_grad_norm(grad):
+        """Compute the local norm of a gradient tensor."""
+        from mindformers.pynative.trainer.utils import _get_grad_factor
+        local_grad = grad.to_local() if hasattr(grad, "to_local") else grad
+        return float(local_grad.pow(2).sum().sqrt().asnumpy()) / _get_grad_factor(grad)
 
 
 class MoeMonitor(Monitor):
@@ -274,7 +357,7 @@ class MoeMonitor(Monitor):
                 self._step_tpe_records.setdefault(meta, []).append((global_micro_step, step_id, micro_step, delta))
             self._prev_tpe[meta] = current
 
-    def flush(self, step: int):  # pylint: disable=W0613
+    def flush(self, step: int):
         if not self._step_tpe_records:
             return
 
