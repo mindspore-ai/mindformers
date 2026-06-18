@@ -128,6 +128,23 @@ class ParallelDims:
                 f"cp({cp}) * tp({tp}) * pp({pp}) != WORLD_SIZE({self.world_size})"
             )
 
+        # EP is carved out of the (dp_shard * cp * tp) region within a single
+        # dp_replicate group: the sparse mesh ["pp", "dp_replicate", "efsdp",
+        # "ep"] nests ``ep`` inside ``dp_replicate``, so ``efsdp * ep`` must
+        # equal ``dp_shard * cp * tp``. If ``ep`` does not divide that region,
+        # ``efsdp = dp_shard * cp * tp // ep`` silently floors to a wrong value
+        # (e.g. 0 when ``ep`` exceeds the region), which only surfaces later as
+        # an opaque mesh-size mismatch. Reject it here with an actionable error.
+        ep_region = dp_shard * cp * tp
+        if ep_region % ep != 0:
+            raise ValueError(
+                f"Invalid expert_parallel: ep({ep}) must divide dp_shard({dp_shard}) * "
+                f"cp({cp}) * tp({tp}) = {ep_region}, and thus cannot exceed {ep_region}. "
+                f"EP is sharded within a single dp_replicate group, so to use a larger ep "
+                f"increase dp_shard*cp*tp (e.g. raise dp_shard) instead of relying on "
+                f"dp_replicate."
+            )
+
     def _mesh_exist(self, name: str, degree: int) -> bool:
         """Whether axis ``name`` needs a real (non-fake) process group."""
         if name == "fsdp":

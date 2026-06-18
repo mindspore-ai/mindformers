@@ -168,6 +168,26 @@ class TestDeviceMesh:
         assert parallel_dims.get_mesh("ep").rank_list == (0, 1, 2, 3, 4, 5, 6, 7)
         assert parallel_dims.get_mesh("efsdp").rank_list == (0,)
 
+    @pytest.mark.level0
+    @pytest.mark.platform_x86_cpu
+    @pytest.mark.env_onecard
+    def test_ep_exceeds_region_is_rejected(self):
+        """
+        Feature: ParallelDims validation when ep does not divide the EP region.
+        Description: EP is carved out of the (dp_shard * cp * tp) region within a
+            single dp_replicate group, so ``efsdp = dp_shard * cp * tp // ep``.
+            With dp_replicate=4, dp_shard=2, cp=1, tp=2 (16 cards), the region is
+            only dp_shard*cp*tp = 4, so ep=8 cannot be satisfied; without the
+            guard, efsdp would silently floor to 0 and fail later as an opaque
+            mesh-size mismatch.
+        Expectation: construction raises ValueError at validation time (before any
+            mesh is built), pointing at the EP-region constraint.
+        """
+        with pytest.raises(ValueError, match=r"ep\(8\) must divide"):
+            ParallelDims(
+                dp_replicate=4, dp_shard=2, cp=1, tp=2, pp=1, ep=8, world_size=16
+            )
+
 
 class TestParallelDimsFromConfig:
     """New cases: ParallelDims.from_config maps MindFormers field semantics."""
