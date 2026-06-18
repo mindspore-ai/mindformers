@@ -386,7 +386,7 @@ class MLASelfAttention(MultiLatentAttention):
         self.tile_kv = mint.tile
         self.cat = mint.cat
         self.apply_rotary_emb_q = ApplyRotaryPosEmb(config)
-        self.apply_rotary_emb_k = ApplyRotaryPosEmb(config, for_k_pos_emb=True)
+        self.apply_rotary_emb_k = ApplyRotaryPosEmb(config)
         self.reshape = mint.reshape
 
         if self.config.q_lora_rank is None:

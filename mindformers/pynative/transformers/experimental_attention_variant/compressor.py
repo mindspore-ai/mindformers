@@ -130,7 +130,7 @@ class Compressor(nn.Cell):
 
         # RoPE applicator for the compressed-KV pe lane (constructed in __init__
         # per the fine-grained-recompute convention; called in ``_apply_rope``).
-        self.apply_rope = ApplyRotaryPosEmb(config, for_k_pos_emb=True)
+        self.apply_rope = ApplyRotaryPosEmb(config)
 
         # Alias the non-trivial mint ops used in construct/forward per the
         # fine-grained-recompute convention (RFC §3.1 #9).
