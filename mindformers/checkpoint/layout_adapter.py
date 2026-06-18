@@ -13,7 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """Load/save checkpoint APIs for distributed parallel layout management."""
-from typing import Dict, Tuple
+from typing import Dict, List, Union
 
 import mindspore as ms
 from mindspore import Parameter
@@ -54,7 +54,7 @@ class LayoutAdapter:
         return get_context("mode") == ms.context.PYNATIVE_MODE
 
     @staticmethod
-    def get_all_layouts(network: Cell) -> Dict[int, Dict[str, list]]:
+    def get_all_layouts(network: Union[Cell, List[Cell]]) -> Dict[int, Dict[str, list]]:
         """
         Retrieve distributed parallel layout information for all ranks in the network.
 
@@ -124,7 +124,15 @@ class LayoutAdapter:
         """
         if get_global_layout is None:
             raise ImportError("hyper_parallel is required for PyNative mode. Please install it.")
-        global_layout_dict = get_global_layout(network)
+        global_layout_dict = {}
+        network = network if isinstance(network, list) else [network]
+        for net in network:
+            layout_dict = get_global_layout(net)
+            for rank_id, metas in layout_dict.items():
+                if rank_id in global_layout_dict:
+                    global_layout_dict[rank_id].update(metas)
+                else:
+                    global_layout_dict[rank_id] = metas
 
         if not global_layout_dict:
             return {}
@@ -190,14 +198,16 @@ class LayoutAdapter:
         if DTensor is None:
             raise ImportError("DTensor is required for PyNative mode. Please install it.")
         state_dict = {}
-        for param_name, param in network.parameters_dict().items():
-            if isinstance(param, DTensor):
-                param_value = Parameter([])
-                param_value.data = param.to_local()
-                param_value.name = param_name
-                param_value.requires_grad = param.requires_grad
-                state_dict[param.name] = param_value
-            else:
-                state_dict[param.name] = param
+        network = network if isinstance(network, list) else [network]
+        for net in network:
+            for param_name, param in net.parameters_dict().items():
+                if isinstance(param, DTensor):
+                    param_value = Parameter([])
+                    param_value.data = param.to_local()
+                    param_value.name = param_name
+                    param_value.requires_grad = param.requires_grad
+                    state_dict[param.name] = param_value
+                else:
+                    state_dict[param.name] = param
 
         return state_dict
