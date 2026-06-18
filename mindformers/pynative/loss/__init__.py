@@ -15,6 +15,7 @@
 """loss modules"""
 from .loss import (
     CrossEntropyLoss,
+    ChunkCrossEntropyLoss,
 )
 
-__all__ = ['CrossEntropyLoss']
+__all__ = ['CrossEntropyLoss', 'ChunkCrossEntropyLoss']

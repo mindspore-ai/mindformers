@@ -605,35 +605,47 @@ def process_mtp_loss(
     if loss_mask is None:
         # if loss_mask is not provided, use all ones as loss_mask
         loss_mask = mint.ones_like(mtp_labels)
+    mtp_loss_mask = loss_mask
 
     for mtp_layer_number in range(config.mtp_num_layers):
         mtp_logits = output_layer(hidden_states_list[mtp_layer_number + 1], weight=output_weight)
-        mtp_logits = mtp_logits.transpose(0, 1).reshape((-1, mtp_logits.shape[-1]))
         mtp_labels = roll_tensor(mtp_labels, shifts=-1, dims=-1)
-        loss_mask = roll_tensor(loss_mask, shifts=-1, dims=-1)
-        loss_mask = mint.reshape(loss_mask, (-1,))
-        loss_mask = ops.cast(loss_mask, mstype.float32)
-        mtp_loss = compute_language_model_loss(mtp_labels, mtp_logits)
-        mtp_loss = mint.mul(mtp_loss, loss_mask)
-        mtp_loss_sum = mtp_loss.sum()
-
-        num_tokens = loss_mask.sum()
-
+        mtp_loss_mask = roll_tensor(mtp_loss_mask, shifts=-1, dims=-1)
         mtp_loss_scale = config.mtp_loss_scaling_factor / config.mtp_num_layers
-        save_to_mtp_losses_tracker(
-            mtp_loss_sum / num_tokens,
-            mtp_layer_number,
-            config.mtp_num_layers,
-        )
 
-        if config.calculate_per_token_loss:
-            hidden_states = mtp_loss_auto_scaler(
-                hidden_states, mtp_loss_scale * mtp_loss
+        if getattr(config, "chunk_loss_num", 0) > 1:
+            mtp_logits = mtp_logits.transpose(0, 1)
+            mtp_loss = compute_language_model_loss(mtp_labels, mtp_logits, mtp_loss_mask)
+            save_to_mtp_losses_tracker(
+                mtp_loss_scale * mtp_loss,
+                mtp_layer_number,
+                config.mtp_num_layers,
             )
+            hidden_states = mtp_loss_auto_scaler(hidden_states, mtp_loss_scale * mtp_loss)
         else:
-            hidden_states = mtp_loss_auto_scaler(
-                hidden_states, mtp_loss_scale * mtp_loss / num_tokens
+            mtp_logits = mtp_logits.transpose(0, 1).reshape((-1, mtp_logits.shape[-1]))
+            mtp_loss_mask = mint.reshape(mtp_loss_mask, (-1,))
+            mtp_loss_mask = ops.cast(mtp_loss_mask, mstype.float32)
+            mtp_loss = compute_language_model_loss(mtp_labels, mtp_logits)
+            mtp_loss = mint.mul(mtp_loss, mtp_loss_mask)
+            mtp_loss_sum = mtp_loss.sum()
+
+            num_tokens = mtp_loss_mask.sum()
+            mtp_loss_scale = config.mtp_loss_scaling_factor / config.mtp_num_layers
+            save_to_mtp_losses_tracker(
+                mtp_loss_scale * mtp_loss_sum / num_tokens,
+                mtp_layer_number,
+                config.mtp_num_layers,
             )
+
+            if config.calculate_per_token_loss:
+                hidden_states = mtp_loss_auto_scaler(
+                    hidden_states, mtp_loss_scale * mtp_loss
+                )
+            else:
+                hidden_states = mtp_loss_auto_scaler(
+                    hidden_states, mtp_loss_scale * mtp_loss / num_tokens
+                )
     return hidden_states
 
 

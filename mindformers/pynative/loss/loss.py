@@ -20,7 +20,6 @@ from mindspore.common._grad_function import _Function
 from mindspore import log as logger
 
 from mindformers.tools.logger import _LogActionOnce
-from mindformers.pynative.dtensor_compat import inplace_copy
 
 
 class _LogSoftmax(_Function):
@@ -192,8 +191,7 @@ class CrossEntropyLoss(nn.Cell):
         (1,)
     """
     @_LogActionOnce(m_logger=logger, key='CrossEntropyLoss')
-    def __init__(self, calculate_per_token_loss=False, loss_tag='lm',
-                 chunk_loss_num=1, **kwargs):
+    def __init__(self, calculate_per_token_loss=False, loss_tag='lm', **kwargs):
         super().__init__()
         self.kwargs = kwargs
         self.loss_tag = loss_tag
@@ -210,14 +208,9 @@ class CrossEntropyLoss(nn.Cell):
         self.nll_loss = _NLLLossModule()
 
         self.calculate_per_token_loss = calculate_per_token_loss
-        self.chunk_loss_num = chunk_loss_num
 
     def construct(self, logits, label, input_mask=None):
         """Forward process"""
-        if self.chunk_loss_num > 1 and logits.ndim == 3:
-            print(f'[chunk loss], logits shape={logits.shape}, chunk_loss_num={self.chunk_loss_num}.')
-            return _ChunkCrossEntropyLoss.apply(logits, label, input_mask, self.chunk_loss_num)
-
         log_softmax = self.log_softmax(logits)
         loss_reduce = self.nll_loss(log_softmax, label)
 
@@ -234,6 +227,24 @@ class CrossEntropyLoss(nn.Cell):
         if not self.calculate_per_token_loss:
             return self.div(numerator, denominator)
         return numerator, denominator
+
+
+class ChunkCrossEntropyLoss(CrossEntropyLoss):
+    """Chunked cross entropy loss for 3D ``[batch, seq, vocab]`` logits."""
+
+    def __init__(self, calculate_per_token_loss=False, loss_tag='lm',
+                 chunk_loss_num=1, **kwargs):
+        super().__init__(calculate_per_token_loss=calculate_per_token_loss, loss_tag=loss_tag, **kwargs)
+        self.chunk_loss_num = chunk_loss_num
+
+    def construct(self, logits, label, input_mask=None):
+        """Forward process."""
+        if logits.ndim == 3:
+            if input_mask is None:
+                input_mask = mint.ones_like(label)
+            return _ChunkCrossEntropyLoss.apply(logits, label, input_mask, self.chunk_loss_num)
+        return super().construct(logits, label, input_mask)
+
 
 class _ChunkCrossEntropyLoss(_Function):
     """
@@ -301,7 +312,7 @@ class _ChunkCrossEntropyLoss(_Function):
         logits = ctx.logits
         labels = ctx.labels
         input_mask = ctx.input_mask
-        grad_logits = mint.empty_like(logits)
+        grad_logits_chunks = []
         start_idx = 0
         for chunk_size in ctx.chunk_sizes:
             end_idx = start_idx + chunk_size
@@ -321,6 +332,7 @@ class _ChunkCrossEntropyLoss(_Function):
             grad_scale = mint.div(mint.mul(seq_mask, grads), ctx.denominator)
             grad = mint.mul(grad, mint.unsqueeze(grad_scale, -1))
             grad = ops.cast(mint.reshape(grad, seq_shape), ctx.logits_dtype)
-            inplace_copy(grad_logits.narrow(1, start_idx, chunk_size), grad)
+            grad_logits_chunks.append(grad)
             start_idx = end_idx
+        grad_logits = mint.cat(grad_logits_chunks, dim=1)
         return grad_logits, mint.zeros_like(labels), mint.zeros_like(input_mask), None

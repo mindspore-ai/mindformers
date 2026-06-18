@@ -30,7 +30,7 @@ from mindspore.mint.distributed import all_reduce, get_world_size
 from mindspore._c_expression import pyboost_detach
 
 from mindformers.tools.logger import logger
-from mindformers.pynative.loss.loss import CrossEntropyLoss
+from mindformers.pynative.loss.loss import CrossEntropyLoss, ChunkCrossEntropyLoss
 from mindformers.parallel_core.utils.spec_utils import ModuleSpec
 from mindformers.pynative.layers.mask_generate import CausalMaskGenerate
 from mindformers.parallel_core.transformer_config import TransformerConfig
@@ -150,7 +150,6 @@ class GPTModel(nn.Cell):
         self.ignore_token_id = config.ignore_token_id
         self.calculate_per_token_loss = config.calculate_per_token_loss
         self.chunk_loss_num = config.chunk_loss_num
-        self._last_chunk_loss_runtime_state = None
         logger.info(
             "GPTModel chunk loss config: chunk_loss_num=%s, calculate_per_token_loss=%s",
             self.chunk_loss_num,
@@ -240,7 +239,8 @@ class GPTModel(nn.Cell):
                                        compute_dtype=self.config.compute_dtype,
                                        params_dtype=self.config.params_dtype)
             config.model_parallel = config.tensor_model_parallel_size
-            self.loss = CrossEntropyLoss(
+            loss_cls = ChunkCrossEntropyLoss if self.chunk_loss_num > 1 else CrossEntropyLoss
+            self.loss = loss_cls(
                 calculate_per_token_loss=self.calculate_per_token_loss,
                 chunk_loss_num=self.chunk_loss_num,
                 config=config
@@ -351,15 +351,6 @@ class GPTModel(nn.Cell):
         hidden_states = self.cast(hidden_states, dtype.bfloat16)
         logits = self.output_layer(hidden_states, output_weight)
         need_chunked_loss = self._should_use_chunked_loss()
-        chunk_loss_runtime_state = (self.training, self.return_logits, need_chunked_loss)
-        if chunk_loss_runtime_state != self._last_chunk_loss_runtime_state:
-            logger.info(
-                "GPTModel chunk loss runtime: training=%s, return_logits=%s, need_chunked_loss=%s",
-                self.training,
-                self.return_logits,
-                need_chunked_loss
-            )
-            self._last_chunk_loss_runtime_state = chunk_loss_runtime_state
         if logits.ndim > 2 and not need_chunked_loss:
             logits = self.transpose(logits, (1, 0, 2))
             logits = self.reshape(logits, (-1, logits.shape[-1]))
