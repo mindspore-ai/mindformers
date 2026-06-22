@@ -821,7 +821,7 @@ def _start_full_tensor_p2p_gather_multi(
     )
 
 
-def newton_schulz(x, dim_a, dim_b, eps, ns_steps, ns_coefficients, matmul_op, addmm_op):
+def newton_schulz(x, dim_a, dim_b, eps, ns_steps, ns_coefficients, matmul_op):
     """Apply Newton-Schulz iteration.
 
     ``ns_coefficients`` is a per-step schedule: a tuple of length ``ns_steps``,
@@ -833,7 +833,7 @@ def newton_schulz(x, dim_a, dim_b, eps, ns_steps, ns_coefficients, matmul_op, ad
     if dim_a > dim_b:
         x = x.mT
     # Ensure spectral norm is at most 1
-    x = mint.nn.functional.normalize(x, p=2, dim=(-2, -1), eps=eps)
+    x = x / (x.norm(dim=(-2, -1), keepdim=True) + eps)
     # Perform the NS iterations
     for step in range(ns_steps):
         a, b, c = ns_coefficients[step]
@@ -841,10 +841,10 @@ def newton_schulz(x, dim_a, dim_b, eps, ns_steps, ns_coefficients, matmul_op, ad
         a_mat = matmul_op(x, x.mT)
 
         # b_mat = b * a_mat + c * (a_mat @ a_mat)
-        b_mat = addmm_op(a_mat, a_mat, a_mat, beta=b, alpha=c)
+        b_mat = b * a_mat + c * matmul_op(a_mat, a_mat)
 
         # x = a * x + (b_mat @ x)
-        x = addmm_op(x, b_mat, x, beta=a, alpha=1)
+        x = a * x + matmul_op(b_mat, x)
     if dim_a > dim_b:
         x = x.mT
     return x
@@ -852,7 +852,7 @@ def newton_schulz(x, dim_a, dim_b, eps, ns_steps, ns_coefficients, matmul_op, ad
 
 def _apply_muon_ns(
     ns_inputs, muon_split_fn, muon_merge_fn, param_name,
-    eps, ns_steps, ns_coefficients, matmul_op, addmm_op,
+    eps, ns_steps, ns_coefficients, matmul_op,
     lr, matched_adamw_rms
 ):
     """Run Newton-Schulz on the full tensor: split → NS per piece → merge → scale."""
@@ -862,7 +862,7 @@ def _apply_muon_ns(
     for ns_inputs_item in ns_inputs_list:
         dim_a, dim_b = ns_inputs_item.shape[-2:]
         x = newton_schulz(
-            ns_inputs_item, dim_a, dim_b, eps, ns_steps, ns_coefficients, matmul_op, addmm_op)
+            ns_inputs_item, dim_a, dim_b, eps, ns_steps, ns_coefficients, matmul_op)
         # base_scale is a constant w.r.t. (dim_a, dim_b, matched_adamw_rms);
         # keep it as a Python float so the cast + sqrt + scalar-mul kernels are
         # gone — ``lr * base_scale`` collapses to a single scalar-tensor multiply.
@@ -884,7 +884,7 @@ def _apply_muon_ns_batched(
     if n_weights == 1:
         return [_apply_muon_ns(
             full_tensors[0], muon_split_fn, muon_merge_fn, param_names[0],
-            eps, ns_steps, ns_coefficients, mint.mm, mint.addmm,
+            eps, ns_steps, ns_coefficients, mint.mm,
             lrs[0], matched_adamw_rms)]
 
     # Split each weight into pieces — same rule → matching shapes.
@@ -910,13 +910,13 @@ def _apply_muon_ns_batched(
         if stack.dim() == 3:
             x_batched = newton_schulz(
                 stack, dim_a, dim_b, eps, ns_steps, ns_coefficients,
-                mint.bmm, mint.baddbmm)
+                mint.bmm)
         elif stack.dim() == 4:
             k_dim, b_dim, m_dim, n_dim = stack.shape
             x_flat = newton_schulz(
                 stack.reshape(k_dim * b_dim, m_dim, n_dim),
                 m_dim, n_dim, eps, ns_steps, ns_coefficients,
-                mint.bmm, mint.baddbmm)
+                mint.bmm)
             x_batched = x_flat.reshape(k_dim, b_dim, m_dim, n_dim)
         else:
             raise ValueError(
@@ -964,10 +964,8 @@ def _apply_muon_update(
 
     if ndim == 2:
         matmul_op = mint.mm
-        addmm_op = mint.addmm
     elif ndim == 3:
         matmul_op = mint.bmm
-        addmm_op = mint.baddbmm
     else:
         raise ValueError(f"newton_schulz only supports 2D or 3D gradient, got shape={gradient.shape}")
 
@@ -993,7 +991,7 @@ def _apply_muon_update(
 
     x_ret = _apply_muon_ns(
         ns_inputs, muon_split_fn, muon_merge_fn, param_name,
-        eps, ns_steps, ns_coefficients, matmul_op, addmm_op,
+        eps, ns_steps, ns_coefficients, matmul_op,
         lr, matched_adamw_rms)
 
     if needs_dtensor_redist:
@@ -1312,10 +1310,8 @@ def _run_muon_batched(
 
         if ndim == 2:
             matmul_op = mint.mm
-            addmm_op = mint.addmm
         else:
             matmul_op = mint.bmm
-            addmm_op = mint.baddbmm
 
         prepared.append({
             'ns_inputs_local': None,  # filled below by batched / per-weight path
@@ -1329,7 +1325,6 @@ def _run_muon_batched(
             'tensor_map_list': tensor_map_list,
             'full_shape_tuple': full_shape_tuple,
             'matmul_op': matmul_op,
-            'addmm_op': addmm_op,
             'param': muon_params[i],
             'muon_m': muon_m_ms[i],
             'lr': muon_lrs[i],
@@ -1470,7 +1465,7 @@ def _run_muon_batched(
             info['ns_inputs_full'],
             muon_split_fn, muon_merge_fn, info['param_name'],
             eps, ns_steps, ns_coefficients,
-            info['matmul_op'], info['addmm_op'],
+            info['matmul_op'],
             info['lr'], matched_adamw_rms)
 
     for sig, infos in local_groups.items():
@@ -1480,7 +1475,7 @@ def _run_muon_batched(
                 info['ns_inputs_full'],
                 muon_split_fn, muon_merge_fn, info['param_name'],
                 eps, ns_steps, ns_coefficients,
-                info['matmul_op'], info['addmm_op'],
+                info['matmul_op'],
                 info['lr'], matched_adamw_rms)
             continue
         full_tensors = [info['ns_inputs_full'] for info in infos]

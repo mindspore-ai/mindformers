@@ -287,7 +287,7 @@ class TestNewtonSchulz:
         """
         dim_a, dim_b = mat.shape
         x = Tensor(mat, mstype.float32)
-        out = newton_schulz(x, dim_a, dim_b, 1e-7, 5, _NS_SCHED_5, mint.mm, mint.addmm)
+        out = newton_schulz(x, dim_a, dim_b, 1e-7, 5, _NS_SCHED_5, mint.mm)
         out_np = out.astype(mstype.float32).asnumpy()
         _skip_if_nonfinite(out_np, "newton_schulz")
         return out_np
