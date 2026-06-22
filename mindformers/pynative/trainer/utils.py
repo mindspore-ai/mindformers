@@ -41,6 +41,53 @@ from mindformers.pynative.optimizer.adamw import AdamW
 from mindformers.pynative.optimizer import Muon
 from mindformers.pynative.distributed.context_parallel import attach_context_parallel_runtime_hints
 from mindformers.pynative.pet.lora_adapter import build_lora_model
+from mindformers.pynative.distributed.utils import get_loss_sense
+
+
+def set_auxiliary_loss_backward_scale(
+        parallelism,
+        enable_parallel: bool,
+        gradient_accumulation_steps: int = 1,
+) -> Tensor:
+    """Set the backward grad scale for all auxiliary losses (aux/mtp/index).
+
+    The auxiliary losses (MoE load-balancing ``aux_loss``, ``mtp_loss`` and the
+    indexer loss) do not flow through the main CE ``loss.backward(sense)`` call.
+    Each instead injects its gradient via a dedicated ``AutoScaler`` whose
+    backward grad equals a single static scale set here. To match the main loss
+    path -- which divides ``loss`` by ``gradient_accumulation_steps`` per
+    micro-batch -- this scale must also fold in ``1 / gradient_accumulation_steps``.
+    Otherwise enabling gradient accumulation makes the auxiliary gradients ``N``
+    times too large and breaks precision parity with the no-accumulation run.
+
+    Called once from the trainer for every code path (single-card, SPMD and PP),
+    because the autoscalers otherwise default to a scale of ``1.0``.
+
+    Args:
+        parallelism: Parallelism config (provides ``pipeline_parallel``).
+        enable_parallel: Whether distributed training is enabled.
+        gradient_accumulation_steps: Micro-batches accumulated per optimizer step.
+
+    Returns:
+        The float32 single-element loss-sense tensor that was applied.
+    """
+    from mindformers.pynative.transformers.experimental_attention_variant.indexer import (
+        _IndexerLossAutoScaler,
+    )
+    from mindformers.pynative.transformers.moe.moe_utils import _MoEAuxLossAutoScaler
+    from mindformers.pynative.transformers.multi_token_prediction import _MTPLossAutoScaler
+    main_loss_sense = get_loss_sense(
+        parallelism=parallelism,
+        enable_parallel=enable_parallel,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        apply_gradient_accumulation=True,
+    )
+    _MoEAuxLossAutoScaler.set_loss_scale(main_loss_sense)
+    _MTPLossAutoScaler.set_loss_scale(main_loss_sense)
+    _IndexerLossAutoScaler.set_loss_scale(main_loss_sense)
+    logger.info("Set auxiliary loss backward scale to %s "
+                "(enable_parallel=%s, gradient_accumulation_steps=%s).",
+                main_loss_sense, enable_parallel, gradient_accumulation_steps)
 
 
 def get_grad(param):
