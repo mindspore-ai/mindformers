@@ -285,6 +285,14 @@ class FlashAttention(Cell):
         clip scales always see every head.
         """
         head_slice = _local_head_slice(softmax_val)
+        # ``head_slice`` (above) is in GLOBAL head coordinates, but when
+        # ``max_logits_val`` is TP-sharded (Shard(0) over the TP group,
+        # parallelize.py:691) the head-slice write path below indexes its LOCAL
+        # shard, which only covers the global range [tp_base, tp_base+n_param).
+        # Capture this shard's own global base so the slice can be rebased into
+        # the local frame. Computed here (outside SkipDTensorDispatch, like
+        # ``head_slice``); pure layout arithmetic, so no extra communication.
+        mlv_head_slice = _local_head_slice(self.max_logits_val, head_dim=0)
         # ``max_logits_val`` may be head-sharded over the tensor-parallel group
         # (parallelize.py:562) or replicated. Everything inside the
         # ``SkipDTensorDispatch`` block below operates on the LOCAL shard, but
@@ -315,6 +323,15 @@ class FlashAttention(Cell):
                     f"matching head-shard layout (head_slice={head_slice})."
                 )
             begin, end = head_slice
+            # Rebase the global head slice into ``max_logits_val``'s local-shard
+            # frame, else a TP-rank>0 shard gets indexed with global coordinates
+            # (e.g. local length 16 indexed as ``[16:24]``) -> empty ``[0]`` ->
+            # ``Maximum`` broadcast crash. This bites only when hybrid CP
+            # (ulysses>1) head-shards *within* a TP>1 head shard. Replicated /
+            # non-DTensor ``max_logits_val`` -> base 0 -> slice unchanged.
+            if mlv_head_slice is not None:
+                begin -= mlv_head_slice[0]
+                end -= mlv_head_slice[0]
             if running:
                 max_logits = self.maximum(self.max_logits_val[begin:end], max_logits)
             self.max_logits_val[begin:end] = max_logits.detach()
