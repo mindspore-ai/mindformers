@@ -17,9 +17,121 @@
 from mindspore import nn, mint, ops
 from mindspore.common import dtype as mstype
 from mindspore.common._grad_function import _Function
+from mindspore.ops.function import comm_func
 from mindspore import log as logger
 
+from hyper_parallel.core.dtensor.dtensor import DTensor
+
 from mindformers.tools.logger import _LogActionOnce
+from mindformers.pynative.distributed.utils import vocab_parallel_shard_dim
+
+
+def _tp_all_reduce(tensor, op, group):
+    """Plain (non-autograd) all-reduce over a mesh dimension's process group.
+
+    Used inside ``_VocabParallelCrossEntropy`` whose manual backward already supplies
+    the gradient, so the collective must not register its own bprop.
+    """
+    output, _ = comm_func.all_reduce(tensor.contiguous(), op, group)
+    return output
+
+
+def _vocab_parallel_meta(logits):
+    """Resolve (mesh, TP process group, this rank's TP index, TP size) for a DTensor
+    sharded on its vocab dimension."""
+    mesh_dim = vocab_parallel_shard_dim(logits)
+    mesh = logits.device_mesh
+    return mesh, mesh.get_group(mesh_dim), mesh.get_local_rank(mesh_dim), mesh.size(mesh_dim)
+
+
+def _vocab_parallel_ce_terms(local_logits, target, group, vocab_start, vocab_per_rank):
+    """Vocab-parallel cross entropy for one block of ``[N, V_local]`` float32 logits.
+
+    ``local_logits`` is this rank's vocab slice; ``target`` holds global vocab indices.
+    The max / sum-exp / target logit are reduced across the TP ``group`` so the full-vocab
+    logits are never materialised. Returns the per-token loss plus the terms the backward
+    needs (the softmax is rebuilt from ``exp_vals / global_sum_exp``).
+    """
+    # Global max over the full vocab (max-reduce the per-rank local maxima).
+    local_max = mint.max(local_logits, -1, True)[0]
+    global_max = _tp_all_reduce(local_max, 'max', group)
+    exp_vals = mint.exp(mint.sub(local_logits, global_max))
+    global_sum_exp = _tp_all_reduce(mint.sum(exp_vals, -1, True), 'sum', group)
+    log_z = mint.log(global_sum_exp)
+
+    # Target logit: each rank contributes its slice; out-of-range targets are zeroed and
+    # all-reduce-summed so the owning rank's value survives.
+    in_range = mint.logical_and(mint.ge(target, vocab_start),
+                                mint.lt(target, vocab_start + vocab_per_rank))
+    in_range_f = ops.cast(in_range, mstype.float32)
+    local_target = mint.reshape(
+        mint.mul(mint.sub(target, vocab_start), ops.cast(in_range, target.dtype)), (-1, 1))
+    target_logit = mint.mul(mint.gather(local_logits, 1, local_target),
+                            mint.reshape(in_range_f, (-1, 1)))
+    target_logit = _tp_all_reduce(target_logit, 'sum', group)
+
+    # CE = logsumexp(z) - z_target = (global_max + log_z) - z_target.
+    loss = mint.sub(mint.reshape(mint.add(global_max, log_z), (-1,)),
+                    mint.reshape(target_logit, (-1,)))
+    return loss, exp_vals, global_sum_exp, local_target, in_range_f
+
+
+def _vocab_parallel_ce_grad(exp_vals, global_sum_exp, local_target, in_range_f, upstream, tp_size):
+    """Gradient w.r.t. the local logits: ``(softmax_local - onehot) * upstream``, scaled
+    by ``tp_size``.
+
+    The trainer pre-scales the loss gradient by sense = 1/(dp*tp*cp) (see
+    distributed/utils.py). In the replicated-logits path that 1/tp is undone by the
+    output_layer all-gather's reduce-scatter (SUM over tp) in backward; the vocab-sharded
+    logits are never gathered, so we restore the missing tp factor here instead -- without
+    it the whole model's gradients come out 1/tp_size too small.
+    """
+    softmax = mint.div(exp_vals, global_sum_exp)
+    grad = mint.scatter_add(softmax, 1, local_target, mint.neg(mint.reshape(in_range_f, (-1, 1))))
+    grad = mint.mul(grad, mint.unsqueeze(upstream, -1))
+    return mint.mul(grad, tp_size)
+
+
+class _VocabParallelCrossEntropy(_Function):
+    """Cross entropy over 2D ``[N, V_local]`` logits sharded on the vocab dimension across
+    the TP mesh. Returns the per-token loss, matching the ``log_softmax`` + ``nll_loss``
+    path; masking / normalisation happen in the caller.
+    """
+
+    @staticmethod
+    def forward(ctx, logits, labels, compensate_tp=True):
+        """Forward pass for vocab-parallel cross entropy."""
+        mesh, group, tp_rank, tp_size = _vocab_parallel_meta(logits)
+        local_logits = logits.to_local()
+        ctx.orig_dtype = local_logits.dtype
+        ctx.mesh = mesh
+        ctx.placements = logits.placements
+        ctx.tp_grad_factor = tp_size if compensate_tp else 1
+
+        local_logits = ops.cast(local_logits, mstype.float32)
+        local_logits = mint.reshape(local_logits, (-1, local_logits.shape[-1]))
+        vocab_per_rank = local_logits.shape[-1]
+        vocab_start = tp_rank * vocab_per_rank
+        target = mint.reshape(labels, (-1,))
+
+        loss, exp_vals, global_sum_exp, local_target, in_range_f = _vocab_parallel_ce_terms(
+            local_logits, target, group, vocab_start, vocab_per_rank)
+
+        ctx.exp_vals = exp_vals
+        ctx.global_sum_exp = global_sum_exp
+        ctx.local_target = local_target
+        ctx.in_range_f = in_range_f
+        ctx.labels = labels
+        return loss
+
+    @staticmethod
+    def backward(ctx, grads):
+        """Backward pass: grad = (softmax - onehot) * upstream, scaled by tp_grad_factor."""
+        grad = _vocab_parallel_ce_grad(ctx.exp_vals, ctx.global_sum_exp, ctx.local_target,
+                                       ctx.in_range_f, grads, ctx.tp_grad_factor)
+        grad = ops.cast(grad, ctx.orig_dtype)
+        grad = DTensor.from_local(grad, ctx.mesh, ctx.placements)
+        return grad, mint.zeros_like(ctx.labels), None
 
 
 class _LogSoftmax(_Function):
@@ -191,9 +303,14 @@ class CrossEntropyLoss(nn.Cell):
         (1,)
     """
     @_LogActionOnce(m_logger=logger, key='CrossEntropyLoss')
-    def __init__(self, calculate_per_token_loss=False, loss_tag='lm', **kwargs):
+    def __init__(self, calculate_per_token_loss=False, loss_tag='lm',
+                 compensate_loss_sense_tp=True, **kwargs):
         super().__init__()
         self.kwargs = kwargs
+        # The trainer's non-PP loss sense is 1/(dp*tp*cp), so the vocab-parallel gradient must
+        # multiply tp back (see _vocab_parallel_ce_grad). Under PP the last-stage loss_scale
+        # already carries that tp factor, so the compensation must be turned off there.
+        self.compensate_loss_sense_tp = compensate_loss_sense_tp
         self.loss_tag = loss_tag
         self.sum = mint.sum
         self.mul = mint.mul
@@ -211,8 +328,13 @@ class CrossEntropyLoss(nn.Cell):
 
     def construct(self, logits, label, input_mask=None):
         """Forward process"""
-        log_softmax = self.log_softmax(logits)
-        loss_reduce = self.nll_loss(log_softmax, label)
+        if vocab_parallel_shard_dim(logits) is not None:
+            # Logits are sharded on the vocab dimension across TP (enable_loss_parallel):
+            # compute cross entropy with a vocab-parallel reduction, no logits all-gather.
+            loss_reduce = _VocabParallelCrossEntropy.apply(logits, label, self.compensate_loss_sense_tp)
+        else:
+            log_softmax = self.log_softmax(logits)
+            loss_reduce = self.nll_loss(log_softmax, label)
 
         # Using input_mask to mask the loss
         if input_mask is None:
@@ -242,6 +364,11 @@ class ChunkCrossEntropyLoss(CrossEntropyLoss):
         if logits.ndim == 3:
             if input_mask is None:
                 input_mask = mint.ones_like(label)
+            if vocab_parallel_shard_dim(logits) is not None:
+                # vocab-sharded 3D logits: fuse sequence-dim chunking with the
+                # vocab-parallel reduction (enable_loss_parallel + chunk_loss_num > 1).
+                return _ChunkVocabParallelCrossEntropy.apply(
+                    logits, label, input_mask, self.chunk_loss_num, self.compensate_loss_sense_tp)
             return _ChunkCrossEntropyLoss.apply(logits, label, input_mask, self.chunk_loss_num)
         return super().construct(logits, label, input_mask)
 
@@ -336,3 +463,83 @@ class _ChunkCrossEntropyLoss(_Function):
             start_idx = end_idx
         grad_logits = mint.cat(grad_logits_chunks, dim=1)
         return grad_logits, mint.zeros_like(labels), mint.zeros_like(input_mask), None
+
+
+class _ChunkVocabParallelCrossEntropy(_Function):
+    """Chunked cross entropy for 3D ``[batch, seq, V_local]`` logits sharded on the vocab
+    dimension across the TP mesh (enable_loss_parallel together with chunk_loss_num > 1).
+
+    Combines two memory savings: sequence-dim chunking (one chunk's softmax is materialised
+    at a time, the fused backward recomputes per chunk) and the vocab-parallel reduction
+    (max / sum-exp / target logit all-reduced over the TP group, full-vocab logits never
+    gathered). Forward saves only the local logits slice, labels and mask; the backward
+    recomputes each chunk's softmax (re-running the TP all-reduce) and concatenates the
+    chunk gradients along the sequence dimension.
+    """
+
+    @staticmethod
+    def forward(ctx, logits, labels, input_mask, chunk_loss_num, compensate_tp=True):
+        """Forward pass for fused chunked vocab-parallel cross entropy."""
+        mesh, group, tp_rank, tp_size = _vocab_parallel_meta(logits)
+        local_logits = logits.to_local()  # [b, s, V_local]
+        ctx.local_logits = local_logits
+        ctx.labels = labels
+        ctx.input_mask = input_mask
+        ctx.logits_dtype = local_logits.dtype
+        ctx.mesh = mesh
+        ctx.placements = logits.placements
+        ctx.group = group
+        ctx.tp_grad_factor = tp_size if compensate_tp else 1
+        ctx.vocab_per_rank = local_logits.shape[-1]
+        ctx.vocab_start = tp_rank * local_logits.shape[-1]
+        ctx.chunk_sizes = _ChunkCrossEntropyLoss._chunk_sizes(labels.shape[1], chunk_loss_num)
+
+        denominator = mint.sum(mint.reshape(input_mask, (-1,)))
+        denominator = mint.add(denominator, ops.cast(ops.tuple_to_array((1e-8,)), mstype.float32))
+        ctx.denominator = denominator
+
+        loss = None
+        start_idx = 0
+        for chunk_size in ctx.chunk_sizes:
+            end_idx = start_idx + chunk_size
+            seq_logits = ops.cast(
+                mint.reshape(local_logits[:, start_idx:end_idx, :], (-1, ctx.vocab_per_rank)),
+                mstype.float32)
+            seq_labels = mint.reshape(labels[:, start_idx:end_idx], (-1,))
+            seq_mask = ops.cast(mint.reshape(input_mask[:, start_idx:end_idx], (-1,)), mstype.float32)
+
+            loss_reduce = _vocab_parallel_ce_terms(
+                seq_logits, seq_labels, group, ctx.vocab_start, ctx.vocab_per_rank)[0]
+            numerator = mint.sum(mint.mul(loss_reduce, seq_mask))
+            seq_loss = mint.div(numerator, denominator)
+            loss = seq_loss if loss is None else loss + seq_loss
+            start_idx = end_idx
+        return loss
+
+    @staticmethod
+    def backward(ctx, grads):
+        """Backward pass: recompute each chunk's vocab-parallel softmax and concatenate."""
+        local_logits = ctx.local_logits
+        labels = ctx.labels
+        input_mask = ctx.input_mask
+        grad_logits_chunks = []
+        start_idx = 0
+        for chunk_size in ctx.chunk_sizes:
+            end_idx = start_idx + chunk_size
+            seq_slice = local_logits[:, start_idx:end_idx, :]
+            seq_shape = seq_slice.shape
+            seq_logits = ops.cast(mint.reshape(seq_slice, (-1, ctx.vocab_per_rank)), mstype.float32)
+            seq_labels = mint.reshape(labels[:, start_idx:end_idx], (-1,))
+            seq_mask = ops.cast(mint.reshape(input_mask[:, start_idx:end_idx], (-1,)), mstype.float32)
+
+            _, exp_vals, global_sum_exp, local_target, in_range_f = _vocab_parallel_ce_terms(
+                seq_logits, seq_labels, ctx.group, ctx.vocab_start, ctx.vocab_per_rank)
+            upstream = mint.div(mint.mul(seq_mask, grads), ctx.denominator)
+            grad = _vocab_parallel_ce_grad(exp_vals, global_sum_exp, local_target, in_range_f,
+                                           upstream, ctx.tp_grad_factor)
+            grad = ops.cast(mint.reshape(grad, seq_shape), ctx.logits_dtype)
+            grad_logits_chunks.append(grad)
+            start_idx = end_idx
+        grad_logits = mint.cat(grad_logits_chunks, dim=1)  # [b, s, V_local]
+        grad_logits = DTensor.from_local(grad_logits, ctx.mesh, ctx.placements)
+        return grad_logits, mint.zeros_like(labels), mint.zeros_like(input_mask), None, None
