@@ -583,11 +583,19 @@ def _apply_layers_tp(
     q_pre_attn_layout = Shard(2) if has_q_lora else Replicate()
     attn_input_shard = attn_qkv_shard if has_q_lora else Replicate()
 
+    # The fused RoPE kernel is dispatched as a distributed op and requires its cos/sin
+    # (derived from the rotary freqs) to be DTensors, so the freqs input is replicated at
+    # the module boundary. The non-fused mul/add path instead broadcasts plain freqs and
+    # must keep them as plain tensors (None) to preserve q_pe's head sharding, so the freqs
+    # slot is only converted when apply_rope_fusion is enabled.
+    rope_freqs_layout = Replicate() if transformer_layer.self_attention.config.apply_rope_fusion else None
+
     # Rotary embedding for q_pe (head-structured tensor from linear_qb when LoRA is
-    # on, otherwise from linear_qkv's replicated slice).
+    # on, otherwise from linear_qkv's replicated slice). The second positional input is
+    # the rotary freqs tensor (mscale is passed as a kwarg and stays a Python scalar).
     q_rotary_emb_plan = prepare_module_input_output(
-        input_layouts=(q_pre_attn_layout, None),
-        desired_input_layouts=(q_pre_attn_layout, None),
+        input_layouts=(q_pre_attn_layout, rope_freqs_layout),
+        desired_input_layouts=(q_pre_attn_layout, rope_freqs_layout),
         output_layouts=(q_pre_attn_layout,),
         desired_output_layouts=(q_pre_attn_layout,),
         use_local_output=False,
@@ -595,8 +603,8 @@ def _apply_layers_tp(
     # Rotary embedding for k_pe (pre-tile 1-head tensor from linear_qkv, stays Replicate).
     # k_pe comes from linear_qkv whose all-reduce is necessary, so k_pe remains Replicate.
     k_rotary_emb_plan = prepare_module_input_output(
-        input_layouts=(Replicate(), None),
-        desired_input_layouts=(Replicate(), None),
+        input_layouts=(Replicate(), rope_freqs_layout),
+        desired_input_layouts=(Replicate(), rope_freqs_layout),
         output_layouts=(Replicate(),),
         desired_output_layouts=(Replicate(),),
         use_local_output=False,

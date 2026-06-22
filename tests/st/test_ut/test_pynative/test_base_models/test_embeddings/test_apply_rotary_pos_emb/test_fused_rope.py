@@ -51,7 +51,6 @@ class TestFusedRoPE:
         self.input_t = ms.Tensor(init_params.get("t"), dtype=ms.float32)
         self.input_freqs = ms.Tensor(freqs, dtype=ms.float32)
         self.mscale = 1.0
-        self.freqs = (self.input_freqs, self.mscale)
 
     def run_test(self, multi_latent_attention, rotary_interleaved):
         """Helper function to run test"""
@@ -68,9 +67,9 @@ class TestFusedRoPE:
                                               multi_latent_attention=multi_latent_attention,
                                               rotary_interleaved=rotary_interleaved)
         fused_rope_output = ApplyRotaryPosEmb(fused_rope_config)(
-            self.input_t, self.freqs, rotary_interleaved, multi_latent_attention)
+            self.input_t, self.input_freqs, self.mscale, rotary_interleaved, multi_latent_attention)
         no_fused_rope_output = ApplyRotaryPosEmb(no_fused_rope_config)(
-            self.input_t, self.freqs, rotary_interleaved, multi_latent_attention)
+            self.input_t, self.input_freqs, self.mscale, rotary_interleaved, multi_latent_attention)
         actual = fused_rope_output.asnumpy()
         golden = no_fused_rope_output.asnumpy()
         if multi_latent_attention and not rotary_interleaved:

@@ -89,7 +89,8 @@ class ApplyRotaryPosEmb(nn.Cell):
 
     def construct(self,
                   t: Tensor,
-                  freqs: tuple,
+                  freqs: Tensor,
+                  mscale: float = 1.0,
                   rotary_interleaved: bool = False,
                   multi_latent_attention: bool = False,
                   inverse: bool = False,
@@ -98,8 +99,9 @@ class ApplyRotaryPosEmb(nn.Cell):
 
         Args:
             t (Tensor): Input tensor is of shape [seq_length, ... , dim]
-            freqs (tuple): A tuple of frequencies and mscale. Rotary position embedding frequencies
-                of shape [seq_length, ... , dim], mscale is float
+            freqs (Tensor): Rotary position embedding frequencies of shape [seq_length, ... , dim].
+            mscale (float, optional): Magnitude scaling applied to the rotary angles before
+                computing cos/sin (yarn interface). Default: 1.0
             rotary_interleaved (bool, optional): Whether to use interleaved rotary position embedding. Default: False
             multi_latent_attention (bool, optional): Whether to use multi latent attention. Default: False
             inverse (bool, optional): Whether to apply the inverse rotation (un-rotate).
@@ -115,7 +117,7 @@ class ApplyRotaryPosEmb(nn.Cell):
         """
         origin_dtype = t.dtype
         seq_len, bs, n_heads, head_dim = t.shape
-        freqs, m_scale = freqs
+        m_scale = mscale
         rot_dim = freqs.shape[-1]
         if head_dim == rot_dim:
             t_not_rotary = None
@@ -170,11 +172,16 @@ class ApplyRotaryPosEmb(nn.Cell):
     def _to_interleaved_freqs(self, freqs: Tensor) -> Tensor:
         """Convert NeoX-style duplicated frequencies to GPT-J interleaved layout."""
         rot_dim = freqs.shape[-1]
-        freqs_half = self.narrow(freqs, dim=-1, start=0, length=rot_dim // 2)
-        return self.reshape(
-            self.stack((freqs_half, freqs_half), dim=-1),
-            (*freqs.shape[:-1], rot_dim),
-        )
+        # NeoX freqs are ``cat(freqs_half, freqs_half)`` so the leading half holds the
+        # unique angles. Interleave-duplicate each angle (``[a, b] -> [a, a, b, b]``)
+        # using only ``split``/``reshape``/``cat``, all of which have registered
+        # distributed (DTensor) layout-inference implementations (``narrow``, ``stack``
+        # and ``repeat_interleave`` do not).
+        freqs_half = self.split(freqs, rot_dim // 2, dim=-1)[0]
+        lead_shape = freqs_half.shape[:-1]
+        expanded = self.reshape(freqs_half, (*lead_shape, rot_dim // 2, 1))
+        duplicated = self.cat((expanded, expanded), dim=-1)
+        return self.reshape(duplicated, (*lead_shape, rot_dim))
 
     def _rotate_half(self, t: Tensor, rotary_interleaved: bool = False) -> Tensor:
         """Rotates half of the input tensor for rotary position embeddings.

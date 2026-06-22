@@ -214,7 +214,8 @@ class TransformerBlock(nn.Cell):
                   rotary_pos_emb: Tensor = None,
                   prefix_keys_values=None,
                   actual_seq_len=None,
-                  input_ids=None):
+                  input_ids=None,
+                  mscale=1.0):
         """
         Construct function of transformer block.
 
@@ -245,7 +246,8 @@ class TransformerBlock(nn.Cell):
                 rotary_pos_emb=rotary_pos_emb,
                 prefix_keys_values=prefix_kv,
                 actual_seq_len=actual_seq_len,
-                input_ids=input_ids
+                input_ids=input_ids,
+                mscale=mscale
             )
 
         if self.hc and self.has_final_layernorm_in_this_stage():

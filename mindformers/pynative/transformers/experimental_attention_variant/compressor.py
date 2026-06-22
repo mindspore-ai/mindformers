@@ -232,7 +232,7 @@ class Compressor(nn.Cell):
         kv_4d = self.unsqueeze(kv, -2)
         kv_nope, kv_pe = self.split(kv_4d, [d - self.qk_pos_emb_head_dim, self.qk_pos_emb_head_dim], dim=-1)
         kv_pe = self.apply_rope(
-            kv_pe, (freqs, 1.0),
+            kv_pe, freqs, 1.0,
             rotary_interleaved=self.config.rotary_interleaved,
             multi_latent_attention=True,
             mla_output_remove_interleaving=True,

@@ -183,7 +183,8 @@ class TransformerLayer(nn.Cell, BaseTransformerLayer):
             rotary_pos_emb=None,
             prefix_keys_values=None,
             actual_seq_len=None,
-            input_ids=None
+            input_ids=None,
+            mscale=1.0
     ):
         """
         Perform a forward pass through the transformer layer.
@@ -226,7 +227,8 @@ class TransformerLayer(nn.Cell, BaseTransformerLayer):
             attention_mask=attention_mask,
             rotary_pos_emb=rotary_pos_emb,
             prefix_keys_values=prefix_keys_values,
-            actual_seq_len=actual_seq_len
+            actual_seq_len=actual_seq_len,
+            mscale=mscale
         )
 
         # Dropout
@@ -290,7 +292,8 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             rotary_pos_emb=None,
             prefix_keys_values=None,
             actual_seq_len=None,
-            input_ids=None
+            input_ids=None,
+            mscale=1.0
     ):
         """mHC forward path.
 
@@ -308,7 +311,8 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             attention_mask=attention_mask,
             rotary_pos_emb=rotary_pos_emb,
             prefix_keys_values=prefix_keys_values,
-            actual_seq_len=actual_seq_len
+            actual_seq_len=actual_seq_len,
+            mscale=mscale
         )
 
         dropout_output = self.hidden_states_dropout(attention_output)

@@ -194,14 +194,15 @@ class DSv4HybridSelfAttention(MultiLatentAttention):
             "'rope' and 'yarn'"
         )
 
-    def _apply_forward_rope(self, t: Tensor, rope_freqs: tuple) -> Tensor:
+    def _apply_forward_rope(self, t: Tensor, freqs: Tensor, mscale: float = 1.0) -> Tensor:
         """Forward-RoPE the trailing ``qk_pos_emb_head_dim`` lanes of ``t``."""
         pos_dim = self.config.qk_pos_emb_head_dim
         nope_dim = int(t.shape[-1]) - pos_dim
         t_nope, t_pe = self.split(t, [nope_dim, pos_dim], dim=-1)
         t_pe = self.apply_rotary_emb(
             t_pe,
-            rope_freqs,
+            freqs,
+            mscale,
             rotary_interleaved=self.config.rotary_interleaved,
             multi_latent_attention=self.config.multi_latent_attention,
             mla_output_remove_interleaving=True,
@@ -223,7 +224,8 @@ class DSv4HybridSelfAttention(MultiLatentAttention):
         freqs, _ = self.rotary_pos_emb(sq)
         rot_part = self.apply_rotary_emb(
             rot_part,
-            (freqs, 1.0),
+            freqs,
+            1.0,
             rotary_interleaved=self.config.rotary_interleaved,
             multi_latent_attention=self.config.multi_latent_attention,
             inverse=True,
@@ -234,7 +236,7 @@ class DSv4HybridSelfAttention(MultiLatentAttention):
 
     # pylint: disable=arguments-differ,unused-argument
     def construct(self, x: Tensor, attention_mask=None, rotary_pos_emb=None,
-                  prefix_keys_values=None, actual_seq_len=None) -> Tensor:
+                  prefix_keys_values=None, actual_seq_len=None, mscale=1.0) -> Tensor:
         """DeepSeek-V4 hybrid attention forward."""
         if prefix_keys_values is not None:
             raise NotImplementedError("prefix_keys_values is not supported for now.")
@@ -268,9 +270,8 @@ class DSv4HybridSelfAttention(MultiLatentAttention):
         # ---- Main Q / K pe-lane RoPE ---------------------------------
         if self.rotary_pos_emb is not None:
             freqs, _ = self.rotary_pos_emb(sq)
-            rope_freqs = (freqs, 1.0)
-            q = self._apply_forward_rope(q, rope_freqs)
-            kv_4d = self._apply_forward_rope(kv_4d, rope_freqs)
+            q = self._apply_forward_rope(q, freqs, 1.0)
+            kv_4d = self._apply_forward_rope(kv_4d, freqs, 1.0)
         key = kv_4d
 
         # ---- Core attention ------------------------------------------
