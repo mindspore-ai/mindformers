@@ -43,7 +43,6 @@ class ApplyRotaryPosEmbRunner:
         self.input_t = ms.Tensor(init_params.get("t"), dtype=ms.bfloat16)
         self.input_freqs = ms.Tensor(init_params.get("freqs"), dtype=ms.bfloat16)
         self.mscale = 1.0
-        self.freqs = (self.input_freqs, self.mscale)
 
         # RANK_ID and worker_num are set by msrun environment
         rank_id_str = os.environ.get("RANK_ID")
@@ -81,7 +80,8 @@ class ApplyRotaryPosEmbRunner:
         """Run the model with given inputs"""
         net = self.build_model()
 
-        output = net(self.input_t, self.freqs, self.rotary_interleaved, self.multi_latent_attention)
+        output = net(self.input_t, self.input_freqs, self.mscale,
+                     self.rotary_interleaved, self.multi_latent_attention)
         output_ms = {"output": output}
 
         if self.rank_id is None or int(self.rank_id) == 0:

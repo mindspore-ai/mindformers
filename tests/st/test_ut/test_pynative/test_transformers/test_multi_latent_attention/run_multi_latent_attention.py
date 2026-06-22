@@ -127,7 +127,8 @@ class MLARunner:
         output = net(
             hidden_state,
             attention_mask=ms.Tensor(attention_mask),
-            rotary_pos_emb=(ms.Tensor(rotary_pos_emb), 1)
+            rotary_pos_emb=ms.Tensor(rotary_pos_emb),
+            mscale=1
         )
         output_ms = {"output": output}
 

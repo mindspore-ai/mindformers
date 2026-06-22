@@ -340,6 +340,7 @@ class MultiTokenPredictionLayer(nn.Cell):
             rotary_pos_emb: Tensor = None,
             actual_seq_len: Tensor = None,
             embedding=None,
+            mscale: float = 1.0,
     ):
         """
         Perform the forward pass through the MTP layer.
@@ -380,7 +381,8 @@ class MultiTokenPredictionLayer(nn.Cell):
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             rotary_pos_emb=rotary_pos_emb,
-            actual_seq_len=actual_seq_len
+            actual_seq_len=actual_seq_len,
+            mscale=mscale
         )
         if self.hc:
             # Collapse the streams back to (s, b, h) by averaging,
@@ -541,6 +543,7 @@ class MultiTokenPredictionBlock(nn.Cell):
             extra_block_kwargs: dict = None,
             embedding: nn.Cell = None,
             actual_seq_len: Tensor = None,
+            mscale: float = 1.0,
     ):
         """
         Perform the forward pass through all of the MTP modules.
@@ -572,6 +575,7 @@ class MultiTokenPredictionBlock(nn.Cell):
                 rotary_pos_emb=rotary_pos_emb,
                 embedding=embedding,
                 actual_seq_len=actual_seq_len,
+                mscale=mscale,
             )
             hidden_states_list.append(hidden_states)
         hidden_states = self.concat_hidden_states(hidden_states_list)

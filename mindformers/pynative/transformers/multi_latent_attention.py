@@ -290,16 +290,17 @@ class MultiLatentAttention(nn.Cell):
             inplace_copy(param, weights)
 
     def construct(self, x: Tensor, attention_mask=None, rotary_pos_emb=None,
-                  prefix_keys_values=None, pad_zeros=None, actual_seq_len=None):
+                  prefix_keys_values=None, pad_zeros=None, actual_seq_len=None, mscale=1.0):
         """
         Forward pass of the Multi-head Latent Attention mechanism.
 
         Args:
             x: Input tensor with shape (seq_length, batch_size, hidden_size).
             attention_mask: Attention mask tensor (optional).
-            rotary_pos_emb: Rotary position embedding tensor (optional).
+            rotary_pos_emb: Rotary position embedding frequencies tensor (optional).
             pad_zeros: Padding zeros tensor (not used).
             actual_seq_len: Actual sequence length for EOD mask compression (optional).
+            mscale: Rotary magnitude scaling (yarn interface). Default: 1.0
 
         Returns:
             Tensor: Output tensor with shape (seq_length, batch_size, hidden_size).
@@ -310,7 +311,7 @@ class MultiLatentAttention(nn.Cell):
             raise NotImplementedError("pad_zeros is not supported for now.")
         ori_dtype = x.dtype
         seq_len, bs, _ = self.shape(x)
-        query, key, value = self.get_query_key_value_tensors(x, rotary_pos_emb=rotary_pos_emb)
+        query, key, value = self.get_query_key_value_tensors(x, rotary_pos_emb=rotary_pos_emb, mscale=mscale)
         if self.use_flash_attention:
             if self.use_eod_attn_mask_compression:
                 context_layer = self.core_attention(
@@ -455,7 +456,7 @@ class MLASelfAttention(MultiLatentAttention):
             bias=self.config.add_bias_linear,
         )
 
-    def get_query_key_value_tensors(self, hidden_states, rotary_pos_emb=None):
+    def get_query_key_value_tensors(self, hidden_states, rotary_pos_emb=None, mscale=1.0):
         """
         Derive query, key, and value tensors from hidden states.
 
@@ -465,7 +466,8 @@ class MLASelfAttention(MultiLatentAttention):
 
         Args:
             hidden_states: Input hidden states tensor with shape [seq_length, batch_size, hidden_size].
-            rotary_pos_emb: Rotary position embedding tensor (optional).
+            rotary_pos_emb: Rotary position embedding frequencies tensor (optional).
+            mscale: Rotary magnitude scaling (yarn interface). Default: 1.0
 
         Returns:
             tuple: A tuple containing query, key, and value tensors.
@@ -506,6 +508,7 @@ class MLASelfAttention(MultiLatentAttention):
             q_pe = self.apply_rotary_emb_q(
                 q_pe,
                 rotary_pos_emb,
+                mscale=mscale,
                 rotary_interleaved=self.config.rotary_interleaved,
                 multi_latent_attention=self.config.multi_latent_attention
             )
@@ -536,6 +539,7 @@ class MLASelfAttention(MultiLatentAttention):
             k_pe = self.apply_rotary_emb_k(
                 k_pe,
                 rotary_pos_emb,
+                mscale=mscale,
                 rotary_interleaved=self.config.rotary_interleaved,
                 multi_latent_attention=self.config.multi_latent_attention
             )

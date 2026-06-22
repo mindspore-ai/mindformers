@@ -170,7 +170,7 @@ class CSAIndexer(nn.Cell):
             q, [self.index_head_dim - self.qk_pos_emb_head_dim, self.qk_pos_emb_head_dim], dim=-1
         )
         q_pe = self.apply_rope(
-            q_pe, (freqs, 1),
+            q_pe, freqs, 1,
             rotary_interleaved=self.config.rotary_interleaved,
             multi_latent_attention=True,
             mla_output_remove_interleaving=True

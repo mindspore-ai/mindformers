@@ -317,7 +317,7 @@ class GPTModel(nn.Cell):
         labels, attention_mask, loss_mask = self._preprocess_input_labels_and_masks(
             input_ids, labels, attention_mask, loss_mask)
 
-        hidden_states, rotary_pos_emb = self.language_model(
+        hidden_states, rotary_pos_emb, mscale = self.language_model(
             input_ids,
             position_ids,
             attention_mask,
@@ -338,7 +338,8 @@ class GPTModel(nn.Cell):
                 attention_mask=attention_mask,
                 rotary_pos_emb=rotary_pos_emb,
                 embedding=self.embedding,
-                actual_seq_len=actual_seq_len
+                actual_seq_len=actual_seq_len,
+                mscale=mscale
             )
 
         if not self.post_process:
@@ -417,8 +418,9 @@ class GPTModel(nn.Cell):
 
         # rope
         rotary_pos_emb = None
+        mscale = 1.0
         if self.use_rotary_position_embeddings:
-            rotary_pos_emb = self.rotary_pos_emb(seq_len, position_ids=position_ids)
+            rotary_pos_emb, mscale = self.rotary_pos_emb(seq_len, position_ids=position_ids)
 
         if prefix_keys_values is not None:
             if attn_mask is None:
@@ -443,10 +445,11 @@ class GPTModel(nn.Cell):
             rotary_pos_emb,
             prefix_keys_values,
             actual_seq_len,
-            input_ids=input_ids
+            input_ids=input_ids,
+            mscale=mscale
         )
 
-        return hidden_states, rotary_pos_emb
+        return hidden_states, rotary_pos_emb, mscale
 
     def shared_embedding_or_output_weight(self):
         """Gets the embedding weight or output logit weights when share embedding and output weights set to True.
