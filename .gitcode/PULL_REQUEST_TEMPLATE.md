@@ -1,6 +1,6 @@
 ### 关联 Issue (Related Issue)
-<!-- 请在下方输入关联的 issue ID，例如：Fixes #123 -->
-<!-- Please link the related issue here, e.g., Fixes #123 -->
+<!-- 请在下方输入关联的 issue ID，例如：Fixes #<issue-id> -->
+<!-- Please link the related issue here, e.g., Fixes #<issue-id> -->
 
 
 ### 修改描述 (Description)
