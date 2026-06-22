@@ -109,8 +109,21 @@ class PpLayerSetting:
         Parse the layer range string to a tuple of (layer_start, layer_end).
         """
         after_parse_layer = {}
+        if len(layers_per_stage) != self.pp:
+            raise ValueError(
+                f"The length of 'pipeline_parallel_layers_per_stage' ({len(layers_per_stage)}) "
+                f"must equal 'pipeline_parallel' ({self.pp}), "
+                f"but got {len(layers_per_stage)} entries for {self.pp} PP ranks."
+            )
         for pp_rank, stage_str in enumerate(layers_per_stage):
             ranges = stage_str.split(',')
+            if len(ranges) != self.pp_interleave_num:
+                raise ValueError(
+                    f"PP rank {pp_rank} has {len(ranges)} chunk(s) in "
+                    f"'pipeline_parallel_layers_per_stage' (got '{stage_str}'), "
+                    f"but 'pipeline_parallel_interleave_num' is {self.pp_interleave_num}. "
+                    f"Each PP rank must have exactly {self.pp_interleave_num} comma-separated chunk(s)."
+                )
             for chunk_id, r in enumerate(ranges):
                 layer_ids = r.strip().split('-')
                 if len(layer_ids) <= 2:
