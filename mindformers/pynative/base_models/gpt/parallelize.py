@@ -78,9 +78,6 @@ from mindformers.pynative.distributed.parallelize import parallelize_module
 from mindformers.pynative.distributed.activation_checkpoint import apply_ac
 from mindformers.pynative.distributed.utils import distribute_module, get_loss_sense
 from mindformers.pynative.base_models.gpt.gpt_model import GPTModel
-from mindformers.pynative.transformers.experimental_attention_variant.indexer import _IndexerLossAutoScaler
-from mindformers.pynative.transformers.moe.moe_utils import _MoEAuxLossAutoScaler
-from mindformers.pynative.transformers.multi_token_prediction import _MTPLossAutoScaler
 from mindformers.tools.logger import logger
 
 __all__ = ["parallelize_gptmodel"]
@@ -1434,7 +1431,6 @@ def _apply_spmd_parallelism(
         recompute: Any,
         recompute_comm: Any,
         swap: Any,
-        gradient_accumulation_steps: int = 1,
         overlap=None,
 ) -> nn.Cell:
     """Unified GPTModel parallelization entry point.
@@ -1536,17 +1532,6 @@ def _apply_spmd_parallelism(
             logger.warning(
                 "[QK-Clip] could not resolve loss_mesh reduce group (%s); "
                 "falling back to world all-reduce.", exc)
-
-    # Set the loss scale for the auxiliary loss of the MoE layer.
-    main_loss_sense = get_loss_sense(
-        parallelism=parallelism,
-        enable_parallel=True,
-        gradient_accumulation_steps=gradient_accumulation_steps,
-        apply_gradient_accumulation=True,
-    )
-    _MoEAuxLossAutoScaler.set_loss_scale(main_loss_sense)
-    _MTPLossAutoScaler.set_loss_scale(main_loss_sense)
-    _IndexerLossAutoScaler.set_loss_scale(main_loss_sense)
 
     # Tag the MTP-shared input embedding so its gradient is summed across the
     # embedding-owning PP stages before the optimizer step (handled in the
@@ -1717,7 +1702,6 @@ def apply_pp(
             recompute,
             recompute_comm,
             swap,
-            gradient_accumulation_steps,
             overlap=overlap,
         )
 
@@ -1788,7 +1772,6 @@ def parallelize_gptmodel(
             gradient_accumulation_steps=gradient_accumulation_steps,
         )
 
-    _apply_spmd_parallelism(model, parallel_dims, parallelism, recompute, recompute_comm, swap,
-                            gradient_accumulation_steps)
+    _apply_spmd_parallelism(model, parallel_dims, parallelism, recompute, recompute_comm, swap)
 
     return [model], None, False, False

@@ -71,6 +71,7 @@ from .utils import (
     _build_lora_model,
     _calculate_global_grad_norm,
     compute_parameters,
+    set_auxiliary_loss_backward_scale,
 )
 
 
@@ -187,6 +188,19 @@ class Trainer:
         if self.enable_parallel:
             # Apply parallelism to model
             self._apply_parallelism(self.model, self.config.parallelism)
+
+        # Set the backward scale for auxiliary losses (aux/mtp/index) once, for
+        # every code path. These losses inject their gradient through dedicated
+        # autoscalers (not the main ``loss.backward``), so the scale must fold in
+        # ``1 / num_accumulation_steps`` to stay aligned with the main loss. The
+        # single-card path skips ``parallelize_model`` entirely, so without this
+        # the autoscalers keep their default ``1.0`` and gradient accumulation
+        # diverges from the no-accumulation run.
+        set_auxiliary_loss_backward_scale(
+            parallelism=self.config.parallelism,
+            enable_parallel=self.enable_parallel,
+            gradient_accumulation_steps=self.num_accumulation_steps,
+        )
 
         # After parallelism, parameters will be reset
         self.model = self.model if isinstance(self.model, list) else [self.model]
