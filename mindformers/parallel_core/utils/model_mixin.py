@@ -345,12 +345,22 @@ class TrainModelMixin:
             # Get missing weight from shared dict
             if wk_value is None:
                 with condition:
-                    condition.wait_for(lambda: wk_key in qkv_weight_dict.keys())
+                    if not condition.wait_for(lambda: wk_key in qkv_weight_dict.keys(), timeout=600):
+                        raise RuntimeError(
+                            f"Timeout waiting for key '{wk_key}' in qkv_weight_dict. "
+                            f"The weight was not produced by any worker thread, which may indicate "
+                            f"a mismatch between wq_keys and the actual weight dict contents."
+                        )
                     wk_value = qkv_weight_dict.pop(wk_key)
 
             if wv_value is None:
                 with condition:
-                    condition.wait_for(lambda: wv_key in qkv_weight_dict.keys())
+                    if not condition.wait_for(lambda: wv_key in qkv_weight_dict.keys(), timeout=600):
+                        raise RuntimeError(
+                            f"Timeout waiting for key '{wv_key}' in qkv_weight_dict. "
+                            f"The weight was not produced by any worker thread, which may indicate "
+                            f"a mismatch between wq_keys and the actual weight dict contents."
+                        )
                     wv_value = qkv_weight_dict.pop(wv_key)
 
             # Start to concat qkv weight
@@ -401,7 +411,12 @@ class TrainModelMixin:
             # Get missing weight from shared dict
             if w3_value is None:
                 with condition:
-                    condition.wait_for(lambda: w3_key in ffn_weight_dict.keys())
+                    if not condition.wait_for(lambda: w3_key in ffn_weight_dict.keys(), timeout=600):
+                        raise RuntimeError(
+                            f"Timeout waiting for key '{w3_key}' in ffn_weight_dict. "
+                            f"The weight was not produced by any worker thread, which may indicate "
+                            f"a mismatch between w1_keys and the actual weight dict contents."
+                        )
                     w3_value = ffn_weight_dict.pop(w3_key)
 
             w_gate_hidden_key = w1_key.replace('gating', 'linear_fc1')
@@ -458,12 +473,22 @@ class TrainModelMixin:
             # get missing weight from shared dict
             if wk_value is None:
                 with condition:
-                    condition.wait_for(lambda: wk_key in qkv_weight_dict.keys())
+                    if not condition.wait_for(lambda: wk_key in qkv_weight_dict.keys(), timeout=600):
+                        raise RuntimeError(
+                            f"Timeout waiting for key '{wk_key}' in qkv_weight_dict. "
+                            f"The weight was not produced by any worker thread, which may indicate "
+                            f"a mismatch between wq_keys and the actual weight dict contents."
+                        )
                     wk_value = qkv_weight_dict.pop(wk_key)
 
             if wv_value is None:
                 with condition:
-                    condition.wait_for(lambda: wv_key in qkv_weight_dict.keys())
+                    if not condition.wait_for(lambda: wv_key in qkv_weight_dict.keys(), timeout=600):
+                        raise RuntimeError(
+                            f"Timeout waiting for key '{wv_key}' in qkv_weight_dict. "
+                            f"The weight was not produced by any worker thread, which may indicate "
+                            f"a mismatch between wq_keys and the actual weight dict contents."
+                        )
                     wv_value = qkv_weight_dict.pop(wv_key)
 
             w_qkv_key = wq_key.replace('linear_q', 'linear_qkv')
@@ -501,7 +526,12 @@ class TrainModelMixin:
             # get missing weight from shared dict
             if w3_value is None:
                 with condition:
-                    condition.wait_for(lambda: w3_key in ffn_weight_dict.keys())
+                    if not condition.wait_for(lambda: w3_key in ffn_weight_dict.keys(), timeout=600):
+                        raise RuntimeError(
+                            f"Timeout waiting for key '{w3_key}' in ffn_weight_dict. "
+                            f"The weight was not produced by any worker thread, which may indicate "
+                            f"a mismatch between w1_keys and the actual weight dict contents."
+                        )
                     w3_value = ffn_weight_dict.pop(w3_key)
 
             w_gate_hidden_key = w1_key.replace('gating', 'linear_fc1')
@@ -572,7 +602,14 @@ class TrainModelMixin:
                     if fc1_value is None:
                         with condition:
                             # If the current process cannot obtain the weight, try to obtain it in the shared dict.
-                            condition.wait_for(lambda: linear_fc1_key in expert_weight_dict.keys())
+                            if not condition.wait_for(
+                                lambda: linear_fc1_key in expert_weight_dict.keys(), timeout=600
+                            ):
+                                raise RuntimeError(
+                                    f"Timeout waiting for key '{linear_fc1_key}' in expert_weight_dict. "
+                                    f"The weight was not produced by any worker thread, which may indicate "
+                                    f"a mismatch between the expert weight distribution and expected keys."
+                                )
                             fc1_value = expert_weight_dict.pop(linear_fc1_key)
                     cur_layer_linear_fc1_weights_dict.append(fc1_value)
 
@@ -603,7 +640,14 @@ class TrainModelMixin:
                     if fc2_value is None:
                         with condition:
                             # If the current process cannot obtain the weight, try to obtain it in the shared dict.
-                            condition.wait_for(lambda: linear_fc2_key in expert_weight_dict.keys())
+                            if not condition.wait_for(
+                                lambda: linear_fc2_key in expert_weight_dict.keys(), timeout=600
+                            ):
+                                raise RuntimeError(
+                                    f"Timeout waiting for key '{linear_fc2_key}' in expert_weight_dict. "
+                                    f"The weight was not produced by any worker thread, which may indicate "
+                                    f"a mismatch between the expert weight distribution and expected keys."
+                                )
                             fc2_value = expert_weight_dict.pop(linear_fc2_key)
                     cur_layer_linear_fc2_weights_dict.append(fc2_value)
 

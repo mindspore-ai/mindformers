@@ -388,7 +388,7 @@ def get_yaml_ast_depth(node, depth=0):
 def check_yaml_depth_before_loading(yaml_str, max_depth=YAML_MAX_NESTING_DEPTH):
     """Check yaml depth before loading"""
     try:
-        node = yaml.compose(yaml_str)  # parse yaml to ast
+        node = yaml.compose(yaml_str, Loader=yaml.SafeLoader)  # parse yaml to ast
         if node is None:
             return  # null file has no question
         depth = get_yaml_ast_depth(node)

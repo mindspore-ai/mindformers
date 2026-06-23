@@ -36,12 +36,18 @@ def create_shm(size, shm_name_save_path):
     if size > MAX_SHM_SIZE:
         raise ValueError(f"Size exceeds the maximum allowed limit of {MAX_SHM_SIZE} bytes.")
 
+    shm = None
     try:
         shm = shared_memory.SharedMemory(create=True, size=size)
         flags_ = os.O_WRONLY | os.O_CREAT | os.O_APPEND
         with os.fdopen(os.open(shm_name_save_path, flags_, FILE_PERMISSION), "a", encoding="utf-8") as fw:
             fw.write(f"{shm.name}\n")
     except Exception as e:
+        if shm is not None:
+            try:
+                shm.close()
+            finally:
+                shm.unlink()
         raise RuntimeError(f"Failed to create shared memory: {e}") from e
     return shm
 
