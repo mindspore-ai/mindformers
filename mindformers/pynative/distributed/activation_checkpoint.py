@@ -800,15 +800,19 @@ def apply_swap(
     if not hasattr(model, "layers"):
         raise ValueError(f"{type(model)} must have 'layers' attribute.")
 
+    prefetch_pairs = set()
     for layer_id in range(model.layer_start, model.layer_end + 1):
         if layer_id in full_target_ids:
             model.layers[layer_id] = swap_wrapper(model.layers[layer_id], policy_fn=policy_fn)
-            SwapManager().set_forward_prefetch_layer(model.layers[layer_id], model.layers[layer_id + prefetch])
+            prefetch_pairs.add((layer_id, layer_id + prefetch))
             logger.info(f"Set layer swap at layer {layer_id}")
 
         if sc.op_swap and layer_id in layer_to_modules:
             _set_op_swap(model.layers[layer_id], layer_id, layer_to_modules, policy_fn)
-            SwapManager().set_forward_prefetch_layer(model.layers[layer_id], model.layers[layer_id + prefetch])
+            prefetch_pairs.add((layer_id, layer_id + prefetch))
+
+    for layer_id, prefetch_layer_id in sorted(prefetch_pairs):
+        SwapManager().set_forward_prefetch_layer(model.layers[layer_id], model.layers[prefetch_layer_id])
 
 
 class _MtpLayerIndex:
