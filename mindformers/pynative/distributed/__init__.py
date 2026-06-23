@@ -29,7 +29,7 @@ from mindformers.pynative.distributed.parallelize import (
     register_parallelize_fn,
     register_parallelize,
 )
-from mindformers.pynative.distributed.pipeline_parallel import PpLayerSetting, StageModelBuilder
+from mindformers.pynative.distributed.pipeline_parallel import PpLayerSetting, StageModelBuilder, _create_schedule, _infer_schedule_type, _SCHEDULE_REGISTRY, register_schedule
 from mindformers.pynative.distributed.ep_overlap import OverlapExpertParallel, apply_chunk_overlap_hooks
 
 __all__ = [
@@ -45,6 +45,10 @@ __all__ = [
     "register_parallelize",
     "PpLayerSetting",
     "StageModelBuilder",
+    "_create_schedule",
+    "_infer_schedule_type",
+    "_SCHEDULE_REGISTRY",
+    "register_schedule",
     "OverlapExpertParallel",
     "apply_chunk_overlap_hooks",
 ]

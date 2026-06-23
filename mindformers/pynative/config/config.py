@@ -385,7 +385,12 @@ class ParallelismConfig(BaseConfig):
     """Layers assigned to each pipeline stage"""
 
     pipeline_parallel_schedule: str = "1f1b"
-    """Pipeline execution schedule"""
+    """Pipeline execution schedule. Supported values:
+    - '1f1b': One-Forward-One-Backward (standard, for interleave_num=1)
+    - 'interleaved_1f1b': Interleaved 1F1B (for interleave_num>1)
+    - 'gpipe': GPipe schedule (simple but more bubbles)
+    Defaults to '1f1b'. Automatically inferred from interleave_num if not specified.
+    """
 
     pipeline_parallel_microbatch_size: int = 1
     """Number of micro-batches per pipeline step"""
@@ -401,6 +406,20 @@ class ParallelismConfig(BaseConfig):
 
     pipeline_parallel_enable_dxdw_split: bool = False
     """Enable split of dxdw communication in pipeline parallelism"""
+
+    pipeline_parallel_p2p_transport: str = "plain"
+    """P2P transport mode for pipeline parallel communication.
+    Controls how pipeline send/recv operations are issued. Must be set
+    identically on every rank — HCCL cannot match a batched op against
+    a plain one.
+    Options:
+    - ``"auto"``: Automatically select the best mode. Uses ``"batch"``
+      (duplex batching via ``batch_isend_irecv``) on schedules with
+      ``overlap_b_f=True``, and ``"plain"`` otherwise.
+    - ``"plain"``: Force per-op ``isend``/``irecv`` for every P2P
+      operation. Simplest and most compatible mode.
+    Defaults to ``"plain"``.
+    """
 
     sequence_parallel: bool = False
     """Enable sequence parallelism"""
