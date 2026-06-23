@@ -26,14 +26,23 @@ Tag 遵循以下格式：
 <MindSpore Transformers 版本号>-<硬件信息（芯片）>-<操作系统>-<Python 版本>
 ```
 
-| 字段                         | 示例值                          | 说明                                        |
+| 字段                         | 取值                           | 说明                                        |
 |----------------------------|------------------------------|-------------------------------------------|
-| MindSpore Transformers 版本号 | 1.8.0                        | 对应 MindSpore Transformers 官方发布 Tag 中的版本标识 |
+| MindSpore Transformers 版本号 | 1.9.0                        | 对应 MindSpore Transformers 官方发布 Tag 中的版本标识 |
 | 硬件信息（芯片）                   | 910b / a3                    | 昇腾芯片型号标识                                  |
 | 操作系统                       | ubuntu22.04 / openeuler24.03 | 基础镜像所使用的操作系统发行版及版本号                       |
 | Python 版本                  | py3.11                       | 镜像内置 Python 大版本号                          |
 
 > Tips: 系统架构通过 Docker Manifest 自动识别，无需在 Tag 中指定。
+
+### 构建参数选择参考地址
+
+### Tag
+
+- `1.9.0-910b-ubuntu22.04-py3.11`
+- `1.9.0-910b-openeuler24.03-py3.11`
+- `1.9.0-a3-ubuntu22.04-py3.11`
+- `1.9.0-a3-openeuler24.03-py3.11`
 
 ### 镜像仓库地址
 
@@ -46,19 +55,21 @@ swr.cn-south-1.myhuaweicloud.com/ascendhub/mindformers
 **完整镜像示例：**
 
 ```text
-swr.cn-south-1.myhuaweicloud.com/ascendhub/mindformers:1.8.0-910b-ubuntu22.04-py3.11
+swr.cn-south-1.myhuaweicloud.com/ascendhub/mindformers:1.9.0-910b-ubuntu22.04-py3.11
 ```
 
 ### 构建参数
 
-| 参数                  | 说明                         | 必填 | 参考来源                         | 示例值                                                    |
+dockerfile详见：[dockerfile](https://gitcode.com/mindspore/mindformers/blob/master/docker/Dockerfile)
+
+| 参数                  | 说明                         | 必填 | 参考来源                         | 取值                                                     |
 |---------------------|----------------------------|----|------------------------------|--------------------------------------------------------|
-| CANN_VERSION        | 昇腾 CANN 工具包版本              | 是  | CANN 镜像标签                    | 8.5.0                                                  |
+| CANN_VERSION        | 昇腾 CANN 工具包版本              | 是  | CANN 镜像标签                    | 9.0.0                                                  |
 | CHIP_ARCH           | 昇腾芯片架构标识                   | 是  | Tag 规范                       | 910b / a3                                              |
 | OS_SYSTEM           | 基础镜像操作系统及版本                | 是  | Tag 规范                       | ubuntu22.04 / openeuler24.03                           |
 | PY_VERSION          | 基础镜像内置 Python 版本           | 是  | Tag 规范                       | py3.11                                                 |
-| MINDSPORE_VERSION   | MindSpore 版本号              | 是  | MindSpore 仓库发行版              | 2.7.2                                                  |
-| MINDFORMERS_VERSION | MindSpore Transformers 版本号 | 是  | MindSpore Transformers 仓库发行版 | 1.8.0                                                  |
+| MINDSPORE_VERSION   | MindSpore 版本号              | 是  | MindSpore 仓库发行版              | 2.9.0                                                  |
+| MINDFORMERS_VERSION | MindSpore Transformers 版本号 | 是  | MindSpore Transformers 仓库发行版 | 1.9.0                                                  |
 | PIP_INDEX_URL       | pip 安装源地址（默认华为云源）          | 否  | PyPI 镜像源                     | https://mirrors.huaweicloud.com/repository/pypi/simple |
 
 ## 快速开始
@@ -67,14 +78,14 @@ swr.cn-south-1.myhuaweicloud.com/ascendhub/mindformers:1.8.0-910b-ubuntu22.04-py
 
 ```bash
 docker build \
---build-arg CANN_VERSION=8.5.0 \
+--build-arg CANN_VERSION=9.0.0 \
 --build-arg CHIP_ARCH=910b \
 --build-arg OS_SYSTEM=ubuntu22.04 \
 --build-arg PY_VERSION=py3.11 \
---build-arg MINDSPORE_VERSION=2.7.2 \
---build-arg MINDFORMERS_VERSION=1.8.0 \
+--build-arg MINDSPORE_VERSION=2.9.0 \
+--build-arg MINDFORMERS_VERSION=1.9.0 \
 --build-arg PIP_INDEX_URL=https://mirrors.huaweicloud.com/repository/pypi/simple \
--t mindformers:1.8.0-910b-ubuntu22.04-py3.11 \
+-t mindformers:1.9.0-910b-ubuntu22.04-py3.11 \
 -f Dockerfile .
 ```
 

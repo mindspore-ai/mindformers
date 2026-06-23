@@ -26,14 +26,21 @@ Tags follow this format:
  <MindSpore Transformers Version>-<Hardware Info (Chip)>-<Operating System>-<Python Version>
 ```
 
-| Field                          | Example Values               | Description                                                                           |
+| Field                          | Values                       | Description                                                                           |
 |--------------------------------|------------------------------|---------------------------------------------------------------------------------------|
-| MindSpore Transformers Version | 1.8.0                        | Corresponds to the version identifier in MindSpore Transformers official release tags |
+| MindSpore Transformers Version | 1.9.0                        | Corresponds to the version identifier in MindSpore Transformers official release tags |
 | Hardware Info (Chip)           | 910b / a3                    | Ascend chip model identifier                                                          |
 | Operating System               | ubuntu22.04 / openeuler24.03 | Operating system distribution and version used in the base image                      |
 | Python Version                 | py3.11                       | Major Python version built into the image                                             |
 
 > Tips: System architecture is automatically detected via Docker Manifest, no need to specify in the tag.
+
+### Available Tags
+
+- `1.9.0-910b-ubuntu22.04-py3.11`
+- `1.9.0-910b-openeuler24.03-py3.11`
+- `1.9.0-a3-ubuntu22.04-py3.11`
+- `1.9.0-a3-openeuler24.03-py3.11`
 
 ### Image Repository Address
 
@@ -46,19 +53,21 @@ swr.cn-south-1.myhuaweicloud.com/ascendhub/mindformers
 **Full Image Example：**
 
 ```text
-swr.cn-south-1.myhuaweicloud.com/ascendhub/mindformers:1.8.0-910b-ubuntu22.04-py3.11
+swr.cn-south-1.myhuaweicloud.com/ascendhub/mindformers:1.9.0-910b-ubuntu22.04-py3.11
 ```
 
 ### 构建参数
 
-| Parameter                      | Description                                                | Required | Source                        | Example Values                                         |
+See dockerfile: [dockerfile](https://gitcode.com/mindspore/mindformers/blob/master/docker/Dockerfile)
+
+| Parameter                      | Description                                                | Required | Source                        | Values                                                 |
 |--------------------------------|------------------------------------------------------------|----------|-------------------------------|--------------------------------------------------------|
-| CANN_VERSION                   | Ascend CANN toolkit version                                | Yes      | CANN image tag                | 8.5.0                                                  |
+| CANN_VERSION                   | Ascend CANN toolkit version                                | Yes      | CANN image tag                | 9.0.0                                                  |
 | CHIP_ARCH                      | Ascend chip architecture identifier                        | Yes      | Tag specification             | 910b / a3                                              |
 | OS_SYSTEM                      | Base image operating system and version                    | Yes      | Tag specification             | ubuntu22.04 / openeuler24.03                           |
 | PY_VERSION                     | Python version built into the base image                   | Yes      | Tag specification             | py3.11                                                 |
-| MINDSPORE_VERSION              | MindSpore version number                                   | Yes      | MindSpore repository releases | 2.7.2                                                  |
-| MINDSPORE_TRANSFORMERS_VERSION | MindSpore version number                                   | Yes      | MindSpore repository releases | 1.8.0                                                  |
+| MINDSPORE_VERSION              | MindSpore version number                                   | Yes      | MindSpore repository releases | 2.9.0                                                  |
+| MINDFORMERS_VERSION | MindSpore Transformers version number                                   | Yes      | MindSpore Transformers repository releases | 1.9.0                                                  |
 | PIP_INDEX_URL                  | pip installation source URL (default: Huawei Cloud mirror) | No       | PyPI mirror source            | https://mirrors.huaweicloud.com/repository/pypi/simple |
 
 ## Quick Start
@@ -67,14 +76,14 @@ swr.cn-south-1.myhuaweicloud.com/ascendhub/mindformers:1.8.0-910b-ubuntu22.04-py
 
 ```bash
 docker build \
---build-arg CANN_VERSION=8.5.0 \
+--build-arg CANN_VERSION=9.0.0 \
 --build-arg CHIP_ARCH=910b \
 --build-arg OS_SYSTEM=ubuntu22.04 \
 --build-arg PY_VERSION=py3.11 \
---build-arg MINDSPORE_VERSION=2.7.2 \
---build-arg MINDFORMERS_VERSION=1.8.0 \
+--build-arg MINDSPORE_VERSION=2.9.0 \
+--build-arg MINDFORMERS_VERSION=1.9.0 \
 --build-arg PIP_INDEX_URL=https://mirrors.huaweicloud.com/repository/pypi/simple \
--t mindformers:1.8.0-910b-ubuntu22.04-py3.11 \
+-t mindformers:1.9.0-910b-ubuntu22.04-py3.11 \
 -f Dockerfile .
 ```
 
