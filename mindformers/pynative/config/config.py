@@ -515,6 +515,9 @@ class TrainDatasetConfig(BaseConfig):
     numa_enable: bool = False
     """Enable NUMA-aware data loading"""
 
+    use_distribute_dataset: bool = False
+    """Whether to broadcast dataset batches within each data domain"""
+
 
 @dataclass
 class ModelConfig(BaseConfig):

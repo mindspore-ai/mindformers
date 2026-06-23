@@ -29,8 +29,10 @@ from mindspore.mint.distributed import (
     init_process_group,
     destroy_process_group,
     get_world_size,
+    get_rank,
     all_reduce,
     new_group,
+    broadcast_object_list,
 )
 from mindspore.graph.api import _no_grad
 
@@ -182,6 +184,10 @@ class Trainer:
         self.gradient_accumulation_steps = None
         self._compute_data_parallel_size()
 
+        # init data broadcast group
+        self.enable_data_broadcast = getattr(self.config.train_dataset, "use_distribute_dataset", False)
+        self._init_distributed_dataset_group()
+
         # Create model
         self.model = self._create_model(model, self.config.model)
         self.parallel_dims = None
@@ -264,6 +270,48 @@ class Trainer:
 
         # Initialize training state
         self.state = None
+
+    def _init_distributed_dataset_group(self):
+        """Initialize per-data-shard batch broadcast group."""
+        self.data_broadcast_group = None
+        self.data_broadcast_src_rank = None
+        self.data_broadcast_group_ranks = None
+
+        if not self.enable_data_broadcast:
+            return
+
+        parallelism = self.config.parallelism
+        data_domain_size = parallelism.context_parallel * parallelism.tensor_parallel
+        if self.world_size <= 1 or data_domain_size <= 1:
+            logger.info(
+                "use_distribute_dataset is enabled but no cross-rank data domain exists; "
+                "fall back to normal dataset iteration."
+            )
+            self.enable_data_broadcast = False
+            return
+
+        if not self.enable_parallel:
+            raise RuntimeError("Data broadcast requires distributed communication.")
+
+        pp_domain_size = self.world_size // parallelism.pipeline_parallel
+        rank = get_rank()
+        pp_rank = rank // pp_domain_size
+        rank_in_pp = rank % pp_domain_size
+        data_domain_id = rank_in_pp // data_domain_size
+        start = pp_rank * pp_domain_size + data_domain_id * data_domain_size
+        self.data_broadcast_group_ranks = list(range(start, start + data_domain_size))
+        self.data_broadcast_src_rank = self.data_broadcast_group_ranks[0]
+        self.data_broadcast_group = new_group(self.data_broadcast_group_ranks)
+        if not self.data_broadcast_group:
+            raise RuntimeError(
+                f"Failed to create data broadcast group for ranks "
+                f"{self.data_broadcast_group_ranks}."
+            )
+        logger.info(
+            "Distributed dataset broadcast is enabled: group ranks=%s, src_rank=%s.",
+            self.data_broadcast_group_ranks,
+            self.data_broadcast_src_rank,
+        )
 
     @staticmethod
     def _init_config(config: Union[str, dict], run_mode: str = "train") -> TrainConfig:
@@ -841,13 +889,12 @@ class Trainer:
         Returns:
             Dict[str, Any]: Dictionary containing batch data.
         """
-        use_distribute_dataset = getattr(self.config, "use_distribute_dataset", False)
         use_remove_redundant_dataset = getattr(
             self.config, "use_remove_redundant_dataset", False
         )
 
-        if use_distribute_dataset:
-            data = self._get_batch_distributed(dataset_iter)
+        if self.enable_data_broadcast:
+            data = self._get_batch_data_broadcast(dataset_iter)
         elif use_remove_redundant_dataset:
             data = self._get_batch_remove_redundant(dataset_iter)
         else:
@@ -870,6 +917,66 @@ class Trainer:
     def _get_batch_naive(self, dataset_iter):
         """Fetch next batch in naive loading mode (simplified)."""
         return next(dataset_iter)
+
+    def _get_batch_data_broadcast(self, dataset_iter):
+        """Fetch a batch on the source rank and broadcast it within the data domain."""
+        rank = get_rank()
+        if rank == self.data_broadcast_src_rank:
+            try:
+                data = next(dataset_iter)
+            except StopIteration:
+                obj = [{"end": True, "data": None}]
+                broadcast_object_list(
+                    obj,
+                    src=self.data_broadcast_src_rank,
+                    group=self.data_broadcast_group,
+                )
+                raise
+            obj = [{"end": False, "data": self._pack_broadcast_data(data)}]
+        else:
+            obj = [None]
+
+        broadcast_object_list(
+            obj,
+            src=self.data_broadcast_src_rank,
+            group=self.data_broadcast_group,
+        )
+        payload = obj[0]
+        if payload["end"]:
+            raise StopIteration
+        return self._unpack_broadcast_data(payload["data"])
+
+    @classmethod
+    def _pack_broadcast_data(cls, data):
+        """Convert tensors in a nested batch object into pickle-friendly arrays."""
+        if isinstance(data, Tensor):
+            return {"__data_broadcast_type__": "tensor", "value": data.asnumpy()}
+        if isinstance(data, np.ndarray):
+            return {"__data_broadcast_type__": "ndarray", "value": data}
+        if isinstance(data, dict):
+            return {k: cls._pack_broadcast_data(v) for k, v in data.items()}
+        if isinstance(data, tuple):
+            return {
+                "__data_broadcast_type__": "tuple",
+                "value": [cls._pack_broadcast_data(v) for v in data],
+            }
+        if isinstance(data, list):
+            return [cls._pack_broadcast_data(v) for v in data]
+        return data
+
+    @classmethod
+    def _unpack_broadcast_data(cls, data):
+        """Restore a nested broadcast batch object for model execution."""
+        if isinstance(data, dict):
+            data_type = data.get("__data_broadcast_type__")
+            if data_type in ("tensor", "ndarray"):
+                return Tensor(data["value"])
+            if data_type == "tuple":
+                return tuple(cls._unpack_broadcast_data(v) for v in data["value"])
+            return {k: cls._unpack_broadcast_data(v) for k, v in data.items()}
+        if isinstance(data, list):
+            return [cls._unpack_broadcast_data(v) for v in data]
+        return data
 
     def _split_micro_batch(self, inputs: Dict[str, Any], acc_step: int):
         """
