@@ -142,7 +142,8 @@ class MegatronDatasetBuilder:
                                            column_names=column_names,
                                            shuffle=shuffle,
                                            num_shards=num_shards,
-                                           shard_id=shard_id)
+                                           shard_id=shard_id,
+                                           num_parallel_workers=kwargs.get('num_parallel_workers', 1))
             return gen_dataset
 
         if get_real_group_size() > 1 and get_context('mode') != MODE['PYNATIVE_MODE']:
