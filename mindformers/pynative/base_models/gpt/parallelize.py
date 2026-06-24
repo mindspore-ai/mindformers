@@ -38,7 +38,6 @@ from mindspore.ops.communication import set_comm_ops_inplace
 from mindspore.mint.distributed import get_rank, all_gather, new_group
 
 from hyper_parallel import DeviceMesh
-from hyper_parallel.core.pipeline_parallel import ScheduleInterleaved1F1B
 from hyper_parallel.core.dtensor.dtensor import DTensor, distribute_tensor
 from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
 from hyper_parallel.core.fully_shard.api import (
@@ -72,7 +71,7 @@ from mindformers.pynative.layers.layer_norm import FusedLayerNorm, FusedRMSNorm
 from mindformers.pynative.distributed.tensor_parallel import NoParallel
 from mindformers.pynative.distributed.expert_parallel import ExpertParallel, DeredundancyExpertParallel
 from mindformers.pynative.distributed.ep_overlap import OverlapExpertParallel
-from mindformers.pynative.distributed.pipeline_parallel import PpLayerSetting, StageModelBuilder
+from mindformers.pynative.distributed.pipeline_parallel import PpLayerSetting, StageModelBuilder, _create_schedule, _infer_schedule_type
 from mindformers.pynative.pet.lora_adapter import build_lora_model
 from mindformers.pynative.distributed.parallelize import parallelize_module
 from mindformers.pynative.distributed.activation_checkpoint import apply_ac
@@ -1724,12 +1723,13 @@ def apply_pp(
         stage.loss_scale = loss_scale
 
     micro_batch_num = parallelism.pipeline_parallel_microbatch_size
-    schedule = ScheduleInterleaved1F1B(
-        stages, micro_batch_num,
-        overlap_p2p=parallelism.pipeline_parallel_overlap_p2p,
-        overlap_b_f=parallelism.pipeline_parallel_overlap_b_f,
+    schedule_type = _infer_schedule_type(parallelism)
+    has_moe = all(
+        any(hasattr(layer.mlp, "experts") for layer in part.model.decoder.layers)
+        for part in model_parts
     )
-    logger.info(f"schedule.exec_oder: {schedule.exec_order}")
+    schedule = _create_schedule(schedule_type, stages, micro_batch_num, parallelism, swap=swap.enable, has_moe=has_moe)
+    logger.info(f"Pipeline schedule: {schedule_type}, exec_order: {schedule.exec_order}")
 
     # Register the OVERLAP_B_F callback when EP overlap is active.
     if use_ep_overlap and overlap is not None:

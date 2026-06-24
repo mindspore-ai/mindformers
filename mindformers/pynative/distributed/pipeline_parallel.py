@@ -13,12 +13,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
+import inspect
+import importlib
 from typing import List, Tuple
 
 import mindspore as ms
 from mindspore import nn
 
 from hyper_parallel import PipelineStage
+
+from mindformers.tools.logger import logger
 
 class ScaledLossPipelineStage(PipelineStage):
     """PipelineStage that scales the last-stage main-loss backward seed.
@@ -225,3 +229,152 @@ class StageModelBuilder:
         pp_size = pp_mesh.size()
         interleave_num = self.layer_setting.pp_interleave_num
         return [chunk_id * pp_size + pp_rank for chunk_id in range(interleave_num)]
+
+
+def _infer_schedule_type(parallelism):
+    """Infer the schedule type based on parallelism config.
+
+    - If ``pipeline_parallel_schedule`` is explicitly set (not empty/"auto"), return it.
+    - Otherwise default to ``"1f1b"``.
+    - When the result is ``"1f1b"`` but ``interleave_num > 1``, auto-upgrade to
+      ``"interleaved_1f1b"`` because 1F1B does not support interleaved stages.
+    """
+    schedule_type = getattr(parallelism, "pipeline_parallel_schedule", None)
+    if schedule_type and schedule_type not in (""):
+        schedule_type = schedule_type.lower()
+    else:
+        schedule_type = "1f1b"
+
+    if schedule_type == "1f1b" and parallelism.pipeline_parallel_interleave_num > 1:
+        schedule_type = "interleaved_1f1b"
+
+    return schedule_type
+
+
+_SCHEDULE_REGISTRY = {
+    "1f1b": ("hyper_parallel.core.pipeline_parallel", "Schedule1F1B"),
+    "interleaved_1f1b": ("hyper_parallel.core.pipeline_parallel", "ScheduleInterleaved1F1B"),
+    "gpipe": ("hyper_parallel.core.pipeline_parallel", "ScheduleGPipe"),
+}
+
+
+def register_schedule(name, module_path, class_name):
+    """Register a custom pipeline schedule type at runtime.
+
+    Args:
+        name (str): Schedule type name (e.g. ``"my_schedule"``).
+        module_path (str): Dotted module path to import from
+            (e.g. ``"my_pkg.schedules"``).
+        class_name (str): Name of the Schedule class inside the module
+            (e.g. ``"ScheduleMyAlgo"``).
+    """
+    key = name.lower()
+    if key in _SCHEDULE_REGISTRY:
+        raise ValueError(
+            f"Schedule '{key}' is already registered. "
+            f"Existing: {_SCHEDULE_REGISTRY[key]}."
+        )
+    _SCHEDULE_REGISTRY[key] = (module_path, class_name)
+
+
+def _resolve_schedule_cls(schedule_type):
+    """Resolve a schedule type string to its class via the registry.
+
+    Performs a lazy import so that ``hyper_parallel`` (and its platform
+    backends) are only loaded when a schedule is actually instantiated.
+    """
+    key = schedule_type.lower()
+    if key not in _SCHEDULE_REGISTRY:
+        supported = ", ".join(sorted(_SCHEDULE_REGISTRY))
+        raise ValueError(
+            f"Unsupported pipeline_parallel_schedule '{schedule_type}'. "
+            f"Supported values: {supported}"
+        )
+    module_path, class_name = _SCHEDULE_REGISTRY[key]
+    try:
+        mod = importlib.import_module(module_path)
+        return getattr(mod, class_name)
+    except (ImportError, AttributeError) as e:
+        raise ImportError(
+            f"Failed to import Schedule class '{class_name}' from "
+            f"'{module_path}' for schedule type '{schedule_type}'. "
+            f"Ensure the module and class exist. Error: {e}"
+        ) from e
+
+
+def _create_schedule(schedule_type, stages, micro_batch_num, parallelism, swap=False, has_moe=True):
+    """Create a pipeline schedule instance based on the specified schedule type.
+
+    Uses ``inspect.signature`` to detect the constructor parameters of each
+    Schedule class so that only the arguments it actually accepts are passed.
+    This avoids hard-coding parameter lists for every Schedule variant and
+    automatically adapts to future additions.
+
+    Supported schedule types (from ``hyper_parallel.core.pipeline_parallel``):
+
+    * ``"1f1b"``            → :class:`Schedule1F1B`
+    * ``"interleaved_1f1b"`` → :class:`ScheduleInterleaved1F1B`
+    * ``"gpipe"``           → :class:`ScheduleGPipe`
+
+    Args:
+        schedule_type (str): Schedule type name.
+        stages: Pipeline stages.
+        micro_batch_num (int): Number of micro-batches.
+        parallelism: Parallelism config object.
+        swap (bool): Whether to enable activation swap.
+        has_moe (bool): Whether the model contains MoE layers.  When
+            ``False`` (dense-only model), ``overlap_b_f`` and
+            ``enable_dxdw_split`` are forced to ``False`` because there is
+            no EP alltoall communication to overlap with compute.
+    """
+    schedule_type = schedule_type.lower()
+    interleave_num = parallelism.pipeline_parallel_interleave_num
+
+    if schedule_type == "1f1b" and interleave_num > 1:
+        raise ValueError(
+            f"pipeline_parallel_schedule='1f1b' is incompatible with "
+            f"pipeline_parallel_interleave_num={interleave_num}. "
+            f"Use 'interleaved_1f1b' schedule instead, or set interleave_num=1."
+        )
+
+    if schedule_type == "interleaved_1f1b" and interleave_num <= 1:
+        raise ValueError(
+            f"pipeline_parallel_schedule='{schedule_type}' requires "
+            f"pipeline_parallel_interleave_num > 1, but got {interleave_num}. "
+            f"Use '1f1b' schedule instead, or set interleave_num > 1."
+        )
+
+    schedule_cls = _resolve_schedule_cls(schedule_type)
+
+    overlap_b_f = getattr(parallelism, "pipeline_parallel_overlap_b_f", False)
+    enable_dxdw_split = getattr(parallelism, "pipeline_parallel_enable_dxdw_split", False)
+
+    if not has_moe and overlap_b_f:
+        logger.warning(
+            "overlap_b_f=True is set but the model has no MoE layers (dense-only). "
+            "Forcing overlap_b_f=False because there is no EP alltoall "
+            "communication to overlap with compute."
+        )
+        overlap_b_f = False
+        enable_dxdw_split = False
+
+    if not overlap_b_f and enable_dxdw_split:
+        logger.warning(
+            "enable_dxdw_split=True requires overlap_b_f=True, but overlap_b_f "
+            "is False. Forcing enable_dxdw_split=False."
+        )
+        enable_dxdw_split = False
+
+    all_kwargs = {
+        "overlap_p2p": getattr(parallelism, "pipeline_parallel_overlap_p2p", False),
+        "overlap_b_f": overlap_b_f,
+        "enable_dxdw_split": enable_dxdw_split,
+        "p2p_transport": getattr(parallelism, "pipeline_parallel_p2p_transport", "plain"),
+        "swap": swap,
+    }
+
+    sig = inspect.signature(schedule_cls.__init__)
+    accepted_params = set(sig.parameters) - {"self"}
+    filtered_kwargs = {k: v for k, v in all_kwargs.items() if k in accepted_params}
+
+    return schedule_cls(stages, micro_batch_num, **filtered_kwargs)
