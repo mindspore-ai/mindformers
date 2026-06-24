@@ -436,7 +436,11 @@ def _build_dataset(
     num_shards, shard_id = _compute_shard_info()
 
     dataloader_config = config.dataloader.to_dict()
-    dataloader_config.update({"num_shards": num_shards, "shard_id": shard_id})
+    dataloader_config.update({
+        "num_shards": num_shards,
+        "shard_id": shard_id,
+        "num_parallel_workers": config.num_parallel_workers
+    })
     dataloader_type = dataloader_config.pop("type")
 
     create_compressed_eod_mask = False
