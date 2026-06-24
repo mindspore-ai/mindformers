@@ -1454,6 +1454,7 @@ def _apply_spmd_parallelism(
             apply_non_moe_tp(
                 model,
                 tp_mesh=tp_mesh,
+                enable_loss_parallel=getattr(parallelism, "enable_loss_parallel", False),
                 enable_ep=parallel_dims.ep_enabled,
                 enable_mc2=getattr(parallelism, "enable_mc2", False),
             )

@@ -409,6 +409,13 @@ class ParallelismConfig(BaseConfig):
     """Enable MC2 (matmul + communication fusion) via all_gather_matmul /
     matmul_reduce_scatter. Requires tensor parallelism with sequence parallelism."""
 
+    enable_loss_parallel: bool = False
+    """Enable vocab-parallel loss. Keeps the output_layer logits sharded on the
+    vocab dimension (Shard(-1)) across the TP mesh instead of all-gathering them
+    to Replicate before the loss, and computes cross entropy with a vocab-parallel
+    reduction. Saves the logits all-gather communication and the full-vocab logits
+    activation. Requires tensor parallelism (tensor_parallel > 1)."""
+
     expert_parallel: int = 1
     """Expert parallelism degree"""
 

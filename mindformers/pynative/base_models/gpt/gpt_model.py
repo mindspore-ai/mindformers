@@ -24,6 +24,7 @@ from typing import Literal, Optional, Union
 
 from hyper_parallel import SkipDTensorDispatch
 from hyper_parallel.core.dtensor.dtensor import DTensor, distribute_tensor
+from hyper_parallel.core.dtensor.placement_types import Replicate
 
 from mindspore import Tensor, dtype, nn, mint, ops
 from mindspore.mint.distributed import all_reduce, get_world_size
@@ -31,6 +32,7 @@ from mindspore._c_expression import pyboost_detach
 
 from mindformers.tools.logger import logger
 from mindformers.pynative.loss.loss import CrossEntropyLoss, ChunkCrossEntropyLoss
+from mindformers.pynative.distributed.utils import vocab_parallel_shard_dim
 from mindformers.parallel_core.utils.spec_utils import ModuleSpec
 from mindformers.pynative.layers.mask_generate import CausalMaskGenerate
 from mindformers.parallel_core.transformer_config import TransformerConfig
@@ -366,6 +368,12 @@ class GPTModel(nn.Cell):
             logits = self.reshape(logits, (-1, logits.shape[-1]))
 
         if not self.training or self.return_logits:
+            # With enable_loss_parallel the logits stay vocab-sharded (Shard(-1)); when we
+            # return them instead of computing the loss, gather to full vocab so callers
+            # (generation, metrics) see the same replicated logits as without loss parallel.
+            if vocab_parallel_shard_dim(logits) is not None:
+                logits = logits.redistribute(
+                    logits.device_mesh, (Replicate(),) * len(logits.placements))
             return self.cast(logits, dtype.float32).contiguous()
 
         # labels origin shape is [b s], Transpose is not required.

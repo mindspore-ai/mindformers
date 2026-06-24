@@ -25,10 +25,30 @@ from mindspore.common import dtype as mstype
 from mindspore.mint.distributed import get_world_size
 
 from hyper_parallel import DeviceMesh, shard_module
+from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.dtensor.placement_types import Replicate
 from hyper_parallel.core.shard.sharding_plan import ShardingPlan
 
 from mindformers.tools import logger
+
+
+def vocab_parallel_shard_dim(logits):
+    """If ``logits`` is a DTensor sharded on its last (vocab) dimension, return the
+    index of the mesh dimension carrying that shard; otherwise return ``None``.
+
+    The output_layer is registered as ``ColwiseParallel`` with
+    ``output_layouts=Shard(-1)`` when ``enable_loss_parallel`` is set, so the logits
+    reaching the loss are sharded on the vocab dimension across the TP mesh. Every
+    other mesh dimension stays ``Replicate``. Detecting the shard at runtime keeps the
+    loss free of extra plumbing and falls back automatically when logits are replicated.
+    """
+    if not isinstance(logits, DTensor):
+        return None
+    last_dim = len(logits.shape) - 1
+    for mesh_dim, placement in enumerate(logits.placements):
+        if placement.is_shard() and placement.dim in (last_dim, -1):
+            return mesh_dim
+    return None
 
 
 def distribute_module(
