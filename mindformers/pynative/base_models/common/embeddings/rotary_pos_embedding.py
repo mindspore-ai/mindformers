@@ -35,8 +35,8 @@ class RotaryEmbedding(nn.Cell):
         rotary_base (int): The base for rotary embedding.
         rope_scaling (bool): Whether to enable dynamic RoPE scaling.
         rope_scaling_factor (float): The scaling factor used in RoPE scaling.
-        use_eod_reset (bool): Whether to reset the positional offset at eod tokens.
         use_position_ids (bool): Whether to honor explicit position_ids when provided.
+            Only enabled automatically under context parallel; non-CP uses self-generated positions.
     """
 
     def __init__(self,
@@ -47,8 +47,7 @@ class RotaryEmbedding(nn.Cell):
                  rotary_base: int = 10000,
                  rope_scaling: bool = False,
                  rope_scaling_factor: float = 8.0,
-                 use_eod_reset: bool = False,
-                 use_position_ids: bool = None
+                 use_position_ids: bool = False
                  ):
         super().__init__()
         dim = kv_channels
@@ -57,8 +56,7 @@ class RotaryEmbedding(nn.Cell):
         self.mscale = 1.0
         self.seq_len_interpolation_factor = seq_len_interpolation_factor
         self.rotary_interleaved = rotary_interleaved
-        self.use_eod_reset = use_eod_reset
-        self.use_position_ids = use_eod_reset if use_position_ids is None else use_position_ids
+        self.use_position_ids = use_position_ids
 
         inv_freq_np = 1.0 / (rotary_base ** (np.arange(0, dim, 2, dtype=np.float32) / dim))
         if rope_scaling:

@@ -180,7 +180,8 @@ class GPTModel(nn.Cell):
         # The MTP implementation pre-computes RotaryEmbedding
         # (unlike Megatron v0.12.0's real-time generation) to minimize dynamic memory usage.
         self.use_rotary_position_embeddings = self.position_embedding_type in ['rope', 'yarn']
-        use_rotary_position_ids = config.use_eod_reset or bool(getattr(config, "use_position_ids", False))
+        # Non-CP uses self-generated positions (use_position_ids=False); context parallel
+        # flips this to True at setup time (see apply_context_parallel_attention).
         if self.position_embedding_type == 'rope':
             if config.multi_latent_attention:
                 self.rotary_pos_emb = RotaryEmbedding(
@@ -191,8 +192,7 @@ class GPTModel(nn.Cell):
                     rotary_base=config.rotary_base,
                     rope_scaling=rope_scaling,
                     rope_scaling_factor=rope_scaling_factor,
-                    use_eod_reset=config.use_eod_reset,
-                    use_position_ids=use_rotary_position_ids
+                    use_position_ids=False
                 )
             else:
                 self.rotary_pos_emb = RotaryEmbedding(
@@ -203,8 +203,7 @@ class GPTModel(nn.Cell):
                     rotary_base=rotary_base,
                     rope_scaling=rope_scaling,
                     rope_scaling_factor=rope_scaling_factor,
-                    use_eod_reset=config.use_eod_reset,
-                    use_position_ids=use_rotary_position_ids
+                    use_position_ids=False
                 )
         elif self.position_embedding_type == 'yarn':
             self.rotary_pos_emb = YarnRotaryEmbedding(
@@ -219,8 +218,7 @@ class GPTModel(nn.Cell):
                 beta_slow=config.beta_slow,
                 mscale=config.mscale,
                 mscale_all_dim=config.mscale_all_dim,
-                use_eod_reset=config.use_eod_reset,
-                use_position_ids=use_rotary_position_ids
+                use_position_ids=False
             )
         elif self.position_embedding_type == 'mrope':
             raise NotImplementedError("position_embedding_type = mrope is not supported now.")
@@ -303,10 +301,6 @@ class GPTModel(nn.Cell):
             are included in the loss calculation. Default is None.
             actual_seq_len (Tensor, optional): Actual sequence length tensor. Default is None.
         """
-        if not self.config.use_eod_reset and position_ids is None:
-            position_ids = None
-        elif position_ids is None:
-            raise ValueError("When use eod_reset, position_ids should not be None.")
         if actual_seq_len is not None:
             actual_seq_len = self.reshape(actual_seq_len, (-1,))
 
