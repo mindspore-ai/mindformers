@@ -28,7 +28,6 @@ from hyper_parallel.core.dtensor.placement_types import Replicate
 
 from mindspore import Tensor, dtype, nn, mint, ops
 from mindspore.mint.distributed import all_reduce, get_world_size
-from mindspore._c_expression import pyboost_detach
 
 from mindformers.tools.logger import logger
 from mindformers.pynative.loss.loss import CrossEntropyLoss, ChunkCrossEntropyLoss
@@ -387,9 +386,10 @@ class GPTModel(nn.Cell):
         if self.calculate_per_token_loss:
             numerator0, denominator0 = loss
             return numerator0, denominator0
-        logits = pyboost_detach(logits)
-        hidden_states = pyboost_detach(hidden_states)
-        return loss, logits, hidden_states
+        # Only the loss is consumed downstream (compute_loss / compute_pp_loss take
+        # output[0]); logits and hidden_states were detached and never read. Keep the
+        # tuple shape so the [0]-indexing consumers stay unchanged.
+        return (loss,)
 
     def language_model(
             self,
