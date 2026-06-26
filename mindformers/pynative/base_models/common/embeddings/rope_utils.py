@@ -67,7 +67,6 @@ class ApplyRotaryPosEmb(nn.Cell):
 
     def __init__(self, config: TransformerConfig,):
         super().__init__()
-        self.append_eod = config.use_eod_reset
         self.apply_rope_fusion = config.apply_rope_fusion
         self.rotary_dtype = config.rotary_dtype
 

@@ -1365,6 +1365,16 @@ def apply_context_parallel_attention(
         rotary_pos_emb = getattr(gpt_model, "rotary_pos_emb", None)
         if rotary_pos_emb is not None and hasattr(rotary_pos_emb, "use_position_ids"):
             setattr(rotary_pos_emb, "use_position_ids", True)
+            # Context parallel forces explicit position_ids, so the rotary cos/sin carries a
+            # per-batch dimension. The fused interleaved RoPE op (apply_rope_fusion) does not
+            # support non-broadcast batch>1 cos/sin and fails in tiling. Reject the combo early.
+            if getattr(model_config, "apply_rope_fusion", False):
+                raise ValueError(
+                    "Context parallel does not support apply_rope_fusion in pynative mode: "
+                    "CP uses explicit position_ids, so fused interleaved RoPE receives per-batch "
+                    "cos/sin which the RotaryPositionEmbedding op rejects. "
+                    "Please set apply_rope_fusion=false."
+                )
         if async_enabled and method == "ulysses":
             num_heads = getattr(model_config, "num_attention_heads", None)
             if num_heads is not None:

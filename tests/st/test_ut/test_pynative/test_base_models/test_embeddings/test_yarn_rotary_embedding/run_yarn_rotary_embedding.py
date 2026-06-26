@@ -39,7 +39,6 @@ class YarnRotaryEmbeddingRunner:
         self.mscale = self.args.mscale
         self.mscale_all_dim = self.args.mscale_all_dim
         self.use_position_ids = self.args.use_position_ids
-        self.use_eod_reset= self.args.use_eod_reset
 
         init_params = get_init_params()
 
@@ -75,7 +74,7 @@ class YarnRotaryEmbeddingRunner:
             beta_slow=self.beta_slow,
             mscale=self.mscale,
             mscale_all_dim=self.mscale_all_dim,
-            use_eod_reset=self.use_eod_reset
+            use_position_ids=self.use_position_ids
         )
         return net
 
@@ -111,7 +110,6 @@ def main():
     parser.add_argument("--output_path", type=str, default="output_ms.npz")
     parser.add_argument("--tensor_parallel", type=int, default=1)
     parser.add_argument("--use_position_ids", type=lambda x: x.lower() == "true", default=False)
-    parser.add_argument("--use_eod_reset", type=lambda x: x.lower() == "true", default=False)
 
     args = parser.parse_args()
 
