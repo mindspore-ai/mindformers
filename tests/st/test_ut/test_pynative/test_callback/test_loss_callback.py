@@ -110,19 +110,22 @@ class TestLossCallback:
 
         model = self._make_model_mock()
 
-        # Case 1: loss is None
-        self.callback.on_step_end(self.args, self.state, loss=None, model=model)
-        mock_logger.info.assert_not_called()
-
-        # Case 2: step not in log interval
+        # Case 1: step not in log interval
         self.callback.log_interval = 2
         self.state.global_step = 1
         self.callback.on_step_end(self.args, self.state, loss=1.0, model=model)
         mock_logger.info.assert_not_called()
 
-        # Case 3: Normal logging
+        # Case 2: loss is None (non-last PP stage)
         self.callback.log_interval = 1
         self.state.global_step = 1
+        self.callback.on_step_end(self.args, self.state, loss=None, model=model)
+        mock_logger.info.assert_called_once()
+        call_args = mock_logger.info.call_args[0][0]
+        assert "loss: N/A" in call_args
+        assert "non-last PP stage" in call_args
+
+        # Case 3: Normal logging
         self.callback.step_time = time.time() - 0.1
 
         lr_scheduler = MagicMock(spec=LearningRateSchedule)

@@ -35,7 +35,6 @@ try:
     from hyper_parallel.core.distributed_checkpoint import get_global_layout
 except ImportError as e:
     get_global_layout = None
-    logger.warning(f"Import get_global_layout failed: {e}.")
 
 from mindformers.checkpoint.layout_adapter import LayoutAdapter
 from mindformers.tools.logger import logger
@@ -356,6 +355,8 @@ def save_checkpoint(iteration: int, network: Union[Cell, List[Cell]], optimizer:
     # Save model weight.
     logger.info("....... Start to save model weight .......")
     if LayoutAdapter.is_pynative_mode() and get_real_group_size() > 1:
+        if get_global_layout is None:
+            raise ImportError("hyper_parallel is required for PyNative mode. Please install it.")
         # Get global model keys.
         network = network if isinstance(network, list) else [network]
         model_keys = set()

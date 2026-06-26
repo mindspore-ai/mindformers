@@ -160,7 +160,17 @@ class LossCallback(TrainerCallback):
         if load_balancing_loss is not None:
             load_balancing_loss /= state.num_accumulation_steps
 
-        if loss is None or state.global_step % self.log_interval != 0:
+        if state.global_step % self.log_interval != 0:
+            return
+
+        if loss is None:
+            log_info = {
+                "loss": None,
+                "cur_step": state.global_step,
+                "max_steps": state.max_steps,
+                "step_time": step_time_cost,
+            }
+            self._print_log(log_info)
             return
 
         grad_norm = kwargs.get("grad_norm")
@@ -240,11 +250,19 @@ class LossCallback(TrainerCallback):
         cur_step = log_info.get("cur_step", 0)
         max_steps = log_info.get("max_steps", 0)
         # Construct the log message parts
-        log_parts = [
-            f"step:[{cur_step:5d}/{max_steps:5d}]",
-            f"loss: {log_info.get('loss'):10.6f}",
-            f"per_step_time: {log_info.get('step_time'):6d}ms",
-        ]
+        loss_val = log_info.get('loss')
+        if loss_val is None:
+            log_parts = [
+                f"step:[{cur_step:5d}/{max_steps:5d}]",
+                "loss: N/A (non-last PP stage, refer to last stage for real loss)",
+                f"per_step_time: {log_info.get('step_time'):6d}ms",
+            ]
+        else:
+            log_parts = [
+                f"step:[{cur_step:5d}/{max_steps:5d}]",
+                f"loss: {loss_val:10.6f}",
+                f"per_step_time: {log_info.get('step_time'):6d}ms",
+            ]
 
         load_balancing_loss = log_info.get("load_balancing_loss")
         if load_balancing_loss is not None:

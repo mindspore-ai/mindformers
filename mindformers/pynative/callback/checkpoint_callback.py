@@ -19,7 +19,6 @@ try:
     from hyper_parallel.core.distributed_checkpoint import get_global_layout
 except ImportError as e:
     get_global_layout = None
-    logger.warning(f"Import get_global_layout failed: {e}.")
 
 from mindformers.pynative.callback.callback import TrainerCallback
 from mindformers.tools.logger import logger
@@ -160,6 +159,8 @@ class CheckpointCallback(TrainerCallback):
         common_info = self._create_common_info(state)
 
         if self.sharded_tensor_metas is None and get_real_group_size() > 1:
+            if get_global_layout is None:
+                raise ImportError("hyper_parallel is required for PyNative mode. Please install it.")
             # Get global model keys.
             model_keys = set()
             for net in model:
