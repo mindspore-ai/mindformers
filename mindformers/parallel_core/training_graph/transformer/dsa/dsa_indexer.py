@@ -242,17 +242,19 @@ class DSAIndexer(nn.Cell):
         q, _ = self.linear_wq_b(qr)
         # [seqlen, batch, index_n_heads * index_head_dim] -> [seqlen, batch, index_n_heads, index_head_dim]
         q = self.reshape(q, (seqlen, bsz, self.index_n_heads, self.index_head_dim))
-        q_nope, q_pe = self.split_q(
-            q, [self.index_head_dim - self.qk_pos_emb_head_dim, self.qk_pos_emb_head_dim], dim=-1
+        q_pe, q_nope = self.split_q(
+            q, [self.qk_pos_emb_head_dim, self.index_head_dim - self.qk_pos_emb_head_dim], dim=-1
         )
         q_pe = self.apply_rotary_emb_q(
             q_pe,
             rotary_pos_emb,
-            rotary_interleaved=False,
-            multi_latent_attention=self.config.multi_latent_attention
+            rotary_interleaved=self.config.rotary_interleaved,
+            # This flag is for the MLA-style interleaving in RoPE.
+            # Set it to False, as indexer does not apply interleaved RoPE.
+            multi_latent_attention=False
         )
         # [seqlen, batch, *, index_head_dim]
-        q = self.cat_q([q_nope, q_pe])
+        q = self.cat_q([q_pe, q_nope])
 
         # =========================================
         # k linear and apply rope to k
@@ -263,17 +265,19 @@ class DSAIndexer(nn.Cell):
         # [seqlen, batch, index_head_dim] -> [seqlen, batch, 1, index_head_dim]
         k = self.reshape(k, (seqlen, bsz, 1, self.index_head_dim))
         # [seqlen, batch, 1, index_head_dim] -> [seqlen, batch, index_head_dim]
-        k_nope, k_pe = self.split_k(
-            k, [self.index_head_dim - self.qk_pos_emb_head_dim, self.qk_pos_emb_head_dim], dim=-1
+        k_pe, k_nope = self.split_k(
+            k, [self.qk_pos_emb_head_dim, self.index_head_dim - self.qk_pos_emb_head_dim], dim=-1
         )
         k_pe = self.apply_rotary_emb_k(
             k_pe,
             rotary_pos_emb,
-            rotary_interleaved=False,
-            multi_latent_attention=self.config.multi_latent_attention
+            rotary_interleaved=self.config.rotary_interleaved,
+            # This flag is for the MLA-style interleaving in RoPE.
+            # Set it to False, as indexer does not apply interleaved RoPE.
+            multi_latent_attention=False
         )
         # [seqlen, batch, *, index_head_dim]
-        k = self.cat_k([k_nope, k_pe])
+        k = self.cat_k([k_pe, k_nope])
 
         # =========================================
         # Rotate activation
