@@ -58,6 +58,8 @@ class ParallelDims:
     _multi_axis_meshes: dict[tuple[str, ...], DeviceMesh] = field(default_factory=dict)
     _world_mesh: DeviceMesh | None = None
     _spmd_meshes: list[DeviceMesh] = field(default_factory=list)
+    # Sub-meshes for dense-weight FSDP sharding at a reduced degree, keyed by shard degree.
+    _fsdp_shard_meshes: dict[int, DeviceMesh] = field(default_factory=dict)
 
     @classmethod
     def from_config(cls, parallelism, world_size: int) -> "ParallelDims":
@@ -414,6 +416,84 @@ class ParallelDims:
                 f"Mesh '{dims}' is not available. "
                 f"Ensure the corresponding parallelism dimension is {enabled_str}."
             )
+        return mesh
+
+    def get_fsdp_shard_mesh(self, shard_size: int) -> DeviceMesh:
+        """Return a 2D ``[replicate, shard]`` FSDP mesh with shard degree ``shard_size``.
+
+        Used to shard a parameter group over fewer ranks than the full fsdp domain
+        (``dp_shard * cp``) while keeping the total gradient-reduction domain the same:
+        the group is reduce-scattered over ``shard_size`` ranks and HSDP all-reduced
+        over the remaining ``dp_replicate * fsdp / shard_size`` ranks. Because the
+        product equals the full data-parallel domain, gradient numerics are identical
+        to a fully-sharded group.
+
+        ``fully_shard`` only accepts a 1D/2D mesh and maps 2D to HSDP (dim0 replicate,
+        dim1 shard), so ``dp_replicate`` and the fsdp leftover are folded into the single
+        replicate axis (dim0) and the shard axis (dim1) has size ``shard_size``. The
+        world ranks are re-partitioned as ``(pp, replicate, shard, tp)``; only the
+        replicate/shard axes get real process groups (``pp``/``tp`` are ``fake`` so we
+        do not duplicate the PP/TP communicators built by the dense/sparse meshes).
+
+        Meshes are cached per shard degree. ``apply_fsdp`` builds the dense sub-mesh once
+        on every rank before any per-layer wrapping, so the (world-collective) process
+        group creation here stays consistent across pipeline stages.
+
+        Args:
+            shard_size: FSDP shard degree ``k``; must be >= 1 and divide
+                ``fsdp = dp_shard * cp``.
+
+        Returns:
+            The existing dense FSDP (1D) / HSDP (2D) mesh when ``shard_size`` equals the
+            full fsdp domain, otherwise a 2D ``[replicate, shard]`` sub-mesh.
+        """
+        if self.full_dtensor:
+            raise NotImplementedError(
+                "get_fsdp_shard_mesh assumes the folded-fsdp layout and is not supported "
+                "under full_dtensor (dp_shard and cp are separate axes there)."
+            )
+        # Reject non-int (and bool, which is an int subclass) early: such values slip
+        # past the divisibility check below (`fsdp % 2.0 == 0`, `fsdp % True == 0`) and
+        # otherwise surface as an opaque shape/stride error deep inside ``_unflatten``.
+        if isinstance(shard_size, bool) or not isinstance(shard_size, int):
+            raise ValueError(
+                f"dense_fsdp_shard_size must be a positive int, got "
+                f"{shard_size!r} ({type(shard_size).__name__})."
+            )
+        fsdp = self.dp_shard * self.cp
+        if shard_size < 1 or fsdp % shard_size != 0 or shard_size > fsdp:
+            raise ValueError(
+                f"dense_fsdp_shard_size {shard_size} is invalid. It must be in range [1, {fsdp}] "
+                f"and evenly divide fsdp (dp_shard * cp = {fsdp})."
+            )
+        # Full shard -> reuse the existing dense FSDP (1D) / HSDP (2D) mesh.
+        if shard_size == fsdp:
+            return (
+                self.get_mesh(["dp_replicate", "fsdp"])
+                if self.dp_replicate_enabled
+                else self.get_mesh("fsdp")
+            )
+        if shard_size in self._fsdp_shard_meshes:
+            return self._fsdp_shard_meshes[shard_size]
+
+        if self._world_mesh is None:
+            self.build_mesh()
+
+        # Fold dp_replicate together with the fsdp leftover (fsdp // shard_size) into the
+        # single replicate axis; the world C-order keeps dp_replicate and fsdp adjacent,
+        # so re-unflattening (pp, replicate, shard, tp) splits each fsdp group of
+        # ``shard_size`` consecutive ranks off as the shard axis.
+        replicate = self.dp_replicate * (fsdp // shard_size)
+        rep_name, shard_name = f"fsdp_rep_{shard_size}", f"fsdp_shard_{shard_size}"
+        group_world = self._world_mesh._unflatten(
+            0,
+            (self.pp, replicate, shard_size, self.tp),
+            ("pp", rep_name, shard_name, "tp"),
+            backend_override={"pp": "fake", "tp": "fake"},
+        )
+        mesh = group_world[rep_name, shard_name]
+        # 2D: dim0=replicate, dim1=shard
+        self._fsdp_shard_meshes[shard_size] = mesh
         return mesh
 
     def spmd_meshes(self) -> list[DeviceMesh]:

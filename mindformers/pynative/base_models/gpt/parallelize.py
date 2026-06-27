@@ -475,8 +475,9 @@ def _collect_layer_replicate_params(layer, shard_size):
 
         if shape[0] % shard_size != 0:
             replicate_params.append(param)
-            logger.warning("The shape[0]=%s of parameter %s is not divisible by data_parallel_shard=%s, " \
-                 "then this parameter will not be applied fsdp.", shape[0], param_name, shard_size)
+            logger.warning("The shape[0]=%s of parameter %s is not divisible by "
+                           "data_parallel_shard or dense_fsdp_shard_size which is %s, "
+                           "then this parameter will not be applied fsdp.", shape[0], param_name, shard_size)
 
     return replicate_params
 
@@ -1076,6 +1077,28 @@ def apply_moe_ep_overlap_tp(
 # GPT FSDP implementation
 # ---------------------------------------------------------------------------
 
+def _resolve_dense_fsdp_config(parallelism, base_fsdp_config, parallel_dims):
+    """Resolve the FSDP config + shard degree for dense (non-expert) weights.
+
+    Reads ``parallelism.dense_fsdp_shard_size``. When it is unset (``None``) or equal to
+    the full fsdp domain (``dp_shard * cp``), returns ``(base_fsdp_config, full_degree)``
+    unchanged -- the default, pre-feature behavior. Otherwise returns a copy of
+    ``base_fsdp_config`` whose ``mesh`` is the reduced ``[replicate, shard]`` sub-mesh
+    (see :meth:`ParallelDims.get_fsdp_shard_mesh`), together with the reduced shard
+    degree ``k``. The degree is fed to :func:`_collect_layer_replicate_params` so params
+    whose leading dim is not divisible by ``k`` are replicated rather than sharded.
+
+    Only dense weights consume the returned config; routed experts keep their own
+    ``efsdp_config`` and are not affected.
+    """
+    full_degree = parallel_dims.fsdp
+    shard_size = getattr(parallelism, "dense_fsdp_shard_size", None)
+    if shard_size is None or shard_size == full_degree:
+        return base_fsdp_config, full_degree
+    dense_mesh = parallel_dims.get_fsdp_shard_mesh(shard_size)
+    return {**base_fsdp_config, "mesh": dense_mesh}, shard_size
+
+
 def apply_fsdp(
         model: nn.Cell,
         parallel_dims: Any,
@@ -1147,6 +1170,24 @@ def apply_fsdp(
         "mp_policy": mp_policy,
     }
 
+    # --- Optionally limit the FSDP shard degree of dense (non-expert) weights ---
+    # When ``dense_fsdp_shard_size`` is set, ``fsdp_config`` is rebound to a reduced
+    # ``[replicate, shard]`` sub-mesh, so every dense wrap below (embedding, norms,
+    # router, shared experts, layers, output layer, root) shards over that many ranks
+    # and HSDP-replicates over the rest of the DP domain. ``efsdp_config`` (routed
+    # experts) is built above and left untouched. The (world-collective) sub-mesh is
+    # built here once, on every rank, before any wrapping, so process-group creation
+    # stays consistent across pipeline stages.
+    fsdp_config, dense_shard_degree = _resolve_dense_fsdp_config(
+        parallelism, fsdp_config, parallel_dims
+    )
+    if dense_shard_degree != parallel_dims.fsdp:
+        logger.info(
+            "Dense-weight FSDP limited to shard_size=%d (full fsdp domain=%d); "
+            "routed experts keep the full efsdp domain.",
+            dense_shard_degree, parallel_dims.fsdp,
+        )
+
     embedding = getattr(gpt_model, "embedding", None)
     layers = list(gpt_model.decoder.layers)
 
@@ -1174,7 +1215,7 @@ def apply_fsdp(
             with ms.DeviceCtx("meta"):
                 fully_shard(layer.mlp.experts, **efsdp_config, reshard_after_forward=reshard_after_forward)
 
-        replicate_params = _collect_layer_replicate_params(layer, parallel_dims.fsdp)
+        replicate_params = _collect_layer_replicate_params(layer, dense_shard_degree)
 
         # 2a'. Wrap MoE router (and shared-expert gate) independently. Their weights are
         # stored in moe_router_dtype (fp32) for gradient precision, so they must NOT share
@@ -1243,7 +1284,7 @@ def apply_fsdp(
                         reshard_after_forward=reshard_after_forward,
                     )
 
-            mtp_replicate_params = _collect_layer_replicate_params(layer.transformer_layer, parallel_dims.fsdp)
+            mtp_replicate_params = _collect_layer_replicate_params(layer.transformer_layer, dense_shard_degree)
 
             # Router (fp32) — independent wrap to avoid dtype conflict with bf16 params
             router = getattr(layer.transformer_layer.mlp, "router", None)
