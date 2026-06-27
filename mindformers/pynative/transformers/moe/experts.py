@@ -180,6 +180,14 @@ class GroupedMLP(nn.Cell):
         # When ep parallelism is enabled, ExpertParallel inference will take over the dispatch operation.
         need_dispatch = not isinstance(self.weight1, DTensor) or "ep" not in self.weight1.device_mesh.mesh_dim_names
 
+        # Convert DTensor to local to avoid unregistered pyboost op dispatch failure.
+        tokens_layout = None
+        if isinstance(tokens, DTensor):
+            tokens_layout = tokens.layout
+            tokens = tokens.to_local()
+            probs = probs.to_local() if isinstance(probs, DTensor) else probs
+            topk_indices = topk_indices.to_local() if isinstance(topk_indices, DTensor) else topk_indices
+
         if need_dispatch:
             tokens_per_expert, token_indices_experts_sorted, permuted_probs, permuted_local_hidden_states = (
                 self.permute(tokens, probs, topk_indices, num_tokens_per_expert))
@@ -195,6 +203,10 @@ class GroupedMLP(nn.Cell):
 
         if need_dispatch:
             experts_output = self.unpermute(experts_output, token_indices_experts_sorted, permuted_probs, tokens.shape)
+
+        if tokens_layout is not None:
+            experts_output = DTensor.from_local(experts_output, tokens_layout.mesh,
+                                                tokens_layout.alias_placements)
 
         return experts_output
 
