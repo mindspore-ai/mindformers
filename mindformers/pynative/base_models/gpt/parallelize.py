@@ -1368,12 +1368,16 @@ def apply_context_parallel_attention(
             # Context parallel forces explicit position_ids, so the rotary cos/sin carries a
             # per-batch dimension. The fused interleaved RoPE op (apply_rope_fusion) does not
             # support non-broadcast batch>1 cos/sin and fails in tiling. Reject the combo early.
-            if getattr(model_config, "apply_rope_fusion", False):
+            # Exception: with EOD attn-mask compression (TND layout), CP flattens the per-rank
+            # position_ids to batch=1 (see prepare_context_parallel_input's TND slicing), so
+            # cos/sin stays broadcastable and the fused op works -- allow it.
+            if getattr(model_config, "apply_rope_fusion", False) and \
+                    not getattr(model_config, "use_eod_attn_mask_compression", False):
                 raise ValueError(
-                    "Context parallel does not support apply_rope_fusion in pynative mode: "
-                    "CP uses explicit position_ids, so fused interleaved RoPE receives per-batch "
-                    "cos/sin which the RotaryPositionEmbedding op rejects. "
-                    "Please set apply_rope_fusion=false."
+                    "Context parallel does not support apply_rope_fusion in pynative mode "
+                    "unless EOD attn-mask compression (TND layout) is enabled: without TND, "
+                    "CP feeds per-batch cos/sin to the fused RoPE op, which rejects it in tiling. "
+                    "Set apply_rope_fusion=false, or enable use_eod_attn_mask_compression."
                 )
         if async_enabled and method == "ulysses":
             num_heads = getattr(model_config, "num_attention_heads", None)
