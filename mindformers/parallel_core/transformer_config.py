@@ -2880,9 +2880,6 @@ class MLATransformerConfig(TransformerConfig):
             if any(r not in (0, 4, 128) for r in self.csa_compress_ratios):
                 raise ValueError("Each entry in csa_compress_ratios must be one of {0, 4, 128}, "
                                  f"got {self.csa_compress_ratios}.")
-            if self.tensor_model_parallel_size > 1:
-                raise ValueError("DSv4 hybrid currently does not support tensor_model_parallel_size > 1, "
-                                 f"got {self.tensor_model_parallel_size}.")
             if (self.num_attention_heads * self.v_head_dim) % self.o_groups != 0:
                 raise ValueError(
                     f"num_attention_heads * v_head_dim ({self.num_attention_heads * self.v_head_dim}) "
