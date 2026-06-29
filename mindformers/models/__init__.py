@@ -30,6 +30,10 @@ from .auto import (
     ImageProcessingMixin,
     TOKENIZER_MAPPING
 )
+from .deepseek4 import (
+    DeepseekV4Config,
+    DeepseekV4ForCausalLM
+)
 from .deepseek3 import (
     DeepseekV3Config,
     DeepseekV3ForCausalLM
