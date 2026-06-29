@@ -193,6 +193,9 @@ def compute_routing_scores_for_aux_loss(
     elif score_function == "sigmoid":
         scores = mint.sigmoid(logits)
         scores = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20)
+    elif score_function == "sqrtsoftplus":
+        scores = mint.sqrt(mint.nn.functional.softplus(ops.cast(logits, mstype.float32)))
+        scores = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20)
     else:
         raise ValueError(f"Invalid score_function: {score_function}")
 

@@ -39,7 +39,7 @@ from mindspore.mint.distributed import get_rank, all_gather, new_group
 
 from hyper_parallel import DeviceMesh
 from hyper_parallel.core.dtensor.dtensor import DTensor, distribute_tensor
-from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
+from hyper_parallel.core.dtensor.placement_types import Replicate, Shard, Partial
 from hyper_parallel.core.fully_shard.api import (
     fully_shard,
     MixedPrecisionPolicy,
@@ -551,6 +551,73 @@ def _attach_lora_layouts(transformer_layer, layer_plan):
             style.extra_param_layouts = extra
 
 
+def _get_dsv4_tp(transformer_layer, shard_plans):
+    """get dsv4 tp plan"""
+    # Fused CSA kernel has CANN shape constraints and no TP benefit from head-sharding
+    # non-fused small-op path does benefit.
+    sp_layout, norm_plan, rowwise_output_plan, attn_qkv_shard = shard_plans
+    distribute_param_plan = []
+    rope_freqs_layout = Replicate() if transformer_layer.self_attention.config.apply_rope_fusion else None
+    core_attn = transformer_layer.self_attention.core_attention
+    csa_q_layout = Replicate() if getattr(core_attn, "apply_dsa_kernel_fusion", False) else Shard(2)
+    attn_sink_plan = Replicate() if getattr(core_attn, "apply_dsa_kernel_fusion", False) else Shard(0)
+    dsv4_core_attn_plan = PrepareModuleInputOutput(
+        # q, key, x, q_compressed
+        input_layouts=(Replicate(), Replicate(), Replicate(), Replicate()),
+        desired_input_layouts=(csa_q_layout, Replicate(), Replicate(), Replicate()),
+        output_layouts=(csa_q_layout,),
+        desired_output_layouts=(Replicate(),),
+        use_local_input=True,
+        use_local_output=False,
+    )
+    unfused_indexer_loss_plan = PrepareModuleInputOutput(
+        input_layouts=(Partial(),),
+        desired_input_layouts=(Replicate(),),
+        output_layouts=(Replicate(),),
+        desired_output_layouts=(Replicate(),),
+        use_local_output=False,
+    )
+    layer_plan = {
+        "input_layernorm": norm_plan,
+        # Input: SP Shard(0) → Replicate (attention internals)
+        # Output: Replicate → SP Shard(0) (so output_cell h_post/x dims match)
+        "self_attention": PrepareModuleInputOutput(
+            input_layouts=(sp_layout,),
+            desired_input_layouts=(Replicate(),),
+            output_layouts=(Replicate(),),
+            desired_output_layouts=(sp_layout,),
+            use_local_output=False,
+        ),
+        # --- Q path ---
+        "self_attention.linear_q_down_proj": NoParallel(use_local_output=False),
+        "self_attention.q_layernorm": NoParallel(use_local_output=False),
+        "self_attention.linear_q_up_proj": ColwiseParallel(
+            output_layouts=Replicate(), use_local_output=False,
+        ),
+        # --- KV path (single shared head) ---
+        "self_attention.linear_kv_proj": NoParallel(use_local_output=False),
+        "self_attention.kv_layernorm": NoParallel(use_local_output=False),
+        # --- Core attention ---
+        "self_attention.core_attention": dsv4_core_attn_plan,
+        # --- Output projection ---
+        "self_attention.linear_proj": NoParallel(use_local_output=False),
+        "pre_mlp_layernorm": norm_plan,
+        "self_attention.apply_rotary_emb": PrepareModuleInputOutput(
+            input_layouts=(Replicate(), rope_freqs_layout, None),
+            desired_input_layouts=(Replicate(), rope_freqs_layout, None),
+            output_layouts=(Replicate(),),
+            desired_output_layouts=(Replicate(),),
+            use_local_output=False,
+        ),
+    }
+    if getattr(core_attn, "unfused_indexer_loss", None) is not None:
+        layer_plan["self_attention.core_attention.unfused_indexer_loss.post_head_sum"] = unfused_indexer_loss_plan
+    distribute_param_plan.append([transformer_layer.self_attention.core_attention, "attn_sink", (attn_sink_plan,)])
+    distribute_param_plan.append([transformer_layer.self_attention, "linear_o_group_proj", (Replicate(),)])
+    distribute_param_plan.append([transformer_layer.self_attention, "q_rms_gamma", (Replicate(),)])
+    return layer_plan, distribute_param_plan
+
+
 def _apply_layers_tp(
     transformer_layer,
     tp_mesh,
@@ -581,74 +648,16 @@ def _apply_layers_tp(
     has_q_lora = transformer_layer.self_attention.config.q_lora_rank is not None
     q_pre_attn_layout = Shard(2) if has_q_lora else Replicate()
     attn_input_shard = attn_qkv_shard if has_q_lora else Replicate()
-    distribute_param_plan = []
     # The fused RoPE kernel is dispatched as a distributed op and requires its cos/sin
     # (derived from the rotary freqs) to be DTensors, so the freqs input is replicated at
     # the module boundary. The non-fused mul/add path instead broadcasts plain freqs and
     # must keep them as plain tensors (None) to preserve q_pe's head sharding, so the freqs
     # slot is only converted when apply_rope_fusion is enabled.
-    rope_freqs_layout = Replicate() if transformer_layer.self_attention.config.apply_rope_fusion else None
     if isinstance(transformer_layer.self_attention, DSv4HybridSelfAttention):
-        # Fused CSA kernel has CANN shape constraints and no TP benefit from head-sharding
-        # non-fused small-op path does benefit.
-        core_attn = transformer_layer.self_attention.core_attention
-        csa_q_layout = Replicate() if getattr(core_attn, "apply_dsa_kernel_fusion", False) else Shard(2)
-        attn_sink_plan = Replicate() if getattr(core_attn, "apply_dsa_kernel_fusion", False) else Shard(0)
-        dsv4_core_attn_plan = prepare_module_input_output(
-            # q, key, x, q_compressed
-            input_layouts=(Replicate(), Replicate(), Replicate(), Replicate()),
-            desired_input_layouts=(csa_q_layout, Replicate(), Replicate(), Replicate()),
-            output_layouts=(csa_q_layout,),
-            desired_output_layouts=(Replicate(),),
-            use_local_input=True,
-            use_local_output=False,
-        )
-        unfused_indexer_loss_plan = prepare_module_input_output(
-            input_layouts=(Shard(1),),
-            desired_input_layouts=(Replicate(),),
-            output_layouts=(Replicate(),),
-            desired_output_layouts=(Replicate(),),
-            use_local_output=False,
-        )
-        layer_plan = {
-            "input_layernorm": norm_plan,
-            # Input: SP Shard(0) → Replicate (attention internals)
-            # Output: Replicate → SP Shard(0) (so output_cell h_post/x dims match)
-            "self_attention": prepare_module_input_output(
-                input_layouts=(sp_layout,),
-                desired_input_layouts=(Replicate(),),
-                output_layouts=(Replicate(),),
-                desired_output_layouts=(sp_layout,),
-                use_local_output=False,
-            ),
-            # --- Q path ---
-            "self_attention.linear_q_down_proj": NoParallel(use_local_output=False),
-            "self_attention.q_layernorm": NoParallel(use_local_output=False),
-            "self_attention.linear_q_up_proj": colwise_parallel(
-                output_layouts=Replicate(), use_local_output=False,
-            ),
-            # --- KV path (single shared head) ---
-            "self_attention.linear_kv_proj": NoParallel(use_local_output=False),
-            "self_attention.kv_layernorm": NoParallel(use_local_output=False),
-            # --- Core attention ---
-            "self_attention.core_attention": dsv4_core_attn_plan,
-            # --- Output projection ---
-            "self_attention.linear_proj": NoParallel(use_local_output=False),
-            "pre_mlp_layernorm": norm_plan,
-            "self_attention.apply_rotary_emb": prepare_module_input_output(
-                input_layouts=(Replicate(), rope_freqs_layout, None),
-                desired_input_layouts=(Replicate(), rope_freqs_layout, None),
-                output_layouts=(Replicate(),),
-                desired_output_layouts=(Replicate(),),
-                use_local_output=False,
-            ),
-        }
-        if getattr(core_attn, "unfused_indexer_loss", None) is not None:
-            layer_plan["self_attention.core_attention.unfused_indexer_loss.pre_head_sum"] = unfused_indexer_loss_plan
-        distribute_param_plan.append([transformer_layer.self_attention.core_attention, "attn_sink", (attn_sink_plan,)])
-        distribute_param_plan.append([transformer_layer.self_attention, "linear_o_group_proj", (Replicate(),)])
-        distribute_param_plan.append([transformer_layer.self_attention, "q_rms_gamma", (Replicate(),)])
+        layer_plan, distribute_param_plan = _get_dsv4_tp(transformer_layer, shard_plans)
     else:
+        rope_freqs_layout = Replicate() if transformer_layer.self_attention.config.apply_rope_fusion else None
+        distribute_param_plan = []
         # Rotary embedding for q_pe (head-structured tensor from linear_qb when LoRA is
         # on, otherwise from linear_qkv's replicated slice). The second positional input is
         # the rotary freqs tensor (mscale is passed as a kwarg and stays a Python scalar).

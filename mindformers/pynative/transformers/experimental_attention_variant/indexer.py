@@ -323,7 +323,7 @@ class UnfusedCSAIndexerLoss(nn.Cell):
         self.loss_coeff = loss_coeff
         self.sparse_loss = sparse_loss
 
-        self.pre_head_sum = IdentityOp()
+        self.post_head_sum = IdentityOp()
 
         self.permute = mint.permute
         self.matmul = mint.matmul
@@ -396,8 +396,10 @@ class UnfusedCSAIndexerLoss(nn.Cell):
 
         # Per-head softmax → sum over heads
         attention_scores = self.softmax(attention_scores, dim=-1)
-        attention_scores = self.pre_head_sum(attention_scores)
         attention_scores = self.sum(attention_scores, dim=1)   # [b, sq, sk] — partial under TP
+        if hasattr(attention_scores, "contiguous"):
+            attention_scores = attention_scores.contiguous()
+        attention_scores = self.post_head_sum(attention_scores)
 
         # L1-normalize the pooled attention scores
         attention_scores = attention_scores / self.max(self.sum(attention_scores, -1, keepdim=True), 1e-10)
