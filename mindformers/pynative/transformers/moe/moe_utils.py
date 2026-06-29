@@ -31,6 +31,11 @@ from mindformers.pynative.distributed.activation_checkpoint import is_in_recompu
 # MOE logging
 _MOE_LAYER_WISE_LOGGING_TRACKER: dict = {}
 
+# Global communication domain variables for MoE aux loss.
+# Set via ``set_moe_aux_loss_group_info`` from the model parallelize step.
+_AUX_LOSS_GROUP = None
+_AUX_LOSS_GROUP_SIZE = 1
+
 
 def switch_load_balancing_loss_func(
         probs: Tensor,
@@ -102,6 +107,173 @@ def switch_load_balancing_loss_func(
             num_experts * moe_aux_loss_coeff / (topk * total_num_tokens * total_num_tokens)
     )
     return aux_loss
+
+
+def get_tokens_per_expert_and_token_count(
+        routing_map: Tensor,
+        reduce_group,
+        topk: int = None,
+        with_padding_mask: bool = False,
+) -> Tuple[Tensor, int, int]:
+    """Compute per-expert global token counts and local/total token counts for MoE aux loss.
+
+    This is the core statistics entry point for the Mixture-of-Experts load-balancing
+    auxiliary loss. It performs two main tasks:
+
+    1. Sums ``routing_map`` along the expert dimension to obtain the local per-expert
+       token histogram (``local_tokens_per_expert``), then all-reduces (SUM) over
+       ``reduce_group`` to aggregate the global per-expert token count
+       (``global_tokens_per_expert``) across the parallel domain.
+    2. Derives the local token count (``local_num_tokens``) from the row count of
+       ``routing_map``, and the global token total (``total_num_tokens``) by scaling
+       it with the world size of ``reduce_group``.
+
+    ``reduce_group`` spans only the TP x CP domain: routing happens BEFORE the MoE
+    dispatcher, so only TP/CP shard the router's token view, and summing over the
+    group recovers the per-(batch, expert) histogram for the full batch. DP is
+    intentionally excluded -- each DP rank contributes its own per-sequence aux loss,
+    averaged by the caller via ``/bsz``; all-reducing over DP would double-count.
+
+    Args:
+        routing_map (Tensor): Local token-expert assignment map with shape
+            ``[slen, bsz*E]`` (after the per-sequence reshape) or ``[T, E]``,
+            matching the format expected by the calling aux-loss variant.
+        reduce_group: Either a single process group covering the tp×cp domain,
+            OR a list of 1D process groups (one per axis) covering the same
+            domain. The list form is used when the mesh is 2D and only per-axis
+            groups are available. ``None`` or empty means "no reduction needed;
+            the local histogram is already the global view".
+        topk (int): Number of experts selected per token. Required when
+            ``with_padding_mask=True``; the ``seq_aux_loss`` variant passes
+            ``topk * bsz`` to account for the per-batch flatten.
+        with_padding_mask (bool): Whether the routing_map is padded. Currently
+            unsupported in this codebase.
+
+    Returns:
+        Tuple of ``(global_tokens_per_expert, local_num_tokens, total_num_tokens)``:
+        - ``global_tokens_per_expert``: per-expert token count after all-reduce over
+          ``reduce_group``.
+        - ``local_num_tokens``: row count of ``routing_map`` (local token count).
+        - ``total_num_tokens``: ``local_num_tokens * reduce_group.size()`` (or the
+          histogram-derived equivalent when padding is masked).
+    """
+    _ = topk
+    if with_padding_mask:
+        raise NotImplementedError(
+            "Padding-mask aware token count is not implemented in this "
+            "codebase; ``get_tokens_per_expert_and_token_count`` falls back "
+            "to the row-count derivation used in the non-padded path."
+        )
+    local_tokens_per_expert = routing_map.sum(dim=0)
+    global_tokens_per_expert = local_tokens_per_expert
+    # Normalize ``reduce_group`` to a list of 1D groups so the nested-reduce
+    # logic below is uniform regardless of whether the caller passed a single
+    # group (legacy path) or a list of axis groups (tp×cp decomposition).
+    if reduce_group is None:
+        reduce_groups = []
+    elif isinstance(reduce_group, (list, tuple)):
+        reduce_groups = list(reduce_group)
+    else:
+        reduce_groups = [reduce_group]
+    if reduce_groups:
+        for sub_group in reduce_groups:
+            all_reduce(global_tokens_per_expert, op=ops.ReduceOp.SUM, group=sub_group)
+    local_num_tokens = routing_map.shape[0]
+    total_num_tokens = local_num_tokens * (
+        get_world_size_from_group(reduce_group)
+    )
+    return global_tokens_per_expert, local_num_tokens, total_num_tokens
+
+
+def get_world_size_from_group(group) -> int:
+    """Best-effort ``world_size`` lookup for a process group.
+
+    Falls back to ``1`` if the size cannot be resolved (e.g. ``group`` is
+    ``None`` or the build lacks a world-size API). Accepts a list/tuple of
+    groups (the tp×cp decomposition produced by
+    ``set_moe_aux_loss_group_info``) and returns the product of the
+    per-axis sizes, i.e. ``cp_size * tp_size``.
+    """
+    # pylint: disable=broad-exception-caught
+    if group is None:
+        return 1
+    if isinstance(group, (list, tuple)):
+        # Early-exit on a degenerate entry to avoid inflating the product
+        # with a stray 0 from a group whose size could not be resolved.
+        sub_sizes = [get_world_size_from_group(g) for g in group]
+        if any(s <= 0 for s in sub_sizes):
+            return 1
+        size = 1
+        for s in sub_sizes:
+            size *= s
+        return size
+    try:
+        return group.size()
+    except Exception:
+        pass
+    try:
+        return get_world_size(group)
+    except Exception:
+        return 1
+
+
+def set_moe_aux_loss_group_info(groups, group_size):
+    """Set global communication domain variables for MoE aux loss.
+
+    Called once during model parallelization to establish the tp×cp reduction
+    group(s) used by both the router-side histogram reduction
+    (``get_tokens_per_expert_and_token_count``) and the step-end logging
+    aggregation (``track_moe_metrics``).
+
+    The hyper-parallel ``DeviceMesh`` does not expose a single process group
+    covering an entire multi-axis mesh, and the per-axis ``get_group()`` API
+    raises when the mesh is 2D. We therefore store the list of 1D axis groups
+    (e.g. ``[cp_group, tp_group]``) and reduce over them sequentially -- SUM
+    is associative, so the result is identical to a single tp×cp all-reduce.
+
+    Args:
+        groups: List of 1D process groups whose Cartesian product spans the
+            tp×cp domain. ``None`` or an empty list means "no reduction
+            needed" (e.g. tp=cp=1). A single-element list is also accepted
+            (e.g. only tp is enabled).
+        group_size: World size of the full tp×cp domain
+            (``cp_size * tp_size``). Used by the router to scale the aux
+            loss gradient so it is independent of the mesh shape.
+    """
+    # pylint: disable=W0603
+    global _AUX_LOSS_GROUP, _AUX_LOSS_GROUP_SIZE
+    if groups is None:
+        groups = []
+    # Drop None entries (size-1 axes) and keep at most one entry per axis.
+    _AUX_LOSS_GROUP = [g for g in groups if g is not None]
+    _AUX_LOSS_GROUP_SIZE = max(group_size, 1)
+
+
+def get_moe_aux_loss_group():
+    """Return the list of tp×cp process groups for aux-loss histogram reduction.
+
+    Returns a list (possibly empty) of 1D groups. Callers that perform a
+    single all-reduce should use ``reduce_over_aux_loss_groups`` instead,
+    which iterates the list and applies each group sequentially.
+    """
+    return _AUX_LOSS_GROUP
+
+
+def get_moe_aux_loss_group_size():
+    """Return the world size of the tp×cp aux-loss group (1 if unset)."""
+    return _AUX_LOSS_GROUP_SIZE
+
+
+def reduce_over_aux_loss_groups(tensor, op=ops.ReduceOp.SUM):
+    """Apply SUM/other reduction sequentially over every tp×cp axis group.
+
+    Equivalent to a single all-reduce over the full tp×cp mesh, but works
+    with hyper-parallel's per-axis 1D process groups. SUM is associative so
+    the order of axes does not affect the result. No-op when there are no
+    enabled groups (e.g. tp=cp=1).
+    """
+    for group in _AUX_LOSS_GROUP:
+        all_reduce(tensor, op=op, group=group)
 
 
 class _MoEAuxLossAutoScaler(_Function):
@@ -237,11 +409,11 @@ def save_to_aux_losses_tracker(
     if isinstance(loss, DTensor):
         loss = loss.to_local()
     if hasattr(loss, "detach"):
-        tracker["values"][layer_number] = tracker["values"][
-                                              layer_number] + loss.detach()  # Aggregate the loss for the layer.
+        cur_val = tracker["values"][layer_number] + loss.detach()
+        tracker["values"][layer_number] = cur_val  # Aggregate the loss for the layer.
     else:
-        tracker["values"][layer_number] = tracker["values"][layer_number] + loss
-
+        cur_val = tracker["values"][layer_number] + loss
+        tracker["values"][layer_number] = cur_val
 
 def clear_aux_losses_tracker() -> None:
     """Clear the auxiliary losses."""
@@ -286,12 +458,20 @@ def track_moe_metrics(
 
     tracker = get_moe_layer_wise_logging_tracker()
 
-    # Combine the per-layer tracker across PP stages (collective; see docstring).
+    # Step 1: CP all-reduce (SUM) — combine context-parallel shards.
+    # Router inputs are replicated across TP and independent across DP;
+    # only CP shards the token view, so only CP ranks (if any) are combined here.
+    if _AUX_LOSS_GROUP and _AUX_LOSS_GROUP_SIZE > 1:
+        if "values" not in tracker:
+            num_total_layers = num_layers
+            if mtp_num_layers:
+                num_total_layers += mtp_num_layers
+            tracker["values"] = mint.zeros(num_total_layers)
+        for sub_group in _AUX_LOSS_GROUP:
+            all_reduce(tracker["values"], op=ops.ReduceOp.SUM, group=sub_group)
+    # Step 2: Combine the per-layer tracker across PP stages.
     if pp_group_size and pp_group_size > 1:
         if "values" not in tracker:
-            # This stage owns no MoE layers that contributed aux losses yet.
-            # Seed a zero vector sized to the global layer count so the
-            # all_reduce shape matches the stages that do hold values.
             num_pp_layers = num_layers
             if mtp_num_layers:
                 num_pp_layers += mtp_num_layers
@@ -301,9 +481,7 @@ def track_moe_metrics(
             clear_aux_losses_tracker()
             return None
 
-    # No MoE layer contributed aux losses (e.g. an all-dense model where every layer
-    # is below first_k_dense_replace). The tracker is empty, so there is nothing to
-    # report; returning None makes the loss callback simply omit load_balancing_loss.
+    # No MoE layer contributed aux losses.
     if "values" not in tracker:
         return None
 
@@ -323,6 +501,7 @@ def track_moe_metrics(
         num_moe_layers += mtp_num_layers
 
     aux_losses = tracker["values"].sum() / num_moe_layers
+
     if group_size is None:
         group_size = get_world_size()
     if group_size > 1:

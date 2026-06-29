@@ -28,6 +28,7 @@ from hyper_parallel.core.dtensor.placement_types import Replicate
 
 from mindspore import Tensor, dtype, nn, mint, ops
 from mindspore.mint.distributed import all_reduce, get_world_size
+from mindspore.graph.api import _no_grad
 
 from mindformers.tools.logger import logger
 from mindformers.pynative.loss.loss import CrossEntropyLoss, ChunkCrossEntropyLoss
@@ -40,11 +41,19 @@ from mindformers.pynative.base_models.common.embeddings.rotary_pos_embedding imp
 from mindformers.pynative.base_models.common.embeddings.yarn_rotary_pos_embedding import YarnRotaryEmbedding
 from mindformers.pynative.base_models.gpt.gpt_layer_specs import get_gpt_mtp_block_spec
 from mindformers.pynative.transformers.transformer_block import TransformerBlock, TransformerBlockSubmodules
-from mindformers.pynative.transformers.multi_token_prediction import MultiTokenPredictionBlock, MTPLossAutoScaler
+from mindformers.pynative.transformers.multi_token_prediction import (
+    MultiTokenPredictionBlock,
+    MTPLossAutoScaler,
+    process_mtp_loss,
+    track_mtp_metrics,
+)
 from mindformers.pynative.layers.linear import Linear
 from mindformers.pynative.optimizer.muon_utils import make_muon_fns
-from mindformers.pynative.transformers.multi_token_prediction import process_mtp_loss
 from mindformers.pynative.dtensor_compat import inplace_copy
+from mindformers.pynative.transformers.moe.moe_utils import track_moe_metrics
+from mindformers.pynative.transformers.experimental_attention_variant.utils import (
+    track_indexer_metrics,
+)
 
 
 class GPTModel(nn.Cell):
@@ -636,6 +645,147 @@ class GPTModel(nn.Cell):
         elif attention_mask is None:
             attention_mask = self.casual_mask(input_ids)
         return labels, attention_mask, loss_mask
+
+    def _get_expert_bias_modules(self):
+        """Return (and lazily cache) the MoE layers in this model that own an
+        auxiliary-loss-free ``expert_bias`` buffer.
+
+        The cache is an instance attribute, so each model object (e.g. each
+        virtual pipeline chunk under ``pipeline_parallel_interleave_num > 1``)
+        keeps its own module list. This makes the per-instance caching correct
+        under interleaving: one model instance per chunk.
+        """
+        cache = getattr(self, "_expert_bias_modules_cache", None)
+        if cache is None:
+            cache = [
+                module for _, module in self.cells_and_names()
+                if getattr(module, "enable_expert_bias", False)
+            ]
+            self._expert_bias_modules_cache = cache
+        return cache
+
+    def _get_global_aux_loss_modules(self):
+        """Return (and lazily cache) the modules in this model that own a
+        global-aux-loss tracker to reset each step.
+
+        Cached as an instance attribute for the same per-chunk reason as
+        :meth:`_get_expert_bias_modules`.
+        """
+        cache = getattr(self, "_global_aux_loss_modules_cache", None)
+        if cache is None:
+            cache = [
+                module for _, module in self.cells_and_names()
+                if hasattr(module, "reset_global_aux_loss_tracker")
+            ]
+            self._global_aux_loss_modules_cache = cache
+        return cache
+
+    def _update_expert_bias(self, metric_group, metric_group_size):
+        """Update auxiliary-loss-free ``expert_bias`` and reset per-step token counters.
+
+        Must be called on every step (regardless of log interval or loss
+        availability) and on every PP stage / VPP chunk, so the routers stay
+        in sync across the pipeline.
+
+        Args:
+            metric_group: Process group spanning the dp x cp domain
+                (``loss_mesh``). Each rank in this group sees a different sample
+                shard of the global batch, so its local ``tokens_per_expert``
+                histogram is only a partial count. We all-reduce SUM over this
+                group to recover the global-batch histogram, otherwise the bias
+                delta diverges from the single-card baseline. ``None`` (or a
+                single-rank group) skips the all-reduce. TP is intentionally
+                excluded: the MoE plan replicates router inputs across TP ranks,
+                so each TP rank already sees the same tokens; reducing over TP
+                would multiply the count by ``tp_size``.
+            metric_group_size: Size of ``metric_group`` (skip all-reduce when
+                ``<= 1``).
+        """
+        cache = self._get_expert_bias_modules()
+        if not cache:
+            return
+
+        # NOTE: Currently this sync is blocking (thus exposed) and happens on the
+        # default compute stream. Need to assess if this is OK performance-wise.
+        tokens_per_expert_list = [module.tokens_per_expert for module in cache]
+        tokens_per_expert_by_layer = ops.vstack(tokens_per_expert_list)
+
+        # All-reduce the per-rank token counts over the dp x cp domain so the
+        # bias delta is computed from global-batch statistics, matching the
+        # single-card path (which has no group to reduce over).
+        if metric_group is not None and (
+                metric_group_size is None or metric_group_size > 1):
+            if DTensor is not None and isinstance(tokens_per_expert_by_layer, DTensor):
+                tokens_per_expert_by_layer = tokens_per_expert_by_layer.to_local()
+            all_reduce(tokens_per_expert_by_layer, group=metric_group)
+
+        with _no_grad():
+            for moe_layer_idx, module in enumerate(cache):
+                tokens_per_expert = tokens_per_expert_by_layer[moe_layer_idx].float()
+
+                # update the expert bias
+                # this is not exactly the same as https://arxiv.org/pdf/2408.15664 proposed
+                expert_bias_delta = module.load_balance_coeff * mint.sign(
+                    tokens_per_expert.mean() - tokens_per_expert
+                )
+
+                # NOTE: Megatron-LM does not apply zero-mean correction to the expert bias delta;
+                # Torchtitan applies zero-mean correction here
+                module.expert_bias.add_(expert_bias_delta)
+                module.tokens_per_expert = mint.zeros_like(module.tokens_per_expert)
+
+    def get_load_balancing_loss(self, metric_group, metric_group_size,
+                                pp_metric_group, pp_metric_group_size, **kwargs):
+        """Combine and reduce the MoE load-balancing (aux) loss for logging.
+
+        ``track_moe_metrics`` combines the per-layer tracker across PP stages
+        (a PP-group collective) before reducing it to a scalar, so it must run
+        on every stage every step to stay deadlock-free. Non-last stages get
+        ``None`` back (they only contribute to the combine).
+
+        Returns the raw tracked aux loss (NOT divided by the number of
+        gradient-accumulation steps); the caller applies that scaling.
+        """
+        has_last = kwargs.get("has_last", True)
+        return track_moe_metrics(
+            loss_scale=self.config.moe_aux_loss_coeff,
+            num_layers=self.config.num_layers,
+            moe_layer_freq=self.config.moe_layer_freq,
+            mtp_num_layers=self.config.mtp_num_layers,
+            group=metric_group,
+            group_size=metric_group_size,
+            pp_group=pp_metric_group,
+            pp_group_size=pp_metric_group_size,
+            has_last=has_last,
+        )
+
+    def reset_model_temporary_tensors(self):
+        """Reset per-step temporary tensors (global-aux-loss trackers).
+
+        No-op unless ``moe_router_load_balancing_type == "global_aux_loss"``.
+        """
+        if self.config.moe_router_load_balancing_type != "global_aux_loss":
+            return
+        for module in self._get_global_aux_loss_modules():
+            module.reset_global_aux_loss_tracker()
+
+    def get_mtp_loss(self, metric_group, metric_group_size):
+        """Return the reduced multi-token-prediction (MTP) loss for logging.
+
+        Returns the raw per-layer tracked MTP loss tensor (NOT divided by the
+        number of gradient-accumulation steps); the caller applies that
+        scaling and formatting. ``None`` when there is no MTP loss to report.
+        """
+        return track_mtp_metrics(group=metric_group, group_size=metric_group_size)
+
+    def get_index_loss(self):
+        """Return the reduced sparse-attention indexer loss for logging.
+
+        Returns the raw tracked indexer loss (NOT divided by the number of
+        gradient-accumulation steps); the caller applies that scaling.
+        ``None`` when there is no indexer loss to report.
+        """
+        return track_indexer_metrics()
 
     def get_gpt_transformer_config(self):
         """Get the transformer config for GPT model.

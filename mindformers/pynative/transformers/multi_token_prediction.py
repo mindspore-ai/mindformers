@@ -44,6 +44,7 @@ from mindformers.pynative.transformers.transformer_block import (
 from mindformers.parallel_core.utils.spec_utils import ModuleSpec, build_module
 from mindformers.parallel_core.transformer_config import TransformerConfig
 from mindformers.pynative.layers.linear import Linear
+from mindformers.pynative.distributed.activation_checkpoint import is_in_recompute
 
 # MTP logging
 _MTP_LAYER_WISE_LOGGING_TRACKER: dict = {}
@@ -117,6 +118,12 @@ def save_to_mtp_losses_tracker(
     """
     # Skip mtp loss logging if layer_number is None.
     if layer_number is None:
+        return
+
+    # Skip during activation recompute: the recomputed forward would otherwise add
+    # this layer's MTP loss to the tracker a second time, doubling mtp_*_loss for
+    # recomputed MTP layers. Mirrors the guard in ``save_to_aux_losses_tracker``.
+    if is_in_recompute():
         return
 
     tracker = get_mtp_layer_wise_logging_tracker()

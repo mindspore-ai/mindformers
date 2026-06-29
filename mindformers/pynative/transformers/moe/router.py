@@ -19,7 +19,11 @@ from .moe_utils import (
     switch_load_balancing_loss_func,
     save_to_aux_losses_tracker,
     MoEAuxLossAutoScaler,
+    get_tokens_per_expert_and_token_count,
+    get_moe_aux_loss_group,
+    get_moe_aux_loss_group_size,
 )
+
 
 
 class TopKRouter(nn.Cell):
@@ -531,22 +535,32 @@ class TopKRouter(nn.Cell):
         Returns:
             Tensor: top_scores with aux loss gradient injected.
         """
-        # NOTE: AllReduce tokens_per_expert over tp_cp_group for multi-card
-        scores_for_aux_loss = scores_for_aux_loss.reshape((seq_length, -1),)
-        tokens_per_expert = routing_map.reshape((seq_length, -1),).sum(dim=0)
-        total_num_tokens = seq_length
+        scores_for_aux_loss = scores_for_aux_loss.reshape(seq_length, -1)
+        routing_map = routing_map.reshape(seq_length, -1)
 
-        aux_loss = (
-                switch_load_balancing_loss_func(
-                    probs=scores_for_aux_loss,
-                    tokens_per_expert=tokens_per_expert,
-                    total_num_tokens=total_num_tokens,
-                    topk=self.top_k,
-                    num_experts=self.config.num_moe_experts,
-                    moe_aux_loss_coeff=self.moe_aux_loss_coeff,
-                )
-                / bsz
+        # ``topk * bsz`` -- the routing_map has shape ``(slen, bsz*E)`` after
+        # the reshape (one row per sequence, ``bsz`` experts' worth of columns),
+        # so each token contributes ``topk * bsz`` to the histogram sum. Used
+        # by ``get_tokens_per_expert_and_token_count`` to derive the token
+        # count from the histogram when padding is masked; kept for parity
+        # with the Megatron helper signature even though we currently only
+        # support the non-padded path.
+        global_tokens_per_expert, _, total_num_tokens = (
+            get_tokens_per_expert_and_token_count(
+                routing_map=routing_map,
+                reduce_group=get_moe_aux_loss_group(),
+                topk=self.top_k * bsz,
+            )
         )
+
+        aux_loss = switch_load_balancing_loss_func(
+            probs=scores_for_aux_loss,
+            tokens_per_expert=global_tokens_per_expert,
+            total_num_tokens=total_num_tokens,
+            topk=self.top_k,
+            num_experts=self.config.num_moe_experts,
+            moe_aux_loss_coeff=self.moe_aux_loss_coeff,
+        ) / bsz
 
         top_scores = self._attach_and_log_aux_loss(
             top_scores, aux_loss, self.moe_aux_loss_coeff
@@ -575,14 +589,16 @@ class TopKRouter(nn.Cell):
             Tensor: top_scores with aux loss gradient injected.
         """
         _ = seq_length, bsz
-        tokens_per_expert = routing_map.sum(dim=0)
-        self.global_tokens_per_expert += tokens_per_expert
+        global_tokens_per_expert, _, total_num_tokens = (
+            get_tokens_per_expert_and_token_count(
+                routing_map=routing_map,
+                reduce_group=get_moe_aux_loss_group(),
+                topk=self.top_k,
+            )
+        )
+        self.global_tokens_per_expert += global_tokens_per_expert
         self.ga_steps += 1
         averated_tokens_per_expert = self.global_tokens_per_expert / self.ga_steps
-
-        num_tokens = scores_for_aux_loss.shape[0]
-        # total_num_tokens = num_tokens * self.tp_dp_cp_group.size()
-        total_num_tokens = num_tokens
 
         global_aux_loss = switch_load_balancing_loss_func(
             probs=scores_for_aux_loss,
@@ -621,6 +637,9 @@ class TopKRouter(nn.Cell):
         if self.config.mtp_num_layers is not None:
             num_layers += self.config.mtp_num_layers
 
+        # Compensate for the tp×cp-dependent scaling in the Switch formula.
+        tp_cp_size = get_moe_aux_loss_group_size()
+
         save_to_aux_losses_tracker(
             aux_loss / aux_loss_coeff,
             self.layer_number,
@@ -635,9 +654,13 @@ class TopKRouter(nn.Cell):
             # which scales both the main_loss gradient and aux_loss gradient by
             # 1/(num_local_tokens * dp_size * num_micro_batches) in finalize_model_grads function.
             # To correct this scaling, we need to scale the aux_loss by num_local_tokens here.
-            top_scores = self.moe_aux_loss_auto_scaler(top_scores, aux_loss * top_scores.shape[0])
+            top_scores = self.moe_aux_loss_auto_scaler(
+                top_scores, aux_loss * top_scores.shape[0] * tp_cp_size
+            )
         else:
-            top_scores = self.moe_aux_loss_auto_scaler(top_scores, aux_loss)
+            top_scores = self.moe_aux_loss_auto_scaler(
+                top_scores, aux_loss * tp_cp_size
+            )
 
         return top_scores
 
