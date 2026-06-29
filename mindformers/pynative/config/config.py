@@ -360,6 +360,19 @@ class ParallelismConfig(BaseConfig):
     disable_gradient_division: bool = True
     """Disable FSDP automatic gradient division (use sum instead of mean)"""
 
+    dense_fsdp_shard_size: Optional[int] = None
+    """Limit the FSDP shard degree of all *dense* (non-expert) weights to this many
+    ranks. Dense weights are everything wrapped on the fsdp mesh: embedding, norms,
+    router, shared experts, attention, dense-MLP and the output layer. Routed experts
+    keep sharding over the full expert-FSDP (``efsdp``) domain and are unaffected.
+
+    The shard degree must divide the full fsdp domain (``dp_shard * cp``); the remaining
+    ranks are used for HSDP-style gradient replication, so the total gradient-reduction
+    domain is unchanged and numerics match the non-limited baseline. ``None`` (default)
+    shards dense weights over the full fsdp domain (unchanged behavior). Example: with a
+    global fsdp of 8, ``dense_fsdp_shard_size: 2`` shards each dense weight across 2 ranks
+    and HSDP-replicates it 4-way (2 * 4 = 8 = full fsdp domain)."""
+
     tensor_parallel: int = 1
     """Tensor parallelism degree"""
 
