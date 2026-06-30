@@ -1909,12 +1909,8 @@ def apply_pp(
     # the whole rank for the cross-PP-stage sync group to form.
     _setup_mtp_embedding_grad_sync(model_parts, parallel_dims)
 
-    # Adjust the last-stage loss backward scaling so PP gradients match the single-card case (loss / grad_accum).
-    # Note: DP/TP/CP are already included in get_loss_sense as 1/(dp*tp*cp)/grad_accum.
-    # However, PipelineStage.get_last_stage_sens also divides the loss DTensor by repeat_num.
-    # (repeat_num equals TP for a TP-replicated scalar loss.)
-    # To avoid double-scaling TP, we multiply TP back here.
-    # This yields an effective scale of 1/(dp*cp)/grad_accum.
+    # Adjust the last-stage loss backward scaling so PP gradients match the single-card case.
+    # DTensor repeat compensation is handled by ScaledLossPipelineStage from the actual output layout.
     # MoE/MTP losses are scaled separately by their own auto-scalers and are not affected here.
     main_loss_sense = get_loss_sense(
         parallelism=parallelism,
@@ -1922,7 +1918,7 @@ def apply_pp(
         gradient_accumulation_steps=gradient_accumulation_steps,
         apply_gradient_accumulation=True,
         )
-    loss_scale = float(main_loss_sense.asnumpy().item()) * int(parallel_dims.tp)
+    loss_scale = float(main_loss_sense.asnumpy().item())
     for stage in stages:
         stage.loss_scale = loss_scale
 

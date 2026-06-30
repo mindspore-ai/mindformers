@@ -42,6 +42,13 @@ class ScaledLossPipelineStage(PipelineStage):
 
     and this class multiplies the backward seed by that factor.
 
+    The base ``PipelineStage`` additionally divides DTensor outputs by their
+    layout ``repeat_num``. That is correct for a generic replicated DTensor
+    backward seed, but MindFormers' main loss scale already includes the TP
+    division. For actual replicated loss outputs, multiply the seed by
+    ``repeat_num`` before applying ``loss_scale``; local loss outputs are left
+    unchanged.
+
     **Scope of scaling:**
     Only the main-loss seed is scaled here. MoE-aux and MTP gradients are
     already scaled at backward time by their respective auto-scalers, so
@@ -82,13 +89,33 @@ class ScaledLossPipelineStage(PipelineStage):
         return super()._get_layout_rank_list(layout, sender_rank)
 
     def get_last_stage_sens(self, last_stage_outputs):
+        """Return the backward seed for the last pipeline stage, scaled by ``loss_scale``.
+
+        The base ``PipelineStage.get_last_stage_sens`` divides DTensor outputs
+        by their layout ``repeat_num``. Because MindFormers' main loss scale
+        already includes the TP division, the seed for a replicated loss output
+        is multiplied back by ``repeat_num`` here (via ``restore_repeat_num``)
+        before ``loss_scale`` is applied; local (non-replicated) loss outputs
+        are left unchanged. ``loss_scale == 1.0`` short-circuits and returns the
+        base seed untouched.
+        """
         p_sens = super().get_last_stage_sens(last_stage_outputs)
         scale = self.loss_scale
         if scale == 1.0:
             return p_sens
+        if isinstance(last_stage_outputs, (list, tuple)):
+            outputs = last_stage_outputs
+        else:
+            outputs = (last_stage_outputs,)
+
+        def restore_repeat_num(sens, output):
+            if hasattr(output, "layout") and hasattr(output.layout, "repeat_num"):
+                return sens * output.layout.repeat_num()
+            return sens
+
         if isinstance(p_sens, list):
-            return [s * scale for s in p_sens]
-        return p_sens * scale
+            return [restore_repeat_num(s, output) * scale for s, output in zip(p_sens, outputs)]
+        return restore_repeat_num(p_sens, outputs[0]) * scale
 
 
 class PpLayerSetting:
