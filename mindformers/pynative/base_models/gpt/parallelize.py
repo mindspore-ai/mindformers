@@ -473,6 +473,12 @@ def _collect_layer_replicate_params(layer, shard_size):
     if hasattr(layer.self_attention.core_attention, "max_logits_val"):
         replicate_params.append(layer.self_attention.core_attention.max_logits_val)
 
+    # DSv4 q-head RMS gamma is a fp32 non-trainable buffer. Replicate it so it is
+    # kept out of the layer's (bf16) sharded flat param-buffer, which is allocated
+    # with a single dtype and would otherwise mis-cast this fp32 tensor.
+    if hasattr(layer.self_attention, "q_rms_gamma"):
+        replicate_params.append(layer.self_attention.q_rms_gamma)
+
     if hasattr(layer.mlp, "tokens_per_expert"):
         replicate_params.append(layer.mlp.tokens_per_expert)
 
@@ -529,6 +535,56 @@ def _wrap_hc_modules(host, fsdp_config, reshard_after_forward):
             fully_shard(hc_module, **fsdp_config, shard_placement_fn=shard_plan,
                         reshard_after_forward=reshard_after_forward,
                         replicate_params=_collect_hc_replicate_params(hc_module))
+
+
+def _wrap_dsv4_attention_modules(self_attention, fsdp_config, reshard_after_forward, replicate_params):
+    """Independently FSDP-wrap the fp32 tensors of a DSv4 hybrid attention.
+
+    DSv4 attention mixes bf16 projection weights with fp32 tensors that ``fully_shard``
+    cannot place in the same HSDP param-group (it asserts a single original dtype per
+    group and allocates one flat buffer per group):
+
+    * the fp32 RMSNorms ``kv_layernorm`` and the compressor ``norm`` cells nested under
+      ``core_attention`` / ``core_attention.indexer`` (``q_layernorm`` is already wrapped
+      by the generic norm pass in :func:`_collect_layer_norms`, so it is skipped here);
+    * the fp32 trainable per-head ``attn_sink`` Parameter on ``core_attention``.
+
+    Strategy: wrap each fp32 norm cell (reached via ``construct``, so its FSDP all-gather
+    hook fires normally) into its own group, then wrap ``core_attention`` with every
+    parameter *except* ``attn_sink`` in ``ignored_params``. That leaves ``core_attention``'s
+    own group holding only the fp32 ``attn_sink``, while the bf16 ``compressor`` /
+    ``indexer`` weights fall through to the enclosing transformer-layer wrap. Those bf16
+    weights MUST stay with the layer wrap: the indexer is invoked through a custom method
+    (``indexer.forward_before_topk``) rather than ``construct``, so a dedicated FSDP wrap
+    around it would never fire its pre-forward all-gather and its weights would still be
+    sharded DTensors at matmul time. The layer wrap all-gathers them before the layer
+    forward, which is when the indexer actually runs. No-op for the non-DSv4 path.
+    """
+    if not isinstance(self_attention, DSv4HybridSelfAttention):
+        return
+
+    q_layernorm = getattr(self_attention, "q_layernorm", None)
+    # 1. fp32 norm cells anywhere under the attention (skip the already-wrapped q_layernorm).
+    #    These are reached via ``construct`` so their FSDP all-gather hook fires normally.
+    norm_modules = [
+        module for _, module in self_attention.cells_and_names()
+        if module is not q_layernorm and is_norm_module(module)
+    ]
+    for norm in norm_modules:
+        with ms.DeviceCtx("meta"):
+            fully_shard(norm, **fsdp_config, replicate_params=replicate_params)
+
+    # 2. Isolate the fp32 ``attn_sink`` into ``core_attention``'s own group; everything else
+    #    under core_attention (bf16 compressor / indexer weights) is ignored here so it falls
+    #    through to the transformer-layer wrap that all-gathers it before the layer forward.
+    core_attention = getattr(self_attention, "core_attention", None)
+    attn_sink = getattr(core_attention, "attn_sink", None) if core_attention is not None else None
+    if core_attention is None or attn_sink is None:
+        return
+    ignored = [param for _, param in core_attention.parameters_and_names() if param is not attn_sink]
+    with ms.DeviceCtx("meta"):
+        fully_shard(core_attention, **fsdp_config, reshard_after_forward=reshard_after_forward,
+                    ignored_params=ignored, replicate_params=replicate_params)
 
 
 # LoRA adapter layouts keyed by the target module's base TP role. Only the non-default
@@ -1331,6 +1387,12 @@ def apply_fsdp(
         # 2c. Wrap HC modules independently (small modules, all params replicated)
         _wrap_hc_modules(layer, fsdp_config, reshard_after_forward)
 
+        # 2c'. Wrap DSv4 hybrid-attention fp32 sub-modules independently so their
+        #      fp32 norms / attn_sink do not share a param-group with bf16 weights.
+        _wrap_dsv4_attention_modules(
+            layer.self_attention, fsdp_config, reshard_after_forward, replicate_params
+        )
+
         # 2d. Wrap the transformer layer (large module)
 
         with ms.DeviceCtx("meta"):
@@ -1407,6 +1469,14 @@ def apply_fsdp(
             # the generic MTP layer wrap and sharded on dim 0, which their shapes
             # do not allow.
             _wrap_hc_modules(layer.transformer_layer, fsdp_config, reshard_after_forward)
+
+            # DSv4 hybrid-attention fp32 sub-modules — same independent wrap as the
+            # main decoder layers (2c'), keeping fp32 norms / attn_sink out of the
+            # MTP layer's bf16 param-group.
+            _wrap_dsv4_attention_modules(
+                layer.transformer_layer.self_attention, fsdp_config, reshard_after_forward,
+                mtp_replicate_params,
+            )
 
             # Wrap the MTP layer (remaining: eh_proj + transformer_layer residual, all bf16)
             with ms.DeviceCtx("meta"):
