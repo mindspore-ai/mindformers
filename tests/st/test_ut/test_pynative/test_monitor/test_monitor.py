@@ -220,6 +220,29 @@ class TestMonitorRecordEffect:
             {"local_norm": "embedding.weight:   3.500000"},
         ]
 
+    @pytest.mark.level0
+    @pytest.mark.platform_x86_cpu
+    @pytest.mark.env_onecard
+    def test_flush_outputs_device_norm_after_local_norm(self, monkeypatch):
+        """device_norm should be flushed after hook-collected local_norm records."""
+        param = _FakeParam("embedding.weight", grad=100.0)
+        model = _FakeModel([param])
+        config = _make_config(local_norm="embedding", device_norm=True)
+        monitor = TrainStateMonitor(config, model=model)
+        monitor._compute_grad_norm = float
+
+        assert param.hooks[0](1.0) == 1.0
+        assert param.hooks[0](2.0) == 2.0
+        monitor.record("device_norm")
+
+        logs = []
+        monkeypatch.setattr("mindformers.pynative.tools.monitor.logger.info", logs.append)
+        monitor.flush(step=1)
+
+        local_norm_index = next(index for index, log in enumerate(logs) if '"local_norm"' in log)
+        device_norm_index = next(index for index, log in enumerate(logs) if '"device_norm"' in log)
+        assert local_norm_index < device_norm_index
+
 
 class TestMonitorReset:
     """Test that reset clears records and state."""
@@ -271,6 +294,16 @@ class TestMonitorGroup:
         assert len(train_state_monitor._records) == 1
         group.reset()
         assert train_state_monitor._records == []
+
+    @pytest.mark.level0
+    @pytest.mark.platform_x86_cpu
+    @pytest.mark.env_onecard
+    def test_group_should_record_respects_config(self):
+        """MonitorGroup should only expose enabled train_state metrics."""
+        config = _make_config(device_norm=True)
+        group = MonitorGroup(config)
+        assert group.should_record("device_norm") is True
+        assert group.should_record("device_loss") is False
 
 
 class TestMoeMonitorConfig:

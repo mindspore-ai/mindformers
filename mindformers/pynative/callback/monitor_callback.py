@@ -23,4 +23,10 @@ class MonitorCallback(TrainerCallback):
     def on_step_end(self, args, state, **kwargs):
         monitor = kwargs.get("monitor")
         if monitor and monitor.active:
+            if kwargs.get("pp_metric_reduce_group") is not None:
+                loss = kwargs.get("loss")
+                if loss is not None and monitor.should_record("device_loss"):
+                    monitor.record("device_loss", loss)
+                if monitor.should_record("device_norm"):
+                    monitor.record("device_norm")
             monitor.flush(step=state.global_step)
