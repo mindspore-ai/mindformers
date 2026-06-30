@@ -39,7 +39,7 @@ from mindspore.mint.distributed import get_rank, all_gather, new_group
 
 from hyper_parallel import DeviceMesh
 from hyper_parallel.core.dtensor.dtensor import DTensor, distribute_tensor
-from hyper_parallel.core.dtensor.placement_types import Replicate, Shard, Partial
+from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
 from hyper_parallel.core.fully_shard.api import (
     fully_shard,
     MixedPrecisionPolicy,
@@ -565,16 +565,15 @@ def _attach_lora_layouts(transformer_layer, layer_plan):
             style.extra_param_layouts = extra
 
 
-def _get_dsv4_tp(transformer_layer, shard_plans):
+def _get_dsv4_tp_shard_plan(transformer_layer, shard_plans, distribute_param_plan):
     """get dsv4 tp plan"""
     # Fused CSA kernel has CANN shape constraints and no TP benefit from head-sharding
     # non-fused small-op path does benefit.
-    sp_layout, norm_plan, rowwise_output_plan, attn_qkv_shard = shard_plans
-    distribute_param_plan = []
+    sp_layout, norm_plan, _, _ = shard_plans
     rope_freqs_layout = Replicate() if transformer_layer.self_attention.config.apply_rope_fusion else None
     core_attn = transformer_layer.self_attention.core_attention
-    csa_q_layout = Replicate() if getattr(core_attn, "apply_dsa_kernel_fusion", False) else Shard(2)
-    attn_sink_plan = Replicate() if getattr(core_attn, "apply_dsa_kernel_fusion", False) else Shard(0)
+    csa_q_layout = Replicate() # currently csa doesn't apply tp
+    attn_sink_plan = Replicate()
     dsv4_core_attn_plan = PrepareModuleInputOutput(
         # q, key, x, q_compressed
         input_layouts=(Replicate(), Replicate(), Replicate(), Replicate()),
@@ -585,7 +584,7 @@ def _get_dsv4_tp(transformer_layer, shard_plans):
         use_local_output=False,
     )
     unfused_indexer_loss_plan = PrepareModuleInputOutput(
-        input_layouts=(Partial(),),
+        input_layouts=(Replicate(),),
         desired_input_layouts=(Replicate(),),
         output_layouts=(Replicate(),),
         desired_output_layouts=(Replicate(),),
@@ -667,11 +666,13 @@ def _apply_layers_tp(
     # the module boundary. The non-fused mul/add path instead broadcasts plain freqs and
     # must keep them as plain tensors (None) to preserve q_pe's head sharding, so the freqs
     # slot is only converted when apply_rope_fusion is enabled.
+    rope_freqs_layout = Replicate() if transformer_layer.self_attention.config.apply_rope_fusion else None
+    distribute_param_plan = []
     if isinstance(transformer_layer.self_attention, DSv4HybridSelfAttention):
-        layer_plan, distribute_param_plan = _get_dsv4_tp(transformer_layer, shard_plans)
+        layer_plan, distribute_param_plan = _get_dsv4_tp_shard_plan(transformer_layer,
+                                                                    shard_plans,
+                                                                    distribute_param_plan)
     else:
-        rope_freqs_layout = Replicate() if transformer_layer.self_attention.config.apply_rope_fusion else None
-        distribute_param_plan = []
         # Rotary embedding for q_pe (head-structured tensor from linear_qb when LoRA is
         # on, otherwise from linear_qkv's replicated slice). The second positional input is
         # the rotary freqs tensor (mscale is passed as a kwarg and stays a Python scalar).
