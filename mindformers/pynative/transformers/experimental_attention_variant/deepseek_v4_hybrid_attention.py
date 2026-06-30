@@ -72,9 +72,13 @@ class DSv4HybridSelfAttention(MultiLatentAttention):
         else:
             self.compress_ratio = 0
 
-        # The compressed-KV branch (ratio > 1) uses a different rotary base than the window branch (rotary_base).
-        rope_base = config.csa_compress_rotary_base if self.compress_ratio > 1 else config.rotary_base
-        self.rotary_pos_emb = self._build_rotary_pos_emb(config, rope_base)
+        # The compressed-KV branch (ratio > 1) uses YaRN rope with csa_compress_rotary_base; the
+        # sliding-window branch (ratio <= 1) uses standard (non-YaRN) rope with rotary_base. The
+        # rope type is selected per-branch by compress_ratio, not by a global config.rope_type
+        # (aligns Megatron-LM dev deepseek_v4_hybrid_attention).
+        use_compressed_yarn = self.compress_ratio > 1
+        rope_base = config.csa_compress_rotary_base if use_compressed_yarn else config.rotary_base
+        self.rotary_pos_emb = self._build_rotary_pos_emb(config, rope_base, use_compressed_yarn)
         self.apply_rotary_emb = ApplyRotaryPosEmb(config)
 
         self.core_attention = build_module(
@@ -164,9 +168,16 @@ class DSv4HybridSelfAttention(MultiLatentAttention):
         self.q_rms_gamma.fill_(1.0)
 
     @staticmethod
-    def _build_rotary_pos_emb(config: MLATransformerConfig, rope_base: float):
-        """Build the per-layer RoPE module."""
-        if config.rope_type == "rope":
+    def _build_rotary_pos_emb(config: MLATransformerConfig, rope_base: float, use_compressed_yarn: bool):
+        """Build the per-layer RoPE module.
+
+        Mirrors Megatron-LM dev deepseek_v4_hybrid_attention: the sliding-window branch
+        (compress_ratio <= 1) uses standard (non-YaRN) rope, while the compressed-KV branch
+        (compress_ratio > 1) uses YaRN. The choice is per-branch via ``use_compressed_yarn``,
+        not a global ``config.rope_type``. YaRN's interpolation reference length is the dedicated
+        ``original_max_position_embeddings`` (not the extended ``max_position_embeddings``).
+        """
+        if not use_compressed_yarn:
             return RotaryEmbedding(
                 config.qk_pos_emb_head_dim,
                 rotary_percent=config.rotary_percent,
@@ -175,23 +186,18 @@ class DSv4HybridSelfAttention(MultiLatentAttention):
                 rotary_base=rope_base,
                 rope_scaling=config.use_rope_scaling,
             )
-        if config.rope_type == "yarn":
-            return YarnRotaryEmbedding(
-                config.qk_pos_emb_head_dim,
-                rotary_percent=config.rotary_percent,
-                rotary_interleaved=config.rotary_interleaved,
-                seq_len_interpolation_factor=config.rotary_seq_len_interpolation_factor,
-                rotary_base=rope_base,
-                scaling_factor=config.rotary_scaling_factor,
-                original_max_position_embeddings=config.max_position_embeddings,
-                beta_fast=config.beta_fast,
-                beta_slow=config.beta_slow,
-                mscale=config.mscale,
-                mscale_all_dim=config.mscale_all_dim,
-            )
-        raise ValueError(
-            f"Unsupported RoPE type: {config.rope_type}, supported types are "
-            "'rope' and 'yarn'"
+        return YarnRotaryEmbedding(
+            config.qk_pos_emb_head_dim,
+            rotary_percent=config.rotary_percent,
+            rotary_interleaved=config.rotary_interleaved,
+            seq_len_interpolation_factor=config.rotary_seq_len_interpolation_factor,
+            rotary_base=rope_base,
+            scaling_factor=config.rotary_scaling_factor,
+            original_max_position_embeddings=config.original_max_position_embeddings,
+            beta_fast=config.beta_fast,
+            beta_slow=config.beta_slow,
+            mscale=config.mscale,
+            mscale_all_dim=config.mscale_all_dim,
         )
 
     def _apply_forward_rope(self, t: Tensor, freqs: Tensor, mscale: float = 1.0, inverse=False) -> Tensor:
