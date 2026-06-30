@@ -397,8 +397,6 @@ class UnfusedCSAIndexerLoss(nn.Cell):
         # Per-head softmax → sum over heads
         attention_scores = self.softmax(attention_scores, dim=-1)
         attention_scores = self.sum(attention_scores, dim=1)   # [b, sq, sk] — partial under TP
-        if hasattr(attention_scores, "contiguous"):
-            attention_scores = attention_scores.contiguous()
         attention_scores = self.post_head_sum(attention_scores)
 
         # L1-normalize the pooled attention scores
