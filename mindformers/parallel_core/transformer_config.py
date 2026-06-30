@@ -2735,6 +2735,18 @@ class MLATransformerConfig(TransformerConfig):
         }
     )
 
+    original_max_position_embeddings: int = field(
+        default=4096,
+        metadata={
+            "description": "Original sequence length before YaRN context extension; sets the YaRN "
+                           "frequency-interpolation reference length (aligns Megatron-LM dev, which "
+                           "uses a dedicated field rather than max_position_embeddings).",
+            "usage": ParamUsage.COMMON,
+            "source": ParamSource.MEGATRON,
+            "mode": ParamMode.COMMON
+        }
+    )
+
     beta_fast: float = field(
         default=32.0,
         metadata={
