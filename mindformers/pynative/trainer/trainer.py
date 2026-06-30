@@ -266,7 +266,7 @@ class Trainer:
         self.compute_loss_func = compute_loss_func
 
         # Initialize monitor
-        self.monitor = MonitorGroup(self.config, model=self.model[0])
+        self.monitor = MonitorGroup(self.config, model=self.model)
 
         # Initialize training state
         self.state = None
@@ -1015,8 +1015,6 @@ class Trainer:
 
             self.monitor.record("local_loss", micro_loss,
                                 context={"micro_step": micro_step, "model": self.model})
-            self.monitor.record("local_norm",
-                                context={"micro_step": micro_step, "model": self.model})
 
             # Only perform optimizer step after gradient accumulation
             if micro_step >= self.num_accumulation_steps - 1:
@@ -1027,8 +1025,10 @@ class Trainer:
                 if self.enable_parallel:
                     all_reduce(loss, op=ops.ReduceOp.SUM)
                     loss /= self.world_size
-                self.monitor.record("device_loss", loss)
-                self.monitor.record("device_norm")
+                if self.monitor.should_record("device_loss"):
+                    self.monitor.record("device_loss", loss)
+                if self.monitor.should_record("device_norm"):
+                    self.monitor.record("device_norm")
         return loss, grad_norm
 
     def training_pp_step(self, inputs: Dict[str, Any]):

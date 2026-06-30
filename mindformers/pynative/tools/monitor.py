@@ -71,7 +71,8 @@ class Monitor(ABC):
 
         for rec in records:
             micro_step = rec.pop("micro_step", None)
-            if micro_step is not None:
+            if micro_step is not None and micro_step != cur_micro_step:
+                flush_pending()
                 cur_micro_step = micro_step
             if not rec:
                 continue
@@ -113,6 +114,21 @@ class Monitor(ABC):
         return float(value)
 
 
+def _iter_models(model):
+    """Yield one or more bound model objects."""
+    if model is None:
+        return ()
+    if isinstance(model, (list, tuple)):
+        return tuple(m for m in model if m is not None)
+    return (model,)
+
+
+def _first_model(model):
+    """Return the first model when a model list is bound."""
+    models = _iter_models(model)
+    return models[0] if models else None
+
+
 def _parse_moe_tpe_module_name(module_name: str) -> Optional[Tuple[str, Optional[int], int]]:
     """Parse a MoE MLP module name into ``(block, mtp_idx, layer)``."""
     match = re.fullmatch(r"(?:.*\.)?decoder\.layers\.(\d+)\.mlp", module_name)
@@ -145,7 +161,8 @@ class TrainStateMonitor(Monitor):
         self._device_norm_config: List[str] = []
         self._prev_local_norms: Dict[str, float] = {}
         self._hook_handles: List[Any] = []
-        self._hook_local_norms: Dict[str, float] = {}
+        self._hook_local_norms: Dict[str, List[float]] = {}
+        self._cached_trainable_params: List[Tuple[Any, Tuple[Any, ...]]] = []
 
         if train_state:
             if getattr(train_state, 'local_loss', False):
@@ -174,21 +191,83 @@ class TrainStateMonitor(Monitor):
             "device_loss": self._record_device_loss,
             "device_norm": self._record_device_norm,
         }
+        self._refresh_trainable_params_cache()
         self._register_grad_hooks()
 
     @property
     def active(self):
         return bool(self._record_config)
 
+    def should_record(self, key: str) -> bool:
+        """Return whether the given training-state metric is enabled."""
+        return self._record_config.get(key, False)
+
     def reset(self):
         super().reset()
         self._prev_local_norms = {}
+        self._hook_local_norms = {}
+
+    def flush(self, step: int):
+        self._record_pending_hook_norms()
+        if self._records:
+            device_norm_records = [rec for rec in self._records if "device_norm" in rec]
+            if device_norm_records:
+                self._records = [
+                    rec for rec in self._records if "device_norm" not in rec
+                ] + device_norm_records
+        super().flush(step)
+
+    def _sync_prev_norms_from_hooks(self):
+        """Refresh current-step norm cache from parameter hooks without consuming records."""
+        if not self._hook_local_norms:
+            return
+        if not self._cached_trainable_params:
+            return
+
+        for _, trainable_params in self._cached_trainable_params:
+            for param in trainable_params:
+                if not (self._should_record_norm(param.name, "local_norm") or
+                        self._should_record_norm(param.name, "device_norm")):
+                    continue
+                actual_norms = self._hook_local_norms.get(param.name)
+                if actual_norms:
+                    self._prev_local_norms[param.name] = actual_norms[-1]
+
+    def _record_pending_hook_norms(self):
+        """Emit hook-collected local norms not consumed by trainer-side records."""
+        if not self._hook_local_norms:
+            return
+
+        if not self._cached_trainable_params:
+            self._hook_local_norms = {}
+            return
+
+        self._sync_prev_norms_from_hooks()
+        if not self._record_config.get("local_norm", False):
+            self._hook_local_norms = {}
+            return
+
+        max_micro_steps = max((len(norms) for norms in self._hook_local_norms.values()), default=0)
+        for micro_step in range(max_micro_steps):
+            self._records.append({"micro_step": micro_step + 1})
+            for _, trainable_params in self._cached_trainable_params:
+                for param in trainable_params:
+                    if not self._should_record_norm(param.name, "local_norm"):
+                        continue
+                    actual_norms = self._hook_local_norms.get(param.name)
+                    if not actual_norms or micro_step >= len(actual_norms):
+                        continue
+                    actual_norm = actual_norms[micro_step]
+                    self._prev_local_norms[param.name] = actual_norm
+                    self._records.append({"local_norm": f"{param.name}: {actual_norm:10.6f}"})
+
         self._hook_local_norms = {}
 
     def set_model(self, model):
         """Bind a model instance to the monitor and refresh parameter hooks."""
         self._remove_grad_hooks()
         super().set_model(model)
+        self._refresh_trainable_params_cache()
         self._register_grad_hooks()
 
     def record(self, key: str = None, value: Any = None, context: Optional[Dict[str, Any]] = None):
@@ -206,33 +285,37 @@ class TrainStateMonitor(Monitor):
 
     def _record_local_norm(self, value, context):  # pylint: disable=W0613
         """Record local gradient norms for parameters matching the config filter."""
-        from mindformers.pynative.trainer.utils import _get_grad_factor, get_grad
-        model = self._resolve_model()
-        if model is None:
+        from mindformers.pynative.trainer.utils import get_grad
+        if not self._cached_trainable_params:
             return
         micro_step = context.get("micro_step", 0)
 
         if self._record_config.get("local_norm", False):
             self._records.append({"micro_step": micro_step + 1})
-        for param in model.trainable_params():
-            grad = get_grad(param)
-            if grad is None:
-                continue
-            record_local_norm = self._should_record_norm(param.name, "local_norm")
-            record_device_norm = self._should_record_norm(param.name, "device_norm")
-            if not record_local_norm and not record_device_norm:
-                continue
-            if param.name not in self._hook_local_norms:
-                continue
-            actual_norm = self._hook_local_norms.pop(param.name)
-            self._prev_local_norms[param.name] = actual_norm
-            if record_local_norm:
-                self._records.append({"local_norm": f"{param.name}: {actual_norm:10.6f}"})
+        for _, trainable_params in self._cached_trainable_params:
+            for param in trainable_params:
+                grad = get_grad(param)
+                if grad is None:
+                    continue
+                record_local_norm = self._should_record_norm(param.name, "local_norm")
+                record_device_norm = self._should_record_norm(param.name, "device_norm")
+                if not record_local_norm and not record_device_norm:
+                    continue
+                actual_norms = self._hook_local_norms.get(param.name)
+                if not actual_norms:
+                    continue
+                actual_norm = actual_norms.pop(0)
+                if not actual_norms:
+                    self._hook_local_norms.pop(param.name, None)
+                self._prev_local_norms[param.name] = actual_norm
+                if record_local_norm:
+                    self._records.append({"local_norm": f"{param.name}: {actual_norm:10.6f}"})
 
     def _record_device_loss(self, value, context):  # pylint: disable=W0613
         self._records.append({"device_loss": self._to_scalar(value)})
 
     def _record_device_norm(self, value, context):  # pylint: disable=W0613
+        self._sync_prev_norms_from_hooks()
         for param_name, accumulated_norm in self._prev_local_norms.items():
             if not self._should_record_norm(param_name, "device_norm"):
                 continue
@@ -263,26 +346,33 @@ class TrainStateMonitor(Monitor):
         """Register backward hooks for parameters monitored by local/device norm."""
         if not (self._record_config.get("local_norm") or self._record_config.get("device_norm")):
             return
-        model = self._resolve_model()
-        if model is None:
+        if not self._cached_trainable_params:
             return
 
-        for param in model.trainable_params():
-            if not (self._should_record_norm(param.name, "local_norm") or
-                    self._should_record_norm(param.name, "device_norm")):
-                continue
-            if not hasattr(param, "register_hook"):
-                logger.warning(
-                    "Parameter %s does not support register_hook, skip hook local_norm.",
-                    param.name
-                )
-                continue
+        for _, trainable_params in self._cached_trainable_params:
+            for param in trainable_params:
+                if not (self._should_record_norm(param.name, "local_norm") or
+                        self._should_record_norm(param.name, "device_norm")):
+                    continue
+                if not hasattr(param, "register_hook"):
+                    logger.warning(
+                        "Parameter %s does not support register_hook, skip hook local_norm.",
+                        param.name
+                    )
+                    continue
 
-            def hook_fn(grad, param_name=param.name):
-                self._hook_local_norms[param_name] = self._compute_grad_norm(grad)
-                return grad
+                def hook_fn(grad, param_name=param.name):
+                    self._hook_local_norms.setdefault(param_name, []).append(self._compute_grad_norm(grad))
+                    return grad
 
-            self._hook_handles.append(param.register_hook(hook_fn))
+                self._hook_handles.append(param.register_hook(hook_fn))
+
+    def _refresh_trainable_params_cache(self):
+        """Cache trainable parameters for the currently bound model(s)."""
+        self._cached_trainable_params = [
+            (model, tuple(model.trainable_params()))
+            for model in _iter_models(self._resolve_model())
+        ]
 
     def _remove_grad_hooks(self):
         """Remove previously registered backward hooks."""
@@ -458,13 +548,21 @@ class MonitorGroup:
         if train_state_monitor.active:
             self._monitors["train_state"] = train_state_monitor
 
-        moe_monitor = MoeMonitor(config, model=model)
+        moe_monitor = MoeMonitor(config, model=_first_model(model))
         if moe_monitor.active:
             self._monitors["moe_monitor"] = moe_monitor
 
     @property
     def active(self):
         return bool(self._monitors)
+
+    def should_record(self, key: str) -> bool:
+        """Return whether any child monitor is configured for the given key."""
+        for monitor in self._monitors.values():
+            should_record = getattr(monitor, "should_record", None)
+            if callable(should_record) and should_record(key):
+                return True
+        return False
 
     def reset(self):
         for m in self._monitors.values():
@@ -473,7 +571,10 @@ class MonitorGroup:
     def set_model(self, model):
         """Bind a model instance to all child monitors."""
         self._model = model
-        for monitor in self._monitors.values():
+        for name, monitor in self._monitors.items():
+            if name == "moe_monitor":
+                monitor.set_model(_first_model(model))
+                continue
             monitor.set_model(model)
 
     def record(self, key: str, value: Any = None, context: Optional[Dict[str, Any]] = None):
