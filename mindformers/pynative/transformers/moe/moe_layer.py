@@ -20,6 +20,7 @@ from mindspore.common.parameter import Parameter
 from mindformers.parallel_core.transformer_config import TransformerConfig
 from mindformers.pynative.layers.linear import Linear
 from mindformers.pynative.transformers.mlp import MLPSubmodules
+from mindformers.pynative.distributed.activation_checkpoint import is_in_recompute
 from .router import TopKRouter
 from .experts import GroupedMLP
 from .shared_experts import SharedExpertMLP
@@ -125,7 +126,8 @@ class MoELayer(nn.Cell):
             hidden_states, self.expert_bias, input_ids
         )
 
-        self.tokens_per_expert.add_(num_tokens_per_expert)
+        if not is_in_recompute():
+            self.tokens_per_expert.add_(num_tokens_per_expert)
 
         routed_output = self.experts(
             hidden_states, top_scores, selected_experts_indices, num_tokens_per_expert

@@ -80,6 +80,7 @@ from mindformers.pynative.base_models.gpt.gpt_model import GPTModel
 from mindformers.pynative.transformers.experimental_attention_variant.deepseek_v4_hybrid_attention import (
     DSv4HybridSelfAttention,
 )
+from mindformers.pynative.transformers.moe.moe_utils import set_moe_aux_loss_group_info
 from mindformers.tools.logger import logger
 
 __all__ = ["parallelize_gptmodel"]
@@ -115,37 +116,49 @@ def _unwrap_gptmodel(model: nn.Cell) -> nn.Cell:
     return gpt_models[0]
 
 
-def _setup_mtp_embedding_grad_sync(model, parallel_dims):
+def _setup_mtp_embedding_grad_sync(model_parts, parallel_dims):
     """Tag the MTP-shared input embedding for cross-PP-stage gradient sync.
 
-    Under pipeline parallelism with MTP enabled, the input embedding is
-    replicated on two PP stages: stage 0 (the main forward) and the last stage
-    (which hosts the MTP block and reuses the embedding to embed the shifted MTP
-    tokens). The single-card baseline keeps ONE embedding tensor that receives
-    ``main_grad + mtp_grad``; under PP the stage-0 copy only sees ``main_grad``
-    and the MTP-stage copy only sees ``mtp_grad``. With no gradient sync the two
-    copies drift apart and the MTP loss diverges from single-card (a slow,
-    one-sided, compounding error).
+    Under PP + MTP, the input embedding is replicated on stage 0 (main forward)
+    and the last stage (MTP block reuses it for shifted tokens). Unlike the
+    single-card baseline where one tensor receives ``main_grad + mtp_grad``,
+    each PP copy only sees its own partial gradient, so without sync the two
+    copies drift apart and the MTP loss diverges.
 
     This builds a process group over the embedding-owning PP ranks (per
     dp/tp/cp/ep coordinate) and tags the local ``word_embeddings.weight`` with
     ``_embedding_grad_sync_group`` / ``_pp_replica_count``. The grad-norm helper
     (`_calculate_global_grad_norm` -> `_get_grad_factor`) then all-reduces the
-    tagged gradient before computing the norm/step and counts the replicated
-    embedding exactly once, with no changes required in the trainer.
+    tagged gradient and counts the replicated embedding exactly once, with no
+    trainer changes.
+
+    ``model_parts`` is the full list of virtual-pipeline chunks owned by this
+    rank. Under interleaving the main and MTP embeddings live in different
+    chunks on different PP stages, so ownership must be aggregated across ALL
+    chunks: per-chunk detection would make each ``all_gather`` see at most one
+    owner, ``embed_ranks`` would never reach length 2, and the sync group would
+    never form -- silently reintroducing the MTP drift described above.
     """
     if parallel_dims is None or not parallel_dims.pp_enabled:
         return
 
-    gpt_model = _unwrap_gptmodel(model)
-    cfg = gpt_model.get_gpt_transformer_config()
+    if not isinstance(model_parts, (list, tuple)):
+        model_parts = [model_parts]
+    if not model_parts:
+        return
+
+    cfg = _unwrap_gptmodel(model_parts[0]).get_gpt_transformer_config()
     if not getattr(cfg, "mtp_num_layers", 0):
         return
 
-    # Locate this rank's input-embedding weight (present on stage 0 and the MTP
-    # stage). At most one on a non-interleaved run.
+    # Locate this rank's input-embedding weight(s) across ALL chunks it owns
+    # (present on stage 0 and the MTP stage). With interleaving the main and MTP
+    # embeddings sit in separate chunks, so we must scan every part -- not just
+    # one -- to detect that this rank owns an embedding at all.
     embed_weights = [
-        param for name, param in model.parameters_and_names()
+        param
+        for part in model_parts
+        for name, param in part.parameters_and_names()
         if name.endswith("embedding.word_embeddings.weight")
     ]
 
@@ -179,8 +192,8 @@ def _setup_mtp_embedding_grad_sync(model, parallel_dims):
         weight._embedding_grad_sync_group = group
         weight._embedding_grad_sync_size = len(embed_ranks)
     logger.info(
-        "[MTP-EmbedSync] rank %d tagged embedding for grad-sync group %s",
-        local_rank, embed_ranks,
+        "[MTP-EmbedSync] rank %d tagged %d embedding weight(s) for grad-sync group %s",
+        local_rank, len(embed_weights), embed_ranks,
     )
 
 
@@ -1540,6 +1553,71 @@ def apply_context_parallel_attention(
         for layer_idx, mtp_layer in enumerate(mtp.layers):
             _apply_cp_to_block(mtp_layer, f"mtp.layers.{layer_idx}")
 
+def _setup_moe_aux_loss_group(model, parallel_dims):
+    """Attach the cp reduction group to every MoE router for aux-loss computation.
+
+    This function equips each MoE router with the process group used to
+    all-reduce ``tokens_per_expert`` before the aux loss is computed.
+
+    The group scope is **cp only**. The router runs BEFORE the MoE dispatcher,
+    so its token view is NOT sharded by TP (router inputs are replicated across
+    TP ranks even under sequence parallelism).  DP ranks hold independent
+    samples — their averaging is handled by the DP all-reduce in
+    ``track_moe_metrics`` (Step 3), not here.
+
+    CP *does* shard the sequence across ranks, so when CP > 1 we collect the
+    cp mesh group so ``get_tokens_per_expert_and_token_count`` can sum the
+    partial per-expert histograms across CP shards.
+
+    When cp is not enabled, ``aux_groups`` stays empty (size = 1) — no
+    all-reduce is needed, and each rank computes aux_loss from its local
+    token view.
+    """
+    if parallel_dims is None:
+        return
+
+    # Only CP shards the router's token view.  TP replicates router inputs
+    # (verified: seq_length is always the global seqlen regardless of SP),
+    # and DP holds independent data (averaged elsewhere).
+    aux_groups: list = []
+    aux_group_size = 1
+    cp_mesh = parallel_dims.get_optional_mesh("cp")
+    if cp_mesh is not None:
+        aux_groups.append(cp_mesh.get_group())
+        aux_group_size = cp_mesh.size()
+
+    gpt_model = _unwrap_gptmodel(model)
+    moe_routers = []
+    for _, cell in gpt_model.cells_and_names():
+        router = getattr(cell, "router", None)
+        # Identify TopKRouters by their ``aux_loss_group`` attribute, without
+        # importing the moe package (keeps this helper decoupled).
+        if router is not None and hasattr(router, "moe_aux_loss_coeff"):
+            moe_routers.append(router)
+
+    mtp = getattr(gpt_model, "mtp", None)
+    if mtp is not None:
+        for _, cell in mtp.cells_and_names():
+            router = getattr(cell, "router", None)
+            if router is not None and hasattr(router, "moe_aux_loss_coeff"):
+                moe_routers.append(router)
+
+    if not moe_routers:
+        return
+
+    # Set global communication domain variables in moe_utils so both the
+    # router forward pass (``get_tokens_per_expert_and_token_count``) and
+    # the step-end aggregation (``track_moe_metrics``) share the same cp
+    # reduction group without per-router attribute plumbing.
+    set_moe_aux_loss_group_info(aux_groups, aux_group_size)
+
+    logger.info(
+        "[MoE-AuxLossGroup] set global cp aux_loss group "
+        "(size=%d, ) for %d MoE router(s).",
+        aux_group_size, len(moe_routers),
+    )
+
+
 def _apply_spmd_parallelism(
         model: nn.Cell,
         parallel_dims: Any,
@@ -1650,10 +1728,10 @@ def _apply_spmd_parallelism(
                 "[QK-Clip] could not resolve loss_mesh reduce group (%s); "
                 "falling back to world all-reduce.", exc)
 
-    # Tag the MTP-shared input embedding so its gradient is summed across the
-    # embedding-owning PP stages before the optimizer step (handled in the
-    # grad-norm helper), keeping the embedding identical to the single-card run.
-    _setup_mtp_embedding_grad_sync(model, parallel_dims)
+    # Tag every MoE router with the dp x cp group so the seq_aux_loss /
+    # global_aux_loss can all-reduce tokens_per_expert and aggregated probs
+    # before applying the Switch formula.
+    _setup_moe_aux_loss_group(model, parallel_dims)
 
     logger.info("GPTModel parallelization completed.")
     return model
@@ -1821,6 +1899,15 @@ def apply_pp(
             swap,
             overlap=overlap,
         )
+
+    # Tag the MTP-shared input embedding so its gradient is summed across the
+    # embedding-owning PP stages before the optimizer step (handled in the
+    # grad-norm helper), keeping the embedding identical to the single-card run.
+    # Run ONCE over all chunks this rank owns (not per-chunk inside
+    # _apply_spmd_parallelism): under interleaving the main and MTP embeddings
+    # live in different chunks/stages, so ownership must be aggregated across
+    # the whole rank for the cross-PP-stage sync group to form.
+    _setup_mtp_embedding_grad_sync(model_parts, parallel_dims)
 
     # Adjust the last-stage loss backward scaling so PP gradients match the single-card case (loss / grad_accum).
     # Note: DP/TP/CP are already included in get_loss_sense as 1/(dp*tp*cp)/grad_accum.

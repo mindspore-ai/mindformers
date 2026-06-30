@@ -17,11 +17,9 @@
 import time
 from typing import Dict, Any
 from copy import deepcopy
-import os
 
-from mindspore import ops
 from mindspore.nn.learning_rate_schedule import LearningRateSchedule
-from mindspore.mint.distributed import get_world_size, all_reduce
+from mindspore.mint.distributed import get_world_size
 
 from mindformers.pynative.callback.callback import TrainerCallback
 from mindformers.tools.logger import logger
@@ -29,9 +27,6 @@ from mindformers.models.utils import (
     convert_transformer_config_to_args_for_tflops,
     num_floating_point_operations,
 )
-from mindformers.pynative.transformers.moe.moe_utils import track_moe_metrics
-from mindformers.pynative.transformers.multi_token_prediction import track_mtp_metrics
-from mindformers.pynative.transformers.experimental_attention_variant.utils import track_indexer_metrics
 
 
 class LossCallback(TrainerCallback):
@@ -53,6 +48,13 @@ class LossCallback(TrainerCallback):
         self.log_interval = log_interval
         self.step_time = time.time()
         self.epoch_time = time.time()
+        self.logger_record = {
+            "_update_expert_bias": False,
+            "reset_model_temporary_tensors": False,
+            "get_load_balancing_loss": False,
+            "get_mtp_loss": False,
+            "get_index_loss": False,
+        }
 
     def on_train_begin(self, args, state, **kwargs):
         """
@@ -129,55 +131,64 @@ class LossCallback(TrainerCallback):
         step_time_cost = int((cur_time - self.step_time) * 1000)
 
         model = model if isinstance(model, list) else [model]
+        model_cls_name = type(model[0]).__name__
         model_config = deepcopy(model[0].get_gpt_transformer_config())
         if model_config is None:
-            raise ValueError("model_config is None, please check the model type.")
-        for m in model:
+            raise ValueError(f"{model_cls_name} model_config is None, please check the model type.")
+
+        if getattr(model_config, "moe_router_enable_expert_bias", False):
             # Update auxiliary-loss-free expert_bias on every step, regardless of
             # log interval or loss availability. Non-last PP stages return loss=None
             # but still hold MoE layers whose ``tokens_per_expert`` accumulators must
             # be drained and converted into a bias delta to keep the router in sync
-            # with the rest of the pipeline.
-            if getattr(model_config, "moe_router_enable_expert_bias", False):
-                _update_expert_bias(m, metric_group, metric_group_size)
+            # with the rest of the pipeline. The model keeps a per-instance module
+            # cache, so each virtual pipeline chunk is updated independently.
+            for m in model:
+                if hasattr(m, "_update_expert_bias"):
+                    m._update_expert_bias(metric_group, metric_group_size)
+                elif not self.logger_record["_update_expert_bias"]:
+                    logger.warning(f"{model_cls_name} does not have _update_expert_bias method.")
+                    self.logger_record["_update_expert_bias"] = True
 
-        # Process the MoE aux loss. ``track_moe_metrics`` combines the per-layer
-        # tracker across PP stages (a PP-group collective) before reducing it to
-        # a scalar, so it must run on every stage every step -- ahead of the
-        # log-interval / loss-None early returns below -- to stay deadlock-free.
-        # Non-last stages get ``None`` back (they only contribute to the combine).
-        load_balancing_loss = track_moe_metrics(
-            loss_scale=model_config.moe_aux_loss_coeff,
-            num_layers=model_config.num_layers,
-            moe_layer_freq=model_config.moe_layer_freq,
-            mtp_num_layers=model_config.mtp_num_layers,
-            group=metric_group,
-            group_size=metric_group_size,
-            pp_group=pp_metric_group,
-            pp_group_size=pp_metric_group_size,
-            has_last=has_last,
-        )
+        # Process the MoE aux loss. ``get_load_balancing_loss`` combines the
+        # per-layer tracker across PP stages (a PP-group collective) before
+        # reducing it to a scalar, so it must run on every stage every step --
+        # ahead of the log-interval / loss-None early returns below -- to stay
+        # deadlock-free. Non-last stages get ``None`` back (they only contribute
+        # to the combine).
+        load_balancing_loss = None
+        if hasattr(model[0], "get_load_balancing_loss"):
+            load_balancing_loss = model[0].get_load_balancing_loss(
+                metric_group,
+                metric_group_size,
+                pp_metric_group,
+                pp_metric_group_size,
+                has_last=has_last,
+            )
+        elif not self.logger_record["get_load_balancing_loss"]:
+            logger.warning(f"{model_cls_name} does not have get_load_balancing_loss method.")
+            self.logger_record["get_load_balancing_loss"] = True
+
         if load_balancing_loss is not None:
             load_balancing_loss /= state.num_accumulation_steps
 
         if loss is None or state.global_step % self.log_interval != 0:
             return
 
-        grad_norm = kwargs.get("grad_norm")
-
-        # Calculate the time cost for the current step in milliseconds
-        cur_time = time.time()
-        step_time_cost = int((cur_time - self.step_time) * 1000)
         for m in model:
-            reset_model_temporary_tensors(model_config, m)
+            if hasattr(m, "reset_model_temporary_tensors"):
+                m.reset_model_temporary_tensors()
+            elif not self.logger_record["reset_model_temporary_tensors"]:
+                logger.warning(f"{model_cls_name} does not have reset_model_temporary_tensors method.")
+                self.logger_record["reset_model_temporary_tensors"] = True
 
         # process mtp loss
-        mtp_loss = track_mtp_metrics(group=metric_group, group_size=metric_group_size,)
-        # mtp_loss_scaling_factor == 0 means the MTP params are frozen (not updated),
-        # so the tracked loss carries no signal and is not worth logging. Guarding on
-        # the config value also avoids the element-wise truthiness of the Tensor
-        # returned by track_mtp_metrics, which crashed the previous `if mtp_loss:`
-        # check by leaking a raw Tensor into _print_log's join.
+        mtp_loss = None
+        if hasattr(model[0], "get_mtp_loss"):
+            mtp_loss = model[0].get_mtp_loss(metric_group, metric_group_size)
+        elif not self.logger_record["get_mtp_loss"]:
+            logger.warning(f"{model_cls_name} does not have get_mtp_loss method.")
+            self.logger_record["get_mtp_loss"] = True
         if mtp_loss is not None and model_config.mtp_loss_scaling_factor:
             mtp_loss_values = []
             for ind, val in enumerate(mtp_loss):
@@ -188,7 +199,12 @@ class LossCallback(TrainerCallback):
             mtp_loss = None
 
         # process indexer loss
-        indexer_loss = track_indexer_metrics()
+        indexer_loss = None
+        if hasattr(model[0], "get_index_loss"):
+            indexer_loss = model[0].get_index_loss()
+        elif not self.logger_record["get_index_loss"]:
+            logger.warning(f"{model_cls_name} does not have get_index_loss method.")
+            self.logger_record["get_index_loss"] = True
         if indexer_loss:
             indexer_loss /= state.num_accumulation_steps
 
@@ -309,97 +325,3 @@ class LossCallback(TrainerCallback):
         if hasattr(data, "item"):
             return data.item()
         return float(data)
-
-
-def reset_model_temporary_tensors(config, model):
-    """
-    Reset the temporary tensors of the model.
-
-    Uses cached module list to avoid full cell tree traversal on every step.
-    """
-    if config.moe_router_load_balancing_type != "global_aux_loss":
-        return
-
-    cache = getattr(reset_model_temporary_tensors, '_cache', None)
-    if cache is None:
-        cache = [
-            module for _, module in model.cells_and_names()
-            if hasattr(module, 'reset_global_aux_loss_tracker')
-        ]
-        reset_model_temporary_tensors._cache = cache
-
-    for module in cache:
-        module.reset_global_aux_loss_tracker()
-
-
-def _update_expert_bias(model, metric_reduce_group=None, metric_reduce_group_size=None):
-    """
-    Update expert bias for load-balanced routing and reset per-step token counters.
-
-    Uses cached module list to avoid full cell tree traversal on every step.
-    Args:
-       model: Root model module to walk for MoE layers.
-       metric_reduce_group: Process group spanning the dp x cp domain
-          (``loss_mesh``). Each rank in this group sees a different sample
-          shard of the global batch, so its local ``tokens_per_expert``
-          histogram is only a partial count. We all-reduce SUM over this
-          group to recover the global-batch histogram, otherwise the bias
-          delta diverges from the single-card baseline. ``None`` (or
-          single-rank group) skips the all-reduce. TP is intentionally
-          excluded: the MoE plan replicates router inputs across TP ranks,
-          so each TP rank already sees the same tokens; reducing over TP
-          would multiply the count by ``tp_size``.
-       metric_reduce_group_size: Size of ``metric_reduce_group`` (skip
-          all-reduce when ``<= 1``).
-    """
-    from mindspore import mint
-    from mindspore.graph.api import _no_grad
-
-    try:
-        from hyper_parallel.core.dtensor.dtensor import DTensor
-    except ImportError:
-        DTensor = None
-
-    cache = getattr(_update_expert_bias, '_cache', None)
-    if cache is None:
-        cache = [
-            module for _, module in model.cells_and_names()
-            if getattr(module, 'enable_expert_bias', False)
-        ]
-        _update_expert_bias._cache = cache
-
-    if not cache:
-        return
-
-    # NOTE: Currently this sync is blocking (thus exposed) and happens on the
-    # default compute stream. Need to assess if this is OK performance-wise.
-    tokens_per_expert_list = [module.tokens_per_expert for module in cache]
-    tokens_per_expert_by_layer = ops.vstack(tokens_per_expert_list)
-
-    # All-reduce the per-rank token counts over the dp x cp domain so the
-    # bias delta is computed from global-batch statistics, matching the
-    # single-card path (which has no group to reduce over).
-
-    if metric_reduce_group is not None and (
-            metric_reduce_group_size is None or metric_reduce_group_size > 1):
-        if DTensor is not None and isinstance(tokens_per_expert_by_layer, DTensor):
-            tokens_per_expert_by_layer = tokens_per_expert_by_layer.to_local()
-        all_reduce(tokens_per_expert_by_layer, group=metric_reduce_group)
-
-    with _no_grad():
-        for moe_layer_idx, module in enumerate(cache):
-            tokens_per_expert = tokens_per_expert_by_layer[moe_layer_idx].float()
-
-            # update the expert bias
-            # this is not exactly the same as https://arxiv.org/pdf/2408.15664 proposed
-            # pyrefly: ignore [missing-attribute]
-            expert_bias_delta = module.load_balance_coeff * mint.sign(
-                tokens_per_expert.mean() - tokens_per_expert
-            )
-            # NOTE: Megatron-LM does not apply zero-mean correction to the expert bias delta;
-            # Torchtitan applies zero-mean correction here
-
-            # pyrefly: ignore [missing-attribute]
-            module.expert_bias.add_(expert_bias_delta)
-            # pyrefly: ignore [missing-attribute]
-            module.tokens_per_expert = mint.zeros_like(module.tokens_per_expert)
