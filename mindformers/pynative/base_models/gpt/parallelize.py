@@ -467,6 +467,28 @@ def _collect_layer_norms(layer):
     return norms
 
 
+def _collect_module_replicate_params(module, shard_size):
+    """Collect parameters from a module that cannot be evenly FSDP-sharded on dim 0.
+
+    This is the generic version of :func:`_collect_layer_replicate_params` for modules
+    that are not standard transformer decoder layers (e.g. embedding, output_layer).
+    It checks only the shape divisibility criterion; it does NOT inspect
+    layer-specific sub-module attributes.
+    """
+    replicate_params = []
+    for param_name, param in module.parameters_and_names():
+        if isinstance(param, DTensor):
+            shape = param.local_shape
+        else:
+            shape = param.shape
+        if shape[0] % shard_size != 0:
+            replicate_params.append(param)
+            logger.warning("The shape[0]=%s of parameter %s is not divisible by "
+                           "data_parallel_shard or dense_fsdp_shard_size which is %s, "
+                           "then this parameter will not be applied fsdp.", shape[0], param_name, shard_size)
+    return replicate_params
+
+
 def _collect_layer_replicate_params(layer, shard_size):
     """Collect non-module parameters that must be replicated (not sharded) under FSDP."""
     replicate_params = []
@@ -489,17 +511,8 @@ def _collect_layer_replicate_params(layer, shard_size):
         if hasattr(layer.mlp.router, "tid2eid") and layer.mlp.router.tid2eid is not None:
             replicate_params.append(layer.mlp.router.tid2eid)
 
-    for param_name, param in layer.parameters_and_names():
-        if isinstance(param, DTensor):
-            shape = param.local_shape
-        else:
-            shape = param.shape
-
-        if shape[0] % shard_size != 0:
-            replicate_params.append(param)
-            logger.warning("The shape[0]=%s of parameter %s is not divisible by "
-                           "data_parallel_shard or dense_fsdp_shard_size which is %s, "
-                           "then this parameter will not be applied fsdp.", shape[0], param_name, shard_size)
+    # Also apply the generic shape[0] divisibility check from _collect_module_replicate_params.
+    replicate_params.extend(_collect_module_replicate_params(layer, shard_size))
 
     return replicate_params
 
@@ -1345,8 +1358,14 @@ def apply_fsdp(
 
     # --- 1. Wrap embedding ---
     if embedding is not None:
+        embed_replicate_params = _collect_module_replicate_params(embedding, dense_shard_degree)
         with ms.DeviceCtx("meta"):
-            fully_shard(embedding, **fsdp_config, reshard_after_forward=reshard_after_forward)
+            fully_shard(
+                embedding,
+                **fsdp_config,
+                reshard_after_forward=reshard_after_forward,
+                replicate_params=embed_replicate_params,
+            )
 
     # --- 2. Wrap transformer layers ---
     # Principle: small modules first, then larger modules
@@ -1375,8 +1394,10 @@ def apply_fsdp(
         shared_experts = getattr(layer.mlp, "shared_experts", None)
         shared_gate = getattr(shared_experts, "shared_experts_gate", None) if shared_experts is not None else None
         if shared_gate is not None:
+            gate_replicate_params = _collect_module_replicate_params(shared_gate, dense_shard_degree)
             with ms.DeviceCtx("meta"):
-                fully_shard(shared_gate, **fsdp_config, reshard_after_forward=reshard_after_forward)
+                fully_shard(shared_gate, **fsdp_config, reshard_after_forward=reshard_after_forward,
+                            replicate_params=gate_replicate_params)
 
         # 2b. Wrap norms independently (small modules first)
         layer_norms = _collect_layer_norms(layer)
@@ -1414,11 +1435,14 @@ def apply_fsdp(
             else:
                 # Larger module: output_layer, do not reshard_after_forward by default
                 # since FSDP would prefetch it immediately after the forward pass.
+                tail_replicate_params = _collect_module_replicate_params(
+                    tail_module, dense_shard_degree)
                 with ms.DeviceCtx("meta"):
                     fully_shard(
                         tail_module,
                         **fsdp_config,
-                        reshard_after_forward=reshard_policy == "always"
+                        reshard_after_forward=reshard_policy == "always",
+                        replicate_params=tail_replicate_params,
                     )
 
     if mtp:
