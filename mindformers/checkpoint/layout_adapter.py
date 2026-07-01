@@ -29,7 +29,6 @@ try:
 except ImportError as e:
     get_global_layout = None
     DTensor = None
-    logger.warning(f"Import get_global_layout, DTensor failed: {e}.")
 
 
 from mindformers.tools.utils import get_real_rank
