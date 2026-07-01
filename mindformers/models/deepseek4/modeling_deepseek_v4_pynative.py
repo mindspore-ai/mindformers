@@ -71,3 +71,23 @@ class PyNativeDeepseekV4ForCausalLM(TrainModelMixin, DeepseekV4PreTrainedModel):
             loss_mask=loss_mask,
             actual_seq_len=actual_seq_len
         )
+
+    def _update_expert_bias(self, metric_group, metric_group_size):
+        return self.model._update_expert_bias(metric_group, metric_group_size)
+
+    def get_load_balancing_loss(
+        self, metric_group, metric_group_size, pp_metric_group, pp_metric_group_size, **kwargs
+    ):
+        return self.model.get_load_balancing_loss(
+            metric_group, metric_group_size,
+            pp_metric_group, pp_metric_group_size, **kwargs,
+        )
+
+    def reset_model_temporary_tensors(self):
+        return self.model.reset_model_temporary_tensors()
+
+    def get_mtp_loss(self, metric_group, metric_group_size):
+        return self.model.get_mtp_loss(metric_group, metric_group_size)
+
+    def get_index_loss(self):
+        return self.model.get_index_loss()
