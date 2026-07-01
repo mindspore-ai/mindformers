@@ -72,10 +72,9 @@ class DSv4HybridSelfAttention(MultiLatentAttention):
         else:
             self.compress_ratio = 0
 
-        # The compressed-KV branch (ratio > 1) uses YaRN rope with csa_compress_rotary_base; the
-        # sliding-window branch (ratio <= 1) uses standard (non-YaRN) rope with rotary_base. The
-        # rope type is selected per-branch by compress_ratio, not by a global config.rope_type
-        # (aligns Megatron-LM dev deepseek_v4_hybrid_attention).
+        # The compressed-KV branch (ratio > 1) uses YaRN rope with csa_compress_rotary_base;
+        # the sliding-window branch (ratio <= 1) uses standard (non-YaRN) rope with rotary_base.
+        # The rope type is selected per-branch by compress_ratio, not by a global config.rope_type.
         use_compressed_yarn = self.compress_ratio > 1
         rope_base = config.csa_compress_rotary_base if use_compressed_yarn else config.rotary_base
         self.rotary_pos_emb = self._build_rotary_pos_emb(config, rope_base, use_compressed_yarn)
@@ -138,7 +137,7 @@ class DSv4HybridSelfAttention(MultiLatentAttention):
         o_lora_rank = config.o_lora_rank
         o_chunk = self.query_projection_size // o_groups
         self.linear_o_group_proj = Parameter(
-            config.init_method((o_groups * o_lora_rank, o_chunk)),
+            mint.empty((o_groups * o_lora_rank, o_chunk), dtype=config.params_dtype),
             name="linear_o_group_proj",
         )
 
@@ -169,13 +168,10 @@ class DSv4HybridSelfAttention(MultiLatentAttention):
 
     @staticmethod
     def _build_rotary_pos_emb(config: MLATransformerConfig, rope_base: float, use_compressed_yarn: bool):
-        """Build the per-layer RoPE module.
-
-        Mirrors Megatron-LM dev deepseek_v4_hybrid_attention: the sliding-window branch
-        (compress_ratio <= 1) uses standard (non-YaRN) rope, while the compressed-KV branch
-        (compress_ratio > 1) uses YaRN. The choice is per-branch via ``use_compressed_yarn``,
-        not a global ``config.rope_type``. YaRN's interpolation reference length is the dedicated
-        ``original_max_position_embeddings`` (not the extended ``max_position_embeddings``).
+        """
+        Build the per-layer RoPE module. The sliding-window branch (compress_ratio <= 1) uses standard (non-YaRN) rope,
+        while the compressed-KV branch (compress_ratio > 1) uses YaRN.
+        YaRN's interpolation reference length is the dedicated ``original_max_position_embeddings``.
         """
         if not use_compressed_yarn:
             return RotaryEmbedding(
