@@ -291,10 +291,18 @@ class TopKRouter(nn.Cell):
         else:
             raise NotImplementedError(f"Unknown score function {self.score_func}")
 
-        # input_ids is [b, s] from the model, but hidden_states are [s, b, h] and get
-        # flattened to [s*b, h]; transpose then flatten to align token order
-        # (aligns Megatron router.py:640-642 .T.reshape(-1)).
+        # input_ids is [b, s] from the model, but hidden_states are [s, b, h] and get flattened to [s*b, h];
+        # transpose then flatten to align token order.
         flat_ids = self.reshape(input_ids.T, (-1,))
+        max_token_id = mint.max(flat_ids)
+        if max_token_id >= self.config.actual_vocab_size:
+            raise ValueError(
+                f"Hash routing layer {self.layer_number}: input_ids contains token ID "
+                f"{max_token_id} which exceeds the tid2eid table size "
+                f"({self.config.actual_vocab_size}). "
+                f"Ensure the tokenizer vocabulary size matches the model's actual_vocab_size. "
+                f"input_ids shape: {input_ids.shape}, max token id: {max_token_id}."
+            )
         # int64 keeps the returned indices consistent with the non-hash path (construct)
         # and matches the documented int64 return type long().
         selected_experts_indices = self.cast(
