@@ -90,7 +90,6 @@ class TopKRouter(nn.Cell):
         self.calculate_per_token_loss = False
         self.moe_aux_loss_auto_scaler = MoEAuxLossAutoScaler()
 
-        # Hash-based MoE routing (RFC §3.4.2.2, aligns Megatron router.py:181-202).
         # The leading moe_n_hash_layers decoder layers (0-based decoder layer index) select
         # experts from a fixed tid2eid lookup table instead of learned top-k routing
         # (aligns mindspeed convert_ckpt_deepseek4.py:246 hash_layer = i < n_hash_layers).
@@ -119,7 +118,6 @@ class TopKRouter(nn.Cell):
             self.tid2eid = None
 
         # Auxiliary loss components. Hash layers do not produce aux loss
-        # (aligns Megatron router.py:200-202: expert bias / aux loss disabled on hash layers).
         self.moe_aux_loss_coeff = 0.0
         if config.moe_aux_loss_coeff and not self.is_hash_layer:
             self.moe_aux_loss_coeff = config.moe_aux_loss_coeff
@@ -264,9 +262,8 @@ class TopKRouter(nn.Cell):
 
         Scores are still computed from the gating logits for weight computation,
         but expert selection is determined by the pre-computed hash table.
-        Aligns Megatron router.py:616-655.
 
-        Framework adaptation (RFC §3.4.2.2): unlike Megatron, which scatters the
+        Framework adaptation : unlike Megatron, which scatters the
         result back to a dense ``[num_tokens, num_experts]`` routing_probs / routing_map,
         the PyNative dispatcher consumes the ``[b*s, top_k]`` form, so this returns
         ``(top_scores, selected_experts_indices)`` directly from the tid2eid lookup

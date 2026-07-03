@@ -285,7 +285,6 @@ class GPTModel(nn.Cell):
         """Whether current runtime state should use chunked loss."""
         return self.training and self.chunk_loss_num > 1 and not self.return_logits
 
-    # pylint: disable=arguments-differ
     def construct(
             self,
             input_ids: Tensor,

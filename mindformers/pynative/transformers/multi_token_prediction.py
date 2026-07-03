@@ -273,14 +273,6 @@ class MultiTokenPredictionLayer(nn.Cell):
             is_mtp_layer: bool = False,
     ):
         super().__init__()
-        # MTP + dsv4_hybrid + hash-MoE co-support is not yet validated end-to-end. The router
-        # short-circuit makes MTP layers non-hash, but fail loudly here to document the boundary.
-        if is_mtp_layer and getattr(config, "experimental_attention_variant", None) == "dsv4_hybrid" \
-                and getattr(config, "moe_n_hash_layers", 0) > 0:
-            raise NotImplementedError(
-                "MTP + dsv4_hybrid + hash-MoE co-support is not yet validated; "
-                "set moe_n_hash_layers=0 or disable mtp_num_layers."
-            )
         self.config = config
         self.is_mtp_layer = is_mtp_layer
         self.submodules = submodules

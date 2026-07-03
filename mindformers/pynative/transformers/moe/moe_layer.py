@@ -68,9 +68,6 @@ class MoELayer(nn.Cell):
         # NOTE: tokens_per_expert is accumulated in the model forward pass.
         #       expert_bias is updated outside the model in an optimizer step pre hook
         #       to work with gradient accumulation.
-        # NOTE: Megatron disables expert_bias on hash layers; here it is still allocated and
-        #       updated on hash layers. This is benign-redundant (the router ignores expert_bias
-        #       in _hash_routing), so it costs a small buffer/update but does not affect results.
         self.enable_expert_bias = config.moe_router_enable_expert_bias and not self.router.is_hash_layer
         if self.enable_expert_bias:
             self.expert_bias = Parameter(
