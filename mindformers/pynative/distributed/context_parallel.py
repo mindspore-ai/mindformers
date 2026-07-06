@@ -209,17 +209,21 @@ def apply_context_parallel_model_io(model: nn.Cell, parallel_dims, parallelism) 
 
 
 def attach_context_parallel_runtime_hints(model_config, parallelism_config):
-    """Attach context-parallel runtime hints to model config."""
+    """Inject the build-time model-config fields context parallel needs.
+
+    Only *real* config fields are written here (colossal's ``context_parallel_size``
+    and the ``BSH`` ``input_layout``). The CP method / async flag / ulysses degree
+    are NOT smuggled onto the model config as ``_mf_runtime_*`` hints: the
+    parallelize step (``apply_context_parallel_attention``) reads them straight from
+    ``parallelism`` at apply time, so nothing needs to survive config conversion.
+    """
     if parallelism_config is None:
         return model_config
 
     context_parallel = getattr(parallelism_config, "context_parallel", 1)
-    model_config._mf_runtime_context_parallel = context_parallel
-
     context_parallel_method = getattr(parallelism_config, "context_parallel_method", "colossal").lower()
-    model_config._mf_runtime_context_parallel_method = context_parallel_method
     async_enabled = bool(getattr(parallelism_config, "context_parallel_async", False))
-    model_config._mf_runtime_context_parallel_async = async_enabled
+
     if context_parallel > 1 and context_parallel_method == "colossal":
         model_config.context_parallel = context_parallel
         model_config.context_parallel_size = context_parallel
@@ -231,12 +235,8 @@ def attach_context_parallel_runtime_hints(model_config, parallelism_config):
         model_config.input_layout = "BSH"
 
     requested_ulysses_degree = getattr(parallelism_config, "ulysses_degree_in_cp", None)
-    if requested_ulysses_degree is not None:
-        model_config._mf_runtime_ulysses_degree_in_cp = requested_ulysses_degree
-    elif context_parallel_method == "colossal":
-        model_config._mf_runtime_ulysses_degree_in_cp = 1
     if async_enabled and context_parallel_method == "ulysses":
-        ulysses_degree = getattr(model_config, "_mf_runtime_ulysses_degree_in_cp", None) or context_parallel
+        ulysses_degree = requested_ulysses_degree or context_parallel
         if model_config.num_attention_heads % ulysses_degree != 0:
             raise ValueError(
                 f"num_attention_heads ({model_config.num_attention_heads}) must be divisible by "
