@@ -55,7 +55,6 @@ class ConfigConverter(ABC):
         ("swap", "cpu_offloading"): "cpu_offloading",
         ("layer_swap", "cpu_offloading_num_layers"): "cpu_offloading_num_layers",
     }
-    _RUNTIME_HINT_PREFIX = "_mf_runtime_"
 
     @classmethod
     def convert(cls, model_config: Dict[str, Any],
@@ -96,7 +95,6 @@ class ConfigConverter(ABC):
             else:
                 missing_keys.add(src_key)
         # check HF config unmapping keys
-        missing_keys = cls._filter_internal_runtime_hints(missing_keys)
         if missing_keys - DEFAULT_WHITE_KEY:
             log_handler.add_warning("Unmapped Keys",
                                     f"following keys:{missing_keys - DEFAULT_WHITE_KEY} not in mapping."
@@ -109,7 +107,6 @@ class ConfigConverter(ABC):
         try:
             config_cls = MLATransformerConfig if is_mla_model else TransformerConfig
             converted_config = config_cls(**result)
-            cls._attach_internal_runtime_hints(converted_config, model_config)
             config_repr = "{\n" + ",\n".join(f"  {repr(k)}: {repr(v)}" for k, v in
                                              asdict(converted_config).items()) + "\n}"
             logger.info(f"The final converted {config_cls.__name__} is: {config_repr}")
@@ -118,18 +115,6 @@ class ConfigConverter(ABC):
             raise RuntimeError(
                 f"Failed to instantiate {'MLATransformerConfig' if is_mla_model else 'TransformerConfig'} because: {e}"
             ) from e
-
-    @classmethod
-    def _filter_internal_runtime_hints(cls, keys):
-        """Exclude internal runtime hints from user-facing unmapped-key warnings."""
-        return {key for key in keys if not key.startswith(cls._RUNTIME_HINT_PREFIX)}
-
-    @classmethod
-    def _attach_internal_runtime_hints(cls, converted_config, model_config):
-        """Carry internal runtime hints to the converted config without exposing them as config keys."""
-        for key, value in model_config.items():
-            if key.startswith(cls._RUNTIME_HINT_PREFIX) and not hasattr(converted_config, key):
-                setattr(converted_config, key, value)
 
     @classmethod
     def _get_final_mapping(cls, log_handler, is_mla_model: bool = False) -> Dict[str, Union[str, Tuple[str, Callable]]]:
