@@ -1,4 +1,4 @@
-setuptools
+setuptools>=83.0.0
 sentencepiece>=0.2.1
 ftfy>=6.1.1
 regex>=2022.10.31
