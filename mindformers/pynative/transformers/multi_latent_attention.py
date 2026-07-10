@@ -545,6 +545,14 @@ class MLASelfAttention(MultiLatentAttention):
             )
 
         k_pe = self.tile_kv(k_pe, (1, 1, self.num_attention_heads, 1))
+        # k_nope carries the TP head sharding from linear_kvb while k_pe (a shared rope
+        # component broadcast across heads) stays replicated. When they disagree the
+        # head-axis concat fails, so align k_pe to k_nope's layout first (no-op when both
+        # are already replicated). Needed for the async-Ulysses CP path that head-shards
+        # K/V upstream.
+        if isinstance(k_nope, DTensor) and isinstance(k_pe, DTensor) and \
+                k_nope.placements != k_pe.placements:
+            k_pe = distribute_tensor(k_pe, k_nope.device_mesh, k_nope.placements)
         key = self.cat([k_nope, k_pe], 3)
         key = self.cast(key, self.compute_dtype)
         if self.input_layout == "TND":
