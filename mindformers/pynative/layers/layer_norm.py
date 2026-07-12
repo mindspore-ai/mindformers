@@ -31,8 +31,14 @@ __all__ = ["get_norm_cls"]
 
 from mindspore import nn, dtype, Parameter, mint
 from mindspore.ops import cast, rms_norm
-from mindspore.common.initializer import initializer
 from mindspore.mint.nn.functional import layer_norm
+
+from hyper_parallel import DTensor
+
+
+def _to_local(tensor):
+    """Localise a Replicate DTensor weight for the local norm compute."""
+    return tensor.to_local() if isinstance(tensor, DTensor) else tensor
 
 
 class FusedLayerNorm(nn.Cell):
@@ -89,7 +95,9 @@ class FusedLayerNorm(nn.Cell):
         original_type = x.dtype
         compute_type = self.compute_type
         x = self.cast(x, compute_type)
-        output = self.layer_norm(x, x.shape[-1], self.gamma, self.beta, self.eps)
+        # Norm weights are Replicate DTensors; run the kernel on the local copy.
+        output = self.layer_norm(
+            x, x.shape[-1], _to_local(self.gamma), _to_local(self.beta), self.eps)
         return self.cast(output, original_type)
 
     def reset_parameter(self):
@@ -141,8 +149,9 @@ class FusedRMSNorm(nn.Cell):
         self.cast = cast
 
     def construct(self, x):
-        """Apply fused RMS Normalization."""
-        output = self.norm(x, self.weight, self.eps)[0]
+        """Apply fused RMS Normalization (on the local, sequence-sharded activation)."""
+        # Norm weight is a Replicate DTensor; run the kernel on the local copy.
+        output = self.norm(x, _to_local(self.weight), self.eps)[0]
         return output
 
     def reset_parameter(self):

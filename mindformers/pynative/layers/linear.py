@@ -22,6 +22,8 @@ from typing import Callable
 from mindspore import nn, Tensor, mint, ops
 from mindspore.common.parameter import Parameter
 
+from hyper_parallel import DTensor
+
 from mindformers.models.utils import convert_mstype
 from mindformers.parallel_core.utils.init_method import init_method_zero
 
@@ -31,6 +33,15 @@ class Linear(nn.Cell):
 
     The linear layer is defined as Y = XA + b. A is parallelized along
     its second dimension as A = [A_1, ..., A_p].
+
+    Tensor parallelism runs on plain local tensors: the weight is stored as a
+    sharded DTensor (TP shard + FSDP) and localised (``to_local``) here at
+    compute time, so the matmul is a pure local op. The tensor-parallel
+    collective is written by hand in forward hooks attached around this module
+    (colwise: all-gather the sequence-sharded input; rowwise: reduce-scatter the
+    output) -- never inside the module. A rowwise module sets ``skip_add_bias``
+    so its Replicate bias is added by the post-hook *after* the reduce (adding it
+    here would count it once per TP rank).
 
     Args:
         input_size (int): The number of input units.
@@ -85,16 +96,19 @@ class Linear(nn.Cell):
         self.cast = ops.cast
         self.add = mint.add
 
-    def construct(self, input_: Tensor, weight: Tensor = None) -> tuple[Tensor, Tensor]:
-        """Forward of Linear.
+    #: Rowwise sets this so its Replicate bias is added by the reduce post-hook,
+    #: after the collective, instead of inside the (per-rank) matmul.
+    skip_add_bias: bool = False
+
+    def construct(self, input_: Tensor, weight: Tensor = None) -> Tensor:
+        """Forward of Linear (local matmul on the local weight shard).
 
         Args:
             input_ (Tensor): The input tensor.
             weight (Tensor): The weight tensor. Default: None.
 
         Returns:
-            - output (Tensor): The output tensor.
-            - bias (Tensor): The bias
+            output (Tensor): The output tensor.
         """
         if weight is None:
             if self.skip_weight_param_allocation:
@@ -104,6 +118,9 @@ class Linear(nn.Cell):
 
         ori_dtype = input_.dtype
 
+        # Weight is a sharded DTensor (TP + FSDP); compute on its local shard.
+        if isinstance(weight, DTensor):
+            weight = weight.to_local()
         weight = self.cast(weight, self.compute_dtype)
         input_ = self.cast(input_, self.compute_dtype)
 
@@ -113,8 +130,9 @@ class Linear(nn.Cell):
         # Directly use 3D input: (batch, seq, input_size) @ (input_size, output_size) -> (batch, seq, output_size)
         output = self.matmul(input_, weight)
 
-        if self.has_bias:
-            bias = self.cast(self.bias, self.compute_dtype)
+        if self.has_bias and not self.skip_add_bias:
+            bias = self.bias.to_local() if isinstance(self.bias, DTensor) else self.bias
+            bias = self.cast(bias, self.compute_dtype)
             output = self.add(output, bias)
 
         output = self.cast(output, ori_dtype)

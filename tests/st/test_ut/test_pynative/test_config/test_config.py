@@ -327,3 +327,11 @@ class TestConfig:
         assert isinstance(config.training, TrainingConfig)
         assert isinstance(config.parallelism, ParallelismConfig)
         assert config.training.steps == 1000  # Default in class definition
+
+    def test_tensor_parallel_requires_sequence_parallel(self):
+        """PyNative TP degrees greater than one require sequence parallelism."""
+        with pytest.raises(ValueError, match="requires sequence_parallel=True"):
+            ParallelismConfig(tensor_parallel=2, sequence_parallel=False)
+
+        config = ParallelismConfig(tensor_parallel=2, sequence_parallel=True)
+        assert config.sequence_parallel is True

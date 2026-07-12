@@ -21,6 +21,7 @@ import numpy as np
 from tests.utils.double_benchmark import DoubleBenchmarkStandard, DoubleBenchmarkComparator
 from tests.st.test_ut.test_parallel_core.test_training_graph.test_transformer.test_multi_latent_attention.data_gen_utils import GOLDEN_DATA, GPU_DATA
 from mindformers.tools.logger import logger
+from mindformers.pynative.transformers.multi_latent_attention import MultiLatentAttention
 
 BATCH_SIZE = 2
 SEQ_LENGTH = 4
@@ -112,6 +113,34 @@ SINGLE_CARD_TEST_CASES = [
         'q8_flash_ql_kl_mscale'
     )
 ]
+
+
+class _NumpyLayoutOps:
+    """Minimal operator surface required by sbh2tnd."""
+
+    @staticmethod
+    def reshape(x, shape):
+        return np.reshape(x, shape)
+
+    @staticmethod
+    def transpose(x, dim0, dim1):
+        return np.swapaxes(x, dim0, dim1)
+
+
+def test_sbh2tnd_uses_local_head_count():
+    """TND conversion must preserve the local TP head dimension."""
+    sbnd = np.arange(3 * 2 * 4 * 5).reshape(3, 2, 4, 5)
+
+    actual = MultiLatentAttention.sbh2tnd(_NumpyLayoutOps(), sbnd)
+    expected = np.swapaxes(sbnd, 0, 1).reshape(6, 4, 5)
+
+    np.testing.assert_array_equal(actual, expected)
+
+
+def test_sbh2tnd_rejects_non_sbnd_input():
+    """TND conversion requires an explicit head dimension."""
+    with pytest.raises(ValueError, match="expects SBND input"):
+        MultiLatentAttention.sbh2tnd(_NumpyLayoutOps(), np.zeros((3, 2, 20)))
 
 
 def build_msrun_command_list(

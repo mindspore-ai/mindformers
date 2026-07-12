@@ -35,6 +35,7 @@ from typing import Any, List
 import mindspore as ms
 from mindspore import nn, Parameter, Tensor
 from mindspore.ops.communication import set_comm_ops_inplace
+from mindspore.ops.operations.nn_ops import FlashAttentionScore
 from mindspore.mint.distributed import get_rank, all_gather, new_group
 
 from hyper_parallel import DeviceMesh
@@ -53,9 +54,9 @@ from mindformers.pynative.distributed.fsdp import (
 )
 from mindformers.pynative.distributed.style import (
     ColwiseParallel,
+    AllGather,
     PrepareModuleInput,
     PrepareModuleInputOutput,
-    PrepareModuleOutput,
     RowwiseParallel,
     SequenceParallel,
 )
@@ -75,11 +76,15 @@ from mindformers.pynative.distributed.pipeline_parallel import PpLayerSetting, S
 from mindformers.pynative.pet.lora_adapter import build_lora_model
 from mindformers.pynative.distributed.parallelize import parallelize_module
 from mindformers.pynative.distributed.activation_checkpoint import apply_ac
-from mindformers.pynative.distributed.utils import distribute_module, get_loss_sense
+from mindformers.pynative.distributed.utils import get_loss_sense
+from mindformers.pynative.layers.flash_attention import FlashAttention
 from mindformers.pynative.base_models.gpt.gpt_model import GPTModel
 from mindformers.pynative.transformers.experimental_attention_variant.deepseek_v4_hybrid_attention import (
     DSv4HybridSelfAttention,
 )
+from mindformers.pynative.transformers.multi_latent_attention import MLASelfAttention
+from mindformers.pynative.transformers.mlp import MLP
+from mindformers.pynative.transformers.moe.moe_layer import MoELayer
 from mindformers.pynative.transformers.moe.moe_utils import set_moe_aux_loss_group_info
 from mindformers.tools.logger import logger
 
@@ -306,150 +311,6 @@ def _distribute_param(module, param_name, device_mesh, placements):
             name=param.name,
             requires_grad=param.requires_grad
         )
-    )
-
-
-def _distribute_router(
-        module,
-        router_mesh,
-        input_layouts,
-        output_layouts,
-        use_local_output=True
-):
-    """
-    Distribute a router module by defining custom input/output transformations
-    for DTensor-based parallel execution.
-
-    Args:
-        module: The router module to be distributed.
-        router_mesh: Device mesh used for distribution.
-        input_layouts (tuple): Expected placements for each input tensor.
-        output_layouts (tuple): Desired placements for each output tensor.
-        use_local_output (bool): Whether to convert DTensor outputs back to local tensors.
-
-    This function wraps the module with input/output hooks to ensure:
-    - Inputs are converted to DTensor with correct placements.
-    - Outputs are redistributed and optionally converted back to local tensors.
-    """
-    def input_fn(device_mesh, mod, args):
-        """
-        Transform inputs into DTensor with correct placements before forward pass.
-        """
-        _ = mod
-        hidden_state, expert_bias, input_ids = args
-
-        # Handle hidden_state: convert or redistribute to expected layout
-        if not isinstance(hidden_state, DTensor):
-            hidden_state = DTensor.from_local(
-                hidden_state, device_mesh, (input_layouts[0],)
-            )
-        elif hidden_state.placements != input_layouts[0]:
-            hidden_state = hidden_state.redistribute(
-                placements=(input_layouts[0],), device_mesh=device_mesh
-            )
-
-        # Handle expert_bias if provided
-        if expert_bias is not None:
-            if not isinstance(expert_bias, DTensor):
-                expert_bias = DTensor.from_local(
-                    expert_bias, device_mesh, (input_layouts[1],)
-                )
-            elif expert_bias.placements != input_layouts[1]:
-                expert_bias = expert_bias.redistribute(
-                    placements=(input_layouts[1],), device_mesh=device_mesh
-                )
-
-        # Handle input_ids if provided (for hash routing)
-        if input_ids is not None and len(input_layouts) > 2:
-            if not isinstance(input_ids, DTensor):
-                input_ids = DTensor.from_local(
-                    input_ids, device_mesh, (input_layouts[2],)
-                )
-            elif input_ids.placements != input_layouts[2]:
-                input_ids = input_ids.redistribute(
-                    placements=(input_layouts[2],), device_mesh=device_mesh
-                )
-
-        if input_ids is not None:
-            return hidden_state, expert_bias, input_ids
-        return hidden_state, expert_bias
-
-    def output_fn(device_mesh, mod, args, outputs):
-        """
-        Transform outputs to desired placements and optionally convert to local tensors.
-        """
-        _, _ = mod, args
-        prepared_outputs = []
-
-        # Ensure each output matches the expected layout
-        for out, out_layout in zip(outputs, output_layouts):
-            if out.placements != out_layout:
-                out = out.redistribute(
-                    placements=(out_layout,),
-                    device_mesh=device_mesh,
-                )
-
-            # Convert to local tensor if required
-            prepared_outputs.append(
-                out.to_local() if use_local_output else out
-            )
-
-        return tuple(prepared_outputs)
-
-    # Apply distribution to the module with custom input/output handlers
-    distribute_module(
-        module=module,
-        device_mesh=router_mesh,
-        parameter_shard_plan={},  # No parameter sharding defined here
-        input_fn=input_fn,
-        output_fn=output_fn
-    )
-
-
-def _apply_mtp_concat_tp(
-    module,
-    tp_mesh,
-):
-    """Distribute the MTP (Multi-Token Prediction) hidden-states concatenation module."""
-    def input_fn(device_mesh, mod, args):
-        """
-        Transform inputs into DTensor with correct placements before forward pass.
-        """
-        _ = mod
-        (hidden_states,) = args
-        cur_hidden_states = []
-        for h in hidden_states:
-            if isinstance(h, DTensor):
-                hidden_state = h.redistribute(
-                    placements=(Replicate(),),
-                    device_mesh=device_mesh,
-                )
-            else:
-                hidden_state = DTensor.from_local(
-                    h, device_mesh, (Replicate(),)
-                )
-            cur_hidden_states.append(hidden_state)
-        return cur_hidden_states
-
-    def output_fn(device_mesh, mod, args, outputs):
-        """
-        Transform outputs to desired placements and optionally convert to local tensors.
-        """
-        _, _ = mod, args
-        hidden_states = outputs
-        if isinstance(hidden_states, DTensor):
-            hidden_states = hidden_states.redistribute(
-                placements=(Replicate(),),
-                device_mesh=device_mesh,
-            )
-        return hidden_states
-
-    distribute_module(
-        module=module,
-        device_mesh=tp_mesh,
-        parameter_shard_plan={},  # No parameter sharding defined here
-        input_fn=input_fn,
-        output_fn=output_fn
     )
 
 
@@ -700,376 +561,243 @@ def _get_dsv4_tp_shard_plan(transformer_layer, shard_plans, distribute_param_pla
     return layer_plan, distribute_param_plan
 
 
+def _configure_local_fa(core_attention, world):
+    """Rebuild FlashAttentionScore with the local head count (n/t) for the TP flow.
+
+    The DTensor flow fed FA a head-sharded DTensor whose logical head dim is the
+    global ``num_attention_heads``; the local flow feeds a plain tensor holding only
+    this rank's ``n/t`` heads, so ``head_num`` must be the local count.
+    """
+    if not isinstance(core_attention, FlashAttention) or world == 1:
+        return
+    if core_attention.head_num % world != 0:
+        raise ValueError(
+            f"num_attention_heads ({core_attention.head_num}) must be divisible by the "
+            f"TP degree ({world}) for the local FlashAttention flow.")
+    core_attention.head_num = core_attention.head_num // world
+    core_attention.flash_attention = FlashAttentionScore(
+        head_num=core_attention.head_num,
+        scale_value=core_attention.scalar_value,
+        pre_tokens=core_attention.pre_tokens,
+        next_tokens=core_attention.next_tokens,
+        inner_precise=core_attention.inner_precise,
+        input_layout=core_attention.input_layout,
+        sparse_mode=core_attention.sparse_mode,
+    )
+
+
+def _mla_attention_layer_plan(self_attn, tp_mesh, enable_mc2=False):
+    """Run MLA compression on the sequence shard and gather only projected Q/K/V."""
+    _configure_local_fa(self_attn.core_attention, tp_mesh.size())
+    colwise = MC2ColwiseParallel if enable_mc2 else ColwiseParallel
+    rowwise = MC2RowwiseParallel() if enable_mc2 else RowwiseParallel()
+    plan = {
+        "self_attention.linear_qkv": SequenceParallel(sequence_dim=0),
+        "self_attention.k_layernorm": SequenceParallel(sequence_dim=0),
+        "self_attention.linear_kvb": colwise(gather_input=True),
+        "self_attention.linear_proj": rowwise,
+        "self_attention.apply_rotary_emb_k": PrepareModuleInput(
+            input_transforms=(AllGather(0), None),
+        ),
+    }
+    if self_attn.config.q_lora_rank is not None:
+        plan["self_attention.linear_qb"] = colwise(gather_input=True)
+        plan["self_attention.q_layernorm"] = SequenceParallel(sequence_dim=0)
+    return plan
+
+
+def _gqa_attention_layer_plan(self_attn, tp_mesh, enable_mc2=False):
+    """Layer-plan entries for standard GQA / MHA self-attention (Qwen3, GLM4, TeleChat3).
+
+    The fused QKV projection (``linear_qkv``) is colwise: its ``Shard(0)`` split follows
+    the group-interleaved weight layout ``[g0_q..q k v | g1_q..q k v | ...]``, so each TP
+    rank owns whole query-groups (requires ``tp`` to divide ``num_query_groups``). Under
+    SP its pre-hook all-gathers the sequence-sharded input before the local matmul. The
+    o-projection (``linear_proj``) is rowwise (reduce-scatter back to the shard). The
+    optional per-head q/k RMSNorm (Qwen3) run local on the head-sharded activations and
+    replicate their ``head_dim`` weight, whose gradient reduces over TP like the other
+    norms (SequenceParallel).
+    """
+    _configure_local_fa(self_attn.core_attention, tp_mesh.size())
+    colwise = MC2ColwiseParallel() if enable_mc2 else ColwiseParallel(gather_input=True)
+    rowwise = MC2RowwiseParallel() if enable_mc2 else RowwiseParallel()
+    plan = {
+        "self_attention.linear_qkv": colwise,
+        "self_attention.linear_proj": rowwise,
+    }
+    if getattr(self_attn, "q_layernorm", None) is not None:
+        plan["self_attention.q_layernorm"] = SequenceParallel(sequence_dim=0)
+    if getattr(self_attn, "k_layernorm", None) is not None:
+        plan["self_attention.k_layernorm"] = SequenceParallel(sequence_dim=0)
+    return plan
+
+
+def _dense_mlp_layer_plan(enable_mc2=False):
+    """Return the complete local TP plan for a dense MLP."""
+    colwise = MC2ColwiseParallel() if enable_mc2 else ColwiseParallel(gather_input=True)
+    rowwise = MC2RowwiseParallel() if enable_mc2 else RowwiseParallel()
+    return {
+        "mlp.linear_fc1": colwise,
+        "mlp.linear_fc2": rowwise,
+    }
+
+
 def _apply_layers_tp(
     transformer_layer,
     tp_mesh,
     enable_ep,
-    shard_plans,
     enable_mc2=False,
 ):
-    """Apply tensor-parallel sharding to a single GPT transformer layer."""
+    """Apply local (to_local) tensor + sequence parallelism to one GPT transformer layer.
 
-    sp_layout, norm_plan, rowwise_output_plan, attn_qkv_shard = shard_plans
-    colwise_parallel, prepare_module_input, prepare_module_output, prepare_module_input_output = (
-        ColwiseParallel,
-        PrepareModuleInput,
-        PrepareModuleOutput,
-        PrepareModuleInputOutput,
-    )
-
-    # MC2 fuses sequence-sharded all-gather into the column-parallel matmul. It
-    # only applies when the module's input is sequence-sharded (sp_layout). In
-    # this layer, MLP linear_fc1 is the qualifying entry: its input is sharded
-    # and the all-gather can be folded into the matmul. Attention's linear_qkv
-    # is NoParallel here (no TP weight shard) and linear_qb consumes a
-    # replicated LoRA path, so neither path benefits from MC2.
-    mc2_mlp_colwise_input = sp_layout if enable_mc2 else None
-    mc2_mlp_colwise_parallel = MC2ColwiseParallel if enable_mc2 else colwise_parallel
-    mlp_desired_input = sp_layout if enable_mc2 else Replicate()
-
-    has_q_lora = transformer_layer.self_attention.config.q_lora_rank is not None
-    q_pre_attn_layout = Shard(2) if has_q_lora else Replicate()
-    attn_input_shard = attn_qkv_shard if has_q_lora else Replicate()
-    # The fused RoPE kernel is dispatched as a distributed op and requires its cos/sin
-    # (derived from the rotary freqs) to be DTensors, so the freqs input is replicated at
-    # the module boundary. The non-fused mul/add path instead broadcasts plain freqs and
-    # must keep them as plain tensors (None) to preserve q_pe's head sharding, so the freqs
-    # slot is only converted when apply_rope_fusion is enabled.
-    rope_freqs_layout = Replicate() if transformer_layer.self_attention.config.apply_rope_fusion else None
-    distribute_param_plan = []
-    if isinstance(transformer_layer.self_attention, DSv4HybridSelfAttention):
-        layer_plan, distribute_param_plan = _get_dsv4_tp_shard_plan(transformer_layer,
-                                                                    shard_plans,
-                                                                    distribute_param_plan)
-    else:
-        # Rotary embedding for q_pe (head-structured tensor from linear_qb when LoRA is
-        # on, otherwise from linear_qkv's replicated slice). The second positional input is
-        # the rotary freqs tensor (mscale is passed as a kwarg and stays a Python scalar).
-        q_rotary_emb_plan = prepare_module_input_output(
-            input_layouts=(q_pre_attn_layout, rope_freqs_layout),
-            desired_input_layouts=(q_pre_attn_layout, rope_freqs_layout),
-            output_layouts=(q_pre_attn_layout,),
-            desired_output_layouts=(q_pre_attn_layout,),
-            use_local_output=False,
-        )
-        # Rotary embedding for k_pe (pre-tile 1-head tensor from linear_qkv, stays Replicate).
-        # k_pe comes from linear_qkv whose all-reduce is necessary, so k_pe remains Replicate.
-        k_rotary_emb_plan = prepare_module_input_output(
-            input_layouts=(Replicate(), rope_freqs_layout),
-            desired_input_layouts=(Replicate(), rope_freqs_layout),
-            output_layouts=(Replicate(),),
-            desired_output_layouts=(Replicate(),),
-            use_local_output=False,
-        )
-
-        # Q arrives at core_attention as attn_input_shard (= attn_qkv_shard when LoRA
-        # produces a head-sharded Q, otherwise Replicate). K/V come in as Replicate and
-        # get reduce-scattered here to attn_qkv_shard.
-        attention_kernel_plan = prepare_module_input(
-            input_layouts=(attn_input_shard, Replicate(), Replicate(), None),
-            desired_input_layouts=(attn_qkv_shard, attn_qkv_shard, attn_qkv_shard, None),
-            use_local_output=False,
-        )
-
-        layer_plan = {
-            "input_layernorm": norm_plan,
-            "self_attention": prepare_module_input(
-                input_layouts=(sp_layout,),
-                desired_input_layouts=(
-                    Replicate()
-                ),
-                use_local_output=False,
-            ),
-            # linear_qkv is kept replicated so its output (which is split into q_a /
-            # compressed_kv / k_pe along the last dim) needs no AllGather. The
-            # downstream up-projections (linear_qb / linear_kvb) carry the actual TP
-            # weight sharding for this attention block.
-            "self_attention.linear_qkv": NoParallel(use_local_output=False),
-            "self_attention.linear_kvb": colwise_parallel(output_layouts=Replicate(), use_local_output=False),
-            "self_attention.k_layernorm": NoParallel(use_local_output=False),
-            # NOTE: use_local_output=True so that the inputs to FlexAttention are plain Tensors
-            "self_attention.core_attention": attention_kernel_plan,
-            "self_attention.linear_proj": rowwise_output_plan,
-            "pre_mlp_layernorm": norm_plan,
-            "self_attention.apply_rotary_emb_q": q_rotary_emb_plan,
-            "self_attention.apply_rotary_emb_k": k_rotary_emb_plan,
-        }
-
-        if transformer_layer.self_attention.q_rank == 0:
+    The whole layer runs on plain, sequence-sharded local tensors; the tensor-parallel
+    collectives are hand-written in the style forward hooks (colwise pre-hook all-gather,
+    rowwise post-hook reduce-scatter) plus the MLA ``k_pe`` all-gather inside the module.
+    Weights stay sharded DTensors (FSDP / checkpoint unchanged), localised at compute.
+    """
+    world = tp_mesh.size()
+    self_attn = transformer_layer.self_attention
+    is_mla = isinstance(self_attn, MLASelfAttention)
+    if isinstance(self_attn, DSv4HybridSelfAttention):
+        raise NotImplementedError("Local TP flow does not support DSv4 hybrid attention yet.")
+    if is_mla and self_attn.config.q_lora_rank is None:
+        # Without q compression, q comes straight out of linear_qkv (sequence-sharded, not
+        # head-sharded) with no colwise up-projection to all-gather it, so SP-native MLA
+        # cannot form the full-sequence query.
+        raise NotImplementedError("Local sequence-parallel MLA requires q_lora_rank (q compression).")
+    if not is_mla:
+        # Standard GQA/MHA: the fused QKV is colwise-sharded along the group-interleaved
+        # output dim, so each rank must own whole query-groups.
+        num_kv_groups = self_attn.kv_num_heads
+        if num_kv_groups % world != 0:
             raise ValueError(
-                "q_rank should be greater than 0, but got 0!"
+                f"num_query_groups ({num_kv_groups}) must be divisible by the TP degree "
+                f"({world}) for the local GQA flow (fused-QKV colwise split)."
             )
 
-        if has_q_lora:
-            layer_plan.update(
-                {
-                    "self_attention.linear_qb": colwise_parallel(
-                        output_layouts=Shard(2), use_local_output=False),
-                    "self_attention.q_layernorm": NoParallel(use_local_output=False),
-                }
-            )
+    # Block-level norms run local on the sequence shard (Replicate weights, no collective);
+    # the attention-internal projections/norms are dispatched by attention type (MLA vs GQA).
+    layer_plan = {
+        "input_layernorm": SequenceParallel(sequence_dim=0),
+        "pre_mlp_layernorm": SequenceParallel(sequence_dim=0),
+    }
+    if getattr(transformer_layer, "attn_hc", None) is not None:
+        layer_plan.update({
+            "attn_hc": SequenceParallel(sequence_dim=0),
+            "ffn_hc": SequenceParallel(sequence_dim=0),
+        })
+    if is_mla:
+        layer_plan.update(_mla_attention_layer_plan(self_attn, tp_mesh, enable_mc2))
+    else:
+        layer_plan.update(_gqa_attention_layer_plan(self_attn, tp_mesh, enable_mc2))
 
-    if hasattr(transformer_layer, "attn_hc"):
-        layer_plan.update(
-            {
-                "attn_hc": SequenceParallel(sequence_dim=0, use_local_output=False),
-                "ffn_hc": SequenceParallel(sequence_dim=0, use_local_output=False),
-            }
-        )
+    distribute_param_plan = []
 
-    if hasattr(transformer_layer.mlp, "linear_fc1"):
-        layer_plan.update(
-            {
-                "mlp": prepare_module_input(
-                    input_layouts=(sp_layout,),
-                    desired_input_layouts=(mlp_desired_input,),
-                    use_local_output=False,
-                ),
-                "mlp.linear_fc1": mc2_mlp_colwise_parallel(
-                    input_layouts=mc2_mlp_colwise_input, use_local_output=False),
-                "mlp.linear_fc2": rowwise_output_plan,
-            }
-        )
+    # Dense MLP.
+    if isinstance(transformer_layer.mlp, MLP):
+        layer_plan.update(_dense_mlp_layer_plan(enable_mc2))
 
-    if hasattr(transformer_layer.mlp, "shared_experts"):
-        layer_plan.update(
-            {
-                "mlp.shared_experts": prepare_module_output(
-                    output_layouts=(sp_layout,),
-                    desired_output_layouts=(Replicate(),),
-                    use_local_output=False
-                ),
-            }
-        )
-        layer_plan["mlp.shared_experts.linear_fc1"] = colwise_parallel(use_local_output=False)
-        layer_plan["mlp.shared_experts.linear_fc2"] = rowwise_output_plan
-
-    core_attention = transformer_layer.self_attention.core_attention
-
-    if hasattr(core_attention, "max_logits_val"):
-        distribute_param_plan.append([core_attention, "max_logits_val", (Shard(0),)])
-    if hasattr(transformer_layer.mlp, "experts"):
-        layer_plan["mlp"] = prepare_module_input_output(
-            input_layouts=(sp_layout,),
-            desired_input_layouts=(Replicate(),),
-            output_layouts=(Replicate(),),
-            desired_output_layouts=(sp_layout,),
-            use_local_input=False,
-            use_local_output=False
-        )
-
-        layer_plan["mlp.router.moe_aux_loss_auto_scaler"] = prepare_module_output(
-            output_layouts=(Replicate(),),
-            desired_output_layouts=(sp_layout,),
-            use_local_output=False
-        )
-
-        # distribute parameters for MoE layer
+    # MoE: the router runs on local tokens (gate weight to_local'd in its construct).
+    if isinstance(transformer_layer.mlp, MoELayer):
+        router = transformer_layer.mlp.router
+        if getattr(router, "aux_loss_type", None) == "global_aux_loss":
+            raise NotImplementedError("Local TP flow does not support global_aux_loss routing yet.")
+        # Match the baseline parameter placements even for non-trainable MoE state.
+        distribute_param_plan.append([router, "weight", (Replicate(),)])
         distribute_param_plan.append([transformer_layer.mlp, "tokens_per_expert", (Replicate(),)])
         if getattr(transformer_layer.mlp, "enable_expert_bias", False):
             distribute_param_plan.append([transformer_layer.mlp, "expert_bias", (Replicate(),)])
-        if hasattr(transformer_layer.mlp, "router"):
-            if getattr(transformer_layer.mlp.router, "is_hash_layer", False):
-                distribute_param_plan.append([transformer_layer.mlp.router, "tid2eid", (Replicate(),)])
-
+        if getattr(router, "is_hash_layer", False):
+            distribute_param_plan.append([router, "tid2eid", (Replicate(),)])
         if not enable_ep:
-            # shard expert weight if not enable_ep
             distribute_param_plan.extend([
                 [transformer_layer.mlp.experts, "weight1", (Replicate(),)],
                 [transformer_layer.mlp.experts, "weight2", (Replicate(),)],
             ])
 
-        # special parallel for router
-        _distribute_router(
-            transformer_layer.mlp.router,
-            router_mesh=tp_mesh,
-            input_layouts=(Replicate(), Replicate(), Replicate()),
-            output_layouts=(Replicate(), Replicate(), Replicate()),
-        )
+    # Routed and shared experts both keep the SP token shard. Shared-expert
+    # parameters are replicated over TP, so its fc1/fc2 and optional gate compute
+    # locally without sequence collectives.
+    shared_experts = getattr(transformer_layer.mlp, "shared_experts", None)
+    if shared_experts is not None:
+        layer_plan["mlp.shared_experts"] = SequenceParallel(sequence_dim=0)
 
-    if distribute_param_plan:
-        for sub_module, param_name, sub_plan in distribute_param_plan:
-            _distribute_param(
-                sub_module,
-                param_name=param_name,
-                device_mesh=tp_mesh,
-                placements=sub_plan
-            )
+    core_attention = self_attn.core_attention
+    if hasattr(core_attention, "max_logits_val"):
+        distribute_param_plan.append([core_attention, "max_logits_val", (Shard(0),)])
 
-    # LoRA: attach adapter layouts to the target styles (model-side; styles stay generic).
+    for sub_module, param_name, sub_plan in distribute_param_plan:
+        _distribute_param(sub_module, param_name=param_name, device_mesh=tp_mesh, placements=sub_plan)
+
     _attach_lora_layouts(transformer_layer, layer_plan)
-
-    parallelize_module(
-        module=transformer_layer,
-        device_mesh=tp_mesh,
-        parallelize_plan=layer_plan,
-    )
-
+    parallelize_module(module=transformer_layer, device_mesh=tp_mesh, parallelize_plan=layer_plan)
 
 def apply_non_moe_tp(
         model: nn.Cell,
         tp_mesh: DeviceMesh,
-        enable_loss_parallel: bool = False,
-        enable_float8_tensorwise_tp: bool = False,
-        enable_sp: bool = True,
         enable_ep: bool = False,
         enable_mc2: bool = False,
 ):
-    """Apply tensor parallelism."""
-    # MC2 (all_gather_matmul / matmul_reduce_scatter) fuses the tensor-parallel
-    # collective into the matmul and is only meaningful when the sequence is
-    # sharded (sequence parallel). Disable it otherwise to keep semantics correct.
-    enable_mc2 = enable_mc2 and enable_sp
-    # 1. Parallelize the embedding and shard its outputs (which are the first
-    # transformer block's inputs)
-    # 2. Parallelize the root norm layer over the sequence dim
-    # 3. Parallelize the final linear output layer
-    sp_layout = Shard(0) if enable_sp else Replicate()
+    """Apply local (to_local) tensor + sequence parallelism to the whole GPTModel forward.
 
-    embed_plan = RowwiseParallel(
-        input_layouts=Replicate(),
-        output_layouts=Shard(1),
-        use_local_output=False,
-    )
+    Every forward module runs on plain, sequence-sharded local tensors; the tensor-parallel
+    collectives are hand-written in forward hooks. Weights stay sharded DTensors (FSDP /
+    checkpoint unchanged) and are localised at compute -- DTensor never appears in the forward.
+    """
+    world = tp_mesh.size()
+    rank = tp_mesh.get_local_rank()
+    group = tp_mesh.get_group()
 
-    rowwise_parallel, prepare_module_output = (
-        MC2RowwiseParallel if enable_mc2 else RowwiseParallel,
-        PrepareModuleOutput,
-    )
-
-    model_plan = {}
-
+    # 1. Embedding: vocab-parallel local gather + reduce onto the sequence shard.
     if hasattr(model.model, "embedding"):
-        model_plan.update(
+        parallelize_module(
+            model.model.embedding,
+            tp_mesh,
             {
-                "model.embedding.word_embeddings": embed_plan,
-            }
+                "word_embeddings": RowwiseParallel()
+            },
         )
 
+    # 2. Final norm: local RMSNorm on the sequence shard (Replicate weight, no collective).
     if getattr(model.model.decoder, "final_layernorm", None):
-        model_plan.update(
-            {
-                "model.decoder.final_layernorm": SequenceParallel(
-                    sequence_dim=0, use_local_output=False) if enable_sp else NoParallel(),
-            }
-        )
+        SequenceParallel(sequence_dim=0)._apply(model.model.decoder.final_layernorm, tp_mesh)
 
+    # 3. Output layer (LM head): colwise; the output stays vocab-sharded local for the loss.
     if hasattr(model.model, "output_layer"):
-        model_plan.update(
-            {
-                "model.output_layer": ColwiseParallel(
-                    input_layouts=sp_layout,
-                    output_layouts=Shard(-1) if enable_loss_parallel else Replicate(),
-                    use_local_output=False,
-                ),
-            }
-        )
+        ColwiseParallel(gather_input=True)._apply(model.model.output_layer, tp_mesh)
 
-    if hasattr(model.model, "mtp_loss_auto_scaler"):
-        model_plan.update(
-            {
-                "model.mtp_loss_auto_scaler": prepare_module_output(
-                    output_layouts=(Replicate(),),
-                    desired_output_layouts=(Replicate(),),
-                    use_local_output=False,
-                )
-            }
-        )
+    # 4. Loss: vocab-parallel CE on the local vocab slice (pass the TP metadata).
+    loss = getattr(model.model, "loss", None)
+    if loss is not None and world > 1:
+        loss.enable_vocab_parallel(group, rank, world)
 
-    parallelize_module(
-        model,
-        tp_mesh,
-        model_plan,
-    )
-
-    decoder_layers = model.model.decoder.layers
-    attn_input_layout = getattr(
-        decoder_layers.get_first_cell().self_attention.config, "input_layout", None
-        ) if decoder_layers else None
-    if attn_input_layout == "TND":
-        attn_qkv_shard = Shard(1)
-    else:
-        attn_qkv_shard = Shard(2)
-
-    # Apply tensor + sequence parallelism to every transformer block
-    # NOTE: At the cost of model code change, we can accelerate Sequence Parallel
-    #       by folding (and unfolding) the batch dimension and the sequence dimension.
-    norm_plan = SequenceParallel(sequence_dim=0, use_local_output=False) if enable_sp else NoParallel()
-    rowwise_output_plan = rowwise_parallel(
-        output_layouts=sp_layout, use_local_output=False,  # use_local_output=enable_sp
-    )
-
+    # 5. Decoder layers.
     for transformer_layer in model.model.decoder.layers:
         _apply_layers_tp(
-            transformer_layer,
-            tp_mesh,
-            enable_ep,
-            (sp_layout, norm_plan, rowwise_output_plan, attn_qkv_shard,),
-            enable_mc2=enable_mc2,
-        )
+            transformer_layer, tp_mesh, enable_ep, enable_mc2=enable_mc2)
 
-    if getattr(model.model, "mtp"):
-        _apply_mtp_concat_tp(
-            model.model.mtp.concat_hidden_states,
-            tp_mesh,
-        )
-
-        for layer in model.model.mtp.layers:
+    # 6. MTP outer modules and inner transformer layers. Match graph mode for eh_proj:
+    # keep its parameters replicated and compute directly on the local sequence shard.
+    # The inner MLA+MoE layer uses the same local plan as the decoder layers.
+    mtp = getattr(model.model, "mtp", None)
+    if mtp is not None:
+        for layer in mtp.layers:
             parallelize_module(
                 layer,
                 tp_mesh,
                 {
-                    "enorm": SequenceParallel(
-                        sequence_dim=0, use_local_output=False) if enable_sp else NoParallel(),
-                    "hnorm": SequenceParallel(
-                        sequence_dim=0, use_local_output=False) if enable_sp else NoParallel(),
-                    "eh_proj": RowwiseParallel(
-                        input_layouts=Shard(0), output_layouts=Shard(0), use_local_output=False),
-                    "final_layernorm": SequenceParallel(
-                        sequence_dim=0, use_local_output=False) if enable_sp else NoParallel(),
+                    "enorm": SequenceParallel(sequence_dim=0),
+                    "hnorm": SequenceParallel(sequence_dim=0),
+                    "eh_proj": SequenceParallel(sequence_dim=0),
+                    "final_layernorm": SequenceParallel(sequence_dim=0),
                 },
             )
-
             _apply_layers_tp(
-                layer.transformer_layer,
-                tp_mesh,
-                enable_ep,
-                (sp_layout, norm_plan, rowwise_output_plan, attn_qkv_shard,),
-                enable_mc2=enable_mc2,
-            )
-
-    if hasattr(model.model, "loss") and (hasattr(model.model.loss, "log_softmax") and
-                                         hasattr(model.model.loss, "nll_loss")):
-        # apply parallelism to loss custom backend functions
-        # NOTE: should support loss parallel in future
-        layer_plan = {
-            "log_softmax": PrepareModuleInputOutput(
-                input_layouts=(Replicate(),),
-                desired_input_layouts=(Replicate(),),
-                output_layouts=(Replicate(),),
-                desired_output_layouts=(Replicate(),),
-                use_local_input=True,
-                use_local_output=False,
-            ),
-            "nll_loss": PrepareModuleInputOutput(
-                input_layouts=(Replicate(), None),
-                desired_input_layouts=(Replicate(), None),
-                output_layouts=(Replicate(),),
-                desired_output_layouts=(Replicate(),),
-                use_local_input=True,
-                use_local_output=False,
-            ),
-        }
-        parallelize_module(
-            module=model.model.loss,
-            device_mesh=tp_mesh,
-            parallelize_plan=layer_plan,
-        )
+                layer.transformer_layer, tp_mesh, enable_ep, enable_mc2=enable_mc2)
 
     logger.info(
-        f"Applied {'Float8 tensorwise ' if enable_float8_tensorwise_tp else ''}"
-        f"Tensor Parallelism to the model (MC2 fusion {'ENABLED' if enable_mc2 else 'disabled'})"
-    )
+        "Applied local (to_local) Tensor + Sequence Parallelism to the model "
+        "(MC2 fusion %s).", "ENABLED" if enable_mc2 else "disabled")
 
 
 def apply_moe_ep_tp(
@@ -1658,37 +1386,28 @@ def apply_context_parallel_attention(
             _apply_cp_to_block(mtp_layer, f"mtp.layers.{layer_idx}")
 
 def _setup_moe_aux_loss_group(model, parallel_dims):
-    """Attach the cp reduction group to every MoE router for aux-loss computation.
+    """Attach TP/CP reduction groups to every sequence-sharded MoE router.
 
     This function equips each MoE router with the process group used to
     all-reduce ``tokens_per_expert`` before the aux loss is computed.
 
-    The group scope is **cp only**. The router runs BEFORE the MoE dispatcher,
-    so its token view is NOT sharded by TP (router inputs are replicated across
-    TP ranks even under sequence parallelism).  DP ranks hold independent
-    samples — their averaging is handled by the DP all-reduce in
-    ``track_moe_metrics`` (Step 3), not here.
-
-    CP *does* shard the sequence across ranks, so when CP > 1 we collect the
-    cp mesh group so ``get_tokens_per_expert_and_token_count`` can sum the
-    partial per-expert histograms across CP shards.
-
-    When cp is not enabled, ``aux_groups`` stays empty (size = 1) — no
-    all-reduce is needed, and each rank computes aux_loss from its local
-    token view.
+    TP sequence parallelism and CP both shard the router token view. Their
+    per-axis groups recover global token statistics without gathering router
+    activations. DP remains excluded because it owns independent samples.
     """
     if parallel_dims is None:
         return
 
-    # Only CP shards the router's token view.  TP replicates router inputs
-    # (verified: seq_length is always the global seqlen regardless of SP),
-    # and DP holds independent data (averaged elsewhere).
     aux_groups: list = []
     aux_group_size = 1
+    tp_mesh = parallel_dims.get_optional_mesh("tp")
+    if tp_mesh is not None:
+        aux_groups.append(tp_mesh.get_group())
+        aux_group_size *= tp_mesh.size()
     cp_mesh = parallel_dims.get_optional_mesh("cp")
     if cp_mesh is not None:
         aux_groups.append(cp_mesh.get_group())
-        aux_group_size = cp_mesh.size()
+        aux_group_size *= cp_mesh.size()
 
     gpt_model = _unwrap_gptmodel(model)
     moe_routers = []
@@ -1711,12 +1430,12 @@ def _setup_moe_aux_loss_group(model, parallel_dims):
 
     # Set global communication domain variables in moe_utils so both the
     # router forward pass (``get_tokens_per_expert_and_token_count``) and
-    # the step-end aggregation (``track_moe_metrics``) share the same cp
+    # the step-end aggregation (``track_moe_metrics``) share the same TP/CP
     # reduction group without per-router attribute plumbing.
     set_moe_aux_loss_group_info(aux_groups, aux_group_size)
 
     logger.info(
-        "[MoE-AuxLossGroup] set global cp aux_loss group "
+        "[MoE-AuxLossGroup] set global TP/CP aux_loss groups "
         "(size=%d, ) for %d MoE router(s).",
         aux_group_size, len(moe_routers),
     )
@@ -1752,7 +1471,6 @@ def _apply_spmd_parallelism(
             apply_non_moe_tp(
                 model,
                 tp_mesh=tp_mesh,
-                enable_loss_parallel=getattr(parallelism, "enable_loss_parallel", False),
                 enable_ep=parallel_dims.ep_enabled,
                 enable_mc2=getattr(parallelism, "enable_mc2", False),
             )

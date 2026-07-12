@@ -12,295 +12,191 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Run script for testing PrepareModuleInput and PrepareModuleOutput."""
+"""Two-card forward/backward validation for local tensor-parallel styles."""
+
 import argparse
 import numpy as np
 
-from hyper_parallel import init_device_mesh
-from hyper_parallel import DTensor
-from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
-
 import mindspore as ms
-from mindspore import nn, Tensor
-from mindspore.communication import init
+from mindspore import nn, Tensor, mint
+from mindspore.communication import get_rank, init
+
+from hyper_parallel import DTensor, init_device_mesh
 from mindformers.pynative.distributed.style import (
-    PrepareModuleInput,
-    PrepareModuleOutput,
-    PrepareModuleInputOutput,
+    ColwiseParallel,
+    RowwiseParallel,
+    SequenceParallel,
 )
 from mindformers.pynative.layers.linear import Linear
-from mindformers.parallel_core.utils.init_method import init_method_normal
-
-TEST_RANDOM_SEED = 42
-
-def create_test_tensors():
-    """Create test tensors with fixed random seed."""
-    np.random.seed(TEST_RANDOM_SEED)
-    return {
-        "tensor_2x16": Tensor(
-            np.random.randn(2, 16).astype(np.float32), dtype=ms.float32
-        ),
-        "tensor_2x8": Tensor(
-            np.random.randn(2, 8).astype(np.float32), dtype=ms.float32
-        ),
-        "tensor_4x4": Tensor(
-            np.random.randn(4, 4).astype(np.float32), dtype=ms.float32
-        ),
-    }
 
 
-class TestModule(nn.Cell):
-    """Test module for PrepareModuleInput and PrepareModuleOutput."""
+class _TwoLinear(nn.Cell):
+    """Column-parallel linear followed by row-parallel linear."""
 
     def __init__(self):
         super().__init__()
-        self.linear = Linear(
-            input_size=8,
-            output_size=8,
-            params_dtype="float32",
-            compute_dtype="float32",
-            init_method=init_method_normal(),
-            bias=True
-        )
-        self.linear.reset_parameter()
+        self.linear_fc1 = Linear(4, 8, "float32", "float32", bias=False)
+        self.linear_fc2 = Linear(8, 4, "float32", "float32", bias=False)
 
-    def construct(self, x, y=None, mask=None):
-        if mask is not None:
-            return mask
-        if y is not None:
-            return x, y
-        return self.linear(x)
+    def construct(self, value):
+        return self.linear_fc2(self.linear_fc1(value))
 
 
-def _verify_dtensor_result(res, expected_res, err_msg, use_local_output=False):
-    """Verify DTensor result matches expected DTensor."""
-    if use_local_output:
-        assert isinstance(res, Tensor)
-        assert not isinstance(res, DTensor)
-        np.testing.assert_array_equal(
-            res.asnumpy(),
-            expected_res.asnumpy(),
-            err_msg=err_msg,
-        )
-    else:
-        assert isinstance(res, DTensor)
-        assert res.placements == expected_res.placements
-        np.testing.assert_array_equal(
-            res.to_local().asnumpy(),
-            expected_res.to_local().asnumpy(),
-            err_msg=err_msg,
-        )
+def _local(tensor):
+    return tensor.to_local() if isinstance(tensor, DTensor) else tensor
 
 
-def _create_reference_module(source_module):
-    """Create a reference module with same weights as source."""
-    ref_module = TestModule()
-    source_weight = source_module.linear.weight.value()
-    ref_module.linear.weight.set_data(source_weight)
-    return ref_module
+def _set_weights(network, weight1, weight2):
+    network.linear_fc1.weight.set_data(Tensor(weight1, ms.float32))
+    network.linear_fc2.weight.set_data(Tensor(weight2, ms.float32))
 
 
-def _compute_expected_output(
-    module, input_tensor, input_layout, desired_layout, device_mesh
-):
-    """Compute expected output after input conversion."""
-    dtensor = DTensor.from_local(input_tensor, device_mesh, (input_layout,))
-    converted_dtensor = dtensor.redistribute(device_mesh, (desired_layout,))
-    local_tensor = converted_dtensor.to_local()
-    ref_module = _create_reference_module(module)
-    return ref_module(local_tensor)
+def _forward_and_grads(network, value):
+    params = network.trainable_params()
+
+    def loss_fn(input_):
+        return mint.sum(network(input_))
+
+    grad_fn = ms.value_and_grad(loss_fn, grad_position=0, weights=params)
+    loss, (input_grad, param_grads) = grad_fn(value)
+    return network(value), loss, input_grad, param_grads
 
 
-def run_prepare_module_input(device_mesh, test_tensors):
-    """Test PrepareModuleInput covering multiple scenarios."""
+def run_colwise_rowwise(mesh):
+    """Compare TP forward, input gradient, and both weight gradients to dense reference."""
+    rank = get_rank()
+    rng = np.random.default_rng(17)
+    global_input = rng.normal(size=(4, 1, 4)).astype(np.float32)
+    weight1 = rng.normal(size=(8, 4)).astype(np.float32)
+    weight2 = rng.normal(size=(4, 8)).astype(np.float32)
 
-    # Test: Multiple inputs
-    module = TestModule()
-    prepare_inps = PrepareModuleInput(
-        input_layouts=(Shard(0), None),
-        desired_input_layouts=(Replicate(), None),
+    reference = _TwoLinear()
+    _set_weights(reference, weight1, weight2)
+    ref_output, _, ref_input_grad, ref_param_grads = _forward_and_grads(
+        reference, Tensor(global_input)
     )
-    # pylint: disable=protected-access
-    prepare_inps._apply(module, device_mesh)
 
-    tensor1 = test_tensors["tensor_2x8"]
-    tensor2 = test_tensors["tensor_4x4"]
-    output_x, output_y = module(tensor1, tensor2)
+    parallel = _TwoLinear()
+    _set_weights(parallel, weight1, weight2)
+    ColwiseParallel(gather_input=True)._apply(parallel.linear_fc1, mesh)
+    RowwiseParallel(reduce_mode="reduce_scatter")._apply(parallel.linear_fc2, mesh)
+    local_input = Tensor(np.split(global_input, 2, axis=0)[rank])
+    output, _, input_grad, param_grads = _forward_and_grads(parallel, local_input)
 
-    sharded_dtensor = DTensor.from_local(tensor1, device_mesh, (Shard(0),))
-    expected_dtensor = sharded_dtensor.redistribute(
-        device_mesh, (Replicate(),)
+    np.testing.assert_allclose(
+        output.asnumpy(), np.split(ref_output.asnumpy(), 2, axis=0)[rank], rtol=1e-5, atol=1e-5
     )
-    _verify_dtensor_result(
-        output_x,
-        expected_dtensor,
-        "Multiple inputs test: Output_x mismatch",
+    np.testing.assert_allclose(
+        input_grad.asnumpy(), np.split(ref_input_grad.asnumpy(), 2, axis=0)[rank], rtol=1e-5, atol=1e-5
     )
-    assert output_y is tensor2
-    print("PrepareModuleInput::multiple_inputs PASSED")
-
-    # Test: DTensor input with use_local_output
-    module_local = TestModule()
-    prepare_local = PrepareModuleInput(
-        input_layouts=(Shard(0),),
-        desired_input_layouts=(Shard(1),),
-        use_local_output=True,
+    np.testing.assert_allclose(
+        _local(param_grads[0]).asnumpy(),
+        np.split(ref_param_grads[0].asnumpy(), 2, axis=0)[rank],
+        rtol=1e-5,
+        atol=1e-5,
     )
-    # pylint: disable=protected-access
-    prepare_local._apply(module_local, device_mesh)
-
-    test_tensor = test_tensors["tensor_2x16"]
-    test_dtensor = DTensor.from_local(test_tensor, device_mesh, (Shard(0),))
-    result = module_local(test_dtensor)
-    expected_result = _compute_expected_output(
-        module_local, test_tensor, Shard(0), Shard(1), device_mesh
+    np.testing.assert_allclose(
+        _local(param_grads[1]).asnumpy(),
+        np.split(ref_param_grads[1].asnumpy(), 2, axis=1)[rank],
+        rtol=1e-5,
+        atol=1e-5,
     )
-    _verify_dtensor_result(
-        result,
-        expected_result,
-        "use_local_output test: Result mismatch",
-        use_local_output=True,
-    )
-    print("PrepareModuleInput::dtensor_input_use_local_output PASSED")
-
-    # Test: Keyword arguments
-    module_kwargs = TestModule()
-    prepare_kwargs = PrepareModuleInput(
-        input_kwarg_layouts={"mask": Replicate()},
-        desired_input_kwarg_layouts={"mask": Shard(0)},
-    )
-    # pylint: disable=protected-access
-    prepare_kwargs._apply(module_kwargs, device_mesh)
-
-    x_tensor = test_tensors["tensor_2x8"]
-    mask_tensor = test_tensors["tensor_2x8"]
-    output = module_kwargs(x_tensor, mask=mask_tensor)
-
-    replicated_dtensor = DTensor.from_local(
-        mask_tensor, device_mesh, (Replicate(),)
-    )
-    expected_dtensor = replicated_dtensor.redistribute(
-        device_mesh, (Shard(0),)
-    )
-    _verify_dtensor_result(
-        output, expected_dtensor, "Kwargs test: Output mismatch"
-    )
-    print("PrepareModuleInput::kwargs_input PASSED")
+    print("ColwiseParallel+RowwiseParallel forward/backward PASSED")
 
 
-def run_prepare_module_output(device_mesh, test_tensors):
-    """Test PrepareModuleOutput covering multiple scenarios."""
+def run_rowwise_all_reduce(mesh):
+    """Validate the rowwise AllReduce output mode and its local input gradient."""
+    rank = get_rank()
+    rng = np.random.default_rng(23)
+    global_input = rng.normal(size=(3, 1, 4)).astype(np.float32)
+    weight = rng.normal(size=(5, 4)).astype(np.float32)
 
-    # Test: Multiple outputs
-    module_multi = TestModule()
-    prepare_output_multi = PrepareModuleOutput(
-        output_layouts=(Shard(0), None),
-        desired_output_layouts=(Replicate(), None),
-        use_local_output=False,
-    )
-    # pylint: disable=protected-access
-    prepare_output_multi._apply(module_multi, device_mesh)
+    reference = Linear(4, 5, "float32", "float32", bias=False)
+    reference.weight.set_data(Tensor(weight))
+    ref_output, _, ref_input_grad, _ = _forward_and_grads(reference, Tensor(global_input))
 
-    test_tensor = test_tensors["tensor_4x4"]
-    output_x, output_y = module_multi(test_tensor, y=test_tensor)
+    parallel = Linear(4, 5, "float32", "float32", bias=False)
+    parallel.weight.set_data(Tensor(weight))
+    RowwiseParallel(reduce_mode="all_reduce")._apply(parallel, mesh)
+    local_input = Tensor(np.split(global_input, 2, axis=-1)[rank])
+    output, _, input_grad, _ = _forward_and_grads(parallel, local_input)
 
-    sharded_dtensor = DTensor.from_local(test_tensor, device_mesh, (Shard(0),))
-    expected_dtensor = sharded_dtensor.redistribute(
-        device_mesh, (Replicate(),)
+    np.testing.assert_allclose(output.asnumpy(), ref_output.asnumpy(), rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(
+        input_grad.asnumpy(), np.split(ref_input_grad.asnumpy(), 2, axis=-1)[rank], rtol=1e-5, atol=1e-5
     )
-    _verify_dtensor_result(
-        output_x, expected_dtensor, "Multiple outputs test: Output_x mismatch"
-    )
-    assert output_y is test_tensor
-    print("PrepareModuleOutput::multiple_outputs PASSED")
-
-    # Test: Shard dimension change with use_local_output
-    module_shard = TestModule()
-    prepare_shard = PrepareModuleOutput(
-        output_layouts=(Shard(0),),
-        desired_output_layouts=(Shard(1),),
-        use_local_output=True,
-    )
-    # pylint: disable=protected-access
-    prepare_shard._apply(module_shard, device_mesh)
-    test_tensor = test_tensors["tensor_2x8"]
-    result = module_shard(test_tensor)
-
-    ref_module = _create_reference_module(module_shard)
-    ref_output = ref_module(test_tensor)
-    sharded_dtensor = DTensor.from_local(
-        ref_output, device_mesh, (Shard(0),)
-    )
-    expected_dtensor = sharded_dtensor.redistribute(
-        device_mesh, (Shard(1),)
-    )
-    expected_tensor = expected_dtensor.to_local()
-    _verify_dtensor_result(
-        result,
-        expected_tensor,
-        "Shard change test: Result mismatch",
-        use_local_output=True,
-    )
-    print("PrepareModuleOutput::shard_dim_change_use_local_output PASSED")
+    print("RowwiseParallel all_reduce forward/backward PASSED")
 
 
-def run_prepare_module_input_output(device_mesh, test_tensors):
-    """Test PrepareModuleInputOutput covering multiple scenarios."""
+def run_colwise_gather_output(mesh):
+    """Validate gather-output slice backward and sequence-input reduce-scatter backward."""
+    rank = get_rank()
+    rng = np.random.default_rng(29)
+    global_input = rng.normal(size=(4, 1, 4)).astype(np.float32)
+    weight = rng.normal(size=(8, 4)).astype(np.float32)
 
-    module_kwargs = TestModule()
-    prepare_kwargs = PrepareModuleInputOutput(
-        input_kwarg_layouts={"mask": Shard(0)},
-        desired_input_kwarg_layouts={"mask": Replicate()},
-        output_layouts=(Replicate(),),
-        desired_output_layouts=(Shard(1),),
-        use_local_output=False,
+    reference = Linear(4, 8, "float32", "float32", bias=False)
+    reference.weight.set_data(Tensor(weight))
+    ref_output, _, ref_input_grad, ref_param_grads = _forward_and_grads(
+        reference, Tensor(global_input)
     )
-    # pylint: disable=protected-access
-    prepare_kwargs._apply(module_kwargs, device_mesh)
 
-    x_tensor = test_tensors["tensor_2x8"]
-    mask_tensor = test_tensors["tensor_2x8"]
-    result = module_kwargs(x_tensor, mask=mask_tensor)
+    parallel = Linear(4, 8, "float32", "float32", bias=False)
+    parallel.weight.set_data(Tensor(weight))
+    ColwiseParallel(gather_input=True, gather_output=True)._apply(parallel, mesh)
+    local_input = Tensor(np.split(global_input, 2, axis=0)[rank])
+    output, _, input_grad, param_grads = _forward_and_grads(parallel, local_input)
 
-    sharded_mask_dtensor = DTensor.from_local(
-        mask_tensor, device_mesh, (Shard(0),)
+    np.testing.assert_allclose(output.asnumpy(), ref_output.asnumpy(), rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(
+        input_grad.asnumpy(), np.split(ref_input_grad.asnumpy(), 2, axis=0)[rank], rtol=1e-5, atol=1e-5
     )
-    expected_mask_dtensor = sharded_mask_dtensor.redistribute(
-        device_mesh, (Replicate(),)
+    np.testing.assert_allclose(
+        _local(param_grads[0]).asnumpy(),
+        np.split(ref_param_grads[0].asnumpy(), 2, axis=0)[rank],
+        rtol=1e-5,
+        atol=1e-5,
     )
-    expected_output_dtensor = expected_mask_dtensor.redistribute(
-        device_mesh, (Shard(1),)
-    )
-    _verify_dtensor_result(
-        result,
-        expected_output_dtensor,
-        "Kwargs I/O test: Result mismatch",
-    )
-    print("PrepareModuleInputOutput::kwargs_io PASSED")
+    print("ColwiseParallel gather_output forward/backward PASSED")
+
+
+def run_automatic_input_sharding(mesh):
+    """Validate that automatic TP/SP slicing gathers local gradients in backward."""
+    rng = np.random.default_rng(31)
+    global_input = rng.normal(size=(4, 1, 4)).astype(np.float32)
+    weight = rng.normal(size=(5, 4)).astype(np.float32)
+
+    reference = Linear(4, 5, "float32", "float32", bias=False)
+    reference.weight.set_data(Tensor(weight))
+    ref_output, _, ref_input_grad, _ = _forward_and_grads(reference, Tensor(global_input))
+
+    parallel = Linear(4, 5, "float32", "float32", bias=False)
+    parallel.weight.set_data(Tensor(weight))
+    RowwiseParallel(reduce_mode="all_reduce", input_is_parallel=False)._apply(parallel, mesh)
+    output, _, input_grad, _ = _forward_and_grads(parallel, Tensor(global_input))
+    np.testing.assert_allclose(output.asnumpy(), ref_output.asnumpy(), rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(input_grad.asnumpy(), ref_input_grad.asnumpy(), rtol=1e-5, atol=1e-5)
+
+    identity = nn.Identity()
+    SequenceParallel(sequence_dim=0, input_is_parallel=False)._apply(identity, mesh)
+    grad_fn = ms.grad(lambda value: mint.sum(identity(value)))
+    sequence_grad = grad_fn(Tensor(global_input))
+    np.testing.assert_array_equal(sequence_grad.asnumpy(), np.ones_like(global_input))
+    print("RowwiseParallel/SequenceParallel input sharding backward PASSED")
 
 
 def main():
-    """Main function to run tests with configurable parameters.""" 
-
-    parser = argparse.ArgumentParser(
-        description="Run PrepareModuleInput/Output/InputOutput tests"
-    )
-    parser.add_argument(
-        "--tp", type=int, default=2, help="Tensor parallel size"
-    )
-
+    parser = argparse.ArgumentParser(description="Run local style distributed gradient tests")
+    parser.add_argument("--tp", type=int, default=2)
     args = parser.parse_args()
 
+    ms.set_context(mode=ms.PYNATIVE_MODE, device_target="Ascend")
     init()
-    device_mesh = init_device_mesh(
-        device_type='npu', mesh_shape=(args.tp,), mesh_dim_names=("tp",)
-    )
-
-    test_tensors = create_test_tensors()
-
-    run_prepare_module_input(device_mesh, test_tensors)
-    run_prepare_module_output(device_mesh, test_tensors)
-    run_prepare_module_input_output(device_mesh, test_tensors)
+    mesh = init_device_mesh("npu", (args.tp,), mesh_dim_names=("tp",))
+    run_colwise_rowwise(mesh)
+    run_rowwise_all_reduce(mesh)
+    run_colwise_gather_output(mesh)
+    run_automatic_input_sharding(mesh)
 
 
 if __name__ == "__main__":

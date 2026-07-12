@@ -312,8 +312,23 @@ class MultiLatentAttention(nn.Cell):
         ori_dtype = x.dtype
         seq_len, bs, _ = self.shape(x)
         query, key, value = self.get_query_key_value_tensors(x, rotary_pos_emb=rotary_pos_emb, mscale=mscale)
+        # The attention output carries q's sequence length -- ``seq_len`` when the input
+        # is full, or the (gathered) full sequence when q was sequence-sharded upstream.
+        attn_seq_len = self.shape(query)[0]
         if self.use_flash_attention:
-            if self.use_eod_attn_mask_compression:
+            if self.input_layout == "TND":
+                if actual_seq_len is None:
+                    raise ValueError("TND attention requires actual_seq_len.")
+                context_layer = self.core_attention(
+                    query, key, value, attention_mask,
+                    actual_seq_qlen=actual_seq_len, actual_seq_kvlen=actual_seq_len,
+                )
+                full_seq_len = attn_seq_len // bs
+                attn_out = self.reshape(context_layer, (bs, full_seq_len, -1))
+                attn_out = self.transpose(attn_out, 0, 1)
+                if hasattr(attn_out, "contiguous"):
+                    attn_out = attn_out.contiguous()
+            elif self.use_eod_attn_mask_compression:
                 context_layer = self.core_attention(
                     query, key, value, attention_mask,
                     actual_seq_qlen=actual_seq_len, actual_seq_kvlen=actual_seq_len
@@ -324,7 +339,7 @@ class MultiLatentAttention(nn.Cell):
                 context_layer = self.core_attention(
                     query, key, value, attention_mask,
                 )
-                attn_out = self.reshape(context_layer, (seq_len, bs, -1))
+                attn_out = self.reshape(context_layer, (attn_seq_len, bs, -1))
                 if hasattr(attn_out, "contiguous"):
                     attn_out = attn_out.contiguous()
         else:
@@ -344,10 +359,11 @@ class MultiLatentAttention(nn.Cell):
         Returns:
             Tensor: Output tensor with TND layout.
         """
-        seq_len, bs = x.shape[:2]
-        x = self.reshape(x, (seq_len, bs, self.num_attention_heads, -1))
+        if x.ndim != 4:
+            raise ValueError(f"TND conversion expects SBND input, but got {x.ndim} dimensions")
+        seq_len, bs, num_heads = x.shape[:3]
         x = self.transpose(x, 0, 1)
-        x = self.reshape(x, (bs * seq_len, self.num_attention_heads, -1))
+        x = self.reshape(x, (bs * seq_len, num_heads, -1))
         return x
 
 
@@ -475,6 +491,9 @@ class MLASelfAttention(MultiLatentAttention):
                 - key: Key tensor with shape [seq_length, batch_size, num_heads, head_dim].
                 - value: Value tensor with shape [seq_length, batch_size, num_heads, v_head_dim].
         """
+        # linear_qkv and the latent norms run on the local sequence shard. The
+        # head-sharded up-projections gather their latent inputs immediately before
+        # matmul; k_pe is gathered separately at the rotary-k boundary.
         seq_len, bs, _ = self.shape(hidden_states)
 
         qkv_combo = self.linear_qkv(hidden_states)
@@ -492,14 +511,14 @@ class MLASelfAttention(MultiLatentAttention):
         if self.q_layernorm is not None:
             q_a = self.q_layernorm(q_a)
             q = self.linear_qb(q_a)
-            q = self.reshape(q, (seq_len, bs, self.num_attention_heads, -1))
+            q = self.reshape(q, (self.shape(q)[0], bs, -1, self.q_head_dim))
 
             q_nope, q_pe = self.split(
                 q, [self.qk_head_dim, self.qk_pos_emb_head_dim], dim=-1
             )
 
         else:
-            q = self.reshape(q_a, (seq_len, bs, self.num_attention_heads, -1))
+            q = self.reshape(q_a, (self.shape(q_a)[0], bs, -1, self.q_head_dim))
             q_nope, q_pe = self.split(
                 q, [self.qk_head_dim, self.qk_pos_emb_head_dim], dim=-1
             )
@@ -519,13 +538,15 @@ class MLASelfAttention(MultiLatentAttention):
             query = self.sbh2tnd(query)
         query = self.q_handoff(query)
 
+        # k_pe stays sequence-sharded here (local seq); gathered to the full
+        # sequence below so it lines up with the full-seq, head-sharded k_nope.
         k_pe = self.reshape(k_pe, (seq_len, bs, 1, self.qk_pos_emb_head_dim))
         compressed_kv_norm = self.k_layernorm(compressed_kv)
-        kv = self.linear_kvb(compressed_kv_norm)
+        kv = self.linear_kvb(compressed_kv_norm)  # colwise up-proj -> full seq
         kv = self.reshape(kv, (
-            seq_len,
+            self.shape(kv)[0],
             bs,
-            self.num_attention_heads,
+            -1,
             self.qk_head_dim + self.v_head_dim,
         ))
 
@@ -535,6 +556,9 @@ class MLASelfAttention(MultiLatentAttention):
             value = self.sbh2tnd(value)
         value = self.v_handoff(value)
 
+        # k_pe is sequence-gathered to the full sequence by the parallelize pre-hook on
+        # apply_rotary_emb_k (a no-op single-card), so after rotary it lines up with the
+        # full-seq k_nope; broadcast its single rope head to k_nope's head count.
         if rotary_pos_emb is not None:
             k_pe = self.apply_rotary_emb_k(
                 k_pe,
@@ -544,7 +568,7 @@ class MLASelfAttention(MultiLatentAttention):
                 multi_latent_attention=self.config.multi_latent_attention
             )
 
-        k_pe = self.tile_kv(k_pe, (1, 1, self.num_attention_heads, 1))
+        k_pe = self.tile_kv(k_pe, (1, 1, self.shape(k_nope)[2], 1))
         key = self.cat([k_nope, k_pe], 3)
         key = self.cast(key, self.compute_dtype)
         if self.input_layout == "TND":

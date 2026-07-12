@@ -14,13 +14,35 @@
 # ============================================================================
 """Test the classes of style.py."""
 import pytest
+from mindspore import Tensor
 
-from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
 from mindformers.pynative.distributed.style import (
+    AllGather,
+    ColwiseParallel,
+    ShardTensor,
     PrepareModuleInput,
     PrepareModuleOutput,
     PrepareModuleInputOutput,
+    NoParallel,
+    RowwiseParallel,
+    SequenceParallel,
 )
+
+
+class _FakeMesh:
+    """Minimal fake device mesh for style unit tests."""
+
+    @staticmethod
+    def size():
+        return 2
+
+    @staticmethod
+    def get_group():
+        return "tp-group"
+
+    @staticmethod
+    def get_local_rank():
+        return 1
 
 
 class TestPrepareModule:
@@ -32,50 +54,17 @@ class TestPrepareModule:
     def test_prepare_module_input_output_validation(self):
         """
         Feature: PrepareModuleInput/Output/InputOutput
-        Description: Test PrepareModuleInputOutput validation, which covers
-        PrepareModuleInput and PrepareModuleOutput validation.
-        Expectation: mismatched layouts raise ValueError.
+        Description: Test positional input/output transform arity validation.
+        Expectation: mismatched transform counts raise ValueError.
         """
-        with pytest.raises(
-            ValueError, match="desired module inputs should not be None"
-        ):
-            PrepareModuleInputOutput(
-                input_layouts=(Shard(0),),
-                desired_input_layouts=None,
-                output_layouts=(Shard(0),),
-                desired_output_layouts=(Replicate(),),
-            )
-
-        with pytest.raises(ValueError, match="should have same length"):
-            PrepareModuleInputOutput(
-                input_layouts=(Shard(0),),
-                desired_input_layouts=(Replicate(), Shard(0)),
-                output_layouts=(Shard(0),),
-                desired_output_layouts=(Replicate(),),
-            )
-
-        with pytest.raises(ValueError, match="should have same length"):
-            PrepareModuleInputOutput(
-                input_kwarg_layouts={"mask": Shard(0)},
-                desired_input_kwarg_layouts={
-                    "mask": Replicate(),
-                    "other": Replicate(),
-                },
-                output_layouts=(Shard(0),),
-                desired_output_layouts=(Replicate(),),
-            )
-
-        with pytest.raises(ValueError, match="should have same length"):
-            PrepareModuleInputOutput(
-                output_layouts=(Shard(0),),
-                desired_output_layouts=(Replicate(), Shard(0)),
-            )
-
-        with pytest.raises(ValueError, match="should have same length"):
-            PrepareModuleInputOutput(
-                output_layouts=(Shard(0), Replicate()),
-                desired_output_layouts=(Shard(1),),
-            )
+        style = PrepareModuleInputOutput(
+            input_transforms=(None,),
+            output_transforms=(None,),
+        )
+        with pytest.raises(ValueError, match="inputs and input_transforms should have same length"):
+            style.prepare_module_input._prepare_input_fn((object(), object()), None)
+        with pytest.raises(ValueError, match="outputs and output_transforms should have same length"):
+            style.prepare_module_output._prepare_out_fn((object(), object()), None)
 
     @pytest.mark.level0
     @pytest.mark.platform_x86_cpu
@@ -86,16 +75,14 @@ class TestPrepareModule:
         Expectation: repr string contains class name and key attributes.
         """
         prepare_input = PrepareModuleInput(
-            input_layouts=(Shard(0),),
-            desired_input_layouts=(Replicate(),),
-            use_local_output=True,
+            input_transforms=(AllGather(0), None),
+            input_kwarg_transforms={"mask": ShardTensor(0)},
         )
 
         repr_str = repr(prepare_input)
         assert "PrepareModuleInput" in repr_str
-        assert "input_layouts" in repr_str
-        assert "desired_input_layouts" in repr_str
-        assert "use_local_output=True" in repr_str
+        assert "input_transforms=(AllGather(dim=0), None)" in repr_str
+        assert "input_kwarg_transforms={'mask': ShardTensor(dim=0)}" in repr_str
 
     @pytest.mark.level0
     @pytest.mark.platform_x86_cpu
@@ -106,16 +93,51 @@ class TestPrepareModule:
         Expectation: repr string contains class name and key attributes.
         """
         prepare_output = PrepareModuleOutput(
-            output_layouts=(Shard(0),),
-            desired_output_layouts=(Replicate(),),
-            use_local_output=True,
+            output_transforms=(ShardTensor(0),),
         )
 
         repr_str = repr(prepare_output)
         assert "PrepareModuleOutput" in repr_str
-        assert "output_layouts" in repr_str
-        assert "desired_output_layouts" in repr_str
-        assert "use_local_output=True" in repr_str
+        assert "output_transforms=(ShardTensor(dim=0),)" in repr_str
+
+    @pytest.mark.level0
+    @pytest.mark.platform_x86_cpu
+    def test_prepare_module_output_shards_local_tensor(self):
+        """PrepareModuleOutput applies a concrete local output transform."""
+        prepare_output = PrepareModuleOutput(output_transforms=ShardTensor(0))
+        output = prepare_output._prepare_out_fn(Tensor([0, 1, 2, 3]), _FakeMesh())
+        assert output.asnumpy().tolist() == [2, 3]
+
+    @pytest.mark.level0
+    @pytest.mark.platform_x86_cpu
+    def test_sequence_parallel_keeps_sequence_dim(self):
+        """SequenceParallel preserves the public sequence-dimension metadata."""
+        style = SequenceParallel(sequence_dim=0)
+        assert style.sequence_dim == 0
+        assert style.input_is_parallel is True
+        assert repr(style) == "SequenceParallel(sequence_dim=0, input_is_parallel=True)"
+
+    @pytest.mark.level0
+    @pytest.mark.platform_x86_cpu
+    def test_sequence_parallel_can_shard_input(self):
+        """SequenceParallel exposes an explicit full-input to sequence-shard mode."""
+        style = SequenceParallel(sequence_dim=0, input_is_parallel=False)
+        assert style.input_is_parallel is False
+
+    @pytest.mark.level0
+    @pytest.mark.platform_x86_cpu
+    def test_no_parallel_and_rowwise_public_contracts(self):
+        """Base styles keep stable names and expose both rowwise reductions."""
+        assert NoParallel.__name__ == "NoParallel"
+        colwise = ColwiseParallel(gather_input=False, gather_output=True)
+        assert colwise.gather_input is False
+        assert colwise.gather_output is True
+        rowwise = RowwiseParallel(reduce_mode="all_reduce", input_is_parallel=False)
+        assert rowwise.reduce_mode == "all_reduce"
+        assert rowwise.input_is_parallel is False
+        assert RowwiseParallel(reduce_mode="reduce_scatter").reduce_mode == "reduce_scatter"
+        with pytest.raises(ValueError, match="reduce_mode must be"):
+            RowwiseParallel(reduce_mode="invalid")
 
     @pytest.mark.level0
     @pytest.mark.platform_x86_cpu
@@ -126,19 +148,11 @@ class TestPrepareModule:
         Expectation: repr string contains class name and key attributes.
         """
         prepare_input_output = PrepareModuleInputOutput(
-            input_layouts=(Shard(0),),
-            desired_input_layouts=(Replicate(),),
-            output_layouts=(Replicate(),),
-            desired_output_layouts=(Shard(0),),
-            use_local_input=True,
-            use_local_output=True,
+            input_transforms=(AllGather(0),),
+            output_transforms=(ShardTensor(0),),
         )
 
         repr_str = repr(prepare_input_output)
         assert "PrepareModuleInputOutput" in repr_str
-        assert "input_layouts" in repr_str
-        assert "desired_input_layouts" in repr_str
-        assert "output_layouts" in repr_str
-        assert "desired_output_layouts" in repr_str
-        assert "use_local_input=True" in repr_str
-        assert "use_local_output=True" in repr_str
+        assert "input_transforms=(AllGather(dim=0),)" in repr_str
+        assert "output_transforms=(ShardTensor(dim=0),)" in repr_str

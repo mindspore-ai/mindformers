@@ -16,6 +16,7 @@
 import os
 import random
 import subprocess
+import tempfile
 import pytest
 from tests.st.test_multi_cards_cases.utils import TaskType
 
@@ -43,12 +44,13 @@ class TestPrepareModule:
         assert os.path.exists(
             run_script_path
         ), f"Run script not found: {run_script_path}"
+        log_dir = tempfile.mkdtemp(prefix="msrun_local_style_")
         cmd = [
             "msrun",
             "--worker_num=2",
             "--local_worker_num=2",
             f"--master_port={port_id}",
-            "--log_dir=./msrun_log_test_style",
+            f"--log_dir={log_dir}",
             "--join=True",
             f"{run_script_path}",
             "--tp=2",
@@ -57,7 +59,7 @@ class TestPrepareModule:
             cmd, shell=False, capture_output=True, text=True, check=False,
         )
         assert result.returncode == 0, (
-            f"PrepareModuleOO script failed with non-zero exit code: "
+            f"Local style script failed with non-zero exit code: "
             f"{result.returncode}.\n"
             f"Stdout:\n{result.stdout}\nStderr:\n{result.stderr}"
         )

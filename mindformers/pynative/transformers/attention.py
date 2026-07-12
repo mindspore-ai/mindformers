@@ -183,16 +183,25 @@ class Attention(nn.Cell):
         # apply query, key, value projection
         query, key, value = self.get_query_key_value_tensors(hidden_states, key_value_states)
 
-        # transpose and reshape
-        query = self.reshape(query, (seq_len, bs, self.num_heads, self.head_dim))
-        key = self.reshape(key, (seq_len, bs, self.kv_num_heads, self.head_dim))
+        # transpose and reshape. The head-count dim is inferred (-1) rather than taken from
+        # the global self.num_heads / self.kv_num_heads, so the same code runs whether the
+        # QKV projection is full (single card) or head-sharded under tensor parallelism
+        # (each rank holds num_heads/tp query heads and num_query_groups/tp kv heads).
+        # The sequence length is read from the projected tensors, not from hidden_states:
+        # under sequence parallelism the colwise linear_qkv all-gathers its input in a
+        # pre-hook, so query/key/value carry the full sequence while hidden_states is still
+        # the local shard (seq/tp).
+        q_seq_len = query.shape[0]
+        kv_seq_len = key.shape[0]
+        query = self.reshape(query, (q_seq_len, bs, -1, self.head_dim))
+        key = self.reshape(key, (kv_seq_len, bs, -1, self.head_dim))
 
         # apply rotary position embedding
         if rotary_pos_emb is not None:
             query = self.apply_rotary_pos_emb(query, rotary_pos_emb, mscale=mscale)
             key = self.apply_rotary_pos_emb(key, rotary_pos_emb, mscale=mscale)
 
-        value = self.reshape(value, (seq_len, bs, self.kv_num_heads, self.head_dim))
+        value = self.reshape(value, (kv_seq_len, bs, -1, self.head_dim))
         key, value = self._cat_prefix(key, value, prefix_keys_values)
 
         if self.input_layout == "TND":
@@ -324,10 +333,14 @@ class SelfAttention(Attention):
         """
         Derives `query`, `key` and `value` tensors from `hidden_states`.
         """
-        seq_len, bs, _ = hidden_states.shape
-
         qkv = self.linear_qkv(hidden_states)
         qkv = self.cast(qkv, self.compute_dtype)
+        # seq_len / bs are read from the projection output rather than hidden_states:
+        # under sequence parallelism the colwise linear_qkv all-gathers its input in a
+        # pre-hook, so qkv carries the full sequence while hidden_states is the local
+        # shard (seq/tp). The group dim is inferred (-1), giving num_query_groups/tp
+        # groups per rank under tensor parallelism and the full count on a single card.
+        seq_len, bs, _ = qkv.shape
         new_tensor_shape = (seq_len, bs, -1, (self.n_rep + 2) * self.head_dim)
         mixed_x_layer = self.reshape_concat(qkv, new_tensor_shape)
         query, key, value = self.split_qkv(mixed_x_layer,
@@ -335,14 +348,12 @@ class SelfAttention(Attention):
 
         if self.q_layernorm is not None:
             orig_query_shape = query.shape
-            query = self.q_layernorm(query.reshape(hidden_states.shape[:-1] +
-                                                   (-1, self.head_dim,)))
+            query = self.q_layernorm(query.reshape((seq_len, bs, -1, self.head_dim)))
             query = query.reshape(orig_query_shape)
 
         if self.k_layernorm is not None:
             orig_query_shape = key.shape
-            key = self.k_layernorm(key.reshape(hidden_states.shape[:-1] +
-                                               (-1, self.head_dim,)))
+            key = self.k_layernorm(key.reshape((seq_len, bs, -1, self.head_dim)))
             key = key.reshape(orig_query_shape)
 
         return query, key, value

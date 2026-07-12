@@ -14,10 +14,16 @@
 # ============================================================================
 """distributed modules"""
 from mindformers.pynative.distributed.style import (
+    AllGather,
+    ShardTensor,
     PrepareModuleInput,
     PrepareModuleOutput,
     PrepareModuleInputOutput,
     ParallelStyle,
+    NoParallel,
+    ColwiseParallel,
+    RowwiseParallel,
+    SequenceParallel,
 )
 from mindformers.pynative.distributed.fsdp import (
     get_fsdp_reshard_after_forward_policy,
@@ -33,10 +39,16 @@ from mindformers.pynative.distributed.pipeline_parallel import PpLayerSetting, S
 from mindformers.pynative.distributed.ep_overlap import OverlapExpertParallel, apply_chunk_overlap_hooks
 
 __all__ = [
+    "AllGather",
+    "ShardTensor",
     "PrepareModuleInput",
     "PrepareModuleOutput",
     "PrepareModuleInputOutput",
     "ParallelStyle",
+    "NoParallel",
+    "ColwiseParallel",
+    "RowwiseParallel",
+    "SequenceParallel",
     "get_fsdp_reshard_after_forward_policy",
     "disable_fsdp_gradient_division",
     "parallelize_module",

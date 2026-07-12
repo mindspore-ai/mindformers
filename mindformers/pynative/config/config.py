@@ -463,6 +463,11 @@ class ParallelismConfig(BaseConfig):
 
     def __post_init__(self):
         """Post-initialization validation."""
+        if self.tensor_parallel > 1 and not self.sequence_parallel:
+            raise ValueError(
+                "PyNative tensor parallelism requires sequence_parallel=True when "
+                f"tensor_parallel > 1, but got tensor_parallel={self.tensor_parallel}."
+            )
         if self.moe_token_dispatcher_type == "alltoall_deredundancy" and \
                 (self.expert_parallel < self.npu_nums_per_device):
             raise ValueError(

@@ -24,6 +24,8 @@ from mindspore import nn, mint
 from mindspore.common import dtype
 from mindspore.common.parameter import Parameter
 
+from hyper_parallel import DTensor
+
 
 class VocabEmbedding(nn.Cell):
     """Vocab Embedding.
@@ -63,19 +65,24 @@ class VocabEmbedding(nn.Cell):
         """
         Forward of vocab embedding.
 
+        Plain single-card gather: ``input_`` are the token ids to look up and ``weight``
+        the (possibly this-rank's local shard of a Shard(0) DTensor) embedding table.
+        Under vocab parallelism the ids are pre-mapped to this rank's local range and the
+        output is masked + reduced by the parallelize pre/post hooks, so this stays a
+        plain per-token gather with no tensor-parallel logic.
+
         input_: (B, S)
-        weight: (V, H)
+        weight: (V, H)  (V/t local shard under vocab parallelism)
         output: (B, S, H)
         """
         Validator.check_type_name("input_ids", input_.dtype, [dtype.int32, dtype.int64], self.cls_name)
 
         _, seq_len = input_.shape
+        weight = self.weight.to_local() if isinstance(self.weight, DTensor) else self.weight
 
         input_ = self.reshape(input_, (-1, 1))
         input_ = self.tile(input_, (1, self.embedding_dim))
-        masked_input = input_
-
-        output = self.embedding(self.weight, 0, masked_input)
+        output = self.embedding(weight, 0, input_)
         output = self.reshape(output, (-1, seq_len, self.embedding_dim))
 
         return output
