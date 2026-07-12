@@ -12,16 +12,14 @@ from mindspore.common.parameter import Parameter
 from mindspore.common import dtype as mstype
 
 from hyper_parallel import DTensor
+from hyper_parallel.platform import get_platform
 
 from mindformers.parallel_core.transformer_config import TransformerConfig
 from mindformers.tools.logger import logger
 from .moe_utils import (
     compute_routing_scores_for_aux_loss,
-    switch_load_balancing_loss_func,
     save_to_aux_losses_tracker,
     MoEAuxLossAutoScaler,
-    get_tokens_per_expert_and_token_count,
-    get_moe_aux_loss_group,
     get_moe_aux_loss_group_size,
 )
 
@@ -157,6 +155,17 @@ class TopKRouter(nn.Cell):
         self.mul = mint.mul
         self.histc = mint.histc
         self.stop_gradient = ops.stop_gradient
+        self._tp_group = None
+        self._tp_size = 1
+        self._cp_groups = ()
+        self._cp_size = 1
+
+    def enable_sequence_parallel(self, tp_group=None, tp_size=1, cp_groups=(), cp_size=1):
+        """Configure the token-sharding groups used by local aux-loss statistics."""
+        self._tp_group = tp_group
+        self._tp_size = tp_size
+        self._cp_groups = tuple(group for group in cp_groups if group is not None)
+        self._cp_size = cp_size
 
 
     def reset_parameter(self):
@@ -360,11 +369,10 @@ class TopKRouter(nn.Cell):
                     "Ensure moe_n_hash_layers is set correctly and input_ids are passed."
                 )
             top_scores, selected_experts_indices = self._hash_routing(logits, input_ids)
-            num_tokens_per_expert = self.histc(
-                selected_experts_indices,
-                bins=self.num_experts,
-                min=0,
-                max=self.num_experts,
+            num_tokens_per_expert = self.cast(
+                self.histc(selected_experts_indices, bins=self.num_experts,
+                           min=0, max=self.num_experts),
+                mstype.int32,
             )
             return top_scores, selected_experts_indices, num_tokens_per_expert
 
@@ -405,11 +413,10 @@ class TopKRouter(nn.Cell):
 
         top_scores = self.mul(top_scores, self.route_scale)
         # group tokens together by expert indices from 0 to num_experts and pass that to experts forward
-        num_tokens_per_expert = self.histc(
-            selected_experts_indices,
-            bins=self.num_experts,
-            min=0,
-            max=self.num_experts,
+        num_tokens_per_expert = self.cast(
+            self.histc(selected_experts_indices, bins=self.num_experts,
+                       min=0, max=self.num_experts),
+            mstype.int32,
         )
 
         # Compute auxiliary load-balancing loss and inject gradient into top_scores
@@ -489,6 +496,52 @@ class TopKRouter(nn.Cell):
 
         return top_scores
 
+    def _reduce_cp_count(self, count: Tensor) -> Tensor:
+        """Reduce detached token counts over CP without touching probability gradients."""
+        for group in self._cp_groups:
+            count = get_platform().differentiable_all_reduce(count, "sum", group)
+        return count
+
+    def _reduce_pair(self, probs_local: Tensor, count_local: Tensor, reduce_count_cp=False):
+        """Reduce probability sums and detached counts in one TP collective."""
+        split = probs_local.shape[0]
+        packed = mint.cat((probs_local, self.cast(count_local, probs_local.dtype)))
+        if self._tp_size > 1:
+            packed = get_platform().differentiable_all_reduce(packed, "sum", self._tp_group)
+        agg_probs, tokens_per_expert = packed[:split], packed[split:]
+        if reduce_count_cp and self._cp_size > 1:
+            tokens_per_expert = self._reduce_cp_count(tokens_per_expert)
+        return agg_probs, tokens_per_expert
+
+    def _reduce_token_sum_pair(
+            self, probs: Tensor, routing_map: Tensor, reduce_count_cp=False
+    ) -> Tuple[Tensor, Tensor]:
+        """Aggregate token-level probability and routing statistics."""
+        return self._reduce_pair(
+            probs.sum(dim=0), routing_map.sum(dim=0), reduce_count_cp
+        )
+
+    def _reduce_seq_sum_pair(
+            self, probs: Tensor, routing_map: Tensor, bsz: int, reduce_count_cp=False
+    ) -> Tuple[Tensor, Tensor]:
+        """Aggregate per-sequence probability and routing statistics."""
+        def seq_sum(tensor):
+            local_seq = tensor.shape[0] // bsz
+            return tensor.reshape((local_seq, bsz, -1)).sum(dim=0).reshape((-1,))
+
+        return self._reduce_pair(
+            seq_sum(probs), seq_sum(routing_map), reduce_count_cp
+        )
+
+    def _aux_loss_from_stats(
+            self, agg_probs: Tensor, tokens_per_expert: Tensor, total_num_tokens: int
+    ) -> Tensor:
+        """Compute Switch auxiliary loss from pre-aggregated expert statistics."""
+        return mint.sum(agg_probs * tokens_per_expert) * (
+            self.num_experts * self.moe_aux_loss_coeff
+            / (self.top_k * total_num_tokens * total_num_tokens)
+        )
+
     def _apply_aux_loss(
             self,
             top_scores: Tensor,
@@ -511,16 +564,12 @@ class TopKRouter(nn.Cell):
             Tensor: top_scores with aux loss gradient injected.
         """
         _ = seq_length, bsz
-        tokens_per_expert = routing_map.sum(dim=0)
-        total_num_tokens = scores_for_aux_loss.shape[0]
-
-        aux_loss = switch_load_balancing_loss_func(
-            probs=scores_for_aux_loss,
-            tokens_per_expert=tokens_per_expert,
-            total_num_tokens=total_num_tokens,
-            topk=self.top_k,
-            num_experts=self.num_experts,
-            moe_aux_loss_coeff=self.moe_aux_loss_coeff,
+        agg_probs, tokens_per_expert = self._reduce_token_sum_pair(
+            scores_for_aux_loss, routing_map, reduce_count_cp=True
+        )
+        total_num_tokens = scores_for_aux_loss.shape[0] * self._tp_size * self._cp_size
+        aux_loss = self._aux_loss_from_stats(
+            agg_probs, tokens_per_expert, total_num_tokens
         )
         return self._attach_and_log_aux_loss(
             top_scores, aux_loss, self.moe_aux_loss_coeff
@@ -547,31 +596,12 @@ class TopKRouter(nn.Cell):
         Returns:
             Tensor: top_scores with aux loss gradient injected.
         """
-        scores_for_aux_loss = scores_for_aux_loss.reshape(seq_length, -1)
-        routing_map = routing_map.reshape(seq_length, -1)
-
-        # ``topk * bsz`` -- the routing_map has shape ``(slen, bsz*E)`` after
-        # the reshape (one row per sequence, ``bsz`` experts' worth of columns),
-        # so each token contributes ``topk * bsz`` to the histogram sum. Used
-        # by ``get_tokens_per_expert_and_token_count`` to derive the token
-        # count from the histogram when padding is masked; kept for parity
-        # with the Megatron helper signature even though we currently only
-        # support the non-padded path.
-        global_tokens_per_expert, _, total_num_tokens = (
-            get_tokens_per_expert_and_token_count(
-                routing_map=routing_map,
-                reduce_group=get_moe_aux_loss_group(),
-                topk=self.top_k * bsz,
-            )
+        agg_probs, tokens_per_expert = self._reduce_seq_sum_pair(
+            scores_for_aux_loss, routing_map, bsz, reduce_count_cp=True
         )
-
-        aux_loss = switch_load_balancing_loss_func(
-            probs=scores_for_aux_loss,
-            tokens_per_expert=global_tokens_per_expert,
-            total_num_tokens=total_num_tokens,
-            topk=self.top_k,
-            num_experts=self.config.num_moe_experts,
-            moe_aux_loss_coeff=self.moe_aux_loss_coeff,
+        total_num_tokens = seq_length * self._tp_size * self._cp_size
+        aux_loss = self._aux_loss_from_stats(
+            agg_probs, tokens_per_expert, total_num_tokens
         ) / bsz
 
         top_scores = self._attach_and_log_aux_loss(
@@ -601,24 +631,17 @@ class TopKRouter(nn.Cell):
             Tensor: top_scores with aux loss gradient injected.
         """
         _ = seq_length, bsz
-        global_tokens_per_expert, _, total_num_tokens = (
-            get_tokens_per_expert_and_token_count(
-                routing_map=routing_map,
-                reduce_group=get_moe_aux_loss_group(),
-                topk=self.top_k,
-            )
+        agg_probs, tokens_per_expert = self._reduce_token_sum_pair(
+            scores_for_aux_loss, routing_map, reduce_count_cp=True
         )
-        self.global_tokens_per_expert += global_tokens_per_expert
+        self.global_tokens_per_expert += tokens_per_expert
         self.ga_steps += 1
         averated_tokens_per_expert = self.global_tokens_per_expert / self.ga_steps
-
-        global_aux_loss = switch_load_balancing_loss_func(
-            probs=scores_for_aux_loss,
-            tokens_per_expert=averated_tokens_per_expert,
-            total_num_tokens=total_num_tokens,
-            topk=self.top_k,
-            num_experts=self.config.num_moe_experts,
-            moe_aux_loss_coeff=self.moe_aux_loss_coeff,
+        total_num_tokens = (
+            scores_for_aux_loss.shape[0] * self._tp_size * self._cp_size
+        )
+        global_aux_loss = self._aux_loss_from_stats(
+            agg_probs, averated_tokens_per_expert, total_num_tokens
         )
         top_scores = self._attach_and_log_aux_loss(
             top_scores,
@@ -651,9 +674,10 @@ class TopKRouter(nn.Cell):
 
         # Compensate for the tp×cp-dependent scaling in the Switch formula.
         tp_cp_size = get_moe_aux_loss_group_size()
+        grad_aux_loss_group_size = max(tp_cp_size // self._tp_size, 1)
 
         save_to_aux_losses_tracker(
-            aux_loss / aux_loss_coeff,
+            aux_loss / (aux_loss_coeff * self._tp_size),
             self.layer_number,
             num_layers,
         )
@@ -671,7 +695,7 @@ class TopKRouter(nn.Cell):
             )
         else:
             top_scores = self.moe_aux_loss_auto_scaler(
-                top_scores, aux_loss * tp_cp_size
+                top_scores, aux_loss * grad_aux_loss_group_size
             )
 
         return top_scores

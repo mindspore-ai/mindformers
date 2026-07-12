@@ -298,7 +298,6 @@ class MultiTokenPredictionLayer(nn.Cell):
             input_size=self.config.hidden_size * 2,
             output_size=self.config.hidden_size,
             compute_dtype=config.compute_dtype,
-            params_dtype=config.params_dtype,
             init_method=self.config.init_method,
             bias=False,
         )

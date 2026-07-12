@@ -79,7 +79,6 @@ class MLP(nn.Cell):
             self.input_size,
             map_ffn_hidden_size,
             compute_dtype=self.config.compute_dtype,
-            params_dtype=self.config.params_dtype,
             init_method=self.config.init_method,
             bias=self.config.add_bias_linear,
         )
@@ -99,7 +98,6 @@ class MLP(nn.Cell):
             self.config.ffn_hidden_size,
             self.config.hidden_size,
             compute_dtype=self.config.compute_dtype,
-            params_dtype=self.config.params_dtype,
             init_method=self.config.output_layer_init_method,
             bias=self.config.add_bias_linear,
         )

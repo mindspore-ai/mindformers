@@ -174,7 +174,8 @@ class Attention(nn.Cell):
             rotary_pos_emb=None,
             prefix_keys_values=None,
             actual_seq_len=None,
-            mscale=1.0
+            mscale=1.0,
+            rotary_cos_sin=None
     ):
         """ Construct function of attention block."""
         ori_dtype = hidden_states.dtype
@@ -198,8 +199,8 @@ class Attention(nn.Cell):
 
         # apply rotary position embedding
         if rotary_pos_emb is not None:
-            query = self.apply_rotary_pos_emb(query, rotary_pos_emb, mscale=mscale)
-            key = self.apply_rotary_pos_emb(key, rotary_pos_emb, mscale=mscale)
+            query = self.apply_rotary_pos_emb(query, rotary_pos_emb, mscale=mscale, cos_sin=rotary_cos_sin)
+            key = self.apply_rotary_pos_emb(key, rotary_pos_emb, mscale=mscale, cos_sin=rotary_cos_sin)
 
         value = self.reshape(value, (kv_seq_len, bs, -1, self.head_dim))
         key, value = self._cat_prefix(key, value, prefix_keys_values)

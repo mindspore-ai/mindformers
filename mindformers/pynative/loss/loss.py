@@ -20,6 +20,7 @@ from mindspore.common._grad_function import _Function
 from mindspore.ops.function import comm_func
 from mindspore import log as logger
 
+from mindformers.pynative.dtensor_compat import inplace_copy
 from mindformers.tools.logger import _LogActionOnce
 
 
@@ -515,11 +516,11 @@ class _ChunkVocabParallelCrossEntropy(_Function):
 
     @staticmethod
     def backward(ctx, grads):
-        """Backward pass: recompute each chunk's vocab-parallel softmax and concatenate."""
+        """Backward pass: recompute each chunk into one preallocated gradient buffer."""
         local_logits = ctx.local_logits
         labels = ctx.labels
         input_mask = ctx.input_mask
-        grad_logits_chunks = []
+        grad_logits = mint.empty_like(local_logits)
         start_idx = 0
         for chunk_size in ctx.chunk_sizes:
             end_idx = start_idx + chunk_size
@@ -535,8 +536,7 @@ class _ChunkVocabParallelCrossEntropy(_Function):
             grad = _vocab_parallel_ce_grad(exp_vals, global_sum_exp, local_target, in_range_f,
                                            upstream, ctx.tp_grad_factor)
             grad = ops.cast(mint.reshape(grad, seq_shape), ctx.logits_dtype)
-            grad_logits_chunks.append(grad)
+            inplace_copy(grad_logits[:, start_idx:end_idx, :], grad)
             start_idx = end_idx
-        grad_logits = mint.cat(grad_logits_chunks, dim=1)  # [b, s, V_local]
         return (grad_logits, mint.zeros_like(labels), mint.zeros_like(input_mask),
                 None, None, None, None, None)

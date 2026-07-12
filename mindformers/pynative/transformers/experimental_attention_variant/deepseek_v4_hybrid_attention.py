@@ -215,8 +215,15 @@ class DSv4HybridSelfAttention(MultiLatentAttention):
         return self.cat([t_nope, t_pe], dim=-1)
 
     def construct(self, x: Tensor, attention_mask=None, rotary_pos_emb=None,
-                  prefix_keys_values=None, pad_zeros=None, actual_seq_len=None, mscale=1.0) -> Tensor:
-        """DeepSeek-V4 hybrid attention forward."""
+                  prefix_keys_values=None, pad_zeros=None, actual_seq_len=None, mscale=1.0,
+                  rotary_cos_sin=None) -> Tensor:
+        """DeepSeek-V4 hybrid attention forward.
+
+        ``rotary_cos_sin`` is accepted for shared TransformerLayer interface
+        parity, but ignored because this variant builds and applies its own
+        per-layer RoPE internally.
+        """
+        _ = rotary_pos_emb, attention_mask, mscale, rotary_cos_sin
         if prefix_keys_values is not None:
             raise NotImplementedError("prefix_keys_values is not supported for now.")
         if pad_zeros:

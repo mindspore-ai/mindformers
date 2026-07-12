@@ -176,7 +176,9 @@ class MC2Linear(Linear):
 
         bias_local = None
         if self.has_bias:
-            bias = self.cast(self.bias, self.compute_dtype)
+            bias = self.bias
+            if bias.dtype != self.compute_dtype:
+                bias = self.cast(bias, self.compute_dtype)
             bias_local = bias.to_local() if isinstance(bias, DTensor) else bias
 
         if self.mc2_mode == "all_gather":
@@ -209,6 +211,9 @@ class MC2Linear(Linear):
             weight = self.weight
 
         ori_dtype = input_.dtype
-        input_ = self.cast(input_, self.compute_dtype)
-        weight = self.cast(weight, self.compute_dtype)
-        return self.cast(self._mc2_forward(input_, weight), ori_dtype)
+        if input_.dtype != self.compute_dtype:
+            input_ = self.cast(input_, self.compute_dtype)
+        if weight.dtype != self.compute_dtype:
+            weight = self.cast(weight, self.compute_dtype)
+        output = self._mc2_forward(input_, weight)
+        return self.cast(output, ori_dtype) if output.dtype != ori_dtype else output

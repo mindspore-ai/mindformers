@@ -461,6 +461,13 @@ class ParallelismConfig(BaseConfig):
     Options are 'alltoall', 'alltoall_deredundancy'.
     """
 
+    expert_parallel_async_d2h: bool = False
+    """Overlap the EP dispatch counts D2H with the token permute on a dedicated side
+    stream (Megatron ``cuda_dtoh_stream`` + deferred sync). Applies to both the plain
+    :class:`ExpertParallel` and the overlap :class:`OverlapExpertParallel` paths; composes
+    with ``pipeline_parallel_overlap_b_f``. Off by default: bit-identical but wall-clock-
+    neutral unless the EP counts D2H is on the critical path (large ep_degree / multi-node)."""
+
     def __post_init__(self):
         """Post-initialization validation."""
         if self.tensor_parallel > 1 and not self.sequence_parallel:

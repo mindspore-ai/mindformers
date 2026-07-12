@@ -461,9 +461,9 @@ def track_moe_metrics(
 
     tracker = get_moe_layer_wise_logging_tracker()
 
-    # Step 1: CP all-reduce (SUM) — combine context-parallel shards.
-    # Router inputs are replicated across TP and independent across DP;
-    # only CP shards the token view, so only CP ranks (if any) are combined here.
+    # Step 1: TP/CP all-reduce (SUM) to combine every shard of the router token view.
+    # Each rank saved aux_loss / tp_size, so the TP logging reduction restores
+    # the baseline value without changing the gradient scaling path.
     if _AUX_LOSS_GROUP and _AUX_LOSS_GROUP_SIZE > 1:
         if "values" not in tracker:
             num_total_layers = num_layers

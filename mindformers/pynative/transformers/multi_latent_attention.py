@@ -119,7 +119,6 @@ class MultiLatentAttention(nn.Cell):
             submodules.linear_proj,
             input_size=self.query_projection_size,
             output_size=self.config.hidden_size,
-            params_dtype=config.params_dtype,
             compute_dtype=config.compute_dtype,
             init_method=self.config.output_layer_init_method,
             bias=self.config.add_bias_linear,
@@ -290,7 +289,8 @@ class MultiLatentAttention(nn.Cell):
             inplace_copy(param, weights)
 
     def construct(self, x: Tensor, attention_mask=None, rotary_pos_emb=None,
-                  prefix_keys_values=None, pad_zeros=None, actual_seq_len=None, mscale=1.0):
+                  prefix_keys_values=None, pad_zeros=None, actual_seq_len=None, mscale=1.0,
+                  rotary_cos_sin=None):
         """
         Forward pass of the Multi-head Latent Attention mechanism.
 
@@ -309,9 +309,9 @@ class MultiLatentAttention(nn.Cell):
             raise NotImplementedError("prefix_keys_values is not supported for now.")
         if pad_zeros:
             raise NotImplementedError("pad_zeros is not supported for now.")
-        ori_dtype = x.dtype
         seq_len, bs, _ = self.shape(x)
-        query, key, value = self.get_query_key_value_tensors(x, rotary_pos_emb=rotary_pos_emb, mscale=mscale)
+        query, key, value = self.get_query_key_value_tensors(
+            x, rotary_pos_emb=rotary_pos_emb, mscale=mscale, rotary_cos_sin=rotary_cos_sin)
         # The attention output carries q's sequence length -- ``seq_len`` when the input
         # is full, or the (gathered) full sequence when q was sequence-sharded upstream.
         attn_seq_len = self.shape(query)[0]
@@ -346,7 +346,6 @@ class MultiLatentAttention(nn.Cell):
             attn_out = self.core_attention(query, key, value, attention_mask)
 
         output = self.linear_proj(attn_out)
-        output = self.cast(output, ori_dtype)
         return output
 
     def sbh2tnd(self, x):
@@ -425,7 +424,6 @@ class MLASelfAttention(MultiLatentAttention):
                 submodules.linear_qb,
                 input_size=self.config.q_lora_rank,
                 output_size=self.config.num_attention_heads * self.q_head_dim,
-                params_dtype=config.params_dtype,
                 compute_dtype=config.compute_dtype,
                 init_method=self.config.init_method,
                 bias=self.config.add_bias_linear or self.config.add_qkv_bias,
@@ -435,7 +433,6 @@ class MLASelfAttention(MultiLatentAttention):
             submodules.linear_qkv,
             input_size=self.config.hidden_size,
             output_size=self.q_rank + self.kv_lora_rank + self.qk_pos_emb_head_dim,
-            params_dtype=config.params_dtype,
             compute_dtype=config.compute_dtype,
             init_method=self.config.init_method,
             bias=self.config.add_bias_linear or self.config.add_qkv_bias,
@@ -456,7 +453,6 @@ class MLASelfAttention(MultiLatentAttention):
             input_size=self.kv_lora_rank,
             output_size=self.config.num_attention_heads * (
                     self.q_head_dim - self.qk_pos_emb_head_dim + self.v_head_dim),
-            params_dtype=config.params_dtype,
             compute_dtype=config.compute_dtype,
             init_method=self.config.init_method,
             bias=self.config.add_bias_linear or self.config.add_qkv_bias,
@@ -466,13 +462,12 @@ class MLASelfAttention(MultiLatentAttention):
             submodules.linear_proj,
             input_size=self.query_projection_size,
             output_size=self.config.hidden_size,
-            params_dtype=config.params_dtype,
             compute_dtype=config.compute_dtype,
             init_method=self.config.output_layer_init_method,
             bias=self.config.add_bias_linear,
         )
 
-    def get_query_key_value_tensors(self, hidden_states, rotary_pos_emb=None, mscale=1.0):
+    def get_query_key_value_tensors(self, hidden_states, rotary_pos_emb=None, mscale=1.0, rotary_cos_sin=None):
         """
         Derive query, key, and value tensors from hidden states.
 
@@ -529,7 +524,8 @@ class MLASelfAttention(MultiLatentAttention):
                 rotary_pos_emb,
                 mscale=mscale,
                 rotary_interleaved=self.config.rotary_interleaved,
-                multi_latent_attention=self.config.multi_latent_attention
+                multi_latent_attention=self.config.multi_latent_attention,
+                cos_sin=rotary_cos_sin
             )
 
         query = self.cat([q_nope, q_pe], 3)
@@ -565,7 +561,8 @@ class MLASelfAttention(MultiLatentAttention):
                 rotary_pos_emb,
                 mscale=mscale,
                 rotary_interleaved=self.config.rotary_interleaved,
-                multi_latent_attention=self.config.multi_latent_attention
+                multi_latent_attention=self.config.multi_latent_attention,
+                cos_sin=rotary_cos_sin
             )
 
         k_pe = self.tile_kv(k_pe, (1, 1, self.shape(k_nope)[2], 1))

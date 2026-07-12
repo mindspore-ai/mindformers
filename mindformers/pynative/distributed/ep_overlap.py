@@ -26,8 +26,8 @@ Key design points
 -----------------
 Single HCCL stream funnel
     Every EP all-to-all on a group (counts, main token, combine — the
-    routing-map a2a is gone, its resort index is rebuilt host-side from the
-    counts matrix) routes through ``comm_func.all_to_all_single`` / the hyper_parallel
+    routing-map a2a is gone, the post-dispatch resort is a fixed chunk
+    permutation applied on device) routes through ``comm_func.all_to_all_single`` / the hyper_parallel
     platform's ``all_to_all_single`` path.  Using ``ops.AlltoAll`` /
     ``ops.AlltoAllV`` Primitives would dispatch on a *different* stream from
     ``comm_func.all_to_all_single``, so mixing them under dual-thread overlap
@@ -105,10 +105,14 @@ class OverlapExpertParallel(ExpertParallel):
         coordinator: HookCoordinator,
         is_last_layer: bool = False,
         moe_permute_fusion: bool = False,
+        async_d2h: bool = False,
     ) -> None:
-        super().__init__(moe_permute_fusion=moe_permute_fusion)
+        super().__init__(moe_permute_fusion=moe_permute_fusion, async_d2h=async_d2h)
         self._coordinator = coordinator
         self._d_hook = "D_LAST" if is_last_layer else "D"
+        # async_d2h (ParallelismConfig.expert_parallel_async_d2h) composes with the
+        # dual-thread overlap: the staged dispatch keeps the A/B hooks at the a2a-segment
+        # boundary (see _dispatch_a2a), so the side-stream counts D2H fits underneath.
 
     # ------------------------------------------------------------------
     # Overlap seams — the only logic added on top of the synchronous base.
@@ -122,16 +126,16 @@ class OverlapExpertParallel(ExpertParallel):
         return _platform.differentiable_sync_hook(x, hook_name, self._coordinator)
 
     @staticmethod
-    def _elem_splits(splits_t, block_size: int):
-        """Per-rank token-count tensor -> Python list of element counts (small host sync)."""
-        return (splits_t * block_size).asnumpy().tolist()
+    def _elem_splits(splits, block_size: int):
+        """Scale a host split ``int`` list to element counts (pure host, no D2H)."""
+        return [s * block_size for s in splits]
 
-    def _async_a2a(self, flat_input, send_splits_t, recv_splits_t, block_size: int):
+    def _async_a2a(self, flat_input, send_splits, recv_splits, block_size: int):
         """Async all-to-all-v returning an AsyncCollectiveTensor (lazy wait)."""
         return _platform.differentiable_all_to_all_single_async(
             flat_input,
-            self._elem_splits(send_splits_t, block_size),
-            self._elem_splits(recv_splits_t, block_size),
+            self._elem_splits(send_splits, block_size),
+            self._elem_splits(recv_splits, block_size),
             self.ep_group,
         )
 
@@ -156,22 +160,46 @@ class OverlapExpertParallel(ExpertParallel):
     # ---- communication segments: wrap the a2a with the A/B/C/D sync hooks ----
 
     def _dispatch_comm(self, flat_in, num_tokens_per_expert, ep_degree, block_size):
-        """Overlap dispatch comm: A hook -> counts -> splits -> resort index
-        (host, from the counts matrix) -> async main a2a -> B hook.
+        """Overlap dispatch comm: A hook -> counts -> splits -> chunk counts
+        (small host list) -> async main a2a -> B hook.
 
-        The index build reads only the already-complete counts a2a, so it does
-        not force the async main a2a's lazy wait — that defers into the resort
-        compute after B, preserving the overlap window. Replaces the routing-map
-        a2a (a third collective) + device sort with one host index build.
+        Reading the chunk counts consumes only the already-complete counts a2a, so
+        it does not force the async main a2a's lazy wait — the device-side
+        ``split``/``cat`` resort (:meth:`_resort_after_dispatch`) after B is what
+        consumes the async output, preserving the overlap window. Replaces the
+        routing-map a2a (a third collective) + device sort with the fixed chunk
+        permutation of :meth:`_chunk_perm`.
         """
         flat_in = self._sync_hook(flat_in, "A")
         num_tokens_per_expert_group = self._counts_a2a(num_tokens_per_expert, ep_degree)
-        input_splits, output_splits, num_tokens_per_expert = self._compute_token_splits(
+        # Single batched D2H (consumes only the already-complete counts a2a, not the
+        # async main a2a below — the overlap window is preserved); group_list on device.
+        input_splits, output_splits, group_counts = self._host_token_splits(
             num_tokens_per_expert, num_tokens_per_expert_group, ep_degree)
-        dispatch_index, combine_index = self._build_resort_index(num_tokens_per_expert_group, ep_degree)
+        num_tokens_per_expert = self._compute_group_list(num_tokens_per_expert_group, ep_degree)
         flat_out = self._main_a2a(flat_in, input_splits, output_splits, block_size)
         flat_out = self._sync_hook(flat_out, "B")
-        return flat_out, dispatch_index, combine_index, input_splits, output_splits, num_tokens_per_expert
+        return flat_out, group_counts, input_splits, output_splits, num_tokens_per_expert
+
+    def _dispatch_a2a(self, flat_in, host_buf, event, num_tokens_per_expert_group,
+                      num_experts, ep_degree, block_size):
+        """Async-D2H stage 2 with A/B hooks (used when expert_parallel_async_d2h is on).
+
+        The counts a2a + the async counts D2H were already issued in
+        :meth:`ExpertParallel._dispatch_preprocess` (before the permute); here we
+        only bracket the *main token a2a* with the A/B rendezvous. The deferred
+        ``event.synchronize()`` waits solely on this rank's side-stream counts copy
+        (a tiny, by-now-complete transfer) — it is NOT a cross-thread rendezvous, so
+        it does not couple with the coordinator's A/B/C/D barriers.
+        """
+        flat_in = self._sync_hook(flat_in, "A")
+        event.synchronize()
+        input_splits, output_splits, group_counts = self._derive_splits(
+            host_buf.tolist(), num_experts, ep_degree)
+        num_tokens_per_expert = self._compute_group_list(num_tokens_per_expert_group, ep_degree)
+        flat_out = self._main_a2a(flat_in, input_splits, output_splits, block_size)
+        flat_out = self._sync_hook(flat_out, "B")
+        return flat_out, group_counts, input_splits, output_splits, num_tokens_per_expert
 
     def _combine_comm(self, flat_in, input_splits, output_splits, block_size):
         """Overlap combine comm: C hook -> async combine a2a -> D / D_LAST hook."""

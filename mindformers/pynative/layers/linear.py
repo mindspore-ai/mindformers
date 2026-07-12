@@ -47,7 +47,7 @@ class Linear(nn.Cell):
         input_size (int): The number of input units.
         output_size (int): The number of output units.
         compute_dtype (str): The data type of the computation (e.g., 'bf16', 'float16').
-        params_dtype (str): The data type of the parameters (e.g., 'float32').
+        params_dtype (str): Optional storage dtype. Defaults to ``compute_dtype``.
         init_method (Callable): The initialization method. Default: None.
         bias (bool): Whether to include bias in the linear layer. Default: True.
         skip_weight_param_allocation (bool): Whether to skip weight parameter allocation. Default: False.
@@ -58,7 +58,7 @@ class Linear(nn.Cell):
                  input_size: int,
                  output_size: int,
                  compute_dtype: str,
-                 params_dtype: str,
+                 params_dtype: str = None,
                  init_method: Callable = None,
                  bias: bool = True,
                  skip_weight_param_allocation: bool = False,
@@ -71,8 +71,10 @@ class Linear(nn.Cell):
         self.init_method = init_method
         self.skip_weight_param_allocation = skip_weight_param_allocation
         self.has_bias = bias
-        self.params_dtype = convert_mstype(params_dtype)
         self.compute_dtype = convert_mstype(compute_dtype)
+        self.params_dtype = (
+            convert_mstype(params_dtype) if params_dtype is not None else self.compute_dtype
+        )
 
         # use_cpu_initialization configuration is not supported for now.
         if skip_weight_param_allocation:
@@ -121,8 +123,10 @@ class Linear(nn.Cell):
         # Weight is a sharded DTensor (TP + FSDP); compute on its local shard.
         if isinstance(weight, DTensor):
             weight = weight.to_local()
-        weight = self.cast(weight, self.compute_dtype)
-        input_ = self.cast(input_, self.compute_dtype)
+        if weight.dtype != self.compute_dtype:
+            weight = self.cast(weight, self.compute_dtype)
+        if input_.dtype != self.compute_dtype:
+            input_ = self.cast(input_, self.compute_dtype)
 
         # Transpose weight from (output_size, input_size) to (input_size, output_size)
         weight = self.transpose(weight, 1, 0)
@@ -132,10 +136,12 @@ class Linear(nn.Cell):
 
         if self.has_bias and not self.skip_add_bias:
             bias = self.bias.to_local() if isinstance(self.bias, DTensor) else self.bias
-            bias = self.cast(bias, self.compute_dtype)
+            if bias.dtype != self.compute_dtype:
+                bias = self.cast(bias, self.compute_dtype)
             output = self.add(output, bias)
 
-        output = self.cast(output, ori_dtype)
+        if output.dtype != ori_dtype:
+            output = self.cast(output, ori_dtype)
 
         return output
 
