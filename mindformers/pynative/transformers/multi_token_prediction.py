@@ -209,21 +209,30 @@ class MultiTokenPredictionLayerSubmodules:
             or instance of the transformer block to be applied.
         layer_norm (Union[ModuleSpec, type]): Specification or instance of the
             final layer normalization to be applied.
+        hc_head (Union[ModuleSpec, type], optional): Specification of the learnable
+            mHC head. If unset, residual streams are collapsed by mean.
     """
     enorm: Union[ModuleSpec, type] = None
     hnorm: Union[ModuleSpec, type] = None
     eh_proj: Union[ModuleSpec, type] = None
     transformer_layer: Union[ModuleSpec, type] = None
     layer_norm: Union[ModuleSpec, type] = None
+    hc_head: Union[ModuleSpec, type] = None
 
 
-def get_mtp_layer_spec(transformer_layer_spec: ModuleSpec, normalization: str, fused_norm=True) -> ModuleSpec:
+def get_mtp_layer_spec(
+        transformer_layer_spec: ModuleSpec,
+        normalization: str,
+        fused_norm=True,
+        hc_head=None,
+) -> ModuleSpec:
     """Get the MTP layer spec.
 
     Args:
         transformer_layer_spec (ModuleSpec): Specification of the transformer layer to use.
         normalization (str): Type of normalization to use.
         fused_norm (bool): Whether to use fused-normalization. Defaults to True.
+        hc_head (Union[ModuleSpec, type], optional): Learnable mHC head specification.
 
     Returns:
         ModuleSpec: Module specification of MultiTokenPredictionLayer.
@@ -236,6 +245,7 @@ def get_mtp_layer_spec(transformer_layer_spec: ModuleSpec, normalization: str, f
             eh_proj=Linear,
             transformer_layer=transformer_layer_spec,
             layer_norm=get_norm_cls(normalization, fused_norm),
+            hc_head=hc_head,
         ),
     )
 
@@ -323,11 +333,15 @@ class MultiTokenPredictionLayer(nn.Cell):
         # Mirror TransformerBlock's hyper-connection handling: with mHC enabled
         # the inner transformer_layer computes on packed residual streams
         # (s, b, n*h), so the MTP layer must expand its (s, b, h) input into n
-        # streams before the layer and collapse them back afterwards.
+        # streams before the layer, then collapse them with the configured head
+        # or the parameter-free mean fallback.
         self.hc = config.enable_hyper_connections
+        self.hc_head = None
         if self.hc:
             self.hc_num_streams = config.num_residual_streams
             self.hc_hidden_size = config.hidden_size
+            if self.submodules.hc_head is not None:
+                self.hc_head = build_module(self.submodules.hc_head, config=config)
 
     def construct(
             self,
@@ -383,11 +397,12 @@ class MultiTokenPredictionLayer(nn.Cell):
             mscale=mscale
         )
         if self.hc:
-            # Collapse the streams back to (s, b, h) by averaging,
-            # same as TransformerBlock does before its final layernorm.
-            hidden_states = collapse_hyper_connection_streams(
-                hidden_states, self.hc_num_streams, self.hc_hidden_size
-            )
+            if self.hc_head is not None:
+                hidden_states = self.hc_head(hidden_states)
+            else:
+                hidden_states = collapse_hyper_connection_streams(
+                    hidden_states, self.hc_num_streams, self.hc_hidden_size
+                )
 
         # Layer norm before shared head layer.
         hidden_states = self.final_layernorm(hidden_states)

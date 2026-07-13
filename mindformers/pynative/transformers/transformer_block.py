@@ -52,9 +52,12 @@ class TransformerBlockSubmodules:
             defines a complete transformer layer (e.g., self-attention, feed-forward network).
         layer_norm (Optional[Union[ModuleSpec, mindspore.nn.Cell]], optional): Specification
             or instance of the layer normalization to be applied.
+        hc_head (Optional[Union[ModuleSpec, type]], optional): Specification
+            of the learnable mHC head. If unset, residual streams are collapsed by mean.
     """
     layer_specs: List[ModuleSpec] = None
     layer_norm: Optional[Union[ModuleSpec, nn.Cell]] = None
+    hc_head: Optional[Union[ModuleSpec, type]] = None
 
 
 def _get_block_submodules(
@@ -164,9 +167,12 @@ class TransformerBlock(nn.Cell):
         self.hc = config.enable_hyper_connections
         self.layer_start = layer_start
         self.layer_end = layer_end
+        self.hc_head = None
         if config.enable_hyper_connections:
             self.n = config.num_residual_streams
             self.hidden_size = config.hidden_size
+            if self.has_final_layernorm_in_this_stage() and self.submodules.hc_head is not None:
+                self.hc_head = build_module(self.submodules.hc_head, config=config)
         cp = config.context_parallel_size if config.context_parallel_size is not None else 1
         if config.sequence_parallel and cp > 1:
             logger.warning("The context parallel way conflicts with sequence parallel way. "
@@ -253,7 +259,12 @@ class TransformerBlock(nn.Cell):
             )
 
         if self.hc and self.has_final_layernorm_in_this_stage():
-            hidden_states = collapse_hyper_connection_streams(hidden_states, self.n, self.hidden_size)
+            if self.hc_head is not None:
+                hidden_states = self.hc_head(hidden_states)
+            else:
+                hidden_states = collapse_hyper_connection_streams(
+                    hidden_states, self.n, self.hidden_size
+                )
 
         # final layernorm.
         if self.post_layer_norm and self.post_process:

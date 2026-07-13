@@ -116,9 +116,11 @@ class TopKRouter(nn.Cell):
         else:
             self.tid2eid = None
 
-        # Auxiliary loss components. Hash layers do not produce aux loss
+        # Auxiliary loss components.  MindSpeed's DSV4 ``--seq-aux`` path
+        # applies this gradient to hash-routed layers as well: their selected
+        # experts are fixed by tid2eid, but router scores remain trainable.
         self.moe_aux_loss_coeff = 0.0
-        if config.moe_aux_loss_coeff and not self.is_hash_layer:
+        if config.moe_aux_loss_coeff:
             self.moe_aux_loss_coeff = config.moe_aux_loss_coeff
 
         self.aux_loss_type = config.moe_router_load_balancing_type
@@ -374,6 +376,13 @@ class TopKRouter(nn.Cell):
                            min=0, max=self.num_experts),
                 mstype.int32,
             )
+            if self.moe_aux_loss_coeff > 0:
+                top_scores = self._compute_aux_loss(
+                    logits,
+                    top_scores,
+                    seq_length,
+                    bsz,
+                )
             return top_scores, selected_experts_indices, num_tokens_per_expert
 
         # By default, sigmoid or softmax is performed in float32 to avoid loss explosion
@@ -470,11 +479,10 @@ class TopKRouter(nn.Cell):
             self.score_func,
         )
 
-        # Keep the aux loss consistent with the routing that is actually used: when
-        # force-balance overrides the dispatch (round-robin), the load-balancing loss
-        # must reflect that balanced assignment, not the router's natural top-k.
-        # Rebuild routing_map from the (forced) selected_experts_indices so f_i is
-        # uniform; scores_for_aux_loss (P_i) stays as the router's own probabilities.
+        # Match Megatron's auxiliary-loss path: hash routing, expert bias and
+        # group-limited routing all derive the auxiliary routing map from the raw
+        # router logits. Only the debug force-balance override uses the explicit
+        # selected indices, because it replaces the normal routing decision.
         if self._debug_force_load_balance and selected_experts_indices is not None:
             routing_map_for_aux_loss = mint.zeros_like(logits).int()
             routing_map_for_aux_loss.scatter_(1, selected_experts_indices, 1)

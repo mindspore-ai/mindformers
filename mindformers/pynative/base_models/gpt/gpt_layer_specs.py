@@ -158,8 +158,15 @@ def get_gpt_layer_local_spec(
 
 def get_gpt_decoder_block_spec(
         config: TransformerConfig,
+        hc_head=None,
 ) -> TransformerBlockSubmodules:
-    """GPT block spec."""
+    """GPT block spec.
+
+    Args:
+        config (TransformerConfig): Transformer configuration.
+        hc_head (Union[ModuleSpec, type], optional): Learnable mHC head specification.
+            If unset, the block uses the parameter-free mean collapse.
+    """
 
     # Layer specs.
     dense_layer_spec = get_gpt_layer_local_spec(
@@ -214,7 +221,10 @@ def get_gpt_decoder_block_spec(
 
     # Block spec.
     block_spec = TransformerBlockSubmodules(
-        layer_specs=layer_specs, layer_norm=get_norm_cls(config.normalization, config.fused_norm))
+        layer_specs=layer_specs,
+        layer_norm=get_norm_cls(config.normalization, config.fused_norm),
+        hc_head=hc_head,
+    )
 
     return block_spec
 
@@ -232,13 +242,19 @@ def get_gpt_mtp_block_spec(
     if isinstance(spec, TransformerBlockSubmodules):
         # get the spec for the last layer of decoder block
         transformer_layer_spec = spec.layer_specs[-1]
+        hc_head = spec.hc_head
     elif isinstance(spec, ModuleSpec) and spec.module == TransformerLayer:
         transformer_layer_spec = spec
+        hc_head = None
     else:
         raise ValueError(f"Invalid spec: {spec}")
 
     mtp_layer_spec = get_mtp_layer_spec(
-        transformer_layer_spec=transformer_layer_spec, normalization=normalization, fused_norm=config.fused_norm)
+        transformer_layer_spec=transformer_layer_spec,
+        normalization=normalization,
+        fused_norm=config.fused_norm,
+        hc_head=hc_head,
+    )
     mtp_num_layers = config.mtp_num_layers if config.mtp_num_layers else 0
     mtp_layer_specs = [mtp_layer_spec] * mtp_num_layers
 

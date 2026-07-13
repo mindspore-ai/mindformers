@@ -21,7 +21,11 @@ import mindspore as ms
 from mindspore import Tensor
 
 from mindformers.parallel_core.transformer_config import TransformerConfig
-from mindformers.pynative.transformers.hyper_connection import HyperConnectionModule
+from mindformers.pynative.transformers.hyper_connection import (
+    HyperConnectionHead,
+    HyperConnectionModule,
+    HyperConnectionOutputCell,
+)
 
 
 def build_config(args):
@@ -48,8 +52,11 @@ def sigmoid(x):
 
 def sinkhorn(logits, iterations):
     """Reference Sinkhorn-Knopp projection."""
-    matrix = np.exp(logits - np.max(logits, axis=-1, keepdims=True))
-    for _ in range(iterations):
+    shifted = logits - np.max(logits, axis=-1, keepdims=True)
+    matrix = np.exp(shifted) / np.sum(np.exp(shifted), axis=-1, keepdims=True)
+    matrix = matrix + 1e-6
+    matrix = matrix / (np.sum(matrix, axis=2, keepdims=True) + 1e-6)
+    for _ in range(iterations - 1):
         matrix = matrix / (np.sum(matrix, axis=3, keepdims=True) + 1e-6)
         matrix = matrix / (np.sum(matrix, axis=2, keepdims=True) + 1e-6)
     return matrix
@@ -85,6 +92,20 @@ def set_deterministic_params(module, rate):
     return weight, bias, alpha
 
 
+def set_deterministic_head_params(head):
+    """Set deterministic learned-head parameters and return their numpy values."""
+    params = head.parameters_dict()
+    weight = np.linspace(
+        -0.05, 0.07, num=np.prod(params["hc_fn.weight"].shape), dtype=np.float32
+    ).reshape(params["hc_fn.weight"].shape)
+    base = np.linspace(-0.2, 0.3, num=params["hc_base"].shape[0], dtype=np.float32)
+    scale = np.array([0.75], dtype=np.float32)
+    params["hc_fn.weight"].set_data(Tensor(weight, dtype=ms.float32))
+    params["hc_base"].set_data(Tensor(base, dtype=ms.float32))
+    params["hc_scale"].set_data(Tensor(scale, dtype=ms.float32))
+    return weight, base, scale
+
+
 def hyper_connection_reference(hidden_states, weight, bias, alpha, config):
     """Compute HyperConnectionModule forward with numpy."""
     seq_len, batch_size, n_hidden = hidden_states.shape
@@ -96,7 +117,7 @@ def hyper_connection_reference(hidden_states, weight, bias, alpha, config):
     projected = projected * alpha + bias
 
     h_pre, h_post, h_res = np.split(projected, [rate, rate * 2], axis=3)
-    h_pre = sigmoid(h_pre).astype(np.float32)
+    h_pre = (sigmoid(h_pre) + 1e-6).astype(np.float32)
     h_post = (2.0 * sigmoid(h_post)).reshape((seq_len, batch_size, rate, 1)).astype(np.float32)
     h_res = h_res.reshape((seq_len, batch_size, rate, rate)).astype(np.float32)
     h_res = sinkhorn(h_res, config.mhc_sinkhorn_iterations).astype(np.float32)
@@ -142,6 +163,56 @@ def run_forward_precision(args):
 
     for name, actual_item, expected_item in zip(("aggregated", "h_res", "h_post"), actual, expected):
         assert_close(name, actual_item, expected_item, args.rtol, args.atol)
+
+    # Use a deliberately non-symmetric residual matrix to lock down the
+    # MindSpeed convention: output stream j receives sum_i H_res[i, j] x_i.
+    output_cell = HyperConnectionOutputCell(args.rate, args.hidden_size, dtype=ms.float32)
+    streams = hidden_states.reshape(
+        (args.seq_len, args.batch_size, args.rate, args.hidden_size)
+    ).astype(np.float32)
+    h_res = np.linspace(
+        -0.4,
+        0.7,
+        num=args.seq_len * args.batch_size * args.rate * args.rate,
+        dtype=np.float32,
+    ).reshape((args.seq_len, args.batch_size, args.rate, args.rate))
+    h_post = np.linspace(
+        0.1,
+        0.9,
+        num=args.seq_len * args.batch_size * args.rate,
+        dtype=np.float32,
+    ).reshape((args.seq_len, args.batch_size, args.rate, 1))
+    sublayer_out = np.linspace(
+        -0.5,
+        0.5,
+        num=args.seq_len * args.batch_size * args.hidden_size,
+        dtype=np.float32,
+    ).reshape((args.seq_len, args.batch_size, args.hidden_size))
+    expected_output = (
+        np.einsum("sbij,sbih->sbjh", h_res, streams)
+        + h_post * np.expand_dims(sublayer_out, axis=2)
+    ).reshape((args.seq_len, args.batch_size, args.rate * args.hidden_size))
+    actual_output = output_cell(
+        Tensor(h_res),
+        Tensor(h_post),
+        Tensor(hidden_states),
+        Tensor(sublayer_out),
+    ).asnumpy()
+    assert_close("output_cell", actual_output, expected_output, args.rtol, args.atol)
+
+    # The learned head is optional at the model-spec level. When explicitly selected,
+    # verify that its numerical path still matches MindSpeed's FP32 formulation.
+    head = HyperConnectionHead(config)
+    head_weight, head_base, head_scale = set_deterministic_head_params(head)
+    flat = hidden_states.astype(np.float32)
+    rms_inv = 1.0 / np.sqrt(
+        np.mean(np.square(flat), axis=-1, keepdims=True) + config.mhc_layernorm_epsilon
+    )
+    mixes = np.matmul(flat, head_weight.T) * rms_inv
+    pre = sigmoid(mixes * head_scale + head_base) + 1e-6
+    expected_head = np.sum(np.expand_dims(pre, -1) * streams, axis=2)
+    actual_head = head(Tensor(hidden_states, dtype=ms.float32)).asnumpy()
+    assert_close("hc_head", actual_head, expected_head, args.rtol, args.atol)
 
 
 def parse_args():

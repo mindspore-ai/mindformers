@@ -36,6 +36,9 @@ from mindspore.communication import init
 from hash_routing_data_gen import CASE_INPUT_REGISTRY
 from mindformers.parallel_core.transformer_config import TransformerConfig
 from mindformers.pynative.transformers.moe.router import TopKRouter
+from mindformers.pynative.transformers.moe.moe_utils import (
+    get_moe_layer_wise_logging_tracker,
+)
 
 
 class HashRouterRunner:
@@ -68,6 +71,10 @@ class HashRouterRunner:
             moe_router_dtype="float32",
             moe_n_hash_layers=1,
             moe_router_pre_softmax=(self.data["top_k"] == 1),
+            moe_router_load_balancing_type=(
+                "seq_aux_loss" if self.args.enable_aux else "none"
+            ),
+            moe_aux_loss_coeff=0.001 if self.args.enable_aux else 0.0,
             actual_vocab_size=self.data["vocab_size"],
             hidden_act="fusedswiglu",
             gated_linear_unit=True,
@@ -103,6 +110,12 @@ class HashRouterRunner:
             "top_scores": top_scores.asnumpy().astype(np.float32),
             "selected_experts_indices": selected_experts_indices.asnumpy().astype(np.int64),
         }
+        if self.args.enable_aux:
+            tracker = get_moe_layer_wise_logging_tracker()
+            if "values" in tracker:
+                output_ms["load_balancing_loss"] = np.asarray(
+                    float(tracker["values"][0].asnumpy()), dtype=np.float32
+                )
 
         if self.rank_id is None or int(self.rank_id) == 0:
             np.savez(self.output_path, **output_ms)
@@ -114,6 +127,8 @@ def main():
                         help="Test case key from hash_routing_data_gen")
     parser.add_argument("--output-path", type=str, required=True,
                         help="Path to save .npz output")
+    parser.add_argument("--enable-aux", action="store_true",
+                        help="Enable seq-aux and save its unscaled tracker value")
     args = parser.parse_args()
 
     if args.case_key not in CASE_INPUT_REGISTRY:

@@ -45,6 +45,10 @@ from mindformers.pynative.base_models.common.embeddings.rope_utils import ApplyR
 from mindformers.pynative.layers.identity_op import IdentityOp
 
 
+# Minimum finite BF16 value, matching MindSpeed's torch.finfo(query.dtype).min mask fill.
+_BF16_MIN = -3.3895313892515355e38
+
+
 @dataclass
 class CSAIndexerSubmodules:
     """
@@ -237,8 +241,13 @@ class CSAIndexer(nn.Cell):
             if mask is not None:
                 mask = self.cast(mask, mstype.float32)
                 index_scores = index_scores + mask
-            _, topk_indices = self.topk(index_scores, k=effective_topk, dim=-1)
+            # Match MindSpeed's small-op contract: the second return value is
+            # the selected top-k logits, not the full score matrix.  Besides
+            # making the fused and unfused contracts consistent, this is
+            # required by the DSV4 indexer KL formulation below.
+            topk_scores, topk_indices = self.topk(index_scores, k=effective_topk, dim=-1)
             topk_indices = self.cast(topk_indices, mstype.int32)
+            index_scores = topk_scores
         return topk_indices, index_scores
 
 
@@ -352,7 +361,7 @@ class UnfusedCSAIndexerLoss(nn.Cell):
         """Compute the unfused indexer KL loss.
 
         Args:
-            index_scores: ``[b, sq, sk]`` raw logits from the indexer.
+            index_scores: ``[b, sq, topk]`` selected raw indexer logits.
             topk_indices: ``[b, sq, topk]`` selected compressed positions.
             query: ``[sq, b, np, v_head_dim]`` multi-head query (SBND).
             key: ``[sk, b, 1, v_head_dim]`` compressed KV (TND, single head).
@@ -362,11 +371,15 @@ class UnfusedCSAIndexerLoss(nn.Cell):
         Returns:
             Scalar KL loss.
         """
+        eps = 1.0e-9
         sq, b, _, _ = query.shape
         sk, _, _, _ = key.shape
-        query = self.permute(query, (1, 2, 0, 3)).to(mstype.float32)   # [b, np, sq, d]
-        key = self.permute(key, (1, 2, 3, 0)).to(mstype.float32)       # [b, 1, d, sk]
-        attention_scores = self.matmul(query, key) * self.softmax_scale      # [b, np, sq, sk]
+        # MindSpeed computes the main-attention matmul in the incoming BF16
+        # dtype, then requests an FP32 softmax.  Promoting the matmul itself to
+        # FP32 shifts the KL loss by roughly 1e-4 on the alignment model.
+        query = self.permute(query, (1, 2, 0, 3))   # [b, np, sq, d]
+        key = self.permute(key, (1, 2, 3, 0))       # [b, 1, d, sk]
+        attention_scores = self.matmul(query, key) * self.softmax_scale
 
         # Causal mask
         if mask is None:
@@ -378,37 +391,51 @@ class UnfusedCSAIndexerLoss(nn.Cell):
             causal_mask = mask.to(mstype.float32)
             causal_mask = self.reshape(causal_mask, (-1, 1, sq, sk))
 
-        attention_scores = attention_scores + causal_mask
+        max_valid_idx = sk - 1
+        replacement = self.full(topk_indices.shape, max_valid_idx, dtype=topk_indices.dtype)
+        clean_indices = self.where(topk_indices == -1, replacement, topk_indices)
+        clean_indices = mint.clamp(clean_indices, 0, max_valid_idx).to(mstype.int64)
 
-        # Sparse index mask (optional)
-        if self.sparse_loss:
-            index_mask = self.full((b, sq, sk), float("-inf"), dtype=mstype.float32)
-            index_mask = self.scatter(index_mask, -1, topk_indices, 0)
-            index_scores = index_scores + index_mask
-            attention_scores = attention_scores + self.unsqueeze(index_mask, 1)
+        # The main distribution used by MindSpeed is the sparse distribution:
+        # its attention mask keeps exactly the selected compressed positions.
+        # Build the same selection mask in the full compressed-key space.
+        selection_mask = self.full((b, sq, sk), float("-inf"), dtype=mstype.float32)
+        selection_mask = self.scatter(selection_mask, -1, clean_indices, 0.0)
 
-        # Zero out fully-masked rows before softmax
-        row_valid = self.any(causal_mask > float("-inf"), dim=-1)
-        attn_row_mask = self.reshape(row_valid, (-1, 1, sq, 1))
-        idx_row_mask = self.reshape(row_valid, (-1, sq, 1))
-        attention_scores = self.where(attn_row_mask, attention_scores, 0.0)
-        index_scores = self.where(idx_row_mask, index_scores, 0.0)
-
-        # Per-head softmax → sum over heads
-        attention_scores = self.softmax(attention_scores, dim=-1)
+        # MindSpeed applies a finite BF16-min mask before its FP32 softmax.
+        # Using -inf changes the all-masked prefix rows from a uniform
+        # distribution into NaNs and requires a non-reference special case.
+        invalid = (causal_mask < 0) | (self.unsqueeze(selection_mask, 1) < 0)
+        bf16_min = self.full(attention_scores.shape, _BF16_MIN,
+                             dtype=attention_scores.dtype)
+        attention_scores = self.where(invalid, bf16_min, attention_scores)
+        attention_scores = self.softmax(self.cast(attention_scores, mstype.float32), dim=-1)
         attention_scores = self.sum(attention_scores, dim=1)   # [b, sq, sk] — partial under TP
         attention_scores = self.post_head_sum(attention_scores)
 
-        # L1-normalize the pooled attention scores
-        attention_scores = attention_scores / self.max(self.sum(attention_scores, -1, keepdim=True), 1e-10)
-
-        # Indexer softmax
-        index_scores = self.softmax(index_scores, dim=-1)
-
-        # KL divergence  [b, sq, sk] → [b, sq] → [1]
-        kl_per_element = attention_scores * (
-            self.log(attention_scores + 1e-10) - self.log(index_scores + 1e-10)
+        # Exact DSV4 reference formulation: L1-normalize the full target,
+        # gather only selected positions, renormalize those for log(p), but
+        # weight the KL terms by their pre-selection-normalized target mass.
+        attention_scores = attention_scores / self.max(
+            self.sum(attention_scores, -1, keepdim=True), 1.0e-12
         )
-        kl_div = self.mean(self.sum(kl_per_element, -1))
+        selected_target = mint.gather(attention_scores, -1, clean_indices)
+
+        # Prefix queries can have no valid compressed key, so top-k returns an
+        # all--inf score row. Convert only those masked entries to a finite
+        # sentinel before softmax; otherwise the indexer loss and grad norm
+        # become NaN even though the row carries no valid target mass.
+        finite_min = self.full(
+            index_scores.shape,
+            _BF16_MIN,
+            dtype=index_scores.dtype,
+        )
+        index_scores = self.where(mint.isfinite(index_scores), index_scores, finite_min)
+        predicted = self.softmax(self.cast(index_scores, mstype.float32), dim=-1)
+        target_sum = self.sum(selected_target, dim=-1, keepdim=True)
+        normalized_target = selected_target / (target_sum + eps)
+        log_target = self.log(self.max(normalized_target, eps))
+        log_predicted = self.log(predicted + eps)
+        kl_div = self.mean(self.sum((log_target - log_predicted) * selected_target, dim=-1))
 
         return kl_div * self.loss_coeff
