@@ -80,11 +80,11 @@ class GroupedMLP(nn.Cell):
         # parameters
         self.weight1 = Parameter(
             mint.empty([self.num_local_experts, self.hidden_size, self.moe_ffn_hidden_size],
-                       dtype=self.config.params_dtype),
+                       dtype=self.compute_dtype),
             name='w1')
         self.weight2 = Parameter(
             mint.empty([self.num_local_experts, self.config.moe_ffn_hidden_size, self.hidden_size],
-                       dtype=self.config.params_dtype),
+                       dtype=self.compute_dtype),
             name='w2')
 
         self.cast = ops.cast
@@ -196,7 +196,10 @@ class GroupedMLP(nn.Cell):
             token_indices_experts_sorted = None
 
         if self.config.moe_apply_probs_on_input:
-            permuted_local_hidden_states = self.mul(self.unsqueeze(permuted_probs, -1), permuted_local_hidden_states)
+            permuted_probs = self.cast(permuted_probs, self.compute_dtype)
+            permuted_local_hidden_states = self.mul(
+                self.unsqueeze(permuted_probs, -1), permuted_local_hidden_states
+            )
             permuted_probs = self.ones_like(permuted_probs)
 
         experts_output = self.experts_forward(permuted_local_hidden_states, tokens_per_expert)
@@ -212,12 +215,8 @@ class GroupedMLP(nn.Cell):
 
     def experts_forward(self, permuted_local_hidden_states, tokens_per_expert):
         """Forward step of GroupedMLP."""
-        original_dtype = permuted_local_hidden_states.dtype
-        permuted_local_hidden_states = self.cast(permuted_local_hidden_states, self.compute_dtype)
-        w1 = self.cast(self.weight1, self.compute_dtype)
-        w2 = self.cast(self.weight2, self.compute_dtype)
-        w1 = w1.to_local() if isinstance(w1, DTensor) else w1
-        w2 = w2.to_local() if isinstance(w2, DTensor) else w2
+        w1 = self.weight1.to_local() if isinstance(self.weight1, DTensor) else self.weight1
+        w2 = self.weight2.to_local() if isinstance(self.weight2, DTensor) else self.weight2
 
         fc1_output = GroupedMatmul(split_item=3, group_type=0)(
             [permuted_local_hidden_states], [w1], None, None, None, None,
@@ -236,7 +235,6 @@ class GroupedMLP(nn.Cell):
         fc2_output = GroupedMatmul(split_item=3, group_type=0)(
             [intermediate_parallel], [w2], None, None, None, None,
             None, tokens_per_expert)[0]
-        fc2_output = self.cast(fc2_output, original_dtype)
         return fc2_output
 
     def reset_parameter(self):

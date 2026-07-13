@@ -17,8 +17,15 @@ from pathlib import Path
 import subprocess
 import pytest
 import numpy as np
+import mindspore as ms
+from mindspore import context
 from tests.utils.double_benchmark import DoubleBenchmarkStandard, DoubleBenchmarkComparator
 from mindformers.tools.logger import logger
+from mindformers.parallel_core.transformer_config import TransformerConfig
+from mindformers.pynative.base_models.common.embeddings.rope_utils import (
+    ApplyRotaryPosEmb,
+    compute_rotary_cos_sin,
+)
 
 from .data_gen_utils import GOLDEN_DATA, GPU_DATA
 
@@ -157,3 +164,35 @@ class TestApplyRotaryPosEmb:
             data_keys=data_keys,
             tmp_path=tmp_path
         )
+
+
+@pytest.mark.level0
+@pytest.mark.platform_x86_cpu
+def test_precomputed_rotary_cos_sin_matches_inline_path():
+    """Precomputed cos/sin should be numerically identical to inline computation."""
+    context.set_context(mode=context.PYNATIVE_MODE)
+    config = TransformerConfig(
+        num_layers=1,
+        num_attention_heads=1,
+        compute_dtype="fp32",
+        params_dtype="fp32",
+        rotary_dtype="fp32",
+        apply_rope_fusion=False,
+    )
+    rng = np.random.default_rng(42)
+    t = ms.Tensor(rng.standard_normal((4, 1, 1, 8)), dtype=ms.float32)
+    freqs = ms.Tensor(rng.standard_normal((4, 1, 1, 8)), dtype=ms.float32)
+
+    net = ApplyRotaryPosEmb(config)
+    inline = net(t, freqs, 1.0, False, False)
+    cos_sin = compute_rotary_cos_sin(
+        freqs,
+        1.0,
+        config.rotary_dtype,
+        apply_rope_fusion=False,
+        rotary_interleaved=False,
+        multi_latent_attention=False,
+    )
+    cached = net(t, freqs, 1.0, False, False, cos_sin=cos_sin)
+
+    np.testing.assert_allclose(cached.asnumpy(), inline.asnumpy(), rtol=0, atol=0)

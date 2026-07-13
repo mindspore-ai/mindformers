@@ -806,6 +806,7 @@ def apply_moe_ep_tp(
         ep_mesh: DeviceMesh = None,
         moe_token_dispatcher_type: str = "all_to_all",
         npu_nums_per_device: int = 8,
+        expert_async_d2h: bool = False,
 ):
     """
     Apply Expert Parallelism (EP) and Tensor Parallelism (TP) to MoE layers in model.
@@ -852,7 +853,8 @@ def apply_moe_ep_tp(
         set_comm_ops_inplace(False)
         # Apply TP to experts: shard along the hidden dimension
         if moe_token_dispatcher_type == "alltoall":
-            experts_plan = ExpertParallel(model.model.config.moe_permute_fusion)
+            experts_plan = ExpertParallel(model.model.config.moe_permute_fusion,
+                                          async_d2h=expert_async_d2h)
         elif moe_token_dispatcher_type == "alltoall_deredundancy":
             experts_plan = DeredundancyExpertParallel(npu_nums_per_device)
         else:
@@ -876,6 +878,7 @@ def apply_moe_ep_overlap_tp(
         tp_mesh=None,
         ep_mesh=None,
         moe_token_dispatcher_type: str = "alltoall",
+        expert_async_d2h: bool = False,
 ):
     """Apply EP with comm/compute overlap hooks to MoE layers in all pipeline model parts.
 
@@ -938,7 +941,12 @@ def apply_moe_ep_overlap_tp(
             strategy = OverlapExpertParallel(
                 coordinator=coordinator,
                 is_last_layer=is_last,
-                moe_permute_fusion=False,  # overlap path always uses manual permute
+                # Honor the yaml fusion flag (same as the non-overlap apply_moe_ep_tp
+                # path). Verified bit-identical to manual permute under overlap on
+                # pp2/ep2 + recompute:full + MTP; other overlap variants (interleaved
+                # pp, no-recompute, larger ep) not yet A/B'd.
+                moe_permute_fusion=model.model.config.moe_permute_fusion,
+                async_d2h=expert_async_d2h,
             )
             parallelize_module(
                 module=layer.mlp.experts,
@@ -1401,13 +1409,21 @@ def _setup_moe_aux_loss_group(model, parallel_dims):
     aux_groups: list = []
     aux_group_size = 1
     tp_mesh = parallel_dims.get_optional_mesh("tp")
+    tp_group = None
+    tp_size = 1
     if tp_mesh is not None:
-        aux_groups.append(tp_mesh.get_group())
-        aux_group_size *= tp_mesh.size()
+        tp_group = tp_mesh.get_group()
+        tp_size = tp_mesh.size()
+        aux_groups.append(tp_group)
+        aux_group_size *= tp_size
     cp_mesh = parallel_dims.get_optional_mesh("cp")
+    cp_groups = []
+    cp_size = 1
     if cp_mesh is not None:
-        aux_groups.append(cp_mesh.get_group())
-        aux_group_size *= cp_mesh.size()
+        cp_groups.append(cp_mesh.get_group())
+        cp_size = cp_mesh.size()
+        aux_groups.extend(cp_groups)
+        aux_group_size *= cp_size
 
     gpt_model = _unwrap_gptmodel(model)
     moe_routers = []
@@ -1433,6 +1449,8 @@ def _setup_moe_aux_loss_group(model, parallel_dims):
     # the step-end aggregation (``track_moe_metrics``) share the same TP/CP
     # reduction group without per-router attribute plumbing.
     set_moe_aux_loss_group_info(aux_groups, aux_group_size)
+    for router in moe_routers:
+        router.enable_sequence_parallel(tp_group, tp_size, cp_groups, cp_size)
 
     logger.info(
         "[MoE-AuxLossGroup] set global TP/CP aux_loss groups "
@@ -1488,6 +1506,7 @@ def _apply_spmd_parallelism(
                 tp_mesh=tp_mesh,
                 ep_mesh=ep_mesh,
                 moe_token_dispatcher_type=parallelism.moe_token_dispatcher_type,
+                expert_async_d2h=getattr(parallelism, "expert_parallel_async_d2h", False),
             )
         else:
             with ms.DeviceCtx("meta"):
@@ -1497,6 +1516,7 @@ def _apply_spmd_parallelism(
                     ep_mesh=ep_mesh,
                     moe_token_dispatcher_type=parallelism.moe_token_dispatcher_type,
                     npu_nums_per_device=parallelism.npu_nums_per_device,
+                    expert_async_d2h=getattr(parallelism, "expert_parallel_async_d2h", False),
                 )
 
     # Phase 3: CP

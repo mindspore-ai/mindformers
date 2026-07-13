@@ -215,7 +215,8 @@ class TransformerBlock(nn.Cell):
                   prefix_keys_values=None,
                   actual_seq_len=None,
                   input_ids=None,
-                  mscale=1.0):
+                  mscale=1.0,
+                  rotary_cos_sin=None):
         """
         Construct function of transformer block.
 
@@ -247,7 +248,8 @@ class TransformerBlock(nn.Cell):
                 prefix_keys_values=prefix_kv,
                 actual_seq_len=actual_seq_len,
                 input_ids=input_ids,
-                mscale=mscale
+                mscale=mscale,
+                rotary_cos_sin=rotary_cos_sin
             )
 
         if self.hc and self.has_final_layernorm_in_this_stage():

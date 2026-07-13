@@ -15,8 +15,7 @@
 
 import hashlib
 
-import numpy as np
-
+import mindspore as ms
 from mindspore import mint, nn, ops, Tensor
 from mindspore.ops import communication as comm
 from mindspore.common import dtype as mstype
@@ -48,7 +47,7 @@ class ExpertParallel(ParallelStyle):
 
     """
 
-    def __init__(self, moe_permute_fusion: bool = False):
+    def __init__(self, moe_permute_fusion: bool = False, async_d2h: bool = False):
         super().__init__()
         self.ctx = None
         self.input_layout = None
@@ -69,6 +68,13 @@ class ExpertParallel(ParallelStyle):
         self.split = mint.split
         self.all_to_all = comm.all_to_all
         self.all_to_all_single = comm.all_to_all_single
+        # Cache of fixed chunk-permutation indices keyed by (ep_degree, num_local_experts).
+        self._chunk_perm_cache = {}
+        # Issue the counts D2H on a side stream and overlap it with the token permute
+        # (Megatron cuda_dtoh_stream + deferred cuda_sync_point). Driven by
+        # ParallelismConfig.expert_parallel_async_d2h; applies to base and overlap paths.
+        self.enable_async_d2h = async_d2h
+        self._d2h_stream = None
 
     # ------------------------------------------------------------------
     # Shared building blocks (used by this class and OverlapExpertParallel).
@@ -94,62 +100,116 @@ class ExpertParallel(ParallelStyle):
         topk_indices = self.concat((pad_topk_indices, topk_indices), dim=0)
         return tokens, probs, topk_indices, num_experts
 
-    def _compute_token_splits(self, num_tokens_per_expert, num_tokens_per_expert_group, ep_degree):
-        """Derive the a2a send/recv token splits and the per-local-expert cumsum."""
-        num_tokens_per_expert_reshaped = self.reshape(num_tokens_per_expert, (ep_degree, -1))
-        input_splits = self.cast(self.sum(num_tokens_per_expert_reshaped, dim=-1, keepdim=False), mstype.int64)
+    def _compute_group_list(self, num_tokens_per_expert_group, ep_degree):
+        """Per-local-expert cumulative token counts (device tensor) — the group_list
+        the grouped GEMM consumes. Stays on device; not a D2H point."""
         num_tokens_per_expert_group_reshaped = self.reshape(num_tokens_per_expert_group, (ep_degree, -1))
-        output_splits = self.cast(self.sum(num_tokens_per_expert_group_reshaped, dim=-1, keepdim=False), mstype.int64)
         num_tokens_per_expert = self.cumsum(self.sum(num_tokens_per_expert_group_reshaped, dim=-2, keepdim=False), 0)
-        num_tokens_per_expert = self.cast(num_tokens_per_expert, mstype.int64)
-        return input_splits, output_splits, num_tokens_per_expert
+        return self.cast(num_tokens_per_expert, mstype.int64)
 
-    def _build_resort_index(self, num_tokens_per_expert_group, ep_degree):
-        """Reconstruct the post-dispatch resort index from the counts matrix.
+    def _host_token_splits(self, num_tokens_per_expert, num_tokens_per_expert_group, ep_degree):
+        """Single batched D2H: derive every host-side split list in one ``.tolist()``.
 
-        ``num_tokens_per_expert_group`` reshaped to ``(ep_degree, num_local_experts)``
-        is ``M_local[s, e]`` — the number of tokens source rank ``s`` sent to this
-        rank's local expert ``e``.  After the main a2a the receive buffer is laid
-        out ``[from_src_0, from_src_1, ...]`` and — because the source-side
-        ``_permute`` sorts each source block by destination expert — ``M_local``
-        alone fixes the permutation into contiguous local-expert order: for each
-        local expert ``e`` gather ``M_local[s, e]`` consecutive rows from each
-        source ``s``.  This replaces the separate routing-map a2a + device sort
-        (one variable-split HCCL roundtrip + two sorts) with one host sync on the
-        counts and a host-side index build.
+        The two count vectors — the local pre-a2a histogram (``num_tokens_per_expert``,
+        gives the send/``input`` splits) and the post-a2a grouped counts
+        (``num_tokens_per_expert_group``, gives the recv/``output`` splits and the
+        per-chunk resort sizes) — are concatenated into one tensor and moved to host
+        with a *single* blocking sync, then all splits are summed on host. This
+        replaces the former ~5 separate blocking ``.tolist()``/``asnumpy`` syncs per
+        MoE layer (Megatron batches its small tensors onto one dtoh point the same way).
 
-        Returns ``(dispatch_index, combine_index)`` where ``combine_index`` is the
-        inverse permutation, cached for ``_token_combine``.
+        Returns Python ``int`` lists ``(input_splits, output_splits, group_counts)``:
+            * ``input_splits[s]``  = tokens this rank SENDS to EP rank ``s``.
+            * ``output_splits[s]`` = tokens this rank RECEIVES from EP rank ``s``.
+            * ``group_counts``     = source-major per-``(source, local_expert)`` chunk
+              sizes (length ``num_experts``) for the device-side resort.
+
+        Counts are exact integers in fp32 (histogram output, well below 2**24), so
+        cast-then-sum on host is bit-identical to the former on-device sum-then-cast.
         """
-        group_counts = self.reshape(
-            num_tokens_per_expert_group, (ep_degree, -1)).asnumpy().astype(np.int64)
-        num_local_experts = group_counts.shape[1]
-        # Start offset of each source block in the receive buffer.
-        src_block_starts = np.concatenate(
-            ([0], group_counts.sum(axis=1).cumsum()[:-1])).astype(np.int64)
-        # Offset of local expert e's tokens within source block s.
-        within_src_offsets = np.concatenate(
-            (np.zeros((ep_degree, 1), dtype=np.int64), group_counts[:, :-1].cumsum(axis=1)), axis=1)
-        total_recv_tokens = int(group_counts.sum())
-        dispatch_index_np = np.empty(total_recv_tokens, dtype=np.int32)
-        write_pos = 0
-        for e in range(num_local_experts):
-            for s in range(ep_degree):
-                start = int(src_block_starts[s] + within_src_offsets[s, e])
-                count = int(group_counts[s, e])
-                dispatch_index_np[write_pos:write_pos + count] = np.arange(
-                    start, start + count, dtype=np.int32)
-                write_pos += count
-        combine_index_np = np.empty(total_recv_tokens, dtype=np.int32)
-        combine_index_np[dispatch_index_np] = np.arange(total_recv_tokens, dtype=np.int32)
-        return Tensor(dispatch_index_np), Tensor(combine_index_np)
+        num_experts = num_tokens_per_expert.shape[-1]
+        both = self.concat((num_tokens_per_expert, num_tokens_per_expert_group), dim=-1)
+        both = self.cast(both, mstype.int64).tolist()
+        return self._derive_splits(both, num_experts, ep_degree)
 
-    def _resort_after_dispatch(self, global_input_tokens, dispatch_index):
-        """Reorder the a2a-received tokens into contiguous local-expert order
-        using the precomputed ``dispatch_index`` (see :meth:`_build_resort_index`)."""
+    @staticmethod
+    def _derive_splits(both_host, num_experts, ep_degree):
+        """Host-side split derivation shared by the sync and async-D2H paths.
+
+        ``both_host`` is the flattened ``[local_counts | grouped_counts]`` (length
+        ``2*num_experts``) already on host. Returns Python ``int`` lists
+        ``(input_splits, output_splits, group_counts)`` (see :meth:`_host_token_splits`)."""
+        local, group_counts = both_host[:num_experts], both_host[num_experts:]
+        num_local_experts = num_experts // ep_degree
+        input_splits = [sum(local[s * num_local_experts:(s + 1) * num_local_experts])
+                        for s in range(ep_degree)]
+        output_splits = [sum(group_counts[s * num_local_experts:(s + 1) * num_local_experts])
+                         for s in range(ep_degree)]
+        return input_splits, output_splits, group_counts
+
+    def _issue_async_d2h(self, counts_tensor):
+        """Kick off a non-blocking D2H of ``counts_tensor`` on a dedicated side
+        stream and return ``(pinned_host_tensor, event)``; the caller does other
+        work then ``event.synchronize()`` before reading the host values.
+
+        ``side.wait_stream(current)`` makes the copy wait for the producing op
+        (the ``concat`` of the two count vectors, which transitively depends on the
+        counts a2a) so there is no cross-stream race. ``.to('cpu', non_blocking=True)``
+        auto-allocates pinned host memory, which is what makes the copy truly async."""
+        counts_tensor = self.cast(counts_tensor, mstype.int64)
+        if self._d2h_stream is None:
+            self._d2h_stream = ms.runtime.Stream()
+        self._d2h_stream.wait_stream(ms.runtime.current_stream())
+        with ms.runtime.StreamCtx(self._d2h_stream):
+            host_buf = counts_tensor.to("cpu", non_blocking=True)
+        event = ms.runtime.Event()
+        event.record(self._d2h_stream)
+        return host_buf, event
+
+    def _chunk_perm(self, ep_degree, num_local_experts):
+        """Fixed chunk-permutation indices for the post-dispatch resort (Megatron
+        ``sort_chunks_by_idxs`` style).
+
+        After the main a2a the receive buffer is laid out in *source-major* chunk
+        order ``[s, e]`` (flat index ``s*num_local_experts + e``) — because the
+        source-side ``_permute`` already sorts each source block by destination
+        expert, chunk ``(s, e)`` holds exactly the ``M_local[s, e]`` tokens source
+        ``s`` sent to this rank's local expert ``e``.  The resort into contiguous
+        *expert-major* order ``[e, s]`` is therefore a pure chunk reordering whose
+        permutation depends only on ``(ep_degree, num_local_experts)`` — not on the
+        (per-step, data-dependent) chunk sizes.  So it is built once and cached,
+        and the per-token gather stays on device as a ``split``/``cat`` (see
+        :meth:`_resort_after_dispatch`), replacing the host ``asnumpy`` + Python
+        index build.
+
+        Returns ``(sort_idx, restore_idx)``:
+            * ``sort_idx`` reorders the source-major receive chunks into
+              expert-major order (dispatch).
+            * ``restore_idx`` is the inverse — reorders the expert-major output
+              chunks back to source-major order for the reverse a2a (combine).
+        """
+        key = (ep_degree, num_local_experts)
+        cached = self._chunk_perm_cache.get(key)
+        if cached is not None:
+            return cached
+        sort_idx = [s * num_local_experts + e
+                    for e in range(num_local_experts) for s in range(ep_degree)]
+        restore_idx = [e * ep_degree + s
+                       for s in range(ep_degree) for e in range(num_local_experts)]
+        self._chunk_perm_cache[key] = (sort_idx, restore_idx)
+        return sort_idx, restore_idx
+
+    def _resort_after_dispatch(self, global_input_tokens, split_sizes, sort_idx):
+        """Reorder the a2a-received tokens into contiguous local-expert order.
+
+        Device-side ``split`` + ``cat``: split the receive buffer into its
+        per-``(source, local_expert)`` chunks (sizes ``split_sizes``, source-major
+        order) and concatenate them in the ``sort_idx`` expert-major order (see
+        :meth:`_chunk_perm`). Pure data movement, so bit-identical to a gather."""
         shape = global_input_tokens.shape
         global_input_tokens = self.reshape(global_input_tokens, (-1, shape[-1]))
-        global_input_tokens = self.index_select(global_input_tokens, 0, dispatch_index)
+        chunks = self.split(global_input_tokens, split_sizes, dim=0)
+        global_input_tokens = self.concat([chunks[i] for i in sort_idx], dim=0)
         global_input_tokens = self.reshape(global_input_tokens, (-1, shape[-1]))
         return global_input_tokens
 
@@ -174,22 +234,27 @@ class ExpertParallel(ParallelStyle):
         return self.concat(output_tensor_list, dim=-1)
 
     def _main_a2a(self, flat_in, input_splits, output_splits, block_size):
-        """All-to-all the routed token payload; return a flat tensor."""
+        """All-to-all the routed token payload; return a flat tensor.
+
+        ``input_splits``/``output_splits`` are host ``int`` lists (from
+        :meth:`_host_token_splits`), scaled to element counts on host — no D2H here."""
         global_input_tokens, _ = self.all_to_all_single(
             output=None,
             input=flat_in,
-            output_split_sizes=(output_splits * block_size).tolist(),
-            input_split_sizes=(input_splits * block_size).tolist(),
+            output_split_sizes=[s * block_size for s in output_splits],
+            input_split_sizes=[s * block_size for s in input_splits],
             group=self.ep_group)
         return global_input_tokens
 
     def _combine_a2a(self, flat_in, send_splits, recv_splits, block_size):
-        """Reverse-direction all-to-all of expert outputs; return a flat tensor."""
+        """Reverse-direction all-to-all of expert outputs; return a flat tensor.
+
+        Reuses the same host split lists computed in dispatch — no extra D2H."""
         permutated_local_input_tokens, _ = self.all_to_all_single(
             output=None,
             input=flat_in,
-            output_split_sizes=(recv_splits * block_size).tolist(),
-            input_split_sizes=(send_splits * block_size).tolist(),
+            output_split_sizes=[s * block_size for s in recv_splits],
+            input_split_sizes=[s * block_size for s in send_splits],
             group=self.ep_group)
         return permutated_local_input_tokens
 
@@ -199,18 +264,23 @@ class ExpertParallel(ParallelStyle):
     def _dispatch_comm(self, flat_in, num_tokens_per_expert, ep_degree, block_size):
         """Dispatch comm segment: counts a2a -> splits -> main token a2a.
 
-        The post-dispatch resort index is reconstructed host-side from the counts
-        matrix (:meth:`_build_resort_index`) — no routing-map a2a needed.
+        No routing-map a2a needed: the post-dispatch resort is a fixed chunk
+        permutation (:meth:`_chunk_perm`) whose only data-dependent input is the
+        per-chunk token counts, returned here as ``group_counts`` (a small host
+        list) for the device-side ``split``/``cat`` in :meth:`_resort_after_dispatch`.
 
-        Returns ``(flat_out, dispatch_index, combine_index, input_splits,
-        output_splits, num_tokens_per_expert)``.
+        Returns ``(flat_out, group_counts, input_splits, output_splits,
+        num_tokens_per_expert)`` where ``group_counts`` is the source-major
+        per-``(source, local_expert)`` chunk-size list and ``input_splits`` /
+        ``output_splits`` are host ``int`` lists (reused unchanged by combine).
         """
         num_tokens_per_expert_group = self._counts_a2a(num_tokens_per_expert, ep_degree)
-        input_splits, output_splits, num_tokens_per_expert = self._compute_token_splits(
+        # Single batched D2H for all host splits; group_list stays on device.
+        input_splits, output_splits, group_counts = self._host_token_splits(
             num_tokens_per_expert, num_tokens_per_expert_group, ep_degree)
-        dispatch_index, combine_index = self._build_resort_index(num_tokens_per_expert_group, ep_degree)
+        num_tokens_per_expert = self._compute_group_list(num_tokens_per_expert_group, ep_degree)
         flat_out = self._main_a2a(flat_in, input_splits, output_splits, block_size)
-        return flat_out, dispatch_index, combine_index, input_splits, output_splits, num_tokens_per_expert
+        return flat_out, group_counts, input_splits, output_splits, num_tokens_per_expert
 
     # performing all-to-all dispatch on the input
     def _token_dispatch(self, device_mesh, cell, args):
@@ -219,6 +289,8 @@ class ExpertParallel(ParallelStyle):
         Thin orchestrator: unwrap -> pad -> permute -> count -> dispatch comm
         -> resort. The all-to-all communication lives in :meth:`_dispatch_comm`.
         """
+        if self.enable_async_d2h:
+            return self._token_dispatch_async(device_mesh, cell, args)
         tokens, probs, topk_indices, num_tokens_per_expert = args
         if isinstance(tokens, DTensor):
             self.input_layout = tokens.layout
@@ -239,14 +311,98 @@ class ExpertParallel(ParallelStyle):
         self.ep_group = get_ep_group_name(get_rank(), ep_degree)
 
         flat_in = self.reshape(routed_input, (-1,))
-        flat_out, dispatch_index, combine_index, input_splits, output_splits, num_tokens_per_expert = \
+        flat_out, group_counts, input_splits, output_splits, num_tokens_per_expert = \
             self._dispatch_comm(flat_in, num_tokens_per_expert, ep_degree, cell.hidden_size)
         global_input_tokens = self.reshape(flat_out, (1, -1, cell.hidden_size))
 
-        global_input_tokens = self._resort_after_dispatch(global_input_tokens, dispatch_index)
+        num_local_experts = num_experts // ep_degree
+        sort_idx, restore_idx = self._chunk_perm(ep_degree, num_local_experts)
+        global_input_tokens = self._resort_after_dispatch(global_input_tokens, group_counts, sort_idx)
+        # Chunk sizes seen by combine, in expert-major order (matches restore_idx).
+        combine_counts = [group_counts[i] for i in sort_idx]
 
         self.ctx = (
-            probs, combine_index, unsort_token_indices_experts,
+            probs, combine_counts, restore_idx, unsort_token_indices_experts,
+            input_splits, output_splits, original_shape, pad_size
+        )
+        return global_input_tokens, probs, topk_indices, num_tokens_per_expert
+
+    def _dispatch_preprocess(self, topk_indices, num_experts, ep_degree):
+        """Dispatch stage 1 (Megatron ``dispatch_preprocess``): count + counts a2a
+        + issue the batched counts D2H async on a side stream. Runs BEFORE the
+        permute so the permute fills the copy's overlap window.
+
+        Counting the padded pre-permute ``topk_indices`` is valid because ``histc``
+        is permutation-invariant. Returns ``(host_buf, event, num_tokens_per_expert_group)``;
+        the host wait is deferred to :meth:`_dispatch_a2a`.
+        """
+        num_tokens_per_expert = self._count_tokens_per_expert(topk_indices, num_experts)
+        self.ep_group = get_ep_group_name(get_rank(), ep_degree)
+        num_tokens_per_expert_group = self._counts_a2a(num_tokens_per_expert, ep_degree)
+        both_counts = self.concat((num_tokens_per_expert, num_tokens_per_expert_group), dim=-1)
+        host_buf, event = self._issue_async_d2h(both_counts)
+        return host_buf, event, num_tokens_per_expert_group
+
+    def _dispatch_a2a(self, flat_in, host_buf, event, num_tokens_per_expert_group,
+                      num_experts, ep_degree, block_size):
+        """Dispatch stage 2 (Megatron ``dispatch_all_to_all``): sync the deferred
+        counts D2H, derive host splits, main token a2a. Overridden by
+        :class:`OverlapExpertParallel` to bracket the a2a with the A/B sync hooks.
+        """
+        event.synchronize()
+        input_splits, output_splits, group_counts = self._derive_splits(
+            host_buf.tolist(), num_experts, ep_degree)
+        num_tokens_per_expert = self._compute_group_list(num_tokens_per_expert_group, ep_degree)
+        flat_out = self._main_a2a(flat_in, input_splits, output_splits, block_size)
+        return flat_out, group_counts, input_splits, output_splits, num_tokens_per_expert
+
+    def _token_dispatch_async(self, device_mesh, cell, args):
+        """Staged dispatch that overlaps the counts D2H with the token permute.
+
+        Megatron ``dispatch_preprocess`` / permute / ``dispatch_all_to_all`` split:
+        stage 1 issues the counts D2H async on a side stream *before* the permute,
+        the permute (main stream) fills the overlap window, stage 2 syncs the copy
+        just before the main a2a needs the host splits. The stage boundary is where
+        :class:`OverlapExpertParallel`'s A/B hooks land, so this composes with the
+        dual-thread overlap instead of bypassing it. Pure reorder + data movement,
+        so bit-identical to the sync path.
+        """
+        tokens, probs, topk_indices, num_tokens_per_expert = args
+        if isinstance(tokens, DTensor):
+            self.input_layout = tokens.layout
+            tokens = tokens.to_local()
+
+        tokens = self.reshape(tokens, (-1, tokens.shape[-1]))
+        ep_degree = device_mesh.mesh_shape[0]
+        num_experts = num_tokens_per_expert.shape[-1]
+        moe_router_topk = topk_indices.shape[-1]
+
+        tokens, probs, topk_indices, pad_size = self._pad_inputs(
+            tokens, probs, topk_indices, num_experts, moe_router_topk)
+
+        # Stage 1: count + counts a2a + issue async D2H, all BEFORE the permute.
+        host_buf, d2h_event, num_tokens_per_expert_group = self._dispatch_preprocess(
+            topk_indices, num_experts, ep_degree)
+
+        # Expensive permute runs on the main stream, overlapping the D2H copy.
+        routed_input, _, topk_indices, unsort_token_indices_experts \
+            = self._permute(tokens, topk_indices, self.moe_permute_fusion)
+        original_shape = routed_input.shape
+
+        # Stage 2: deferred sync + main a2a (overlap subclass adds A/B hooks here).
+        flat_in = self.reshape(routed_input, (-1,))
+        flat_out, group_counts, input_splits, output_splits, num_tokens_per_expert = \
+            self._dispatch_a2a(flat_in, host_buf, d2h_event, num_tokens_per_expert_group,
+                               num_experts, ep_degree, cell.hidden_size)
+        global_input_tokens = self.reshape(flat_out, (1, -1, cell.hidden_size))
+
+        num_local_experts = num_experts // ep_degree
+        sort_idx, restore_idx = self._chunk_perm(ep_degree, num_local_experts)
+        global_input_tokens = self._resort_after_dispatch(global_input_tokens, group_counts, sort_idx)
+        combine_counts = [group_counts[i] for i in sort_idx]
+
+        self.ctx = (
+            probs, combine_counts, restore_idx, unsort_token_indices_experts,
             input_splits, output_splits, original_shape, pad_size
         )
         return global_input_tokens, probs, topk_indices, num_tokens_per_expert
@@ -331,13 +487,18 @@ class ExpertParallel(ParallelStyle):
             "weight2": (Shard(0),)
         }
 
-    def _unsort_for_combine(self, routed_output, combine_index, hidden_size):
-        """Undo the local-expert resort that ``_resort_after_dispatch`` applied."""
+    def _unsort_for_combine(self, routed_output, split_sizes, restore_idx, hidden_size):
+        """Undo the local-expert resort that ``_resort_after_dispatch`` applied.
+
+        Inverse device-side ``split`` + ``cat``: split the expert-major output into
+        its per-``(source, local_expert)`` chunks (sizes ``split_sizes``, expert-major
+        order) and concatenate them back into source-major order via ``restore_idx``
+        (see :meth:`_chunk_perm`), so the reverse a2a sends contiguous blocks home."""
         routed_output = self.reshape(routed_output, (1, -1, hidden_size))
-        index = self.reshape(combine_index, (-1,))
         shape = routed_output.shape
         routed_output = self.reshape(routed_output, (-1, shape[-1]))
-        routed_output = self.index_select(routed_output, 0, index)
+        chunks = self.split(routed_output, split_sizes, dim=0)
+        routed_output = self.concat([chunks[i] for i in restore_idx], dim=0)
         routed_output = self.reshape(routed_output, (shape[0], -1, shape[-1]))
         return routed_output
 
@@ -388,11 +549,12 @@ class ExpertParallel(ParallelStyle):
         communication lives in :meth:`_combine_comm`.
         """
         (
-            probs, combine_index, unsort_token_indices_experts,
+            probs, combine_counts, restore_idx, unsort_token_indices_experts,
             input_splits, output_splits, original_shape, pad_size
         ) = self.ctx
         # unsort tokens by local expert
-        routed_output = self._unsort_for_combine(routed_output, combine_index, cell.hidden_size)
+        routed_output = self._unsort_for_combine(
+            routed_output, combine_counts, restore_idx, cell.hidden_size)
 
         flat_in = self.reshape(routed_output, (-1,))
         flat_out = self._combine_comm(flat_in, input_splits, output_splits, cell.hidden_size)
@@ -455,7 +617,10 @@ class DeredundancyExpertParallel(ExpertParallel):
         tokens_shape = tokens.shape
         tokens = self.reshape(tokens, (-1, tokens_shape[-1]))
         tokens = self.squeeze(tokens, 0)
-        probs = self.cast(self.squeeze(probs, 0), mstype.bfloat16)
+        # Follow the token (compute) dtype rather than hardcoding bf16 so the
+        # dispatch works for both bfloat16 and float32 compute.
+        compute_dtype = tokens.dtype
+        probs = self.cast(self.squeeze(probs, 0), compute_dtype)
         topk_indices = self.cast(self.squeeze(topk_indices, 0), mstype.int32)
 
         # communication group
@@ -470,12 +635,12 @@ class DeredundancyExpertParallel(ExpertParallel):
 
         top_k = topk_indices.shape[-1]
         node_expert_num = self.local_expert_end_index - self.local_expert_start_index
-        safe_tokens = self.zeros((node_expert_num, tokens_shape[-1]), dtype=mstype.bfloat16)
+        safe_tokens = self.zeros((node_expert_num, tokens_shape[-1]), dtype=compute_dtype)
         tokens = self.cat((safe_tokens, tokens), dim=0)
         safe_topk_indices = self.cumsum(self.ones((node_expert_num, top_k)), dim=0)
         safe_topk_indices = self.cast(safe_topk_indices - 1 + self.local_expert_start_index, mstype.int32)
         topk_indices = self.cat((safe_topk_indices, topk_indices), dim=0)
-        safe_probs = self.zeros((node_expert_num, top_k), dtype=mstype.bfloat16)
+        safe_probs = self.zeros((node_expert_num, top_k), dtype=compute_dtype)
         probs = self.cat((safe_probs, probs), dim=0)
 
         # prepare counter
@@ -522,7 +687,7 @@ class DeredundancyExpertParallel(ExpertParallel):
         sorted_expert_ids = self.index_select(sorted_expert_ids, 0, idx)
         sorted_router_coeff = self.index_select(sorted_router_coeff, 0, idx)
 
-        excombine_whiteboard = self.mul(routed_input, Tensor(0.0, dtype=mstype.bfloat16))
+        excombine_whiteboard = self.mul(routed_input, Tensor(0.0, dtype=routed_input.dtype))
         routed_input = self.index_select(routed_input, 0, dispatch_idx)
 
         # 3. inner alltoallv

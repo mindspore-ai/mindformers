@@ -39,6 +39,7 @@ from mindformers.parallel_core.transformer_config import TransformerConfig
 from mindformers.pynative.base_models.common.embeddings.language_model_embedding import LanguageModelEmbedding
 from mindformers.pynative.base_models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from mindformers.pynative.base_models.common.embeddings.yarn_rotary_pos_embedding import YarnRotaryEmbedding
+from mindformers.pynative.base_models.common.embeddings.rope_utils import compute_rotary_cos_sin
 from mindformers.pynative.base_models.gpt.gpt_layer_specs import get_gpt_mtp_block_spec
 from mindformers.pynative.transformers.transformer_block import TransformerBlock, TransformerBlockSubmodules
 from mindformers.pynative.transformers.multi_token_prediction import (
@@ -253,8 +254,7 @@ class GPTModel(nn.Cell):
                                        init_method=self.init_method,
                                        bias=False,
                                        skip_weight_param_allocation=skip_weight_param_allocation,
-                                       compute_dtype=self.config.compute_dtype,
-                                       params_dtype=self.config.params_dtype)
+                                       compute_dtype=self.config.compute_dtype)
             config.model_parallel = config.tensor_model_parallel_size
             loss_cls = ChunkCrossEntropyLoss if self.chunk_loss_num > 1 else CrossEntropyLoss
             self.loss = loss_cls(
@@ -332,6 +332,7 @@ class GPTModel(nn.Cell):
         output_weight = None
         if self.share_embeddings_and_output_weights:
             output_weight = self.shared_embedding_or_output_weight()
+            output_weight = self.cast(output_weight, self.config.compute_dtype)
 
         if self.mtp_process:
             hidden_states = self.mtp(
@@ -361,7 +362,6 @@ class GPTModel(nn.Cell):
             )
 
         # logits origin shape is [s b h], transform it to [b*s h].
-        hidden_states = self.cast(hidden_states, dtype.bfloat16)
         logits = self.output_layer(hidden_states, output_weight)
         need_chunked_loss = self._should_use_chunked_loss()
         if logits.ndim > 2 and not need_chunked_loss:
@@ -429,8 +429,17 @@ class GPTModel(nn.Cell):
         # rope
         rotary_pos_emb = None
         mscale = 1.0
+        rotary_cos_sin = None
         if self.use_rotary_position_embeddings:
             rotary_pos_emb, mscale = self.rotary_pos_emb(seq_len, position_ids=position_ids)
+            rotary_cos_sin = compute_rotary_cos_sin(
+                rotary_pos_emb,
+                mscale,
+                self.config.rotary_dtype,
+                apply_rope_fusion=self.config.apply_rope_fusion,
+                rotary_interleaved=self.config.rotary_interleaved,
+                multi_latent_attention=self.config.multi_latent_attention,
+            )
 
         if prefix_keys_values is not None:
             if attn_mask is None:
@@ -456,7 +465,8 @@ class GPTModel(nn.Cell):
             prefix_keys_values,
             actual_seq_len,
             input_ids=input_ids,
-            mscale=mscale
+            mscale=mscale,
+            rotary_cos_sin=rotary_cos_sin
         )
 
         return hidden_states, rotary_pos_emb, mscale
@@ -692,11 +702,10 @@ class GPTModel(nn.Cell):
                 shard of the global batch, so its local ``tokens_per_expert``
                 histogram is only a partial count. We all-reduce SUM over this
                 group to recover the global-batch histogram, otherwise the bias
-                delta diverges from the single-card baseline. ``None`` (or a
-                single-rank group) skips the all-reduce. TP is intentionally
-                excluded: the MoE plan replicates router inputs across TP ranks,
-                so each TP rank already sees the same tokens; reducing over TP
-                would multiply the count by ``tp_size``.
+                delta diverges from the single-card baseline. Local TP sequence
+                parallelism additionally shards the router token view across TP,
+                so the TP group stored on the router is reduced as well. ``None``
+                (or a single-rank group) skips the corresponding all-reduce.
             metric_group_size: Size of ``metric_group`` (skip all-reduce when
                 ``<= 1``).
         """
@@ -717,6 +726,14 @@ class GPTModel(nn.Cell):
             if DTensor is not None and isinstance(tokens_per_expert_by_layer, DTensor):
                 tokens_per_expert_by_layer = tokens_per_expert_by_layer.to_local()
             all_reduce(tokens_per_expert_by_layer, group=metric_group)
+
+        router = getattr(cache[0], "router", None)
+        tp_group = getattr(router, "_tp_group", None)
+        tp_size = getattr(router, "_tp_size", 1)
+        if tp_group is not None and tp_size > 1:
+            if DTensor is not None and isinstance(tokens_per_expert_by_layer, DTensor):
+                tokens_per_expert_by_layer = tokens_per_expert_by_layer.to_local()
+            all_reduce(tokens_per_expert_by_layer, group=tp_group)
 
         with _no_grad():
             for moe_layer_idx, module in enumerate(cache):
