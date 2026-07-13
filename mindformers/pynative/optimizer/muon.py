@@ -58,6 +58,13 @@ _ALL_CONCAT_GROUP_CACHE = {}
 _LOW_PRECISION_DTYPES = (mstype.float16, mstype.bfloat16)
 op_cast = P.Cast()
 
+# Momentum state is written back before the parameter stage.  The remaining
+# stacked inputs/outputs need at most four FP32-sized buffers, so budget 16
+# bytes per local parameter element and target 4 GiB per apply.  Existing
+# batched groups retain at least two slots to stay on the same numerical path.
+_PHASE4_BATCH_TEMP_BYTES_PER_ELEMENT = 16
+_PHASE4_BATCH_TEMP_MEMORY_LIMIT = 4 * 1024 * 1024 * 1024
+
 
 def _create_state_parameter(old_param, prefix, init='zeros', name=None):
     """Create optimizer state parameter with the same shape and dtype as the original parameter."""
@@ -77,6 +84,30 @@ def _shape_numel(shape):
     for dim in shape:
         numel *= int(dim)
     return int(numel)
+
+
+def _bound_phase4_groups(groups, max_temp_bytes=_PHASE4_BATCH_TEMP_MEMORY_LIMIT):
+    """Split same-shape Phase 4 groups to cap batched-apply temporaries."""
+    bounded = {}
+    for group_key, slots in groups.items():
+        local_shape = group_key[0]
+        bytes_per_slot = _shape_numel(local_shape) * _PHASE4_BATCH_TEMP_BYTES_PER_ELEMENT
+        slots_per_batch = max(1, int(max_temp_bytes) // max(1, bytes_per_slot))
+        if len(slots) > 1:
+            # Keep groups that were batched on the batched numerical path.  A
+            # singleton uses a separate update implementation, so avoid creating
+            # new singleton chunks solely as a side effect of memory bounding.
+            slots_per_batch = max(2, slots_per_batch)
+        chunks = [slots[start:start + slots_per_batch]
+                  for start in range(0, len(slots), slots_per_batch)]
+        if len(chunks) > 1 and len(chunks[-1]) == 1:
+            if len(chunks[-2]) > 2:
+                chunks[-1].insert(0, chunks[-2].pop())
+            else:
+                chunks[-2].extend(chunks.pop())
+        for chunk_index, chunk in enumerate(chunks):
+            bounded[(group_key, chunk_index)] = chunk
+    return bounded
 
 
 class _ShapeOnlyTensor:
@@ -1104,10 +1135,11 @@ def _prepare_muon_input_batched(gradients, muon_m_list, momentum, use_nesterov):
 def _apply_prepared_update_batched(infos):
     """Phase 4 batched apply for ``n_slots`` same-shape weights.
 
-    Stacks ``param`` / ``x_ret`` / ``next_m`` across the group, runs one
-    fused ``cast → mul scalar → sub → cast`` chain, then K small ``copy_``
-    writes back to the original Parameter slots.  ``muon_m`` is updated
-    by a separate batched cast + per-slot copy_.
+    Writes the already-FP32 ``next_m`` views directly to ``muon_m``, then
+    stacks ``param`` / ``x_ret`` across the group and runs one
+    ``cast → mul scalar → sub → cast`` chain followed by per-slot ``copy_``.
+    Staging the momentum writeback keeps its views out of the parameter-stage
+    working set and avoids a redundant stack/cast.
 
     Per-weight ``lr * wd`` may differ across slots; we use a scalar when
     they're identical (the common case for non-grouped LR) and broadcast a
@@ -1154,9 +1186,16 @@ def _apply_prepared_update_batched(infos):
         scales = [1.0 - float(info['lr']) * float(info['wd']) for info in infos]
     scales_all_same = all(s == scales[0] for s in scales)
     param_dtype = F.dtype(params[0])
-    m_dtype = F.dtype(muon_ms[0])
-
     with SkipDTensorDispatch():
+        # Complete the momentum-state writeback as a separate stage so its
+        # Phase 0 views do not overlap the larger parameter-update buffers.
+        # ``muon_m`` is FP32 state cloned from the FP32 master parameter, so a
+        # second stack/cast of the already-FP32 ``next_m`` views is redundant.
+        for k in range(n_slots):
+            inplace_copy(muon_ms[k], next_ms[k])
+            infos[k]['next_m'] = None
+        del next_ms
+
         # ``param.shape`` for DTensor Parameter reports the GLOBAL shape, so
         # peel off the local tensors first; everything below operates on
         # local-shape tensors only.
@@ -1166,7 +1205,6 @@ def _apply_prepared_update_batched(infos):
         stacked_param = mint.stack(params_local, dim=0)
         stacked_x_ret = mint.stack(
             [x_ret.reshape(local_shape) for x_ret in x_rets], dim=0)
-        stacked_next_m = mint.stack(next_ms, dim=0)
 
         param_fp32 = op_cast(stacked_param, mstype.float32)
         if scales_all_same:
@@ -1177,11 +1215,9 @@ def _apply_prepared_update_batched(infos):
             scaled = param_fp32 * scale_vec
         next_param_stacked = scaled - stacked_x_ret
         next_param_cast = op_cast(next_param_stacked, param_dtype)
-        next_m_cast = op_cast(stacked_next_m, m_dtype)
 
         for k in range(n_slots):
             inplace_copy(params[k], next_param_cast[k])
-            inplace_copy(muon_ms[k], next_m_cast[k])
     return params
 
 
@@ -2301,6 +2337,12 @@ class Muon(Optimizer):
             sig = meta.get(param_idx_for_slot[slot], {}).get('group_sig')
             return (sig if sig is not None else ('__ungrouped__', slot), slot)
         flat_order_2d_slots.sort(key=_sort_key)
+
+        # Batched apply materializes several stacked FP32 tensors.  Bounding
+        # groups here keeps the hot path free of shape arithmetic and prevents
+        # large repeated expert weights from multiplying the peak by layer count.
+        phase4_groups_local = _bound_phase4_groups(phase4_groups_local)
+        phase4_groups_2d = _bound_phase4_groups(phase4_groups_2d)
 
         return {
             'param_idx_for_slot': param_idx_for_slot,
