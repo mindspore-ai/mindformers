@@ -15,12 +15,13 @@
 """Parallel styles for MC2 fused linear layers."""
 
 from hyper_parallel import DeviceMesh
-from hyper_parallel.core.dtensor.placement_types import Placement, Shard
+from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
 from mindspore import nn
 
 from mindformers.pynative.distributed.style import ColwiseParallel, RowwiseParallel
 from mindformers.pynative.layers.linear import Linear
 from mindformers.pynative.layers.mc2 import MC2Linear
+from mindformers.pynative.distributed.utils import distribute_module
 
 __all__ = ["MC2ColwiseParallel", "MC2RowwiseParallel"]
 
@@ -38,21 +39,10 @@ def _replace_with_mc2_linear(module: nn.Cell, mode: str, device_mesh: DeviceMesh
 class MC2ColwiseParallel(ColwiseParallel):
     """Column parallelism using fused all-gather and matmul."""
 
-    def __init__(
-        self,
-        *,
-        input_layouts: Placement | None = None,
-        output_layouts: Placement | None = None,
-        use_local_output: bool = True,
-    ):
-        super().__init__(
-            input_layouts=input_layouts,
-            output_layouts=output_layouts,
-            use_local_output=use_local_output,
-        )
-        if not isinstance(self.input_layouts[0], Shard):
-            raise ValueError("MC2ColwiseParallel requires a sharded input layout.")
-        self.desired_input_layouts = self.input_layouts
+    def __init__(self, *, gather_input: bool = True, gather_output: bool = False):
+        super().__init__(gather_input=False, gather_output=gather_output)
+        if not gather_input:
+            raise ValueError("MC2ColwiseParallel requires a sequence-sharded input.")
 
     def _apply(self, module: nn.Cell, device_mesh: DeviceMesh):
         module = _replace_with_mc2_linear(module, "all_gather", device_mesh)
@@ -62,21 +52,19 @@ class MC2ColwiseParallel(ColwiseParallel):
 class MC2RowwiseParallel(RowwiseParallel):
     """Row parallelism using fused matmul and reduce-scatter."""
 
-    def __init__(
-        self,
-        *,
-        input_layouts: Placement | None = None,
-        output_layouts: Placement | None = None,
-        use_local_output: bool = True,
-    ):
-        super().__init__(
-            input_layouts=input_layouts,
-            output_layouts=output_layouts,
-            use_local_output=use_local_output,
-        )
-        if not isinstance(self.output_layouts[0], Shard):
-            raise ValueError("MC2RowwiseParallel requires a sharded output layout.")
+    def __init__(self):
+        super().__init__(reduce_mode="reduce_scatter", input_is_parallel=True)
 
     def _apply(self, module: nn.Cell, device_mesh: DeviceMesh):
         module = _replace_with_mc2_linear(module, "reduce_scatter", device_mesh)
-        return super()._apply(module, device_mesh)
+        sharding_plan = {"weight": (Shard(1),)}
+        if getattr(module, "bias", None) is not None:
+            sharding_plan["bias"] = (Replicate(),)
+        distribute_module(
+            module=module,
+            device_mesh=device_mesh,
+            parameter_shard_plan=sharding_plan,
+            input_fn=None,
+            output_fn=None,
+        )
+        return module

@@ -16,8 +16,6 @@
 
 import pytest
 
-from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
-
 from mindformers.pynative.distributed.mc2_style import MC2ColwiseParallel, MC2RowwiseParallel
 from mindformers.pynative.distributed.style import ColwiseParallel, RowwiseParallel
 from mindformers.pynative.layers.linear import Linear
@@ -39,8 +37,8 @@ class _FakeMesh:
 @pytest.mark.parametrize(
     "style,base_style,mode",
     [
-        (MC2ColwiseParallel(input_layouts=Shard(0)), ColwiseParallel, "all_gather"),
-        (MC2RowwiseParallel(output_layouts=Shard(0)), RowwiseParallel, "reduce_scatter"),
+        (MC2ColwiseParallel(), ColwiseParallel, "all_gather"),
+        (MC2RowwiseParallel(), RowwiseParallel, "reduce_scatter"),
     ],
 )
 def test_mc2_style_replaces_linear_in_place(monkeypatch, style, base_style, mode):
@@ -63,8 +61,6 @@ def test_mc2_style_replaces_linear_in_place(monkeypatch, style, base_style, mode
 @pytest.mark.level0
 @pytest.mark.platform_x86_cpu
 def test_mc2_style_requires_sequence_sharding():
-    """MC2 styles reject layouts that cannot fuse sequence communication."""
-    with pytest.raises(ValueError, match="sharded input"):
-        MC2ColwiseParallel(input_layouts=Replicate())
-    with pytest.raises(ValueError, match="sharded output"):
-        MC2RowwiseParallel(output_layouts=Replicate())
+    """MC2 colwise rejects an input that does not require its fused all-gather."""
+    with pytest.raises(ValueError, match="sequence-sharded input"):
+        MC2ColwiseParallel(gather_input=False)

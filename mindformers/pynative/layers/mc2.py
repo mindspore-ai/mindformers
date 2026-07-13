@@ -37,8 +37,8 @@ needed (the CANN kernel transposes internally).
 """
 from mindspore import Tensor, mint, ops
 
-from hyper_parallel import DFunction, DTensor
-from hyper_parallel.core.dtensor.placement_types import Shard
+from hyper_parallel import DTensor
+from mindspore.common._grad_function import _Function
 
 from mindformers.pynative.layers.linear import Linear
 
@@ -54,7 +54,7 @@ def _transpose_2d(tensor):
     return mint.transpose(tensor, 0, 1)
 
 
-class AllGatherMatmulFunction(DFunction):
+class AllGatherMatmulFunction(_Function):
     """Column-parallel fused all-gather + matmul with custom backward.
 
     Forward (local view): ``out = AllGather_m(x) @ w^T``.
@@ -100,7 +100,7 @@ class AllGatherMatmulFunction(DFunction):
         return grad_x, grad_w, None, None, grad_bias
 
 
-class MatmulReduceScatterFunction(DFunction):
+class MatmulReduceScatterFunction(_Function):
     """Row-parallel fused matmul + reduce-scatter with custom backward.
 
     Forward (local view): ``out = ReduceScatter_m(x @ w^T)``.
@@ -168,12 +168,11 @@ class MC2Linear(Linear):
         linear.__class__ = cls
         return linear
 
-    def _mc2_forward(self, input_: DTensor, weight: DTensor) -> DTensor:
+    def _mc2_forward(self, input_: Tensor, weight: Tensor) -> Tensor:
         """Run the configured fused kernel on local tensors."""
         seq, batch = int(input_.shape[0]), int(input_.shape[1])
-        input_local = input_.to_local()
-        weight_local = weight.to_local()
-        input_2d = input_local.reshape(-1, input_local.shape[-1])
+        weight_local = weight.to_local() if isinstance(weight, DTensor) else weight
+        input_2d = input_.reshape(-1, input_.shape[-1])
 
         bias_local = None
         if self.has_bias:
@@ -184,19 +183,20 @@ class MC2Linear(Linear):
             output_2d = AllGatherMatmulFunction.apply(
                 input_2d, weight_local, self.mc2_group, self.mc2_world_size, bias_local
             )
-            output = output_2d.reshape(seq, batch, output_2d.shape[-1])
-            return DTensor.from_local(output, input_.device_mesh, (Shard(-1),))
+            output_seq = seq * self.mc2_world_size
+            output = output_2d.reshape(output_seq, batch, output_2d.shape[-1])
+            return output
 
         output_2d = MatmulReduceScatterFunction.apply(
             input_2d, weight_local, self.mc2_group, self.mc2_world_size, bias_local
         )
         output = output_2d.reshape(seq // self.mc2_world_size, batch, output_2d.shape[-1])
-        return DTensor.from_local(output, input_.device_mesh, (Shard(0),))
+        return output
 
     def construct(self, input_: Tensor, weight: Tensor = None) -> Tensor:
-        """Forward using MC2 for DTensor inputs and Linear otherwise."""
-        if not isinstance(input_, DTensor):
-            return super().construct(input_, weight)
+        """Forward using MC2 with local activations."""
+        if isinstance(input_, DTensor):
+            raise TypeError("MC2Linear expects a local Tensor activation, but got DTensor.")
         if not hasattr(self, "mc2_mode"):
             raise RuntimeError("MC2Linear must be configured by an MC2 parallel style before use.")
 

@@ -17,6 +17,7 @@ import numpy as np
 import mindspore.common.dtype as mstype
 from mindspore import nn, Parameter, Tensor, mint, ops
 from mindspore.common.initializer import initializer
+from hyper_parallel import DTensor
 try:
     from hyper_parallel.custom_ops.experimental import npu_mhc_pre_sinkhorn, npu_mhc_post
 except ImportError:
@@ -24,6 +25,11 @@ except ImportError:
 from mindformers.parallel_core.transformer_config import TransformerConfig
 from mindformers.parallel_core.utils.init_method import init_method_zero
 from mindformers.pynative.layers.linear import Linear
+
+
+def _to_local(tensor):
+    """Return the local value of a distributed mHC parameter."""
+    return tensor.to_local() if isinstance(tensor, DTensor) else tensor
 
 
 class SinkhornKnopp(nn.Cell):
@@ -193,25 +199,28 @@ class HyperConnectionModule(nn.Cell):
         # 1. RMSNorm with fixed gamma=1.
         norm_x = self.rms_norm(
             self.cast(hidden_states, mstype.float32),
-            self.rms_weight,
+            _to_local(self.rms_weight),
             self.norm_eps
         )[0]
 
         # 2. Project normalised streams -> [s, b, 1, n+n+n^2].
         x4d = self.cast(self.reshape(norm_x, (s, -1, 1, n_hidden)), self.dtype)
-        proj_w_t = self.transpose(self.cast(self.mapping_proj.weight, self.dtype), (1, 0))
+        proj_w_t = self.transpose(
+            self.cast(_to_local(self.mapping_proj.weight), self.dtype),
+            (1, 0),
+        )
         h = self.matmul(x4d, proj_w_t)
         h = self.cast(h, mstype.float32)
 
         alpha_ = self.concat(
             (
-                self.tile(self.alpha_pre, (n,)),
-                self.tile(self.alpha_post, (n,)),
-                self.tile(self.alpha_res, (n * n,)),
+                self.tile(_to_local(self.alpha_pre), (n,)),
+                self.tile(_to_local(self.alpha_post), (n,)),
+                self.tile(_to_local(self.alpha_res), (n * n,)),
             ),
             dim=-1,
         )
-        h = self.add(self.mul(h, alpha_), self.bias)
+        h = self.add(self.mul(h, alpha_), _to_local(self.bias))
 
         # 3. Split raw projection.
         h_pre, h_post, h_res = self.split(h, [n, n, n * n], dim=3)
@@ -337,10 +346,13 @@ class FusedHyperConnectionModule(HyperConnectionModule):
         x = self.reshape(hidden_states, (s, b, n, hidden_size))
         x = self.cast(x, self.dtype)
 
-        alpha = self.concat((self.alpha_pre, self.alpha_post, self.alpha_res), dim=-1)
+        alpha = self.concat(
+            (_to_local(self.alpha_pre), _to_local(self.alpha_post), _to_local(self.alpha_res)),
+            dim=-1,
+        )
 
         h_in, h_post, h_res_flat, *_ = npu_mhc_pre_sinkhorn(
-            x, self.mapping_proj.weight, alpha, self.bias,
+            x, _to_local(self.mapping_proj.weight), alpha, _to_local(self.bias),
             hc_mult=n,
             num_iters=self.sinkhorn_iterations,
             hc_eps=self.hc_eps,

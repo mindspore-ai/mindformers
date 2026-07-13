@@ -1,26 +1,17 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates
-"""
-Parallel style for distributed tensor parallel.
-
-Modifications from the original PyTorch implementation:
-1. Framework migration: PyTorch (torch/nn.Module) replaced with MindSpore
-   (mindspore/nn.Cell). DTensor/DeviceMesh/Placement now imported from
-   hyper_parallel.core instead of distributed.tensor.
-2. Type and API adaptation: nn.Module -> nn.Cell, Tensor -> ms.Tensor
-   throughout. DTensor.from_local() and redistribute() calls adjusted to
-   hyper_parallel API.
-"""
-from typing import Any, Optional, Tuple, Dict, Union
-from functools import partial
+"""Parallel styles for local-tensor distributed execution."""
+from typing import Any, Optional, Tuple, Dict, Union, Literal
 from abc import ABC, abstractmethod
 
 import mindspore as ms
-from mindspore import nn, Tensor
+from mindspore import mint, nn
+from mindspore.common._grad_function import _Function
+from mindspore.ops.function import comm_func
 
 from hyper_parallel import DTensor, DeviceMesh
 from hyper_parallel.core.context_parallel.context_parallel import ContextParallel as HPContextParallel
 from hyper_parallel.core.context_parallel.async_context_parallel import AsyncContextParallel as HPAsyncContextParallel
-from hyper_parallel.core.dtensor.placement_types import Placement, Shard, Replicate
+from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
 
 from mindformers.pynative.layers.linear import Linear
 from mindformers.pynative.base_models.common.embeddings.vocab_embedding import VocabEmbedding
@@ -33,6 +24,9 @@ __all__ = [
     "HPAsyncContextParallelAdapter",
     "ColwiseParallel",
     "RowwiseParallel",
+    "NoParallel",
+    "AllGather",
+    "ShardTensor",
     "SequenceParallel",
     "PrepareModuleInput",
     "PrepareModuleOutput",
@@ -40,6 +34,171 @@ __all__ = [
     "build_hp_cp_style",
     "build_hp_async_cp_style",
 ]
+
+
+def _contiguous(tensor):
+    return tensor.contiguous() if hasattr(tensor, "contiguous") else tensor
+
+
+def _normalize_dim(dim: int, ndim: int) -> int:
+    """Normalize and validate a possibly-negative tensor dimension."""
+    normalized = dim if dim >= 0 else ndim + dim
+    if normalized < 0 or normalized >= ndim:
+        raise ValueError(f"Dimension {dim} is out of range for a {ndim}-D tensor.")
+    return normalized
+
+
+def _all_gather_dim(tensor, dim, group):
+    """All-gather a local tensor shard along an arbitrary dimension."""
+    value = tensor.movedim(dim, 0).contiguous()
+    value, _ = comm_func.all_gather_into_tensor(None, value, group=group)
+    return value.movedim(0, dim).contiguous()
+
+
+def _reduce_scatter_dim(tensor, dim, group):
+    """Reduce-scatter a tensor along an arbitrary dimension."""
+    value = tensor.movedim(dim, 0).contiguous()
+    value, _ = comm_func.reduce_scatter_tensor(None, value, group=group)
+    return value.movedim(0, dim).contiguous()
+
+
+def _slice_dim(tensor, dim, world, rank):
+    """Select one equal-sized rank shard along ``dim``."""
+    if tensor.shape[dim] % world != 0:
+        raise ValueError(
+            f"Dimension {dim} with size {tensor.shape[dim]} must be divisible by "
+            f"mesh size {world}."
+        )
+    shard_size = tensor.shape[dim] // world
+    slices = [slice(None)] * tensor.ndim
+    slices[dim] = slice(rank * shard_size, (rank + 1) * shard_size)
+    return tensor[tuple(slices)]
+
+
+class _AllReduceFunction(_Function):
+    """AllReduce partial values in forward and preserve replicated gradients."""
+
+    @staticmethod
+    def forward(ctx, tensor, group):  # pylint: disable=arguments-differ
+        del ctx
+        output, _ = comm_func.all_reduce(tensor, group=group)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):  # pylint: disable=arguments-differ
+        del ctx
+        return grad_output, None
+
+
+class _AllGatherFunction(_Function):
+    """AllGather with either ReduceScatter or local-slice backward."""
+
+    @staticmethod
+    def forward(ctx, tensor, dim, group, world, rank, reduce_grad):  # pylint: disable=arguments-differ
+        ctx.dim = dim
+        ctx.group = group
+        ctx.world = world
+        ctx.rank = rank
+        ctx.reduce_grad = reduce_grad
+        return _all_gather_dim(tensor, dim, group)
+
+    @staticmethod
+    def backward(ctx, grad_output):  # pylint: disable=arguments-differ
+        if ctx.reduce_grad:
+            grad_input = _reduce_scatter_dim(grad_output, ctx.dim, ctx.group)
+        else:
+            grad_input = _slice_dim(grad_output, ctx.dim, ctx.world, ctx.rank)
+        return grad_input, None, None, None, None, None
+
+
+class _ShardFunction(_Function):
+    """Select a local shard in forward and gather shard gradients in backward."""
+
+    @staticmethod
+    def forward(ctx, tensor, dim, group, world, rank):  # pylint: disable=arguments-differ
+        ctx.dim = dim
+        ctx.group = group
+        return _slice_dim(tensor, dim, world, rank)
+
+    @staticmethod
+    def backward(ctx, grad_output):  # pylint: disable=arguments-differ
+        return _all_gather_dim(grad_output, ctx.dim, ctx.group), None, None, None, None
+
+
+class AllGather:
+    """Gather a sharded local tensor along ``dim``."""
+
+    def __init__(self, dim: int, *, reduce_grad: bool = True):
+        self.dim = dim
+        self.reduce_grad = reduce_grad
+
+    def __repr__(self):
+        if not self.reduce_grad:
+            return f"AllGather(dim={self.dim}, reduce_grad=False)"
+        return f"AllGather(dim={self.dim})"
+
+
+class ShardTensor:
+    """Select this rank's local shard along ``dim``."""
+
+    def __init__(self, dim: int):
+        self.dim = dim
+
+    def __repr__(self):
+        return f"ShardTensor(dim={self.dim})"
+
+
+TensorTransform = Union[AllGather, ShardTensor]
+
+
+def _apply_local_transform(tensor, transform, device_mesh):
+    """Apply an explicit local tensor transform on a one-dimensional mesh."""
+    if transform is None:
+        return tensor
+    if isinstance(tensor, DTensor):
+        raise TypeError("Local parallel styles expect plain Tensor activations, but got DTensor.")
+
+    world = device_mesh.size()
+    group = device_mesh.get_group()
+    rank = device_mesh.get_local_rank()
+    if isinstance(transform, AllGather):
+        dim = _normalize_dim(transform.dim, tensor.ndim)
+        return _AllGatherFunction.apply(
+            tensor, dim, group, world, rank, transform.reduce_grad
+        )
+
+    if isinstance(transform, ShardTensor):
+        dim = _normalize_dim(transform.dim, tensor.ndim)
+        return _ShardFunction.apply(tensor, dim, group, world, rank)
+
+    raise TypeError(f"Unsupported local tensor transform: {transform!r}.")
+
+
+def _layout_transform(current_layout, desired_layout):
+    """Map a simple DTensor layout transition to a local tensor transform."""
+    if current_layout is None or desired_layout is None or current_layout == desired_layout:
+        return None
+    if isinstance(current_layout, Shard) and isinstance(desired_layout, Replicate):
+        return AllGather(current_layout.dim)
+    if isinstance(current_layout, Replicate) and isinstance(desired_layout, Shard):
+        return ShardTensor(desired_layout.dim)
+    raise ValueError(
+        f"Unsupported local layout transition: {current_layout!r} -> {desired_layout!r}."
+    )
+
+
+def _layout_transforms(current_layouts, desired_layouts):
+    """Map matching layout tuples to local tensor transforms."""
+    if current_layouts is None or desired_layouts is None:
+        return None
+    current_items = current_layouts if isinstance(current_layouts, tuple) else (current_layouts,)
+    desired_items = desired_layouts if isinstance(desired_layouts, tuple) else (desired_layouts,)
+    if len(current_items) != len(desired_items):
+        raise ValueError("current_layouts and desired_layouts should have same length!")
+    return tuple(
+        _layout_transform(current_layout, desired_layout)
+        for current_layout, desired_layout in zip(current_items, desired_items)
+    )
 
 
 class ParallelStyle(ABC):
@@ -254,65 +413,25 @@ def build_hp_async_cp_style(
 
 
 class ColwiseParallel(ParallelStyle):
-    """
-    Partition a compatible nn.Cell in a column-wise fashion. Currently supports nn.Linear and nn.Embedding.
-    Users can compose it together with RowwiseParallel to achieve the sharding of more complicated modules.
-    (i.e. MLP, Attention)
+    """Shard linear output features and compute with local tensors.
 
-    Keyword Args:
-        input_layouts (Placement, optional):
-            The DTensor layout of input tensor for the nn.Cell, this is used to annotate the input tensor to
-            become a DTensor. If not specified, we assume the input tensor to be replicated.
-        output_layouts (Placement, optional):
-            The DTensor layout of the output for the nn.Cell, this is used to ensure the output of the nn.Cell
-            with the user desired layout. If not specified, the output tensor is sharded on the last dimension.
-        use_local_output (bool, optional):
-            Whether to use local :class:`Tensor` instead of :class:`DTensor` for the module output, default: True.
-    Returns:
-        A :class:`ParallelStyle` object that represents Colwise sharding of the nn.Cell.
+    ``gather_input`` gathers a sequence-sharded input before the local matmul.
     """
 
     def __init__(
         self,
         *,
-        input_layouts: Placement | None = None,
-        output_layouts: Placement | None = None,
-        use_local_output: bool = True,
+        gather_input: bool = True,
+        gather_output: bool = False,
+        output_layouts=None,
+        use_local_output=None,
     ):
         super().__init__()
-        self.input_layouts = (input_layouts or Replicate(),)
-        self.output_layouts = (output_layouts or Shard(-1),)
-        # colwise linear runtime sharding (desired sharding):
-        # 1. requires replicate input
-        # 2. shard output on last dim
-        self.desired_input_layouts = (Replicate(),)
-        self.use_local_output = use_local_output
-
-    @staticmethod
-    # pylint: disable=W0613
-    def _prepare_input_fn(
-        input_layouts, desired_input_layouts, device_mesh, mod, args
-    ):
-        """"prepare input."""
-        input_tensor = args[0]
-        if not isinstance(input_tensor, DTensor):
-            input_tensor = DTensor.from_local(
-                input_tensor, device_mesh, input_layouts
-            )
-        if input_layouts != desired_input_layouts:
-            input_tensor = input_tensor.redistribute(
-                placements=desired_input_layouts, device_mesh=device_mesh
-            )
-        return input_tensor
-
-    @staticmethod
-    # pylint: disable=W0613
-    def _prepare_output_fn(output_layouts, use_local_output, device_mesh, mod, args, outputs):
-        # outputs is a shard on last dimension DTensor, i.e. Shard(-1)
-        if outputs.placements != output_layouts:
-            outputs = outputs.redistribute(placements=output_layouts, device_mesh=device_mesh)
-        # back to local tensor
-        return outputs.to_local() if use_local_output else outputs
+        del output_layouts, use_local_output
+        # Local flow: all-gather the sequence-sharded input before the local matmul
+        # (SP). ``gather_input=False`` when the input is already full sequence.
+        self.gather_input = gather_input
+        self.gather_output = gather_output
 
     def _create_weight_sharding_plan(self, module: nn.Cell) -> Dict:
         """Create weight sharding plan for column-wise parallelism."""
@@ -336,91 +455,66 @@ class ColwiseParallel(ParallelStyle):
         return sharding_plan
 
     def _apply(self, module: nn.Cell, device_mesh: DeviceMesh) -> nn.Cell:
+        # Shard the weight (Shard(0)); no DTensor redistribute hooks -- the module
+        # computes locally on its weight shard. The tensor-parallel collective is a
+        # hand-written all-gather of the sequence-sharded input in a pre-hook.
         sharding_plan = self._create_weight_sharding_plan(module=module)
-
-        input_fn = partial(
-                self._prepare_input_fn, self.input_layouts, self.desired_input_layouts
-            )
-        
-        output_fn = partial(
-                self._prepare_output_fn, self.output_layouts, self.use_local_output
-            )
-        
-        return distribute_module(
+        distribute_module(
             module=module,
             device_mesh=device_mesh,
             parameter_shard_plan=sharding_plan,
-            input_fn=input_fn,
-            output_fn=output_fn
+            input_fn=None,
+            output_fn=None,
         )
+        if self.gather_input:
+            input_transform = AllGather(0)
+
+            def _pre_hook(unused_cell, args):
+                del unused_cell
+                gathered = _apply_local_transform(args[0], input_transform, device_mesh)
+                return (gathered,) + tuple(args[1:])
+
+            module.register_forward_pre_hook(_pre_hook)
+        if self.gather_output:
+            # The gathered output is replicated, so its backward is a local slice,
+            # matching Megatron's gather_from_tensor_model_parallel_region.
+            output_transform = AllGather(-1, reduce_grad=False)
+
+            def _post_hook(unused_cell, unused_args, output):
+                del unused_cell, unused_args
+                return _apply_local_transform(output, output_transform, device_mesh)
+
+            module.register_forward_hook(_post_hook)
+        return module
 
     def __repr__(self) -> str:
         tmpstr = self.__class__.__name__ + "("
-        tmpstr += f"input_layouts={self.input_layouts}, "
-        tmpstr += f"output_layouts={self.output_layouts}, "
-        tmpstr += f"use_local_output={self.use_local_output}"
+        tmpstr += f"gather_input={self.gather_input}, gather_output={self.gather_output}"
         tmpstr += ")"
         return tmpstr
 
 
 class RowwiseParallel(ParallelStyle):
-    """
-    Partition a compatible nn.Cell in a row-wise fashion. Currently supports nn.Linear and nn.Embedding.
-    Users can compose it with ColwiseParallel to achieve the sharding of more complicated modules.
-    (i.e. MLP, Attention)
-
-    Keyword Args:
-        input_layouts (Placement, optional):
-            The DTensor layout of input tensor for the nn.Cell, this is used to annotate the input tensor to
-            become a DTensor. If not specified, we assume the input tensor to be sharded on the last dimension.
-        output_layouts (Placement, optional):
-            The DTensor layout of the output for the nn.Cell, this is used to ensure the output of the nn.Cell
-            with the user desired layout. If not specified, the output tensor is replicated.
-        use_local_output (bool, optional):
-            Whether to use local :class:`Tensor` instead of :class:`DTensor` for the module output, default: True.
-    Returns:
-        A :class:`ParallelStyle` object that represents Rowwise sharding of the nn.Cell.
-    """
+    """Shard linear input features and reduce partial outputs over TP."""
 
     def __init__(
         self,
         *,
-        input_layouts: Placement | None = None,
-        output_layouts: Placement | None = None,
-        use_local_output: bool = True,
+        reduce_mode: Literal["all_reduce", "reduce_scatter"] = "reduce_scatter",
+        input_is_parallel: bool = True,
     ):
         super().__init__()
-        self.input_layouts = (input_layouts or Shard(-1),)
-        self.output_layouts = (output_layouts or Replicate(),)
-        self.use_local_output = use_local_output
-
-    @staticmethod
-    # pylint: disable=W0613
-    def _prepare_input_fn(
-        input_layouts, desired_input_layouts, device_mesh, mod, args,
-    ):
-        """"prepare input."""
-        input_tensor = args[0]
-        if not isinstance(input_tensor, DTensor):
-            input_tensor = DTensor.from_local(
-                input_tensor, device_mesh, input_layouts
+        if reduce_mode not in ("all_reduce", "reduce_scatter"):
+            raise ValueError(
+                "reduce_mode must be 'all_reduce' or 'reduce_scatter', "
+                f"but got {reduce_mode!r}."
             )
-        if input_layouts != desired_input_layouts:
-            input_tensor = input_tensor.redistribute(
-                placements=desired_input_layouts, device_mesh=device_mesh
+        self.reduce_mode = reduce_mode
+        if not isinstance(input_is_parallel, bool):
+            raise TypeError(
+                f"input_is_parallel must be a bool, but got {type(input_is_parallel).__name__}."
             )
-        return input_tensor
-
-    @staticmethod
-    # pylint: disable=W0613
-    def _prepare_output_fn(output_layouts, use_local_output, device_mesh, mod, args, outputs):
-        # Rowwise sharding produces partial output, depending on output layouts:
-        # 1. to replicate -> allreduce
-        # 2. to shard -> reduce_scatter
-        if outputs.placements != output_layouts:
-            outputs = outputs.redistribute(placements=output_layouts, device_mesh=device_mesh)
-        # back to local tensor
-        return outputs.to_local() if use_local_output else outputs
+        self.input_is_parallel = input_is_parallel
 
     def _create_weight_sharding_plan(self, module: nn.Cell) -> Dict:
         """Create weight sharding plan for row-wise parallelism."""
@@ -430,12 +524,8 @@ class RowwiseParallel(ParallelStyle):
                 sharding_plan.update({"weight": (Shard(1),)})
             if getattr(module, "bias", None) is not None:
                 sharding_plan.update({"bias": (Replicate(),)})
-            # rowwise linear runtime sharding requires input tensor shard on last dim
-            self.desired_input_layouts: tuple[Placement, ...] = (Shard(-1),)
         elif isinstance(module, VocabEmbedding):
             sharding_plan = {"weight": (Shard(0),)}
-            # rowwise embedding runtime sharding requires input tensor replicated
-            self.desired_input_layouts = (Replicate(),)
         else:
             raise NotImplementedError(
                 "RowwiseParallel currently only support nn.Linear and nn.Embedding!"
@@ -448,236 +538,194 @@ class RowwiseParallel(ParallelStyle):
         return sharding_plan
 
     def _apply(self, module: nn.Cell, device_mesh: DeviceMesh) -> nn.Cell:
+        if isinstance(module, VocabEmbedding):
+            return self._apply_vocab_embedding(module, device_mesh)
+
+        # Shard the weight (Shard(1)); no DTensor redistribute hooks. The partial
+        # output is reduced by a hand-written post-hook; a Replicate bias is added
+        # there, after the reduce (defer it out of the per-rank matmul).
         sharding_plan = self._create_weight_sharding_plan(module=module)
-
-        input_fn = partial(
-                self._prepare_input_fn, self.input_layouts, self.desired_input_layouts
-            )
-
-        output_fn = partial(
-                self._prepare_output_fn, self.output_layouts, self.use_local_output
-            )
-
-        return distribute_module(
+        if getattr(module, "bias", None) is not None:
+            module.skip_add_bias = True
+        distribute_module(
             module=module,
             device_mesh=device_mesh,
             parameter_shard_plan=sharding_plan,
-            input_fn=input_fn,
-            output_fn=output_fn
+            input_fn=None,
+            output_fn=None,
         )
+        group = device_mesh.get_group()
+        if not self.input_is_parallel:
+            transform = ShardTensor(-1)
+
+            def _pre_hook(unused_cell, args):
+                del unused_cell
+                sharded = _apply_local_transform(args[0], transform, device_mesh)
+                return (sharded,) + tuple(args[1:])
+
+            module.register_forward_pre_hook(_pre_hook)
+
+        def _post_hook(cell, unused_args, output):
+            del unused_args
+            out = _contiguous(output)
+            if self.reduce_mode == "reduce_scatter":
+                out, _ = comm_func.reduce_scatter_tensor(None, out, group=group)
+            else:
+                out = _AllReduceFunction.apply(out, group)
+            if getattr(cell, "has_bias", False) and getattr(cell, "skip_add_bias", False):
+                bias = cell.bias.to_local() if isinstance(cell.bias, DTensor) else cell.bias
+                out = out + cell.cast(bias, out.dtype)
+            return out
+
+        module.register_forward_hook(_post_hook)
+        return module
+
+    def _apply_vocab_embedding(self, module: VocabEmbedding, device_mesh: DeviceMesh) -> nn.Cell:
+        """Apply vocab-row sharding, masking, and output reduction to an embedding."""
+        distribute_module(
+            module=module,
+            device_mesh=device_mesh,
+            parameter_shard_plan={"weight": (Shard(0),)},
+            input_fn=None,
+            output_fn=None,
+        )
+        world = device_mesh.size()
+        rank = device_mesh.get_local_rank()
+        group = device_mesh.get_group()
+        vocab_per_rank = module.num_embeddings // world
+        vocab_start = rank * vocab_per_rank
+        vocab_end = vocab_start + vocab_per_rank
+        masks = []
+
+        def _pre_hook(unused_cell, args):
+            del unused_cell
+            ids = args[0]
+            in_range = mint.logical_and(ids >= vocab_start, ids < vocab_end)
+            masks.append(in_range)
+            local_ids = (ids - vocab_start) * in_range.to(ids.dtype)
+            return (local_ids,) + tuple(args[1:])
+
+        def _post_hook(unused_cell, unused_args, output):
+            del unused_cell, unused_args
+            in_range = masks.pop()
+            bsz, seq = in_range.shape
+            output = output * in_range.reshape(bsz, seq, 1).to(output.dtype)
+            if self.reduce_mode == "all_reduce":
+                return _AllReduceFunction.apply(output.contiguous(), group)
+            output = output.transpose(0, 1).contiguous()
+            output, _ = comm_func.reduce_scatter_tensor(None, output, group=group)
+            return output.transpose(0, 1).contiguous()
+
+        module.register_forward_pre_hook(_pre_hook)
+        module.register_forward_hook(_post_hook)
+        return module
 
     def __repr__(self) -> str:
-        tmpstr = self.__class__.__name__ + "("
-        tmpstr += f"input_layouts={self.input_layouts}, "
-        tmpstr += f"output_layouts={self.output_layouts}, "
-        tmpstr += f"use_local_output={self.use_local_output}"
-        tmpstr += ")"
-        return tmpstr
+        return (
+            f"{self.__class__.__name__}(reduce_mode={self.reduce_mode!r}, "
+            f"input_is_parallel={self.input_is_parallel})"
+        )
 
 
-class SequenceParallel(ParallelStyle):
-    """
-    SequenceParallel replicates a compatible ``nn.Cell`` parameters and runs the sharded computation with
-    input sharded on the sequence dimension. This currently supports ``nn.LayerNorm``, ``nn.Dropout``, and the
-    `RMSNorm python implementation <https://github.com/facebookresearch/llama/blob/main/llama/model.py#L34>`__
-
-    This style implements the operation that is described in the paper
-    `Reducing Activation Recomputation in Large Transformer Models <https://arxiv.org/abs/2205.05198>`__
-
-    The output of the ``nn.Cell`` will be sharded on the sequence dimension.
-
-    Keyword Args:
-        sequence_dim (int, optional):
-            The sequence dimension of the input tensor for the ``nn.Cell``,
-            this is used to annotate the input tensor to become a DTensor
-            that is sharded on the sequence dimension, default: 1.
-        use_local_output (bool, optional):
-            Whether to use local :class:`Tensor` instead of :class:`DTensor` for the module output, default: False.
-    Returns:
-        A :class:`ParallelStyle` object that represents Sequence Parallel of the ``nn.Cell``.
-
-    .. note:: SequenceParallel style assumes ones initialization if there are weights in the nn.Cell (i.e.
-        ``nn.LayerNorm`` or ``RMSNorm``, and they by default have ones initialization). If you have custom
-        inits for the weights on those modules, you need to broadcast the weights before/after parallelizing
-        to ensure that they are replicated.
-    """
-
-    def __init__(self, *, sequence_dim: int = 1, use_local_output: bool = False):
-        super().__init__()
-        self.sequence_sharding = (Shard(sequence_dim),)
-        self.use_local_output = use_local_output
-
-    @staticmethod
-    def _prepare_input_fn(sequence_sharding, device_mesh, mod, args):
-        """"prepare input."""
-        input_tensor = args[0]
-        if isinstance(input_tensor, DTensor):
-            # if the passed in input DTensor is not sharded on the sequence dim, we need to redistribute it
-            if input_tensor.placements != sequence_sharding:
-                input_tensor = input_tensor.redistribute(
-                    placements=sequence_sharding, device_mesh=device_mesh
-                )
-            return input_tensor
-        if isinstance(input_tensor, Tensor):
-            # assume the input passed in already sharded on the sequence dim and create the DTensor
-            return DTensor.from_local(
-                input_tensor, device_mesh, sequence_sharding
-            )
-        raise ValueError(
-            f"expecting input of {mod} to be a Tensor or DTensor, but got {input_tensor}"
-            )
-
-    @staticmethod
-    # pylint: disable=W0613
-    def _prepare_output_fn(use_local_output, device_mesh, mod, args, outputs):
-        return outputs.to_local() if use_local_output else outputs
+class NoParallel(ParallelStyle):
+    """Replicate module parameters and leave local activations unchanged."""
 
     def _apply(self, module: nn.Cell, device_mesh: DeviceMesh) -> nn.Cell:
-        sharding_plan = {}
-        for p_name, _ in module.parameters_and_names():
-            sharding_plan.update({p_name: (Replicate(),)})
-
-        input_fn = partial(self._prepare_input_fn, self.sequence_sharding)
-
-        output_fn = partial(self._prepare_output_fn, self.use_local_output)
-
+        sharding_plan = {name: (Replicate(),) for name, _ in module.parameters_and_names()}
+        for name, layout in getattr(self, "extra_param_layouts", {}).items():
+            if getattr(module, name, None) is not None:
+                sharding_plan[name] = layout
         return distribute_module(
             module=module,
             device_mesh=device_mesh,
             parameter_shard_plan=sharding_plan,
-            input_fn=input_fn,
-            output_fn=output_fn
+            input_fn=None,
+            output_fn=None,
         )
 
+
+class SequenceParallel(NoParallel):
+    """Replicate module parameters and compute on a local sequence shard."""
+
+    def __init__(self, *, sequence_dim: int = 1, input_is_parallel: bool = True):
+        super().__init__()
+        if not isinstance(sequence_dim, int):
+            raise TypeError(f"sequence_dim must be an int, but got {type(sequence_dim).__name__}.")
+        self.sequence_dim = sequence_dim
+        if not isinstance(input_is_parallel, bool):
+            raise TypeError(
+                f"input_is_parallel must be a bool, but got {type(input_is_parallel).__name__}."
+            )
+        self.input_is_parallel = input_is_parallel
+
+    def _apply(self, module: nn.Cell, device_mesh: DeviceMesh) -> nn.Cell:
+        module = super()._apply(module, device_mesh)
+        if not self.input_is_parallel:
+            transform = ShardTensor(self.sequence_dim)
+
+            def _pre_hook(unused_cell, args):
+                del unused_cell
+                sharded = _apply_local_transform(args[0], transform, device_mesh)
+                return (sharded,) + tuple(args[1:])
+
+            module.register_forward_pre_hook(_pre_hook)
+        return module
+
     def __repr__(self) -> str:
-        tmpstr = self.__class__.__name__ + "("
-        if len(self.sequence_sharding) == 1:
-            tmpstr += f"sequence_dim={self.sequence_sharding[0].dim}, "
-        tmpstr += f"use_local_output={self.use_local_output}"
-        tmpstr += ")"
-        return tmpstr
+        return (
+            f"{self.__class__.__name__}(sequence_dim={self.sequence_dim}, "
+            f"input_is_parallel={self.input_is_parallel})"
+        )
 
 
 class PrepareModuleInput(ParallelStyle):
-    """
-    Configure the nn.Cell's inputs to convert the input tensors of the nn.Cell to DTensors at runtime according to
-    ``input_layouts``, and perform layout redistribution according to the ``desired_input_layouts``.
-
-    Keyword Args:
-        input_layouts (Union[Placement, Tuple[Optional[Placement], ...]], optional):
-            The DTensor layouts of input tensors for the nn.Cell, this is used to convert the input tensors to
-            DTensors. If some inputs are not Tensor or no need to convert to DTensors, ``None`` need to be specified
-            as a placeholder. default: None.
-        desired_input_layouts (Union[Placement, Tuple[Optional[Placement], ...]], optional):
-            The desired DTensor layout of input tensors for the nn.Cell, this is used to
-            ensure the inputs of the nn.Cell have the desired DTensor layouts. This argument
-            needs to have the same length with ``input_layouts``. default: ``None``.
-        input_kwarg_layouts (Dict[str, Placement], optional):
-            The DTensor layouts of input kwargs for the nn.Cell, this is used to convert
-            the input kwarg tensors to DTensors. default: None.
-        desired_input_kwarg_layouts (Dict[str, Placement], optional):
-            The desired DTensor layout of input kwargs for the nn.Cell, this is used to
-            ensure the inputs of the nn.Cell have the desired DTensor layouts. default: None.
-        use_local_output (bool, optional):
-            Whether to use local :class:`Tensor` instead of :class:`DTensor` for the module inputs, default: False.
-    Returns:
-        A :class:`ParallelStyle` object that prepares the sharding layouts of the nn.Cell's inputs.
-
-    Example::
-        >>> from mindformers.pynative.distributed import PrepareModuleInput
-        >>> from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
-        >>> from hyper_parallel import init_device_mesh
-        >>> ...
-        >>> block = TransformerBlock(...)  # block is a nn.Cell that contains an "attn" Attention submodule
-        >>> tp_mesh = init_device_mesh(mesh_shape=(8,), alias_name=("tp",))
-        >>>
-        >>> # According to the style specified below, the first input of attn will be annotated to Sharded DTensor
-        >>> # and then redistributed to Replicated DTensor.
-        >>> prepare_input = PrepareModuleInput(
-        >>>     input_layouts=(Shard(0), None, None),
-        >>>     desired_input_layouts=(Replicate(), None, None)
-        >>> )
-        >>> prepare_input._apply(block.attn, tp_mesh)
-    """
+    """Apply explicit local transforms to positional or keyword inputs."""
 
     def __init__(
         self,
         *,
-        input_layouts: Optional[Union[Placement, Tuple[Optional[Placement], ...]]] = None,
-        desired_input_layouts: Optional[Union[Placement, Tuple[Optional[Placement], ...]]] = None,
-        input_kwarg_layouts: Optional[Dict[str, Placement]] = None,
-        desired_input_kwarg_layouts: Optional[Dict[str, Placement]] = None,
-        use_local_output: bool = False,
+        input_transforms: Optional[Union[TensorTransform, Tuple[Optional[TensorTransform], ...]]] = None,
+        input_kwarg_transforms: Optional[Dict[str, TensorTransform]] = None,
+        input_layouts=None,
+        desired_input_layouts=None,
+        use_local_input=None,
     ):
-        self.input_layouts = (
-            (input_layouts,) if isinstance(input_layouts, Placement) else input_layouts
+        del use_local_input
+        if input_transforms is None and input_layouts is not None:
+            input_transforms = _layout_transforms(input_layouts, desired_input_layouts)
+        self.input_transforms = (
+            (input_transforms,) if isinstance(input_transforms, (AllGather, ShardTensor))
+            else input_transforms
         )
-        self.desired_input_layouts = (
-            (desired_input_layouts,)
-            if isinstance(desired_input_layouts, Placement)
-            else desired_input_layouts
-        )
-        self.use_local_output = use_local_output
-        if self.input_layouts is not None:
-            if self.desired_input_layouts is None:
-                raise ValueError("desired module inputs should not be None!")
-            if len(self.input_layouts) != len(self.desired_input_layouts):
-                raise ValueError(
-                    "input_layouts and desired_input_layouts should have same length!"
-                )
-        self.with_kwargs = input_kwarg_layouts is not None
-        self.input_kwarg_layouts = input_kwarg_layouts or {}
-        self.desired_input_kwarg_layouts = desired_input_kwarg_layouts or {}
-        if self.with_kwargs:
-            if len(self.input_kwarg_layouts) != len(self.desired_input_kwarg_layouts):
-                raise ValueError(
-                    "input_kwarg_layouts and desired_input_kwarg_layouts should have same length!"
-                )
+        self.with_kwargs = input_kwarg_transforms is not None
+        self.input_kwarg_transforms = input_kwarg_transforms or {}
 
     def _prepare_input_arg(
         self,
         inp: Any,
         mesh: DeviceMesh,
-        input_layout: Optional[Placement],
-        desired_layout: Optional[Placement],
+        transform: Optional[TensorTransform],
     ):
-        """Prepare a single input argument."""
-        if input_layout is not None:
-            if isinstance(inp, DTensor):
-                dt_inp = inp
-            else:
-                if not isinstance(inp, ms.Tensor):
-                    raise ValueError(
-                        f"expecting input to be a Tensor, but got {type(inp)}"
-                    )
-                dt_inp = DTensor.from_local(
-                    inp, mesh, (input_layout,)
-                )
-
-            if desired_layout is not None and input_layout != desired_layout:
-                dt_inp = dt_inp.redistribute(mesh, (desired_layout,))
-
-            return dt_inp.to_local() if self.use_local_output else dt_inp
-        return inp
+        """Prepare a single plain-tensor input argument."""
+        if transform is None:
+            return inp
+        if not isinstance(inp, ms.Tensor):
+            raise ValueError(f"expecting input to be a Tensor, but got {type(inp)}")
+        return _apply_local_transform(inp, transform, mesh)
 
     def _prepare_input_fn(self, inputs, device_mesh):
         """Prepare input arguments."""
-        if self.input_layouts is None:
+        if self.input_transforms is None:
             return inputs
         prepared_inputs = []
         if not isinstance(inputs, tuple):
             inputs = (inputs,)
-        if len(inputs) != len(self.input_layouts):
-            raise ValueError("module inputs and input_layouts should have same length!")
+        if len(inputs) != len(self.input_transforms):
+            raise ValueError("module inputs and input_transforms should have same length!")
 
-        if self.desired_input_layouts is None:
-            raise ValueError("desired module inputs should not be None!")
-
-        for inp, input_layout, desired_layout in zip(
-            inputs, self.input_layouts, self.desired_input_layouts
-        ):
+        for inp, transform in zip(inputs, self.input_transforms):
             prepared_inputs.append(
-                self._prepare_input_arg(inp, device_mesh, input_layout, desired_layout)
+                self._prepare_input_arg(inp, device_mesh, transform)
             )
         return tuple(prepared_inputs)
 
@@ -686,11 +734,8 @@ class PrepareModuleInput(ParallelStyle):
         prepared_arg_inputs = self._prepare_input_fn(inputs, device_mesh)
         prepared_kwarg_inputs = {}
         for kwarg_key, kwarg_val in kwarg_inputs.items():
-            input_layout = self.input_kwarg_layouts.get(kwarg_key)
-            desired_input_layout = self.desired_input_kwarg_layouts.get(kwarg_key)
-
             prepared_kwarg_inputs[kwarg_key] = self._prepare_input_arg(
-                kwarg_val, device_mesh, input_layout, desired_input_layout
+                kwarg_val, device_mesh, self.input_kwarg_transforms.get(kwarg_key)
             )
 
         return (prepared_arg_inputs, prepared_kwarg_inputs)
@@ -700,7 +745,7 @@ class PrepareModuleInput(ParallelStyle):
         Apply PrepareModuleInput style to the module.
 
         This method registers a forward pre-hook on the module to prepare inputs
-        according to the specified layouts before the module's construct method is called.
+        according to the specified transforms before the module's construct method is called.
         """
         if self.with_kwargs:
             module.register_forward_pre_hook(
@@ -717,102 +762,50 @@ class PrepareModuleInput(ParallelStyle):
 
     def __repr__(self) -> str:
         tmpstr = self.__class__.__name__ + "("
-        tmpstr += f"input_layouts={self.input_layouts}, "
-        tmpstr += f"desired_input_layouts={self.desired_input_layouts}, "
-        tmpstr += f"input_kwarg_layouts={self.input_kwarg_layouts}, "
-        tmpstr += f"desired_input_kwarg_layouts={self.desired_input_kwarg_layouts}, "
-        tmpstr += f"use_local_output={self.use_local_output}"
+        tmpstr += f"input_transforms={self.input_transforms}, "
+        tmpstr += f"input_kwarg_transforms={self.input_kwarg_transforms}"
         tmpstr += ")"
         return tmpstr
 
 
 class PrepareModuleOutput(ParallelStyle):
-    """
-    Configure the nn.Cell's outputs to convert the output tensors of the nn.Cell to DTensors at runtime according to
-    ``output_layouts``, and perform layout redistribution according to the ``desired_output_layouts``.
-
-    Keyword Args:
-        output_layouts (Union[Placement, Tuple[Optional[Placement], ...]]):
-            The DTensor layouts of output tensors for the nn.Cell, this is used to convert the output tensors to
-            DTensors if they are :class:`Tensor`. If some outputs are not Tensor or no need to convert to DTensors,
-            ``None`` need to be specified as a placeholder.
-        desired_output_layouts (Union[Placement, Tuple[Placement, ...]]):
-            The desired DTensor layouts of output tensors for the nn.Cell, this is used
-            to ensure the outputs of the nn.Cell have the desired DTensor layouts.
-        use_local_output (bool, optional):
-            Whether to use local :class:`Tensor` instead of :class:`DTensor` for the module outputs, default: True.
-    Returns:
-        A :class:`ParallelStyle` object that prepares the sharding layouts of the nn.Cell's outputs.
-
-    Example::
-        >>> from mindformers.pynative.distributed import PrepareModuleOutput
-        >>> from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
-        >>> from hyper_parallel import init_device_mesh
-        >>> ...
-        >>> block = TransformerBlock(...)  # block is a nn.Cell that contains an "attn" Attention submodule
-        >>> tp_mesh = init_device_mesh(mesh_shape=(8,), alias_name=("tp",))
-        >>> 
-        >>> # According to the style specified below, the output of the TransformerBlock
-        >>> # will be converted to Replicated DTensor
-        >>> # and then redistributed to Sharded DTensor.
-        >>> prepare_output = PrepareModuleOutput(
-        >>>     output_layouts=Replicate(),
-        >>>     desired_output_layouts=Shard(0)
-        >>> )
-        >>> prepare_output._apply(block, tp_mesh)
-    """
+    """Apply explicit local transforms to module outputs."""
 
     def __init__(
         self,
         *,
-        output_layouts: Union[Placement, Tuple[Optional[Placement], ...]],
-        desired_output_layouts: Union[Placement, Tuple[Placement, ...]],
-        use_local_output: bool = True,
+        output_transforms: Optional[Union[TensorTransform, Tuple[Optional[TensorTransform], ...]]] = None,
+        output_layouts=None,
+        desired_output_layouts=None,
+        use_local_output=None,
     ):
-        self.output_layouts = (
-            (output_layouts,) if isinstance(output_layouts, Placement) else output_layouts
+        del use_local_output
+        if output_transforms is None and output_layouts is not None:
+            output_transforms = _layout_transforms(output_layouts, desired_output_layouts)
+        self.output_transforms = (
+            (output_transforms,) if isinstance(output_transforms, (AllGather, ShardTensor))
+            else output_transforms
         )
-        self.desired_output_layouts = (
-            (desired_output_layouts,)
-            if isinstance(desired_output_layouts, Placement)
-            else desired_output_layouts
-        )
-        self.use_local_output = use_local_output
-        if len(self.output_layouts) != len(self.desired_output_layouts):
-            raise ValueError(
-                "output_layouts and desired_output_layouts should have same length!"
-            )
 
     def _prepare_out_fn(self, outputs, device_mesh):
         """Prepare output arguments."""
         prepared_outputs = []
         if not isinstance(outputs, tuple):
             outputs = (outputs,)
-        if len(outputs) != len(self.output_layouts):
+        if len(outputs) != len(self.output_transforms):
             raise ValueError(
-                "module outputs and output_layouts should have same length!"
+                "module outputs and output_transforms should have same length!"
             )
 
-        for out, out_layout, desired_out_layout in zip(
-            outputs, self.output_layouts, self.desired_output_layouts
-        ):
-            if out_layout is not None:
-                if isinstance(out, DTensor):
-                    dt_out = out
-                else:
-                    if not isinstance(out, ms.Tensor):
-                        raise ValueError(f"expecting output to be a Tensor, but got {type(out)}")
-                    dt_out = DTensor.from_local(
-                        out, device_mesh, (out_layout,)
-                    )
-
-                if out_layout != desired_out_layout:
-                    dt_out = dt_out.redistribute(device_mesh, (desired_out_layout,))
-                prepared_outputs.append(
-                    dt_out.to_local() if self.use_local_output else dt_out
-                )
-            else:
+        for out, transform in zip(outputs, self.output_transforms):
+            if transform is None:
                 prepared_outputs.append(out)
+                continue
+            if not isinstance(out, ms.Tensor):
+                raise ValueError(f"expecting output to be a Tensor, but got {type(out)}")
+            prepared_outputs.append(
+                _apply_local_transform(out, transform, device_mesh)
+            )
 
         if len(prepared_outputs) == 1:
             return prepared_outputs[0]
@@ -823,7 +816,7 @@ class PrepareModuleOutput(ParallelStyle):
         Apply PrepareModuleOutput style to the module.
 
         This method registers a forward hook on the module to prepare outputs
-        according to the specified layouts after the module's construct method is called.
+        according to the specified transforms after the module's construct method is called.
         """
         module.register_forward_hook(
             lambda _, inputs, outputs: self._prepare_out_fn(outputs, device_mesh)
@@ -832,94 +825,36 @@ class PrepareModuleOutput(ParallelStyle):
 
     def __repr__(self) -> str:
         tmpstr = self.__class__.__name__ + "("
-        tmpstr += f"output_layouts={self.output_layouts}, "
-        tmpstr += f"desired_output_layouts={self.desired_output_layouts}, "
-        tmpstr += f"use_local_output={self.use_local_output}"
+        tmpstr += f"output_transforms={self.output_transforms}"
         tmpstr += ")"
         return tmpstr
 
 
 class PrepareModuleInputOutput(ParallelStyle):
-    """
-    Configure the nn.Cell's inputs (and outputs) to convert the input tensors (and output
-    tensors, respectively) of the nn.Cell to DTensors at runtime according to
-    ``input_layouts`` (and output_layouts, respectively), and perform layout redistribution
-    according to the ``desired_input_layouts`` (and ``desired_output_layouts``,
-    respectively). This is a combination of :class:`PrepareModuleInput` and
-    :class:`PrepareModuleOutput`.
-
-    Keyword Args:
-        input_layouts (Union[Placement, Tuple[Optional[Placement], ...]], optional):
-            The DTensor layouts of input tensors for the nn.Cell, this is used to convert
-            the input tensors to DTensors. If some inputs are not Tensor or no need to
-            convert to DTensors, ``None`` need to be specified as a placeholder.
-            default: ``None``.
-        desired_input_layouts (Union[Placement, Tuple[Optional[Placement], ...]], optional):
-            The desired DTensor layout of input tensors for the nn.Cell, this is used to
-            ensure the inputs of the nn.Cell have the desired DTensor layouts. This argument
-            needs to have the same length with ``input_layouts``. default: None.
-        input_kwarg_layouts (Dict[str, Placement], optional):
-            The DTensor layouts of input kwargs for the nn.Cell, this is used to convert
-            the input kwarg tensors to DTensors. default: None
-        desired_input_kwarg_layouts (Dict[str, Placement], optional):
-            The desired DTensor layout of input kwargs for the nn.Cell, this is used to ensure the inputs of the nn.Cell
-            have the desired DTensor layouts. default: None.
-        use_local_input (bool, optional):
-            Whether to use local :class:`Tensor` instead of :class:`DTensor` for the module inputs, default: False.
-        output_layouts (Union[Placement, Tuple[Optional[Placement], ...]]):
-            The DTensor layouts of output tensors for the nn.Cell, this is used to convert
-            the output tensors to DTensors if they are :class:`Tensor`. If some outputs are
-            not Tensor or no need to convert to DTensors, ``None`` need to be specified as
-            a placeholder.
-        desired_output_layouts (Union[Placement, Tuple[Placement, ...]]):
-            The desired DTensor layouts of output tensors for the nn.Cell,
-            this is used to ensure the outputs of the nn.Cell
-            have the desired DTensor layouts.
-        use_local_output (bool, optional):
-            Whether to use local :class:`Tensor` instead of :class:`DTensor` for the module outputs, default: True.
-    Returns:
-        A :class:`ParallelStyle` object that prepares the sharding layouts of the nn.Cell's inputs and outputs.
-
-    Example::
-        >>> from mindformers.pynative.distributed import PrepareModuleInputOutput
-        >>> from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
-        >>> from hyper_parallel import init_device_mesh
-        >>> ...
-        >>> block = TransformerBlock(...)  # block is a nn.Cell that contains an "attn" Attention submodule
-        >>> tp_mesh = init_device_mesh(mesh_shape=(8,), alias_name=("tp",))
-        >>>
-        >>> # According to the style specified below, the first input of attn will be annotated as Sharded DTensor
-        >>> # and then redistributed to Replicated DTensor, and the output of the TransformerBlock will be annotated
-        >>> # as Replicated DTensor and then redistributed to Sharded DTensor.
-        >>> prepare_input_output = PrepareModuleInputOutput(
-        >>>     input_layouts=(Shard(0), None, None, ...),
-        >>>     desired_input_layouts=(Replicate(), None, None, ...),
-        >>>     output_layouts=Replicate(),
-        >>>     desired_output_layouts=Shard(0),
-        >>> )
-        >>> prepare_input_output._apply(block.attn, tp_mesh)
-    """
+    """Compose explicit local input and output transforms around a module."""
 
     def __init__(
         self,
         *,
-        input_layouts: Optional[Union[Placement, Tuple[Optional[Placement], ...]]] = None,
-        desired_input_layouts: Optional[Union[Placement, Tuple[Optional[Placement], ...]]] = None,
-        input_kwarg_layouts: Optional[Dict[str, Placement]] = None,
-        desired_input_kwarg_layouts: Optional[Dict[str, Placement]] = None,
-        use_local_input: bool = False,
-        output_layouts: Union[Placement, Tuple[Optional[Placement], ...]],
-        desired_output_layouts: Union[Placement, Tuple[Placement, ...]],
-        use_local_output: bool = True,
+        input_transforms: Optional[Union[TensorTransform, Tuple[Optional[TensorTransform], ...]]] = None,
+        input_kwarg_transforms: Optional[Dict[str, TensorTransform]] = None,
+        output_transforms: Optional[Union[TensorTransform, Tuple[Optional[TensorTransform], ...]]] = None,
+        input_layouts=None,
+        desired_input_layouts=None,
+        output_layouts=None,
+        desired_output_layouts=None,
+        use_local_input=None,
+        use_local_output=None,
     ):
         self.prepare_module_input = PrepareModuleInput(
+            input_transforms=input_transforms,
+            input_kwarg_transforms=input_kwarg_transforms,
             input_layouts=input_layouts,
             desired_input_layouts=desired_input_layouts,
-            input_kwarg_layouts=input_kwarg_layouts,
-            desired_input_kwarg_layouts=desired_input_kwarg_layouts,
-            use_local_output=use_local_input,
+            use_local_input=use_local_input,
         )
         self.prepare_module_output = PrepareModuleOutput(
+            output_transforms=output_transforms,
             output_layouts=output_layouts,
             desired_output_layouts=desired_output_layouts,
             use_local_output=use_local_output,
@@ -939,13 +874,8 @@ class PrepareModuleInputOutput(ParallelStyle):
 
     def __repr__(self) -> str:
         tmpstr = self.__class__.__name__ + "("
-        tmpstr += f"input_layouts={self.prepare_module_input.input_layouts}, "
-        tmpstr += f"desired_input_layouts={self.prepare_module_input.desired_input_layouts}, "
-        tmpstr += f"input_kwarg_layouts={self.prepare_module_input.input_kwarg_layouts}, "
-        tmpstr += f"desired_input_kwarg_layouts={self.prepare_module_input.desired_input_kwarg_layouts}, "
-        tmpstr += f"use_local_input={self.prepare_module_input.use_local_output}, "
-        tmpstr += f"output_layouts={self.prepare_module_output.output_layouts}, "
-        tmpstr += f"desired_output_layouts={self.prepare_module_output.desired_output_layouts}, "
-        tmpstr += f"use_local_output={self.prepare_module_output.use_local_output}"
+        tmpstr += f"input_transforms={self.prepare_module_input.input_transforms}, "
+        tmpstr += f"input_kwarg_transforms={self.prepare_module_input.input_kwarg_transforms}, "
+        tmpstr += f"output_transforms={self.prepare_module_output.output_transforms}"
         tmpstr += ")"
         return tmpstr

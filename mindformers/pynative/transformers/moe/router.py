@@ -11,8 +11,9 @@ from mindspore import nn, Tensor, mint, ops
 from mindspore.common.parameter import Parameter
 from mindspore.common import dtype as mstype
 
+from hyper_parallel import DTensor
+
 from mindformers.parallel_core.transformer_config import TransformerConfig
-from mindformers.parallel_core.utils.init_method import init_method_normal
 from mindformers.tools.logger import logger
 from .moe_utils import (
     compute_routing_scores_for_aux_loss,
@@ -339,11 +340,17 @@ class TopKRouter(nn.Cell):
         # preprocess input shape (slen, bs, num_experts)
         seq_length, bsz, dim = x.shape
         x = self.reshape(x, (-1, dim))
+        # expert_bias is a Replicate DTensor; localise it for the plain-tensor add.
+        if isinstance(expert_bias, DTensor):
+            expert_bias = expert_bias.to_local()
 
         # scores shape (bs*slen, num_experts)
         # Compute gate in float32 to help stability of expert load balancing.
         x = self.cast(x, self.config.moe_router_dtype)
-        logits = self.linear(x, self.weight)
+        # Gate weight is a Replicate DTensor (its grad all-reduces over TP under SP);
+        # localise for the plain-tensor matmul.
+        weight = self.weight.to_local() if isinstance(self.weight, DTensor) else self.weight
+        logits = self.linear(x, weight)
 
         # Hash-based routing: select experts from tid2eid, weights from gating scores.
         if self.is_hash_layer:

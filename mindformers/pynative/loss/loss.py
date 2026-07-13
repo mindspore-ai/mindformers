@@ -20,10 +20,7 @@ from mindspore.common._grad_function import _Function
 from mindspore.ops.function import comm_func
 from mindspore import log as logger
 
-from hyper_parallel.core.dtensor.dtensor import DTensor
-
 from mindformers.tools.logger import _LogActionOnce
-from mindformers.pynative.distributed.utils import vocab_parallel_shard_dim
 
 
 def _tp_all_reduce(tensor, op, group):
@@ -34,14 +31,6 @@ def _tp_all_reduce(tensor, op, group):
     """
     output, _ = comm_func.all_reduce(tensor.contiguous(), op, group)
     return output
-
-
-def _vocab_parallel_meta(logits):
-    """Resolve (mesh, TP process group, this rank's TP index, TP size) for a DTensor
-    sharded on its vocab dimension."""
-    mesh_dim = vocab_parallel_shard_dim(logits)
-    mesh = logits.device_mesh
-    return mesh, mesh.get_group(mesh_dim), mesh.get_local_rank(mesh_dim), mesh.size(mesh_dim)
 
 
 def _vocab_parallel_ce_terms(local_logits, target, group, vocab_start, vocab_per_rank):
@@ -93,19 +82,18 @@ def _vocab_parallel_ce_grad(exp_vals, global_sum_exp, local_target, in_range_f, 
 
 
 class _VocabParallelCrossEntropy(_Function):
-    """Cross entropy over 2D ``[N, V_local]`` logits sharded on the vocab dimension across
-    the TP mesh. Returns the per-token loss, matching the ``log_softmax`` + ``nll_loss``
-    path; masking / normalisation happen in the caller.
+    """Cross entropy over 2D ``[N, V_local]`` local logits holding this rank's vocab slice.
+
+    TP group, rank, and size are cached on the loss module instead of read from a DTensor.
+    The max / sum-exp / target logit are reduced so the
+    full-vocab logits are never materialised; the gradient stays a plain local tensor.
     """
 
     @staticmethod
-    def forward(ctx, logits, labels, compensate_tp=True):
-        """Forward pass for vocab-parallel cross entropy."""
-        mesh, group, tp_rank, tp_size = _vocab_parallel_meta(logits)
-        local_logits = logits.to_local()
+    def forward(ctx, logits, labels, group, tp_rank, tp_size, compensate_tp=True):
+        """Forward pass for vocab-parallel cross entropy on local logits."""
+        local_logits = logits
         ctx.orig_dtype = local_logits.dtype
-        ctx.mesh = mesh
-        ctx.placements = logits.placements
         ctx.tp_grad_factor = tp_size if compensate_tp else 1
 
         local_logits = ops.cast(local_logits, mstype.float32)
@@ -130,8 +118,7 @@ class _VocabParallelCrossEntropy(_Function):
         grad = _vocab_parallel_ce_grad(ctx.exp_vals, ctx.global_sum_exp, ctx.local_target,
                                        ctx.in_range_f, grads, ctx.tp_grad_factor)
         grad = ops.cast(grad, ctx.orig_dtype)
-        grad = DTensor.from_local(grad, ctx.mesh, ctx.placements)
-        return grad, mint.zeros_like(ctx.labels), None
+        return grad, mint.zeros_like(ctx.labels), None, None, None, None
 
 
 class _LogSoftmax(_Function):
@@ -325,13 +312,24 @@ class CrossEntropyLoss(nn.Cell):
         self.nll_loss = _NLLLossModule()
 
         self.calculate_per_token_loss = calculate_per_token_loss
+        self._tp_group = None
+        self._tp_rank = 0
+        self._tp_size = 1
+
+    def enable_vocab_parallel(self, group, rank, size):
+        """Enable vocab-parallel cross entropy for plain local logits."""
+        self._tp_group = group
+        self._tp_rank = rank
+        self._tp_size = size
 
     def construct(self, logits, label, input_mask=None):
         """Forward process"""
-        if vocab_parallel_shard_dim(logits) is not None:
-            # Logits are sharded on the vocab dimension across TP (enable_loss_parallel):
-            # compute cross entropy with a vocab-parallel reduction, no logits all-gather.
-            loss_reduce = _VocabParallelCrossEntropy.apply(logits, label, self.compensate_loss_sense_tp)
+        if self._tp_group is not None:
+            # Logits are the local vocab slice (TP > 1): cross entropy with a vocab-parallel
+            # reduction over the TP group, no logits all-gather.
+            loss_reduce = _VocabParallelCrossEntropy.apply(
+                logits, label, self._tp_group, self._tp_rank, self._tp_size,
+                self.compensate_loss_sense_tp)
         else:
             log_softmax = self.log_softmax(logits)
             loss_reduce = self.nll_loss(log_softmax, label)
@@ -364,11 +362,12 @@ class ChunkCrossEntropyLoss(CrossEntropyLoss):
         if logits.ndim == 3:
             if input_mask is None:
                 input_mask = mint.ones_like(label)
-            if vocab_parallel_shard_dim(logits) is not None:
-                # vocab-sharded 3D logits: fuse sequence-dim chunking with the
-                # vocab-parallel reduction (enable_loss_parallel + chunk_loss_num > 1).
+            if self._tp_group is not None:
+                # local vocab slice (TP > 1): fuse sequence-dim chunking with the
+                # vocab-parallel reduction over the TP group.
                 return _ChunkVocabParallelCrossEntropy.apply(
-                    logits, label, input_mask, self.chunk_loss_num, self.compensate_loss_sense_tp)
+                    logits, label, input_mask, self.chunk_loss_num,
+                    self._tp_group, self._tp_rank, self._tp_size, self.compensate_loss_sense_tp)
             return _ChunkCrossEntropyLoss.apply(logits, label, input_mask, self.chunk_loss_num)
         return super().construct(logits, label, input_mask)
 
@@ -478,16 +477,14 @@ class _ChunkVocabParallelCrossEntropy(_Function):
     """
 
     @staticmethod
-    def forward(ctx, logits, labels, input_mask, chunk_loss_num, compensate_tp=True):
-        """Forward pass for fused chunked vocab-parallel cross entropy."""
-        mesh, group, tp_rank, tp_size = _vocab_parallel_meta(logits)
-        local_logits = logits.to_local()  # [b, s, V_local]
+    def forward(ctx, logits, labels, input_mask, chunk_loss_num, group, tp_rank, tp_size,
+                compensate_tp=True):
+        """Forward pass for fused chunked vocab-parallel cross entropy on local logits."""
+        local_logits = logits  # [b, s, V_local]
         ctx.local_logits = local_logits
         ctx.labels = labels
         ctx.input_mask = input_mask
         ctx.logits_dtype = local_logits.dtype
-        ctx.mesh = mesh
-        ctx.placements = logits.placements
         ctx.group = group
         ctx.tp_grad_factor = tp_size if compensate_tp else 1
         ctx.vocab_per_rank = local_logits.shape[-1]
@@ -541,5 +538,5 @@ class _ChunkVocabParallelCrossEntropy(_Function):
             grad_logits_chunks.append(grad)
             start_idx = end_idx
         grad_logits = mint.cat(grad_logits_chunks, dim=1)  # [b, s, V_local]
-        grad_logits = DTensor.from_local(grad_logits, ctx.mesh, ctx.placements)
-        return grad_logits, mint.zeros_like(labels), mint.zeros_like(input_mask), None, None
+        return (grad_logits, mint.zeros_like(labels), mint.zeros_like(input_mask),
+                None, None, None, None, None)
