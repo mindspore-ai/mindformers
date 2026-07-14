@@ -82,6 +82,7 @@ from mindformers.pynative.base_models.gpt.gpt_model import GPTModel
 from mindformers.pynative.transformers.experimental_attention_variant.deepseek_v4_hybrid_attention import (
     DSv4HybridSelfAttention,
 )
+from mindformers.pynative.transformers.hyper_connection import FusedHyperConnectionModule
 from mindformers.pynative.transformers.multi_latent_attention import MLASelfAttention
 from mindformers.pynative.transformers.mlp import MLP
 from mindformers.pynative.transformers.moe.moe_layer import MoELayer
@@ -378,37 +379,104 @@ def _collect_layer_replicate_params(layer, shard_size):
     return replicate_params
 
 
-def _collect_hc_replicate_params(hc_module):
-    """Collect small HC params as replicate_params (avoid sharding issues with delayed init)."""
+def _direct_parameters(module):
+    """Return parameters owned directly by ``module``, excluding child cells."""
+    return [param for _, param in module.parameters_and_names(expand=False)]
+
+
+def _wrap_fp32_linear(linear, fsdp_config, reshard_after_forward, shard_size):
+    """FSDP-wrap one forced-FP32 Linear independently from its BF16 owner.
+
+    mHC projection weights are sharded on their input dimension. Any direct
+    parameter that cannot be evenly sharded there (including a future bias) is
+    kept replicated while still participating in gradient synchronization.
+    """
+    weight = getattr(linear, "weight", None)
+    if weight is None:
+        return
+
     replicate_params = []
-    for attr in ("alpha_pre", "alpha_post", "alpha_res", "bias"):
-        p = getattr(hc_module, attr, None)
-        if p is not None:
-            replicate_params.append(p)
-    return replicate_params
+    for param in _direct_parameters(linear):
+        if param is not weight:
+            replicate_params.append(param)
+            continue
+        shape = param.local_shape if isinstance(param, DTensor) else param.shape
+        if shape[1] % shard_size != 0:
+            replicate_params.append(param)
+
+    with ms.DeviceCtx("meta"):
+        fully_shard(
+            linear,
+            **fsdp_config,
+            shard_placement_fn=lambda _: Shard(1),
+            reshard_after_forward=reshard_after_forward,
+            replicate_params=replicate_params,
+        )
 
 
-def _wrap_hc_modules(host, fsdp_config, reshard_after_forward):
+def _wrap_fp32_linear_owner(
+        owner, linear_attr, fsdp_config, reshard_after_forward, shard_size, *, wrap_linear=True):
+    """Wrap a forced-FP32 Linear and its directly-owned FP32 parameters.
+
+    The Linear is wrapped first so its weight forms an independent sharded
+    FSDP unit. The callable owner is then wrapped for the remaining scalar and
+    vector parameters, which stay replicated. Fused mHC bypasses
+    ``Linear.construct`` and therefore sets ``wrap_linear=False`` so the owner
+    hook manages the projection weight as well.
+    """
+    linear = getattr(owner, linear_attr, None)
+    if linear is None:
+        return
+
+    direct_params = _direct_parameters(owner)
+    if wrap_linear:
+        _wrap_fp32_linear(linear, fsdp_config, reshard_after_forward, shard_size)
+
+    def shard_plan(param):
+        if param is getattr(linear, "weight", None) and len(param.shape) > 1:
+            return Shard(1)
+        return Shard(0)
+
+    with ms.DeviceCtx("meta"):
+        fully_shard(
+            owner,
+            **fsdp_config,
+            shard_placement_fn=shard_plan,
+            reshard_after_forward=reshard_after_forward,
+            replicate_params=direct_params,
+        )
+
+
+def _wrap_hc_modules(host, fsdp_config, reshard_after_forward, shard_size):
     """Independently FSDP-wrap a host's mHC sub-modules (attn_hc/ffn_hc).
 
-    Their params are tiny and must be replicated rather than swept into the host's
-    generic wrap and sharded on dim 0 (their shapes do not allow it): 1-D params
-    shard on dim 0, the rest on dim 1. Shared by the main decoder layers and the
-    MTP transformer layers so both get the same treatment.
+    Each FP32 projection gets a dedicated FSDP group, while the owner's scalar
+    and vector parameters stay replicated. Shared by the main decoder layers
+    and the MTP transformer layers so both get the same treatment.
     """
-    def shard_plan(param):
-        if len(param.shape) == 1:
-            return Shard(0)
-        return Shard(1)
-
     for hc_attr in ("attn_hc", "ffn_hc"):
         hc_module = getattr(host, hc_attr, None)
         if hc_module is None:
             continue
-        with ms.DeviceCtx("meta"):
-            fully_shard(hc_module, **fsdp_config, shard_placement_fn=shard_plan,
-                        reshard_after_forward=reshard_after_forward,
-                        replicate_params=_collect_hc_replicate_params(hc_module))
+        _wrap_fp32_linear_owner(
+            hc_module,
+            "mapping_proj",
+            fsdp_config,
+            reshard_after_forward,
+            shard_size,
+            wrap_linear=not isinstance(hc_module, FusedHyperConnectionModule),
+        )
+
+
+def _wrap_hc_head(host, fsdp_config, reshard_after_forward, shard_size):
+    """Independently wrap the head FP32 Linear and replicated gate parameters."""
+    hc_head = getattr(host, "hc_head", None)
+    if hc_head is None:
+        return None
+    _wrap_fp32_linear_owner(
+        hc_head, "hc_fn", fsdp_config, reshard_after_forward, shard_size
+    )
+    return hc_head
 
 
 def _wrap_dsv4_attention_modules(self_attention, fsdp_config, reshard_after_forward, replicate_params):
@@ -1141,8 +1209,8 @@ def apply_fsdp(
             with ms.DeviceCtx("meta"):
                 fully_shard(norm, **fsdp_config)
 
-        # 2c. Wrap HC modules independently (small modules, all params replicated)
-        _wrap_hc_modules(layer, fsdp_config, reshard_after_forward)
+        # 2c. Wrap HC FP32 projections independently; replicate scalar/vector params.
+        _wrap_hc_modules(layer, fsdp_config, reshard_after_forward, dense_shard_degree)
 
         # 2c'. Wrap DSv4 hybrid-attention fp32 sub-modules independently so their
         #      fp32 norms / attn_sink do not share a param-group with bf16 weights.
@@ -1160,7 +1228,14 @@ def apply_fsdp(
                 replicate_params=replicate_params
             )
 
-    # --- 3. Wrap final_layernorm and output_layer independently ---
+    # --- 3. Wrap the FP32 mHC head, final_layernorm and output_layer independently ---
+    _wrap_hc_head(
+        gpt_model.decoder,
+        fsdp_config,
+        reshard_policy == "always",
+        dense_shard_degree,
+    )
+
     # Principle: small modules (norms) first, then larger modules (output_layer)
     if tail_modules:
         for tail_module in tail_modules:
@@ -1228,7 +1303,16 @@ def apply_fsdp(
             # main decoder layers (2c); otherwise the tiny mHC params get swept into
             # the generic MTP layer wrap and sharded on dim 0, which their shapes
             # do not allow.
-            _wrap_hc_modules(layer.transformer_layer, fsdp_config, reshard_after_forward)
+            _wrap_hc_modules(
+                layer.transformer_layer,
+                fsdp_config,
+                reshard_after_forward,
+                dense_shard_degree,
+            )
+
+            # Keep the FP32 mHC head projection separate from the BF16 outer MTP
+            # layer and replicate the head's scalar/vector parameters.
+            _wrap_hc_head(layer, fsdp_config, reshard_after_forward, dense_shard_degree)
 
             # DSv4 hybrid-attention fp32 sub-modules — same independent wrap as the
             # main decoder layers (2c'), keeping fp32 norms / attn_sink out of the

@@ -35,8 +35,8 @@ def _to_local(tensor):
 class SinkhornKnopp(nn.Cell):
     """Doubly-stochastic projection via alternating row/column normalisation.
 
-    Uses exp-based initialisation (Megatron style) rather than softmax, so
-    neither rows nor columns are pre-normalised before the first iteration.
+    Matches the MindSpeed DSV4 reference: row-softmax plus epsilon, one column
+    normalisation, then ``iterations - 1`` alternating row/column updates.
     """
 
     _EPS = 1e-6
@@ -45,8 +45,7 @@ class SinkhornKnopp(nn.Cell):
         super().__init__()
         self.iterations = iterations
         self.eps = self._EPS
-        self.max = mint.max
-        self.exp = mint.exp
+        self.softmax = mint.softmax
         self.sum = mint.sum
         self.add = mint.add
         self.div = mint.div
@@ -60,9 +59,9 @@ class SinkhornKnopp(nn.Cell):
         Returns:
             Doubly-stochastic matrix [s, b, n, n], float32.
         """
-        h_max, _ = self.max(h, -1, True)
-        m = self.exp(h - h_max)
-        for _ in range(self.iterations):
+        m = self.add(self.softmax(h, dim=-1), self.eps)
+        m = self.div(m, self.add(self.sum(m, dim=2, keepdim=True), self.eps))
+        for _ in range(self.iterations - 1):
             # Row normalise along the last axis.
             m = self.div(m, self.add(self.sum(m, dim=3, keepdim=True), self.eps))
             # Column normalise along the residual-stream axis.
@@ -74,7 +73,7 @@ class HyperConnectionOutputCell(nn.Cell):
     """Residual-stream update after a sublayer.
 
     Computes:
-        new_streams = H_res @ x_streams + H_post * sublayer_out
+        new_streams = H_res^T @ x_streams + H_post * sublayer_out
                       [s,b,n,n]@[s,b,n,H] + [s,b,n,1]*[s,b,1,H]
                     = [s,b,n,H] + [s,b,n,H]
     """
@@ -88,6 +87,7 @@ class HyperConnectionOutputCell(nn.Cell):
         self.matmul = mint.matmul
         self.mul = mint.mul
         self.add = mint.add
+        self.transpose = mint.permute
         self.cast = ops.cast
 
     def construct(self, h_res, h_post, original_streams, sublayer_out):
@@ -105,17 +105,81 @@ class HyperConnectionOutputCell(nn.Cell):
         s = original_streams.shape[0]
         n, hidden_size = self.n, self.hidden_size
 
-        # H_res @ streams: [s,b,n,n] @ [s,b,n,H] -> [s,b,n,H]
+        # H_res^T @ streams: [s,b,n,n] @ [s,b,n,H] -> [s,b,n,H]
         x_streams = self.reshape(original_streams, (s, -1, n, hidden_size))
-        x_streams = self.cast(x_streams, self.dtype)
-        res_part = self.matmul(h_res, x_streams)
+        x_streams = self.cast(x_streams, mstype.float32)
+        h_res = self.cast(h_res, mstype.float32)
+        # MindSpeed's reference computes
+        #   sum_i h_res[i, j] * stream[i]
+        # for output stream j, i.e. h_res^T @ streams.  This orientation is
+        # observable once the learned Sinkhorn matrix is no longer symmetric.
+        h_res_t = self.transpose(h_res, (0, 1, 3, 2))
+        res_part = self.matmul(h_res_t, x_streams)
 
         # H_post * sublayer_out: [s,b,n,1] * [s,b,1,H] -> [s,b,n,H]
         sublayer_exp = self.reshape(sublayer_out, (s, -1, 1, hidden_size))
+        sublayer_exp = self.cast(sublayer_exp, mstype.float32)
+        h_post = self.cast(h_post, mstype.float32)
         post_part = self.mul(h_post, sublayer_exp)
 
-        output = self.add(res_part, post_part)
+        output = self.cast(self.add(res_part, post_part), self.dtype)
         return self.reshape(output, (s, -1, n * hidden_size))
+
+
+class HyperConnectionHead(nn.Cell):
+    """Learnable DSV4 mHC head used to collapse the final residual streams.
+
+    MindSpeed applies this head before the main decoder final RMSNorm and before
+    each MTP final RMSNorm.  Keeping it learnable is important for multi-step
+    loss alignment; a fixed arithmetic mean is only equivalent at a specially
+    initialised checkpoint and diverges after the first optimiser update.
+    """
+
+    def __init__(self, config: TransformerConfig):
+        super().__init__()
+        self.n = config.num_residual_streams
+        self.hidden_size = config.hidden_size
+        self.dtype = config.compute_dtype
+        self.norm_eps = config.mhc_layernorm_epsilon
+        self.hc_eps = 1e-6
+
+        self.hc_fn = Linear(
+            input_size=self.n * self.hidden_size,
+            output_size=self.n,
+            compute_dtype=mstype.float32,
+            params_dtype=mstype.float32,
+            init_method=config.init_method,
+            bias=False,
+        )
+        self.hc_base = Parameter(mint.empty((self.n,), dtype=mstype.float32), name="hc_base")
+        self.hc_scale = Parameter(mint.empty((1,), dtype=mstype.float32), name="hc_scale")
+
+        self.reshape = mint.reshape
+        self.cast = ops.cast
+        self.mean = mint.mean
+        self.rsqrt = mint.rsqrt
+        self.sigmoid = mint.sigmoid
+        self.sum = mint.sum
+        self.unsqueeze = mint.unsqueeze
+
+    def construct(self, hidden_states):
+        """Collapse packed ``[s, b, n*h]`` streams into ``[s, b, h]``."""
+        s, _, _ = hidden_states.shape
+        flat = self.cast(hidden_states, mstype.float32)
+        rms_inv = self.rsqrt(self.mean(flat * flat, dim=-1, keepdim=True) + self.norm_eps)
+        mixes = self.hc_fn(flat) * rms_inv
+        pre = self.sigmoid(
+            mixes * _to_local(self.hc_scale) + _to_local(self.hc_base)
+        ) + self.hc_eps
+
+        streams = self.reshape(flat, (s, -1, self.n, self.hidden_size))
+        output = self.sum(self.unsqueeze(pre, -1) * streams, dim=2)
+        return self.cast(output, self.dtype)
+
+    def reset_parameter(self):
+        """Reset the scalar and bias gates for delayed initialisation."""
+        self.hc_base.zero_()
+        self.hc_scale.zero_()
 
 
 class HyperConnectionModule(nn.Cell):
@@ -149,7 +213,7 @@ class HyperConnectionModule(nn.Cell):
         self.mapping_proj = Linear(
             input_size=n * hidden_size,
             output_size=dim,
-            compute_dtype=self.dtype,
+            compute_dtype=mstype.float32,
             params_dtype=mstype.float32,
             init_method=init_method_zero(mstype.float32),
             bias=False,
@@ -177,7 +241,6 @@ class HyperConnectionModule(nn.Cell):
         self.add = mint.add
         self.tile = mint.tile
         self.cast = ops.cast
-        self.transpose = mint.permute
         self.concat = mint.concat
         self.split = mint.split
 
@@ -204,12 +267,11 @@ class HyperConnectionModule(nn.Cell):
         )[0]
 
         # 2. Project normalised streams -> [s, b, 1, n+n+n^2].
-        x4d = self.cast(self.reshape(norm_x, (s, -1, 1, n_hidden)), self.dtype)
-        proj_w_t = self.transpose(
-            self.cast(_to_local(self.mapping_proj.weight), self.dtype),
-            (1, 0),
-        )
-        h = self.matmul(x4d, proj_w_t)
+        # MindSpeed keeps the weightless RMSNorm and mHC projection in FP32,
+        # even for a BF16 model.  Premature BF16 casts here measurably shift the
+        # training loss and gradients.
+        x4d = self.reshape(norm_x, (s, -1, 1, n_hidden))
+        h = self.mapping_proj(x4d)
         h = self.cast(h, mstype.float32)
 
         alpha_ = self.concat(
@@ -226,18 +288,16 @@ class HyperConnectionModule(nn.Cell):
         h_pre, h_post, h_res = self.split(h, [n, n, n * n], dim=3)
 
         # 4. Apply activation and Sinkhorn projection.
-        h_pre = self.sigmoid(h_pre)
+        h_pre = self.add(self.sigmoid(h_pre), self._sinkhorn_op.eps)
         h_post = self.mul(2.0, self.sigmoid(h_post))
         h_res = self.reshape(h_res, (s, -1, n, n))
-        h_res = self.cast(self._sinkhorn_op(h_res), self.dtype)
-
-        h_pre = self.cast(h_pre, self.dtype)
-        h_post = self.cast(self.reshape(h_post, (s, -1, n, 1)), self.dtype)
+        h_res = self._sinkhorn_op(h_res)
+        h_post = self.reshape(h_post, (s, -1, n, 1))
 
         # 5. Aggregate streams: [s,b,1,n] @ [s,b,n,H] -> [s,b,H]
         x_streams = self.reshape(hidden_states, (s, -1, n, hidden_size))
-        x_streams = self.cast(x_streams, self.dtype)
-        aggregated = self.squeeze(self.matmul(h_pre, x_streams), 2)
+        x_streams = self.cast(x_streams, mstype.float32)
+        aggregated = self.cast(self.squeeze(self.matmul(h_pre, x_streams), 2), self.dtype)
 
         return aggregated, h_res, h_post
 

@@ -242,10 +242,10 @@ class DSv4HybridSelfAttention(MultiLatentAttention):
         q = self.reshape(q, (sq, bsz, self.config.num_attention_heads, self.q_head_dim))
         # Q-head RMS normalization, aligns with Megatron
         eps = self.config.layernorm_epsilon
-        q = self.cast(
-            self.rms_norm(self.cast(q, mstype.float32), self.q_rms_gamma, eps)[0],
-            self.compute_dtype,
-        )
+        # Match the MindSpeed DSV4 reference's model-dtype Q-head RMS path.
+        # Promoting this one norm to FP32 moves the BF16 rounding boundary and
+        # can flip later MoE top-k choices despite bit-identical q_up output.
+        q = q * mint.rsqrt(mint.mean(q * q, dim=-1, keepdim=True) + eps)
 
         # ---- KV shared single head -----------------------------------
         # kv: [sq, b, v_head_dim]

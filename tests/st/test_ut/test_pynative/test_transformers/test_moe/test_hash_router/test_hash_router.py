@@ -33,7 +33,7 @@ import pytest
 from tests.utils.double_benchmark import DoubleBenchmarkComparator, DoubleBenchmarkStandard
 
 from .hash_routing_data_gen import (
-    CASE_KEYS, GOLDEN_DATA, GPU_DATA,
+    CASE_KEYS, CASE_INPUT_REGISTRY, GOLDEN_DATA, GPU_DATA,
 )
 
 SINGLE_CARD_TEST_PARAM = "case_key"
@@ -102,7 +102,15 @@ class TestHashRouterPrecision:
                 f"{np.argwhere(npu_val != golden_val)[:5].flatten().tolist()}"
             )
 
-    def run_test(self, case_key, tmp_path, worker_num=1, local_worker_num=1, port_id=8118):
+    def run_test(
+            self,
+            case_key,
+            tmp_path,
+            worker_num=1,
+            local_worker_num=1,
+            port_id=8118,
+            enable_aux=False,
+    ):
         """
         Test hash routing test cases with single-card.
         """
@@ -129,6 +137,8 @@ class TestHashRouterPrecision:
             f"--case-key={case_key}",
             f"--output-path={output_path}",
         ]
+        if enable_aux:
+            cmd.append("--enable-aux")
 
         result = subprocess.run(cmd, shell=False, capture_output=True, text=True, check=False)
 
@@ -144,6 +154,7 @@ class TestHashRouterPrecision:
 
         self.check_indices_exact(output_ms_dict, case_key)
         self.check_acc(output_ms_dict, case_key)
+        return output_ms_dict
 
     @pytest.mark.level0
     @pytest.mark.platform_arm_ascend910b_training
@@ -154,3 +165,49 @@ class TestHashRouterPrecision:
         Test All hash routing test cases with single-card.
         """
         self.run_test(case_key, tmp_path, worker_num=1, local_worker_num=1)
+
+    @pytest.mark.level0
+    @pytest.mark.platform_arm_ascend910b_training
+    @pytest.mark.env_onecard
+    def test_hash_seq_aux_matches_megatron_natural_topk(self, tmp_path):
+        """Hash seq-aux follows Megatron's logits-derived natural top-k map."""
+        case_key = "v50_e4_k1_softmax_s1.0_l4_b2_h16"
+        output = self.run_test(case_key, tmp_path, enable_aux=True)
+        data = CASE_INPUT_REGISTRY[case_key]
+
+        hidden = data["hidden_states"].astype(np.float32)
+        weight = data["weight"].astype(np.float32)
+        logits = hidden.reshape(-1, hidden.shape[-1]) @ weight.T
+        logits -= logits.max(axis=-1, keepdims=True)
+        probabilities = np.exp(logits)
+        probabilities /= probabilities.sum(axis=-1, keepdims=True)
+
+        selected = output["selected_experts_indices"].astype(np.int64)
+        routing_map = np.zeros_like(probabilities, dtype=np.float32)
+        np.put_along_axis(routing_map, selected, 1.0, axis=1)
+
+        seq_length, batch_size = hidden.shape[:2]
+        num_experts = data["num_experts"]
+        top_k = data["top_k"]
+        probabilities = probabilities.reshape(seq_length, -1)
+        routing_map = routing_map.reshape(seq_length, -1)
+        expected_raw_aux = (
+            (probabilities.sum(axis=0) * routing_map.sum(axis=0)).sum()
+            * num_experts
+            / (top_k * seq_length * seq_length * batch_size)
+        )
+
+        natural_topk = np.argmax(probabilities.reshape(-1, num_experts), axis=1)
+        natural_map = np.zeros_like(probabilities.reshape(-1, num_experts))
+        np.put_along_axis(natural_map, natural_topk[:, None], 1.0, axis=1)
+        natural_map = natural_map.reshape(seq_length, -1)
+        natural_raw_aux = (
+            (probabilities.sum(axis=0) * natural_map.sum(axis=0)).sum()
+            * num_experts
+            / (top_k * seq_length * seq_length * batch_size)
+        )
+
+        assert abs(expected_raw_aux - natural_raw_aux) > 1.0e-4
+        np.testing.assert_allclose(
+            output["load_balancing_loss"], natural_raw_aux, rtol=0.0, atol=2.0e-6
+        )

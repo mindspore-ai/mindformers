@@ -2059,6 +2059,17 @@ class TransformerConfig:
         }
     )
 
+    enable_hc_head: bool = field(
+        default=False,
+        metadata={
+            "description": "If True, use the learnable mHC head to collapse final "
+                           "residual streams. If False, use the parameter-free mean collapse.",
+            "usage": ParamUsage.TRAINING,
+            "source": ParamSource.MF,
+            "mode": ParamMode.COMMON
+        }
+    )
+
     num_residual_streams: int = field(
         default=4,
         metadata={
@@ -2143,6 +2154,8 @@ class TransformerConfig:
             raise ValueError(f"hidden_dropout should be a float within [0, 1), but get {self.hidden_dropout}.")
         if not isinstance(self.attention_dropout, float) or not 0 <= self.attention_dropout < 1:
             raise ValueError(f"attention_dropout should be a float within [0, 1), but get {self.attention_dropout}.")
+        if self.enable_hc_head and not self.enable_hyper_connections:
+            raise ValueError("enable_hc_head requires enable_hyper_connections to be enabled.")
         if self.enable_hyper_connections:
             if not isinstance(self.num_residual_streams, int) or self.num_residual_streams <= 0:
                 raise ValueError(
@@ -2343,8 +2356,18 @@ class TransformerConfig:
             )
 
         if self.first_k_dense_replace:
-            moe_layer_freq_template = [0] * self.first_k_dense_replace + [1] * (
-                    self.num_layers - self.first_k_dense_replace)
+            if self.first_k_dense_replace < -1:
+                raise ValueError(
+                    f"'first_k_dense_replace' must be -1 or non-negative, "
+                    f"but got {self.first_k_dense_replace}."
+                )
+            # DeepSeek-V4 uses -1 to mean that every decoder layer is MoE.
+            # Do not feed -1 directly to list multiplication: ``[1] *
+            # (num_layers - -1)`` creates one spurious layer and later breaks
+            # FLOPs accounting (and any consumer that validates the pattern).
+            dense_layer_count = max(self.first_k_dense_replace, 0)
+            moe_layer_freq_template = [0] * dense_layer_count + [1] * (
+                    self.num_layers - dense_layer_count)
             if isinstance(self.moe_layer_freq, int) and not isinstance(self.moe_layer_freq, bool):
                 if self.moe_layer_freq > 1:
                     raise ValueError(

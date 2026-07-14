@@ -36,6 +36,23 @@ class DummyConfig(dict):
 @pytest.mark.level0
 @pytest.mark.platform_x86_cpu
 @pytest.mark.env_onecard
+def test_first_k_dense_replace_minus_one_means_all_moe_layers():
+    """DeepSeek-V4's -1 sentinel must produce exactly num_layers MoE entries."""
+    config = TransformerConfig(
+        num_layers=3,
+        hidden_size=512,
+        num_attention_heads=8,
+        num_moe_experts=8,
+        first_k_dense_replace=-1,
+        add_bias_linear=False,
+    )
+
+    assert config.moe_layer_freq == [1, 1, 1]
+
+
+@pytest.mark.level0
+@pytest.mark.platform_x86_cpu
+@pytest.mark.env_onecard
 def test_normal_execution_case():
     """
     Feature: Test case for verifying normal execution.
