@@ -12,45 +12,48 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Tests for GPT FSDP parameter grouping."""
+"""Tests for GPT FSDP wrapper boundaries."""
 
 from contextlib import nullcontext
+from types import SimpleNamespace
 
 import pytest
-
-from hyper_parallel.core.dtensor.placement_types import Shard
 
 from mindformers.pynative.base_models.gpt import parallelize
 
 
+class _FakeModule:
+    """Minimal parameter-free module used to exercise FSDP orchestration."""
+
+    def parameters_and_names(self):
+        return iter(())
+
+
+class _FakeTransformerLayer(_FakeModule):
+    """Transformer-layer attributes consumed by the policy builder."""
+
+    def __init__(self):
+        self.self_attention = SimpleNamespace(core_attention=SimpleNamespace())
+        self.mlp = SimpleNamespace()
+
+
+class _FakeMtpLayer(_FakeModule):
+    """Outer MTP unit containing one transformer layer."""
+
+    def __init__(self):
+        self.transformer_layer = _FakeTransformerLayer()
+
+
+class _FakeMesh:
+    def size(self):
+        return 2
+
+
 class _FakeParameter:
-    """Minimal parameter carrying only the shape used by the sharding plan."""
+    """Minimal parameter carrying only the shape used by the sync setup."""
 
     def __init__(self, shape):
         self.shape = shape
-
-
-class _FakeLinear:
-    """Minimal Linear-like object with one directly owned weight."""
-
-    def __init__(self, shape=(4, 8)):
-        self.weight = _FakeParameter(shape)
-
-    def parameters_and_names(self, expand=True):
-        assert expand is False
-        return [("weight", self.weight)]
-
-
-class _FakeOwner:
-    """Minimal mHC-like owner with a Linear and a scalar gate parameter."""
-
-    def __init__(self):
-        self.proj = _FakeLinear()
-        self.scale = _FakeParameter((1,))
-
-    def parameters_and_names(self, expand=True):
-        assert expand is False
-        return [("scale", self.scale)]
 
 
 class _FakeTensor:
@@ -100,47 +103,50 @@ class _FakeParallelDims:
 
 @pytest.mark.level0
 @pytest.mark.platform_x86_cpu
-def test_fp32_linear_and_owner_use_separate_fsdp_groups(monkeypatch):
-    """The FP32 projection is wrapped before its replicated scalar owner."""
-    calls = []
+def test_apply_fsdp_wraps_each_layer_once(monkeypatch):
+    """Only decoder layers and outer MTP units are wrapped; their children are not."""
+    decoder_layer = _FakeTransformerLayer()
+    mtp_layer = _FakeMtpLayer()
+    decoder = SimpleNamespace(layers=[decoder_layer], final_layernorm=None, hc_head=None)
+    gpt_model = SimpleNamespace(
+        embedding=None,
+        decoder=decoder,
+        mtp=SimpleNamespace(layers=[mtp_layer]),
+        output_layer=None,
+    )
+    model = _FakeModule()
+    parallel_dims = SimpleNamespace(
+        dp_replicate_enabled=False,
+        ep_enabled=False,
+        pp_enabled=False,
+        fsdp=2,
+        get_mesh=lambda *_: _FakeMesh(),
+    )
+    parallelism = SimpleNamespace(
+        dense_fsdp_shard_size=None,
+        reshard_after_forward_policy="default",
+        cpu_offload=False,
+        disable_gradient_division=False,
+    )
+    wrapped = []
 
-    def fake_fully_shard(module, **kwargs):
-        calls.append((module, kwargs))
-
-    monkeypatch.setattr(parallelize, "fully_shard", fake_fully_shard)
+    monkeypatch.setattr(parallelize, "_unwrap_gptmodel", lambda _: gpt_model)
+    monkeypatch.setattr(parallelize, "get_fsdp_reshard_after_forward_policy", lambda *_: False)
+    monkeypatch.setattr(parallelize, "MixedPrecisionPolicy", lambda **_: object())
+    monkeypatch.setattr(parallelize, "OffloadPolicy", object)
     monkeypatch.setattr(parallelize.ms, "DeviceCtx", lambda *_: nullcontext())
-
-    owner = _FakeOwner()
-    parallelize._wrap_fp32_linear_owner(  # pylint: disable=protected-access
-        owner, "proj", {}, False, shard_size=2
+    monkeypatch.setattr(parallelize, "_setup_gpt_prefetch", lambda *_: None)
+    monkeypatch.setattr(
+        parallelize,
+        "fully_shard",
+        lambda module, **kwargs: wrapped.append((module, kwargs)),
     )
 
-    assert [module for module, _ in calls] == [owner.proj, owner]
-    assert calls[0][1]["replicate_params"] == []
-    assert calls[0][1]["shard_placement_fn"](owner.proj.weight) == Shard(1)
-    assert calls[1][1]["replicate_params"] == [owner.scale]
+    parallelize.apply_fsdp(model, parallel_dims, parallelism)
 
-
-@pytest.mark.level0
-@pytest.mark.platform_x86_cpu
-def test_fused_fp32_linear_is_managed_by_owner_hook(monkeypatch):
-    """Fused mHC bypasses Linear.construct, so only its callable owner is wrapped."""
-    calls = []
-
-    def fake_fully_shard(module, **kwargs):
-        calls.append((module, kwargs))
-
-    monkeypatch.setattr(parallelize, "fully_shard", fake_fully_shard)
-    monkeypatch.setattr(parallelize.ms, "DeviceCtx", lambda *_: nullcontext())
-
-    owner = _FakeOwner()
-    parallelize._wrap_fp32_linear_owner(  # pylint: disable=protected-access
-        owner, "proj", {}, False, shard_size=2, wrap_linear=False
-    )
-
-    assert [module for module, _ in calls] == [owner]
-    assert calls[0][1]["replicate_params"] == [owner.scale]
-    assert calls[0][1]["shard_placement_fn"](owner.proj.weight) == Shard(1)
+    assert [module for module, _ in wrapped] == [decoder_layer, mtp_layer, model]
+    assert mtp_layer.transformer_layer not in [module for module, _ in wrapped]
+    assert all(call[1]["comm_fusion"] is False for call in wrapped)
 
 
 @pytest.mark.level0

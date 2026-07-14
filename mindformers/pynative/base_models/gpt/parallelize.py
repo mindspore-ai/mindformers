@@ -85,7 +85,6 @@ from mindformers.pynative.base_models.gpt.gpt_model import GPTModel
 from mindformers.pynative.transformers.experimental_attention_variant.deepseek_v4_hybrid_attention import (
     DSv4HybridSelfAttention,
 )
-from mindformers.pynative.transformers.hyper_connection import FusedHyperConnectionModule
 from mindformers.pynative.transformers.multi_latent_attention import MLASelfAttention
 from mindformers.pynative.transformers.mlp import MLP
 from mindformers.pynative.transformers.moe.moe_layer import MoELayer
@@ -97,6 +96,30 @@ from mindformers.tools.logger import logger
 __all__ = ["parallelize_gptmodel"]
 
 _DTYPE_MAP = {"float16": ms.float16, "float32": ms.float32, "bfloat16": ms.bfloat16}
+
+_LAYER_FSDP_PARAM_RULES = {
+    "attn_hc.mapping_proj.weight": {"shard_dim": 1},
+    "attn_hc.alpha_pre": {"replicate": True},
+    "attn_hc.alpha_post": {"replicate": True},
+    "attn_hc.alpha_res": {"replicate": True},
+    "attn_hc.bias": {"replicate": True},
+    "ffn_hc.mapping_proj.weight": {"shard_dim": 1},
+    "ffn_hc.alpha_pre": {"replicate": True},
+    "ffn_hc.alpha_post": {"replicate": True},
+    "ffn_hc.alpha_res": {"replicate": True},
+    "ffn_hc.bias": {"replicate": True},
+}
+
+_HC_HEAD_FSDP_PARAM_RULES = {
+    "hc_fn.weight": {"shard_dim": 1},
+    "hc_base": {"replicate": True},
+    "hc_scale": {"replicate": True},
+}
+
+_MTP_FSDP_PARAM_RULES = {
+    **{f"transformer_layer.{name}": rule for name, rule in _LAYER_FSDP_PARAM_RULES.items()},
+    **{f"hc_head.{name}": rule for name, rule in _HC_HEAD_FSDP_PARAM_RULES.items()},
+}
 
 
 # ---------------------------------------------------------------------------
@@ -238,9 +261,8 @@ def _setup_gpt_prefetch(
 ) -> None:
     """Set up forward and backward prefetch chains for GPT FSDP modules.
 
-    Each layer additionally prefetches its own inner fully_shard-wrapped
-    sub-modules (norms, q/k norms inside self_attention, attn_hc/ffn_hc, MoE
-    experts) so their all-gathers can overlap with the layer's forward/backward.
+    Each layer additionally prefetches its own inner fully_shard-wrapped MoE
+    experts so their all-gathers can overlap with the layer's forward/backward.
     """
     if not transformer_layers:
         return
@@ -326,27 +348,11 @@ def _distribute_param(module, param_name, device_mesh, placements):
     )
 
 
-def _collect_layer_norms(layer):
-    """Collect independent norm submodules from a transformer layer for separate FSDP wrapping."""
-    norms = {}
-    for attr_name in ("input_layernorm", "pre_mlp_layernorm", "pre_cross_attn_layernorm"):
-        norm = getattr(layer, attr_name, None)
-        if is_norm_module(norm):
-            norms[attr_name] = norm
-    for attr_name in ("q_layernorm", "k_layernorm"):
-        norm = getattr(layer.self_attention, attr_name, None)
-        if is_norm_module(norm):
-            norms[attr_name] = norm
-    return norms
-
-
 def _collect_module_replicate_params(module, shard_size):
     """Collect parameters from a module that cannot be evenly FSDP-sharded on dim 0.
 
-    This is the generic version of :func:`_collect_layer_replicate_params` for modules
-    that are not standard transformer decoder layers (e.g. embedding, output_layer).
-    It checks only the shape divisibility criterion; it does NOT inspect
-    layer-specific sub-module attributes.
+    This helper is for modules that are not standard transformer decoder layers
+    (e.g. embedding and output_layer). It checks only shape divisibility.
     """
     replicate_params = []
     for param_name, param in module.parameters_and_names():
@@ -362,205 +368,132 @@ def _collect_module_replicate_params(module, shard_size):
     return replicate_params
 
 
-def _collect_layer_replicate_params(layer, shard_size):
-    """Collect non-module parameters that must be replicated (not sharded) under FSDP."""
-    replicate_params = []
-    if hasattr(layer.self_attention.core_attention, "max_logits_val"):
-        replicate_params.append(layer.self_attention.core_attention.max_logits_val)
+def _build_fsdp_policy(module, shard_size, param_rules=None, forced_replicate_params=None):
+    """Build a module's shard-placement callback and replicated parameter list.
 
-    # DSv4 q-head RMS gamma is a fp32 non-trainable buffer. Replicate it so it is
-    # kept out of the layer's (bf16) sharded flat param-buffer, which is allocated
-    # with a single dtype and would otherwise mis-cast this fp32 tensor.
-    if hasattr(layer.self_attention, "q_rms_gamma"):
-        replicate_params.append(layer.self_attention.q_rms_gamma)
+    ``param_rules`` maps module-relative parameter names to either ``shard_dim``
+    or ``replicate``. Parameters without a rule use the default ``Shard(0)``.
+    """
+    param_rules = {} if param_rules is None else param_rules
+    placement_overrides = {}
+    replicate_params = list(forced_replicate_params or ())
+
+    for param_name, param in module.parameters_and_names():
+        rule = param_rules.get(param_name, {})
+        unknown_keys = rule.keys() - {"shard_dim", "replicate"}
+        if unknown_keys:
+            raise ValueError(f"Unsupported FSDP rule keys for {param_name}: {sorted(unknown_keys)}")
+        if rule.get("replicate", False) and "shard_dim" in rule:
+            raise ValueError(f"FSDP rule for {param_name} cannot set both replicate and shard_dim")
+        if rule.get("replicate", False):
+            replicate_params.append(param)
+            continue
+
+        shard_dim = rule.get("shard_dim", 0)
+        if "shard_dim" in rule:
+            placement_overrides[id(param)] = Shard(shard_dim)
+
+        shape = param.local_shape if isinstance(param, DTensor) else param.shape
+        normalized_dim = shard_dim if shard_dim >= 0 else shard_dim + len(shape)
+        if shape[normalized_dim] % shard_size != 0:
+            replicate_params.append(param)
+            placement_overrides.pop(id(param), None)
+            logger.warning("The shape[%s]=%s of parameter %s is not divisible by "
+                           "data_parallel_shard or dense_fsdp_shard_size which is %s, "
+                           "then this parameter will not be applied fsdp.",
+                           normalized_dim, shape[normalized_dim], param_name, shard_size)
+
+    unique_params = []
+    seen = set()
+    for param in replicate_params:
+        if id(param) not in seen:
+            seen.add(id(param))
+            unique_params.append(param)
+    if not placement_overrides:
+        return None, unique_params
+
+    def shard_plan(param):
+        return placement_overrides.get(id(param))
+
+    return shard_plan, unique_params
+
+
+def _build_expert_fsdp_policy(experts, shard_size):
+    """Prefer sharding grouped expert weights by expert, then by matrix row."""
+    param_rules = {}
+    for param_name, param in experts.parameters_and_names():
+        if param_name not in ("weight1", "weight2"):
+            continue
+        shape = param.local_shape if isinstance(param, DTensor) else param.shape
+        if len(shape) != 3:
+            raise ValueError(
+                f"Grouped expert parameter {param_name} must be 3D, but got shape={shape}")
+        if shape[0] % shard_size == 0:
+            param_rules[param_name] = {"shard_dim": 0}
+        elif shape[1] % shard_size == 0:
+            param_rules[param_name] = {"shard_dim": 1}
+        else:
+            param_rules[param_name] = {"replicate": True}
+            logger.warning(
+                "Neither shape[0]=%s nor shape[1]=%s of grouped expert parameter %s "
+                "is divisible by expert FSDP shard size %s; FSDP is disabled for this parameter.",
+                shape[0], shape[1], param_name, shard_size)
+    return _build_fsdp_policy(experts, shard_size, param_rules=param_rules)
+
+
+def _collect_layer_forced_replicate_params(layer):
+    """Collect transformer-layer state that must remain replicated under FSDP."""
+    forced_replicate_params = []
+    if hasattr(layer.self_attention.core_attention, "max_logits_val"):
+        forced_replicate_params.append(layer.self_attention.core_attention.max_logits_val)
 
     if hasattr(layer.mlp, "tokens_per_expert"):
-        replicate_params.append(layer.mlp.tokens_per_expert)
+        forced_replicate_params.append(layer.mlp.tokens_per_expert)
 
     if getattr(layer.mlp, "enable_expert_bias", False):
-        replicate_params.append(layer.mlp.expert_bias)
+        forced_replicate_params.append(layer.mlp.expert_bias)
 
     if hasattr(layer.mlp, "router"):
         if hasattr(layer.mlp.router, "tid2eid") and layer.mlp.router.tid2eid is not None:
-            replicate_params.append(layer.mlp.router.tid2eid)
+            forced_replicate_params.append(layer.mlp.router.tid2eid)
 
-    # Also apply the generic shape[0] divisibility check from _collect_module_replicate_params.
-    replicate_params.extend(_collect_module_replicate_params(layer, shard_size))
-
-    return replicate_params
+    return forced_replicate_params
 
 
-def _direct_parameters(module):
-    """Return parameters owned directly by ``module``, excluding child cells."""
-    return [param for _, param in module.parameters_and_names(expand=False)]
+def _build_layer_fsdp_policy(layer, shard_size):
+    """Build one transformer layer's complete FSDP policy."""
+    forced_replicate_params = _collect_layer_forced_replicate_params(layer)
 
-
-def _wrap_fp32_linear(linear, fsdp_config, reshard_after_forward, shard_size):
-    """FSDP-wrap one forced-FP32 Linear independently from its BF16 owner.
-
-    mHC projection weights are sharded on their input dimension. Any direct
-    parameter that cannot be evenly sharded there (including a future bias) is
-    kept replicated while still participating in gradient synchronization.
-    """
-    weight = getattr(linear, "weight", None)
-    if weight is None:
-        return
-
-    replicate_params = []
-    for param in _direct_parameters(linear):
-        if param is not weight:
-            replicate_params.append(param)
-            continue
-        shape = param.local_shape if isinstance(param, DTensor) else param.shape
-        if shape[1] % shard_size != 0:
-            replicate_params.append(param)
-
-    with ms.DeviceCtx("meta"):
-        fully_shard(
-            linear,
-            **fsdp_config,
-            shard_placement_fn=lambda _: Shard(1),
-            reshard_after_forward=reshard_after_forward,
-            replicate_params=replicate_params,
-        )
-
-
-def _wrap_fp32_linear_owner(
-        owner, linear_attr, fsdp_config, reshard_after_forward, shard_size, *, wrap_linear=True):
-    """Wrap a forced-FP32 Linear and its directly-owned FP32 parameters.
-
-    The Linear is wrapped first so its weight forms an independent sharded
-    FSDP unit. The callable owner is then wrapped for the remaining scalar and
-    vector parameters, which stay replicated. Fused mHC bypasses
-    ``Linear.construct`` and therefore sets ``wrap_linear=False`` so the owner
-    hook manages the projection weight as well.
-    """
-    linear = getattr(owner, linear_attr, None)
-    if linear is None:
-        return
-
-    direct_params = _direct_parameters(owner)
-    if wrap_linear:
-        _wrap_fp32_linear(linear, fsdp_config, reshard_after_forward, shard_size)
-
-    def shard_plan(param):
-        if param is getattr(linear, "weight", None) and len(param.shape) > 1:
-            return Shard(1)
-        return Shard(0)
-
-    with ms.DeviceCtx("meta"):
-        fully_shard(
-            owner,
-            **fsdp_config,
-            shard_placement_fn=shard_plan,
-            reshard_after_forward=reshard_after_forward,
-            replicate_params=direct_params,
-        )
-
-
-def _wrap_hc_modules(host, fsdp_config, reshard_after_forward, shard_size):
-    """Independently FSDP-wrap a host's mHC sub-modules (attn_hc/ffn_hc).
-
-    Each FP32 projection gets a dedicated FSDP group, while the owner's scalar
-    and vector parameters stay replicated. Shared by the main decoder layers
-    and the MTP transformer layers so both get the same treatment.
-    """
-    for hc_attr in ("attn_hc", "ffn_hc"):
-        hc_module = getattr(host, hc_attr, None)
-        if hc_module is None:
-            continue
-        _wrap_fp32_linear_owner(
-            hc_module,
-            "mapping_proj",
-            fsdp_config,
-            reshard_after_forward,
-            shard_size,
-            wrap_linear=not isinstance(hc_module, FusedHyperConnectionModule),
-        )
-
-
-def _wrap_hc_head(host, fsdp_config, reshard_after_forward, shard_size):
-    """Independently wrap the head FP32 Linear and replicated gate parameters."""
-    hc_head = getattr(host, "hc_head", None)
-    if hc_head is None:
-        return None
-    _wrap_fp32_linear_owner(
-        hc_head, "hc_fn", fsdp_config, reshard_after_forward, shard_size
+    return _build_fsdp_policy(
+        layer,
+        shard_size,
+        param_rules=_LAYER_FSDP_PARAM_RULES,
+        forced_replicate_params=forced_replicate_params,
     )
-    return hc_head
 
 
-def _wrap_dsv4_attention_modules(self_attention, fsdp_config, reshard_after_forward, replicate_params):
-    """Independently FSDP-wrap the fp32 tensors of a DSv4 hybrid attention.
-
-    DSv4 attention mixes bf16 projection weights with fp32 tensors that ``fully_shard``
-    cannot place in the same HSDP param-group (it asserts a single original dtype per
-    group and allocates one flat buffer per group):
-
-    * the fp32 RMSNorms ``kv_layernorm`` and the compressor ``norm`` cells nested under
-      ``core_attention`` / ``core_attention.indexer`` (``q_layernorm`` is already wrapped
-      by the generic norm pass in :func:`_collect_layer_norms`, so it is skipped here);
-    * the fp32 trainable per-head ``attn_sink`` Parameter on ``core_attention``.
-
-    Strategy: wrap each fp32 norm cell (reached via ``construct``, so its FSDP all-gather
-    hook fires normally) into its own group, then wrap ``core_attention`` with every
-    parameter *except* ``attn_sink`` in ``ignored_params``. That leaves ``core_attention``'s
-    own group holding only the fp32 ``attn_sink``, while the bf16 ``compressor`` /
-    ``indexer`` weights fall through to the enclosing transformer-layer wrap. Those bf16
-    weights MUST stay with the layer wrap: the indexer is invoked through a custom method
-    (``indexer.forward_before_topk``) rather than ``construct``, so a dedicated FSDP wrap
-    around it would never fire its pre-forward all-gather and its weights would still be
-    sharded DTensors at matmul time. The layer wrap all-gathers them before the layer
-    forward, which is when the indexer actually runs. No-op for the non-DSv4 path.
-    """
-    if not isinstance(self_attention, DSv4HybridSelfAttention):
-        return
-
-    q_layernorm = getattr(self_attention, "q_layernorm", None)
-    # 1. fp32 norm cells anywhere under the attention (skip the already-wrapped q_layernorm).
-    #    These are reached via ``construct`` so their FSDP all-gather hook fires normally.
-    norm_modules = [
-        module for _, module in self_attention.cells_and_names()
-        if module is not q_layernorm and is_norm_module(module)
-    ]
-    for norm in norm_modules:
-        with ms.DeviceCtx("meta"):
-            fully_shard(norm, **fsdp_config, replicate_params=replicate_params)
-
-    # 2. Isolate the fp32 ``attn_sink`` into ``core_attention``'s own group; everything else
-    #    under core_attention (bf16 compressor / indexer weights) is ignored here so it falls
-    #    through to the transformer-layer wrap that all-gathers it before the layer forward.
-    core_attention = getattr(self_attention, "core_attention", None)
-    attn_sink = getattr(core_attention, "attn_sink", None) if core_attention is not None else None
-    if core_attention is None or attn_sink is None:
-        return
-    ignored = [param for _, param in core_attention.parameters_and_names() if param is not attn_sink]
-    with ms.DeviceCtx("meta"):
-        fully_shard(core_attention, **fsdp_config, reshard_after_forward=reshard_after_forward,
-                    ignored_params=ignored, replicate_params=replicate_params)
+def _build_mtp_fsdp_policy(mtp_layer, shard_size):
+    """Build one outer MTP unit's policy, including its transformer layer and mHC head."""
+    forced_replicate_params = _collect_layer_forced_replicate_params(
+        mtp_layer.transformer_layer
+    )
+    return _build_fsdp_policy(
+        mtp_layer,
+        shard_size,
+        param_rules=_MTP_FSDP_PARAM_RULES,
+        forced_replicate_params=forced_replicate_params,
+    )
 
 
-def _wrap_dsa_indexer_norms(self_attention, fsdp_config):
-    """Independently FSDP-wrap norms nested under a DSA indexer.
-
-    The DSA indexer's ``k_norm`` lives at
-    ``core_attention.indexer.k_norm`` — deeper than :func:`_collect_layer_norms`
-    reaches.  Gate this helper strictly to DSA so DSv4/CSA compressor norms,
-    which are handled by :func:`_wrap_dsv4_attention_modules`, are not wrapped
-    twice.
-    """
-    if isinstance(self_attention, DSv4HybridSelfAttention):
-        return
-    if getattr(self_attention.config, "experimental_attention_variant", None) != "dsa":
-        return
-    core_attention = getattr(self_attention, "core_attention", None)
-    indexer = getattr(core_attention, "indexer", None) if core_attention is not None else None
-    if indexer is None:
-        return
-    for _, module in indexer.cells_and_names():
-        if is_norm_module(module):
-            with ms.DeviceCtx("meta"):
-                fully_shard(module, **fsdp_config)
+def _build_hc_head_fsdp_policy(hc_head, shard_size):
+    """Build root-owned mHC head policy without creating a dedicated wrapper."""
+    if hc_head is None:
+        return None, []
+    return _build_fsdp_policy(
+        hc_head,
+        shard_size,
+        param_rules=_HC_HEAD_FSDP_PARAM_RULES,
+    )
 
 
 # LoRA adapter layouts keyed by the target module's base TP role. Only the non-default
@@ -1201,8 +1134,8 @@ def _resolve_dense_fsdp_config(parallelism, base_fsdp_config, parallel_dims):
     unchanged -- the default, pre-feature behavior. Otherwise returns a copy of
     ``base_fsdp_config`` whose ``mesh`` is the reduced ``[replicate, shard]`` sub-mesh
     (see :meth:`ParallelDims.get_fsdp_shard_mesh`), together with the reduced shard
-    degree ``k``. The degree is fed to :func:`_collect_layer_replicate_params` so params
-    whose leading dim is not divisible by ``k`` are replicated rather than sharded.
+    degree ``k``. The degree is fed to :func:`_build_layer_fsdp_policy` so params
+    whose selected shard dim is not divisible by ``k`` are replicated rather than sharded.
 
     Only dense weights consume the returned config; routed experts keep their own
     ``efsdp_config`` and are not affected.
@@ -1261,6 +1194,7 @@ def apply_fsdp(
             else ["efsdp"]
         )
         edp_mesh = parallel_dims.get_mesh(edp_mesh_names)
+    expert_shard_degree = parallel_dims.get_mesh("efsdp").size() if edp_mesh is not None else 1
 
     # --- Build FSDP config ---
     reshard_policy = getattr(parallelism, "reshard_after_forward_policy", "default")
@@ -1279,18 +1213,20 @@ def apply_fsdp(
         "mesh": dp_mesh,
         "offload_policy": CPUOffloadPolicy() if cpu_offload else OffloadPolicy(),
         "mp_policy": mp_policy,
+        "comm_fusion": False,
     }
     efsdp_config = {
         "mesh": edp_mesh,
         "offload_policy": CPUOffloadPolicy() if cpu_offload else OffloadPolicy(),
         "mp_policy": mp_policy,
+        "comm_fusion": False,
     }
 
     # --- Optionally limit the FSDP shard degree of dense (non-expert) weights ---
     # When ``dense_fsdp_shard_size`` is set, ``fsdp_config`` is rebound to a reduced
-    # ``[replicate, shard]`` sub-mesh, so every dense wrap below (embedding, norms,
-    # router, shared experts, layers, output layer, root) shards over that many ranks
-    # and HSDP-replicates over the rest of the DP domain. ``efsdp_config`` (routed
+    # ``[replicate, shard]`` sub-mesh, so all dense parameters below (embedding,
+    # transformer layers, output layer, and root) shard over that many ranks and
+    # HSDP-replicate over the rest of the DP domain. ``efsdp_config`` (routed
     # experts) is built above and left untouched. The (world-collective) sub-mesh is
     # built here once, on every rank, before any wrapping, so process-group creation
     # stays consistent across pipeline stages.
@@ -1330,74 +1266,34 @@ def apply_fsdp(
             )
 
     # --- 2. Wrap transformer layers ---
-    # Principle: small modules first, then larger modules
     for layer in layers:
-        # 2a. Expert FSDP (small expert block)
+        # Routed experts use their own EDP mesh and remain a nested FSDP unit.
         if hasattr(layer.mlp, "experts") and edp_mesh is not None:
-            with ms.DeviceCtx("meta"):
-                fully_shard(layer.mlp.experts, **efsdp_config, reshard_after_forward=reshard_after_forward)
-
-        replicate_params = _collect_layer_replicate_params(layer, dense_shard_degree)
-
-        # 2a'. Wrap MoE router (and shared-expert gate) independently. Their weights are
-        # stored in moe_router_dtype (fp32) for gradient precision, so they must NOT share
-        # an HSDP param-group with the layer's bf16 params — fully_shard asserts a single
-        # original dtype per group. Same treatment as the fp32 embedding wrapped above.
-        router = getattr(layer.mlp, "router", None)
-        if router is not None:
+            expert_shard_plan, expert_replicate_params = _build_expert_fsdp_policy(
+                layer.mlp.experts, expert_shard_degree)
             with ms.DeviceCtx("meta"):
                 fully_shard(
-                    router,
-                    **fsdp_config,
+                    layer.mlp.experts,
+                    **efsdp_config,
+                    shard_placement_fn=expert_shard_plan,
                     reshard_after_forward=reshard_after_forward,
-                    replicate_params=replicate_params
+                    replicate_params=expert_replicate_params,
                 )
 
-        shared_experts = getattr(layer.mlp, "shared_experts", None)
-        shared_gate = getattr(shared_experts, "shared_experts_gate", None) if shared_experts is not None else None
-        if shared_gate is not None:
-            gate_replicate_params = _collect_module_replicate_params(shared_gate, dense_shard_degree)
-            with ms.DeviceCtx("meta"):
-                fully_shard(shared_gate, **fsdp_config, reshard_after_forward=reshard_after_forward,
-                            replicate_params=gate_replicate_params)
-
-        # 2b. Wrap norms independently (small modules first)
-        layer_norms = _collect_layer_norms(layer)
-        for norm in layer_norms.values():
-            with ms.DeviceCtx("meta"):
-                fully_shard(norm, **fsdp_config)
-
-        # 2c. Wrap HC FP32 projections independently; replicate scalar/vector params.
-        _wrap_hc_modules(layer, fsdp_config, reshard_after_forward, dense_shard_degree)
-
-        # 2c'. Wrap DSv4 hybrid-attention fp32 sub-modules independently so their
-        #      fp32 norms / attn_sink do not share a param-group with bf16 weights.
-        _wrap_dsv4_attention_modules(
-            layer.self_attention, fsdp_config, reshard_after_forward, replicate_params
+        layer_shard_plan, replicate_params = _build_layer_fsdp_policy(
+            layer, dense_shard_degree
         )
-
-        # 2c''. Wrap DSA indexer fp32 norms independently — same dtype-isolation
-        #       reason as 2c'.
-        _wrap_dsa_indexer_norms(layer.self_attention, fsdp_config)
-
-        # 2d. Wrap the transformer layer (large module)
 
         with ms.DeviceCtx("meta"):
             fully_shard(
                 layer,
                 **fsdp_config,
+                shard_placement_fn=layer_shard_plan,
                 reshard_after_forward=reshard_after_forward,
                 replicate_params=replicate_params
             )
 
-    # --- 3. Wrap the FP32 mHC head, final_layernorm and output_layer independently ---
-    _wrap_hc_head(
-        gpt_model.decoder,
-        fsdp_config,
-        reshard_policy == "always",
-        dense_shard_degree,
-    )
-
+    # --- 3. Wrap final_layernorm and output_layer independently ---
     # Principle: small modules (norms) first, then larger modules (output_layer)
     if tail_modules:
         for tail_module in tail_modules:
@@ -1422,84 +1318,39 @@ def apply_fsdp(
         for layer in mtp.layers:
             # Expert FSDP (same as main decoder layers)
             if hasattr(layer.transformer_layer.mlp, "experts") and edp_mesh is not None:
+                expert_shard_plan, expert_replicate_params = _build_expert_fsdp_policy(
+                    layer.transformer_layer.mlp.experts, expert_shard_degree)
                 with ms.DeviceCtx("meta"):
                     fully_shard(
                         layer.transformer_layer.mlp.experts, **efsdp_config,
+                        shard_placement_fn=expert_shard_plan,
                         reshard_after_forward=reshard_after_forward,
+                        replicate_params=expert_replicate_params,
                     )
 
-            mtp_replicate_params = _collect_layer_replicate_params(layer.transformer_layer, dense_shard_degree)
-
-            # Router (fp32) — independent wrap to avoid dtype conflict with bf16 params
-            router = getattr(layer.transformer_layer.mlp, "router", None)
-            if router is not None:
-                with ms.DeviceCtx("meta"):
-                    fully_shard(
-                        router,
-                        **fsdp_config,
-                        reshard_after_forward=reshard_after_forward,
-                        replicate_params=mtp_replicate_params
-                    )
-
-            # Shared experts gate (fp32) — independent wrap
-            shared_experts = getattr(layer.transformer_layer.mlp, "shared_experts", None)
-            shared_gate = getattr(shared_experts, "shared_experts_gate", None) if shared_experts is not None else None
-            if shared_gate is not None:
-                with ms.DeviceCtx("meta"):
-                    fully_shard(shared_gate, **fsdp_config, reshard_after_forward=reshard_after_forward)
-
-            # Norms inside transformer_layer (fp32) — independent wrap
-            layer_norms = _collect_layer_norms(layer.transformer_layer)
-            for norm in layer_norms.values():
-                with ms.DeviceCtx("meta"):
-                    fully_shard(norm, **fsdp_config)
-
-            # MTP-specific norms (fp32) — independent wrap
-            for norm_attr in ("enorm", "hnorm", "final_layernorm"):
-                norm = getattr(layer, norm_attr, None)
-                if norm is not None:
-                    with ms.DeviceCtx("meta"):
-                        fully_shard(norm, **fsdp_config)
-
-            # HC modules inside transformer_layer — same independent wrap as the
-            # main decoder layers (2c); otherwise the tiny mHC params get swept into
-            # the generic MTP layer wrap and sharded on dim 0, which their shapes
-            # do not allow.
-            _wrap_hc_modules(
-                layer.transformer_layer,
-                fsdp_config,
-                reshard_after_forward,
-                dense_shard_degree,
+            layer_shard_plan, mtp_replicate_params = _build_mtp_fsdp_policy(
+                layer, dense_shard_degree
             )
 
-            # Keep the FP32 mHC head projection separate from the BF16 outer MTP
-            # layer and replicate the head's scalar/vector parameters.
-            _wrap_hc_head(layer, fsdp_config, reshard_after_forward, dense_shard_degree)
-
-            # DSv4 hybrid-attention fp32 sub-modules — same independent wrap as the
-            # main decoder layers (2c'), keeping fp32 norms / attn_sink out of the
-            # MTP layer's bf16 param-group.
-            _wrap_dsv4_attention_modules(
-                layer.transformer_layer.self_attention, fsdp_config, reshard_after_forward,
-                mtp_replicate_params,
-            )
-
-            # DSA indexer fp32 norms — same independent wrap as the main
-            # decoder layers (2c'').
-            _wrap_dsa_indexer_norms(layer.transformer_layer.self_attention, fsdp_config)
-
-            # Wrap the MTP layer (remaining: eh_proj + transformer_layer residual, all bf16)
             with ms.DeviceCtx("meta"):
                 fully_shard(
                     layer,
                     **fsdp_config,
+                    shard_placement_fn=layer_shard_plan,
                     reshard_after_forward=reshard_after_forward,
                     replicate_params=mtp_replicate_params,
                 )
-
-    # --- 4. Wrap root ---
+    # --- 4. Wrap root-owned state, including the decoder mHC head ---
+    root_shard_plan, root_replicate_params = _build_hc_head_fsdp_policy(
+        getattr(gpt_model.decoder, "hc_head", None), dense_shard_degree
+    )
     with ms.DeviceCtx("meta"):
-        fully_shard(model, **fsdp_config)
+        fully_shard(
+            model,
+            **fsdp_config,
+            shard_placement_fn=root_shard_plan,
+            replicate_params=root_replicate_params,
+        )
 
     # --- 5. Disable gradient division ---
     if getattr(parallelism, "disable_gradient_division", True):

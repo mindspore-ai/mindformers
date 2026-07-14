@@ -78,6 +78,61 @@ def _to_local(tensor):
     return tensor.to_local() if isinstance(tensor, DTensor) else tensor
 
 
+def _is_expert_muon_weight(param_name):
+    """Return whether ``param_name`` is a grouped expert weight supported by Muon."""
+    return (
+        param_name in ("experts.weight1", "experts.weight2")
+        or param_name.endswith((".experts.weight1", ".experts.weight2"))
+    )
+
+
+def _select_muon_matmul_op(ndim, param_name, shape):
+    """Select the Newton-Schulz matmul and reject unsupported 3D weights."""
+    if ndim == 2:
+        return mint.mm
+    if ndim == 3 and _is_expert_muon_weight(param_name):
+        return mint.bmm
+    if ndim == 3:
+        raise ValueError(
+            "Muon only supports 3D weights from grouped experts "
+            f"(`*.experts.weight1/weight2`), but got param={param_name!r}, shape={shape}")
+    raise ValueError(
+        f"Muon only supports 2D weights and grouped 3D expert weights, "
+        f"but got param={param_name!r}, shape={shape}")
+
+
+def _get_expert_muon_redist_spec(tensor, param_name):
+    """Return the storage/compute layouts for a 3D expert weight sharded on dim 1."""
+    if (not isinstance(tensor, DTensor) or len(tensor.shape) != 3
+            or not _is_expert_muon_weight(param_name)):
+        return None
+
+    storage_placements = tuple(tensor.placements)
+
+    def _is_dim1_shard(placement):
+        if not placement.is_shard():
+            return False
+        shard_dim = placement.dim if placement.dim >= 0 else placement.dim + 3
+        return shard_dim == 1
+
+    compute_placements = tuple(
+        Replicate() if _is_dim1_shard(placement) else placement
+        for placement in storage_placements
+    )
+    if compute_placements == storage_placements:
+        return None
+    return tensor.device_mesh, storage_placements, compute_placements
+
+
+def _redistribute_expert_muon_tensor(local_tensor, device_mesh, source_placements, target_placements):
+    """Redistribute an expert tensor between its FSDP storage and Muon compute layouts."""
+    return DTensor.from_local(
+        local_tensor, device_mesh, source_placements
+    ).redistribute(
+        device_mesh, target_placements
+    ).to_local()
+
+
 def _shape_numel(shape):
     """Return the number of elements represented by ``shape``."""
     numel = 1
@@ -986,23 +1041,17 @@ def _apply_muon_update(
     """Apply Muon optimizer update (original sequential allgather strategy).
 
     Works for both DTensor (multi-card) and regular Tensor (single-card) gradients.
-    When ``gradient`` is a 2D DTensor, the full tensor is gathered to run Newton-Schulz
-    and the result is redistributed back to the original sharding before applying the
-    update. All other cases (regular Tensor, or non-2D DTensor) operate on the local
-    tensor directly and skip the gather/redistribute entirely.
+    A 2D DTensor follows the existing full-tensor path. A grouped 3D expert
+    weight sharded on dim 1 temporarily replicates that matrix dimension while
+    preserving any expert-dimension shard, then restores the original layout.
     """
     ndim = len(gradient.shape)
-
-    if ndim == 2:
-        matmul_op = mint.mm
-    elif ndim == 3:
-        matmul_op = mint.bmm
-    else:
-        raise ValueError(f"newton_schulz only supports 2D or 3D gradient, got shape={gradient.shape}")
+    matmul_op = _select_muon_matmul_op(ndim, param_name, gradient.shape)
 
     needs_dtensor_redist = isinstance(gradient, DTensor) and len(gradient.shape) == 2
     device_mesh = gradient.device_mesh if needs_dtensor_redist else None
     placements = gradient.placements if needs_dtensor_redist else None
+    expert_redist_spec = _get_expert_muon_redist_spec(gradient, param_name)
 
     gradient = _to_local(gradient)
     muon_m = _to_local(muon_m)
@@ -1019,6 +1068,10 @@ def _apply_muon_update(
     ns_inputs = op_cast(gradient_fp32, mstype.bfloat16)
     if needs_dtensor_redist:
         ns_inputs = DTensor.from_local(ns_inputs, device_mesh, placements).full_tensor()
+    elif expert_redist_spec is not None:
+        expert_mesh, expert_storage_placements, expert_compute_placements = expert_redist_spec
+        ns_inputs = _redistribute_expert_muon_tensor(
+            ns_inputs, expert_mesh, expert_storage_placements, expert_compute_placements)
 
     x_ret = _apply_muon_ns(
         ns_inputs, muon_split_fn, muon_merge_fn, param_name,
@@ -1027,6 +1080,9 @@ def _apply_muon_update(
 
     if needs_dtensor_redist:
         x_ret = distribute_tensor(x_ret, device_mesh, placements).to_local()
+    elif expert_redist_spec is not None:
+        x_ret = _redistribute_expert_muon_tensor(
+            x_ret, expert_mesh, expert_compute_placements, expert_storage_placements)
 
     with SkipDTensorDispatch():
         param_fp32 = param * (1 - lr * weight_decay)
@@ -1050,15 +1106,15 @@ def _apply_muon_update(
 #                               tensor); falls back to an all-gather for
 #                               layouts that do not cover the full worker
 #                               group.
-#    Phase 2 – Compute        : local 3D/non-DTensor weights run NS on every
-#                               rank; 2D DTensors run NS only on the assigned
-#                               rank after the full tensor is available
+#    Phase 2 – Compute        : grouped 3D expert weights run NS on every rank
+#                               after any dim-1 materialization; 2D DTensors run
+#                               NS only on the assigned rank
 #    Phase 3 – Shard send     : send each rank only the local 2D shard it needs,
 #                               with a full broadcast fallback
 #    Phase 4 – Apply          : write param / momentum
 #
 #  This removes redundant NS for sharded 2D weights while preserving the
-#  allgather-mode local path for 3D weights such as expert batches.
+#  allgather-mode rank-local path for supported 3D expert batches.
 # ---------------------------------------------------------------------------
 
 def _prepare_muon_input_compute(gradient, muon_m, momentum, use_nesterov):
@@ -1132,6 +1188,19 @@ def _prepare_muon_input_batched(gradients, muon_m_list, momentum, use_nesterov):
     )
 
 
+def _restore_expert_muon_update(info, x_ret):
+    """Restore a matrix-complete expert update to its local FSDP shard."""
+    compute_placements = info.get('expert_compute_placements')
+    if compute_placements is None:
+        return x_ret
+    return _redistribute_expert_muon_tensor(
+        x_ret,
+        info['dev_mesh'],
+        compute_placements,
+        info['placements'],
+    )
+
+
 def _apply_prepared_update_batched(infos):
     """Phase 4 batched apply for ``n_slots`` same-shape weights.
 
@@ -1154,6 +1223,8 @@ def _apply_prepared_update_batched(infos):
         if info['needs_redist'] and not info.get('x_ret_is_local', False):
             x_ret = distribute_tensor(
                 x_ret, info['dev_mesh'], info['placements']).to_local()
+        else:
+            x_ret = _restore_expert_muon_update(info, x_ret)
         param = info['param']
         muon_m = info['muon_m']
         with SkipDTensorDispatch():
@@ -1173,6 +1244,8 @@ def _apply_prepared_update_batched(infos):
         if info['needs_redist'] and not info.get('x_ret_is_local', False):
             x_ret = distribute_tensor(
                 x_ret, info['dev_mesh'], info['placements']).to_local()
+        else:
+            x_ret = _restore_expert_muon_update(info, x_ret)
         x_rets.append(x_ret)
 
     # Use pre-computed Python-float weight-decay scales when present (set by
@@ -1286,6 +1359,8 @@ def _run_muon_batched(
         if info['needs_redist'] and not info.get('x_ret_is_local', False):
             x_ret = distribute_tensor(
                 x_ret, info['dev_mesh'], info['placements']).to_local()
+        else:
+            x_ret = _restore_expert_muon_update(info, x_ret)
 
         param = info['param']
         muon_m = info['muon_m']
@@ -1344,15 +1419,20 @@ def _run_muon_batched(
                     skip_redist_comm = True
                 layout_covers_world = len(rank_list_tuple) == get_group_size()
 
-        if ndim == 2:
-            matmul_op = mint.mm
-        else:
-            matmul_op = mint.bmm
+        expert_redist_spec = _get_expert_muon_redist_spec(
+            muon_gradients[i], muon_param_names[i])
+        expert_compute_placements = None
+        if expert_redist_spec is not None:
+            dev_mesh, plmts, expert_compute_placements = expert_redist_spec
+
+        matmul_op = _select_muon_matmul_op(
+            ndim, muon_param_names[i], muon_gradients[i].shape)
 
         prepared.append({
             'ns_inputs_local': None,  # filled below by batched / per-weight path
             'next_m': None,
             'needs_redist': needs_redist,
+            'expert_compute_placements': expert_compute_placements,
             'dev_mesh': dev_mesh,
             'placements': plmts,
             'layout': layout,
@@ -1413,6 +1493,14 @@ def _run_muon_batched(
     gather_p2p_ops = []
     gather_pending_objs = []  # objects whose shared_handle we set after batch
     for info in prepared:
+        if info['expert_compute_placements'] is not None:
+            info['ns_inputs_full'] = _redistribute_expert_muon_tensor(
+                info['ns_inputs_local'],
+                info['dev_mesh'],
+                info['placements'],
+                info['expert_compute_placements'],
+            )
+            continue
         if not info['needs_redist']:
             info['ns_inputs_full'] = info['ns_inputs_local']
             continue
@@ -1743,10 +1831,10 @@ class Muon(Optimizer):
             - ``"allgather"`` (default): every rank all-gathers and runs NS independently
               (sequential, one weight at a time).
             - ``"allgather_deredundency"``: 2D DTensor weights all-gather on every
-              rank, but NS runs only on one assigned rank per weight. 3D/local
-              weights run NS independently on each rank, matching allgather mode.
+              rank, but NS runs only on one assigned rank per weight. Supported
+              grouped 3D expert weights run NS independently on each rank.
         model: The model model. Default: ``None``.
-        adamw_include (list[str]): Glob patterns (``fnmatch``); 2D/3D weights
+        adamw_include (list[str]): Glob patterns (``fnmatch``); eligible Muon weights
             whose name matches any pattern are optimized by AdamW instead of
             Muon. This replaces the model-side ``get_muon_filter`` hook. When
             ``None`` it defaults to ``["*word_embeddings*", "*output_layer*"]``,
@@ -1796,8 +1884,8 @@ class Muon(Optimizer):
 
         # Which params get Muon (vs AdamW) is decided here from ``adamw_include``
         # config, fully replacing the model-side ``get_muon_filter`` hook. The
-        # default reproduces the historical model policy exactly (2D/3D weights,
-        # with word_embeddings / output_layer routed to AdamW).
+        # Preserve the historical 2D/3D shape-based routing here. The update
+        # path validates 3D weights and accepts only grouped expert weight1/2.
         self._muon_filter = self._build_muon_filter(adamw_include)
 
         self.muon_split_fn, self.muon_merge_fn = model.make_model_muon_fns()
@@ -1935,11 +2023,9 @@ class Muon(Optimizer):
     def _build_muon_filter(adamw_include):
         """Build the Muon-vs-AdamW param predicate (``True`` ⇒ optimized by Muon).
 
-        Muon applies to 2D/3D weights only; any such weight whose name matches an
-        ``adamw_include`` glob is routed to AdamW instead.  ``adamw_include=None``
-        keeps the historical default of ``word_embeddings`` / ``output_layer`` on
-        AdamW.  Patterns are ``fnmatch`` globs (``"*word_embeddings*"`` is the
-        glob equivalent of a substring match).
+        Muon routing considers 2D/3D weights; any such weight whose name matches
+        an ``adamw_include`` glob is routed to AdamW instead. Unsupported 3D
+        weights are rejected by the update path. Patterns are ``fnmatch`` globs.
         """
         if adamw_include is None:
             adamw_include = ("*word_embeddings*", "*output_layer*")
