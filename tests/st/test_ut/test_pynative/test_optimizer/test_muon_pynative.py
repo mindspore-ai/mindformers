@@ -131,6 +131,32 @@ class TestMuonConfig:
     @pytest.mark.level0
     @pytest.mark.platform_x86_cpu
     @pytest.mark.env_onecard
+    def test_bound_phase4_groups(self):
+        """
+        Feature: memory-bounded Phase 4 Muon batching.
+        Description: a same-shape group is chunked according to its estimated
+            temporary bytes while preserving slot order.
+        Expectation: groups fit two slots per batch without creating a singleton tail.
+        """
+        group_key = ((8, 8), mstype.bfloat16, mstype.float32)
+        bytes_per_slot = 8 * 8 * muon_mod._PHASE4_BATCH_TEMP_BYTES_PER_ELEMENT
+        groups = {group_key: [0, 1, 2, 3, 4]}
+
+        bounded = muon_mod._bound_phase4_groups(groups, max_temp_bytes=2 * bytes_per_slot)
+        assert list(bounded.values()) == [[0, 1], [2, 3, 4]]
+
+        bounded = muon_mod._bound_phase4_groups(groups, max_temp_bytes=4 * bytes_per_slot)
+        assert list(bounded.values()) == [[0, 1, 2], [3, 4]]
+
+        bounded = muon_mod._bound_phase4_groups(groups, max_temp_bytes=1)
+        assert list(bounded.values()) == [[0, 1], [2, 3, 4]]
+
+        bounded = muon_mod._bound_phase4_groups({group_key: [0]}, max_temp_bytes=1)
+        assert list(bounded.values()) == [[0]]
+
+    @pytest.mark.level0
+    @pytest.mark.platform_x86_cpu
+    @pytest.mark.env_onecard
     def test_normalize_ns_schedule_flat(self):
         """
         Feature: Muon._normalize_ns_schedule flat-triple form.
@@ -368,6 +394,49 @@ class TestMuonSingleCardUpdate:
 
     def teardown_method(self):
         muon_mod.core_context.is_legacy_model = self._orig_is_legacy_model
+
+    @pytest.mark.level0
+    @pytest.mark.platform_arm_ascend910b_training
+    @pytest.mark.env_onecard
+    def test_batched_phase4_stages_momentum_writeback(self):
+        """The staged Phase 4 path preserves updates without restacking next_m."""
+        params = [
+            Parameter(Tensor(np.full((2, 2), value, np.float32)), name=f"param_{index}")
+            for index, value in enumerate((2.0, 3.0))
+        ]
+        momenta = [
+            Parameter(Tensor(np.zeros((2, 2), np.float32)), name=f"momentum_{index}")
+            for index in range(2)
+        ]
+        next_m = [Tensor(np.full((2, 2), value, np.float32)) for value in (0.25, 0.5)]
+        x_rets = [
+            Tensor(np.full((2, 2), value, np.float32), dtype=ms.bfloat16)
+            for value in (0.1, 0.2)
+        ]
+        scales = (0.9, 0.8)
+        infos = [
+            {
+                "param": params[index],
+                "muon_m": momenta[index],
+                "next_m": next_m[index],
+                "x_ret": x_rets[index],
+                "needs_redist": False,
+                "lr": 0.1,
+                "wd": 0.1,
+                "wd_scale": scales[index],
+            }
+            for index in range(2)
+        ]
+
+        muon_mod._apply_prepared_update_batched(infos)
+
+        for index in range(2):
+            expected_param = np.full(
+                (2, 2), np.float32(2.0 + index) * np.float32(scales[index]), np.float32)
+            expected_param -= x_rets[index].float().asnumpy()
+            np.testing.assert_allclose(params[index].asnumpy(), expected_param, rtol=0, atol=0)
+            np.testing.assert_array_equal(momenta[index].asnumpy(), next_m[index].asnumpy())
+            assert infos[index]["next_m"] is None
 
     @pytest.mark.level0
     @pytest.mark.platform_arm_ascend910b_training
