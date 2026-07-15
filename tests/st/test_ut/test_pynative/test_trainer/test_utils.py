@@ -21,6 +21,7 @@ import mindspore as ms
 from mindspore import Tensor, Parameter, nn
 
 from mindformers.pynative.config.config import OptimizerConfig
+from mindformers.pynative.trainer import utils as trainer_utils
 from mindformers.pynative.trainer.utils import get_param_groups
 
 
@@ -195,3 +196,23 @@ def test_optimizer_config_weight_decay_rules():
 
     assert config.weight_decay_include == ["norm.weight"]
     assert config.weight_decay_exclude == ["special.*"]
+
+
+@pytest.mark.level0
+@pytest.mark.platform_x86_cpu
+@pytest.mark.env_onecard
+def test_global_grad_norm_propagates_parameter_replica_count():
+    """A replica count tagged on a parameter must reach its FSDP main_grad."""
+    parameter = Parameter(Tensor(np.ones((2,)), ms.float32), name="weight")
+    parameter.main_grad = Tensor(np.asarray([3.0, 4.0], dtype=np.float32))
+    setattr(parameter, "_grad_norm_replica_count", 2)
+
+    calculate_global_grad_norm = getattr(trainer_utils, "_calculate_global_grad_norm")
+    global_norm, _ = calculate_global_grad_norm(
+        [parameter], enable_parallel=False, max_norm=1.0e9
+    )
+
+    assert getattr(parameter.main_grad, "_pp_replica_count") == 2
+    np.testing.assert_allclose(
+        global_norm.asnumpy(), np.sqrt((3.0 ** 2 + 4.0 ** 2) / 2.0), rtol=1.0e-6
+    )

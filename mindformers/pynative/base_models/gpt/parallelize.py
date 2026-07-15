@@ -751,8 +751,27 @@ def _dsv4_attention_layer_plan(self_attn, tp_mesh):
             sequence_dim=0
         )
 
+    # Full CSA runs on every TP rank, so all of its parameters except Q-up and
+    # the indexer hold identical already-global gradients.  Keep the count on
+    # the cell for propagation after FSDP replaces the Parameter objects.
+    setattr(self_attn, "_tp_full_attention_replica_count", world)
+
     distribute_param_plan = []
     return plan, distribute_param_plan
+
+
+def _tag_dsv4_tp_replicated_grad_norm_params(model):
+    """Tag replicated DSV4 attention parameters for global grad-norm de-duplication."""
+    for _, cell in model.cells_and_names():
+        replica_count = getattr(cell, "_tp_full_attention_replica_count", 1)
+        if replica_count <= 1:
+            continue
+        for param_name, param in cell.parameters_and_names():
+            if param_name.startswith("linear_q_up_proj."):
+                continue
+            if param_name.startswith("core_attention.indexer."):
+                continue
+            setattr(param, "_grad_norm_replica_count", replica_count)
 
 
 def _dense_mlp_layer_plan(enable_mc2=False):
@@ -1692,6 +1711,7 @@ def _apply_spmd_parallelism(
         parallel_dims,
         parallelism,
     )
+    _tag_dsv4_tp_replicated_grad_norm_params(model)
 
     for param_name, param in model.parameters_and_names():
         if isinstance(param, DTensor):
