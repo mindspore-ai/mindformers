@@ -155,13 +155,15 @@ class CSAIndexer(nn.Cell):
         self.topk = mint.topk
         self.clamp = mint.clamp
 
-    def forward_before_topk(self, x, qr):
+    def forward_before_topk(self, x, qr, query_pos_offset: int = 0):
         """
         Pre-forward pass that computes indexer Q, K and weights.
 
         Args:
             x: Hidden states, shape (S, B, hidden_size).
             qr: Compressed query, shape (S, B, q_lora_rank).
+            query_pos_offset: Global query-token offset used by CP. Defaults
+                to ``0`` and preserves single-card behavior.
 
         Returns:
             q: Indexer query, shape (B, S, n_idx_heads, head_dim).
@@ -169,7 +171,7 @@ class CSAIndexer(nn.Cell):
             weights: Indexer weights, shape (B, S, n_idx_heads).
         """
         seqlen, bsz, _ = x.shape
-        freqs, _ = self.rotary_pos_emb(seqlen)
+        freqs, _ = self.rotary_pos_emb(seqlen, offset=query_pos_offset)
 
         # Query path: linear -> reshape -> split -> RoPE -> concat -> Hadamard
         q = self.linear_wq_b(qr)

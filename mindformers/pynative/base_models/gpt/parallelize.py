@@ -70,6 +70,7 @@ from mindformers.pynative.distributed.context_parallel import (
     apply_context_parallel_model_io,
     build_context_parallel_attention_style,
 )
+from mindformers.pynative.distributed.csa_context_parallel import DSv4HybridAttentionContextParallel
 from mindformers.pynative.layers.layer_norm import FusedLayerNorm, FusedRMSNorm
 from mindformers.pynative.distributed.tensor_parallel import NoParallel
 from mindformers.pynative.distributed.expert_parallel import ExpertParallel, DeredundancyExpertParallel
@@ -89,6 +90,7 @@ from mindformers.pynative.transformers.multi_latent_attention import MLASelfAtte
 from mindformers.pynative.transformers.mlp import MLP
 from mindformers.pynative.transformers.moe.moe_layer import MoELayer
 from mindformers.pynative.transformers.moe.moe_utils import set_moe_aux_loss_group_info
+from mindformers.pynative.transformers.experimental_attention_variant.csa import CompressedSparseAttention
 from mindformers.tools.logger import logger
 
 __all__ = ["parallelize_gptmodel"]
@@ -1517,6 +1519,17 @@ def apply_context_parallel_attention(
 
     def _apply_cp_to_block(transformer_block, block_label):
         cp_module_path, cp_module = _find_one_module(transformer_block, block_label, "core_attention")
+        if isinstance(cp_module, CompressedSparseAttention):
+            attention_path, attention_module = _find_one_module(transformer_block, block_label, "self_attention")
+            DSv4HybridAttentionContextParallel(cp_mesh)._apply(attention_module, cp_mesh)
+            logger.info(
+                "Applied CSA context parallel to %s.%s through %s",
+                block_label,
+                cp_module_path,
+                attention_path,
+            )
+            return
+
         if async_enabled:
             attention_path, attention_module = _find_one_module(transformer_block, block_label, "self_attention")
             cp_style.apply_to_attention(attention_module, cp_mesh)
