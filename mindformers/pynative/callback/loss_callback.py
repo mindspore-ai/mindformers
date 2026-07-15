@@ -172,6 +172,24 @@ class LossCallback(TrainerCallback):
         if load_balancing_loss is not None:
             load_balancing_loss /= state.num_accumulation_steps
 
+        # Like MoE aux metrics, indexer layers can live on a non-last PP
+        # stage.  Run the PP collective on every stage before the early return;
+        # only the last stage receives a value to print.
+        indexer_loss = None
+        if hasattr(model[0], "get_index_loss"):
+            indexer_loss = model[0].get_index_loss(
+                metric_group,
+                metric_group_size,
+                pp_metric_group,
+                pp_metric_group_size,
+                has_last=has_last,
+            )
+        elif not self.logger_record["get_index_loss"]:
+            logger.warning(f"{model_cls_name} does not have get_index_loss method.")
+            self.logger_record["get_index_loss"] = True
+        if indexer_loss is not None:
+            indexer_loss /= state.num_accumulation_steps
+
         if state.global_step % self.log_interval != 0:
             return
 
@@ -207,16 +225,6 @@ class LossCallback(TrainerCallback):
             mtp_loss = ", ".join(mtp_loss_values)
         else:
             mtp_loss = None
-
-        # process indexer loss
-        indexer_loss = None
-        if hasattr(model[0], "get_index_loss"):
-            indexer_loss = model[0].get_index_loss()
-        elif not self.logger_record["get_index_loss"]:
-            logger.warning(f"{model_cls_name} does not have get_index_loss method.")
-            self.logger_record["get_index_loss"] = True
-        if indexer_loss:
-            indexer_loss /= state.num_accumulation_steps
 
         # Calculate total FLOPs for the model
         model_config = convert_transformer_config_to_args_for_tflops(model_config)

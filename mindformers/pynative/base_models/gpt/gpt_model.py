@@ -794,14 +794,22 @@ class GPTModel(nn.Cell):
         """
         return track_mtp_metrics(group=metric_group, group_size=metric_group_size)
 
-    def get_index_loss(self):
+    def get_index_loss(self, metric_group=None, metric_group_size=None,
+                       pp_metric_group=None, pp_metric_group_size=None,
+                       has_last=True):
         """Return the reduced sparse-attention indexer loss for logging.
 
         Returns the raw tracked indexer loss (NOT divided by the number of
         gradient-accumulation steps); the caller applies that scaling.
         ``None`` when there is no indexer loss to report.
         """
-        return track_indexer_metrics()
+        return track_indexer_metrics(
+            group=metric_group,
+            group_size=metric_group_size,
+            pp_group=pp_metric_group,
+            pp_group_size=pp_metric_group_size,
+            has_last=has_last,
+        )
 
     def get_gpt_transformer_config(self):
         """Get the transformer config for GPT model.

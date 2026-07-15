@@ -31,12 +31,10 @@ from hyper_parallel.core.dtensor.dtensor import DTensor
 
 try:
     from hyper_parallel.custom_ops.experimental import (
-        npu_lightning_indexer_v2,
-        npu_sparse_lightning_indexer_grad_kl_loss_v2
+        npu_lightning_indexer,
     )
 except ImportError:
-    npu_lightning_indexer_v2 = None
-    npu_sparse_lightning_indexer_grad_kl_loss_v2 = None
+    npu_lightning_indexer = None
 
 from mindformers.parallel_core.utils.spec_utils import ModuleSpec, build_module
 from mindformers.parallel_core.transformer_config import MLATransformerConfig
@@ -100,13 +98,18 @@ class CSAIndexer(nn.Cell):
         self.softmax_scale = self.index_head_dim ** -0.5
         self.compute_dtype = config.compute_dtype
         self.apply_dsa_kernel_fusion = config.apply_dsa_kernel_fusion
-        if self.apply_dsa_kernel_fusion and npu_lightning_indexer_v2 is None:
+        if self.apply_dsa_kernel_fusion and npu_lightning_indexer is None:
             raise ValueError(
-                "Fused DSA op 'npu_lightning_indexer_v2' is unavailable in this hyper_parallel build."
+                "Fused DSA LightningIndexerV2 ops are unavailable in this hyper_parallel build."
                 "set apply_dsa_kernel_fusion=False to use the unfused small-op implement."
             )
+        if self.apply_dsa_kernel_fusion and self.input_layout != "BSND":
+            raise ValueError("The DSV4 fused indexer precision path currently supports BSND layout only.")
 
-        self.weight_scale = self.index_n_heads ** -0.5 * self.softmax_scale
+        # Keep the two factors separate.  MindSpeed applies them as two BF16
+        # multiplies; pre-combining the Python constants removes one rounding
+        # boundary and changes the fused indexer weights.
+        self.index_head_scale = self.index_n_heads ** -0.5
 
         self.apply_rope = ApplyRotaryPosEmb(config)
 
@@ -186,7 +189,8 @@ class CSAIndexer(nn.Cell):
 
         # Weights path: linear -> scale
         weights = self.linear_weights_proj(x)
-        weights = weights * self.weight_scale
+        weights = weights * self.index_head_scale
+        weights = weights * self.softmax_scale
 
         # Convert from SB* layout to BS* layout
         weights = self.permute(weights, (1, 0, 2))
@@ -202,20 +206,28 @@ class CSAIndexer(nn.Cell):
 
     def construct(self, q, k, weights, mask=None, actual_seq_qlen=None, actual_seq_klen=None):
         """compute top-k indices using lightning_indexer."""
-        effective_topk = min(self.index_topk, int(k.shape[1]))
+        del actual_seq_qlen, actual_seq_klen
+        effective_topk = self.index_topk if self.apply_dsa_kernel_fusion else min(self.index_topk, int(k.shape[1]))
         if self.apply_dsa_kernel_fusion:
             with _no_grad():
                 q = self.cast(q, self.compute_dtype)
                 k = self.cast(k, self.compute_dtype)
-                topk_indices, index_scores = npu_lightning_indexer_v2(
-                    q, k, weights,
+                weights = self.cast(weights, mstype.float32)
+                key_length = k.shape[1]
+                cmp_residual_k = Tensor([int(key_length) % self.compress_ratio], dtype=mstype.int32)
+                topk_indices, index_scores = npu_lightning_indexer(
+                    q,
+                    k,
+                    weights,
+                    effective_topk,
+                    cmp_residual_k=cmp_residual_k,
                     layout=self.input_layout,
-                    cu_seq_lens_q=actual_seq_qlen,
-                    cu_seq_lens_k=actual_seq_klen,
-                    sparse_count=effective_topk,
-                    cmp_ratio=self.compress_ratio,
                     sparse_mode=self.sparse_mode,
+                    cmp_ratio=self.compress_ratio,
+                    return_value=True,
                 )
+                topk_indices = mint.squeeze(topk_indices, dim=2)
+                index_scores = mint.squeeze(index_scores, dim=2)
         else:
             q = self.cast(q, mstype.float32)
             k = self.cast(k, mstype.float32)
@@ -275,52 +287,6 @@ class _IndexerLossAutoScaler(_Function):
     def set_loss_scale(scale):
         """Set the backward scale (trainer/callback is responsible for reduce)."""
         _IndexerLossAutoScaler.main_loss_backward_scale = scale
-
-
-class FusedCSAIndexerLoss(_Function):
-    """Fused CSA Indexer loss"""
-
-    @staticmethod
-    def forward(ctx,
-                query, key,
-                query_index, key_index, weights, topk_indices,
-                scale_value, layout, cmp_ratio, loss_coeff,
-                softmax_max=None, softmax_sum=None,
-                actual_seq_qlen=None, actual_seq_klen=None):
-        """Forward pass: call fused op + stash indexer-input gradients on ctx."""
-        d_query_index, d_key_index, d_weights, loss = npu_sparse_lightning_indexer_grad_kl_loss_v2(
-            query, key, query_index, key_index, weights, topk_indices,
-            softmax_max=softmax_max, softmax_sum=softmax_sum, scale_value=scale_value,
-            actual_seq_qlen=actual_seq_qlen, actual_seq_klen=actual_seq_klen,
-            layout=layout, sparse_mode=3,
-            pre_tokens=9223372036854775807, next_tokens=9223372036854775807, cmp_ratio=cmp_ratio,
-        )
-        if layout == "TND":
-            scale = query.shape[0]
-        else:
-            scale = query.shape[0] * query.shape[1]
-        loss = loss * loss_coeff / scale
-        ctx.d_query_index = d_query_index
-        ctx.d_key_index = d_key_index
-        ctx.d_weights = d_weights
-        ctx.loss_coeff = loss_coeff
-        ctx.scale = scale
-        return loss[0] # the loss output has a shape (1,), so get its value.
-
-    @staticmethod
-    def backward(ctx, grad_loss):
-        """Scale the three pre-computed indexer gradients by `grad_loss`."""
-        grad_scale = grad_loss * ctx.loss_coeff / ctx.scale
-        return (
-            None, None,
-            ctx.d_query_index * grad_scale,
-            ctx.d_key_index * grad_scale,
-            ctx.d_weights * grad_scale,
-            None,
-            None, None, None,
-            None, None,
-            None, None,
-        )
 
 
 class UnfusedCSAIndexerLoss(nn.Cell):

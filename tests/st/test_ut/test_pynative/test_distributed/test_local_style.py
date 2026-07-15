@@ -15,6 +15,7 @@
 """Unit tests for local-tensor parallel styles."""
 
 import pytest
+import mindspore as ms
 from mindspore import Tensor, nn
 
 from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
@@ -122,6 +123,30 @@ def test_local_transforms_cover_dims_and_validation(mock_local_runtime):
 
 @pytest.mark.level0
 @pytest.mark.platform_x86_cpu
+def test_shard_then_gather_reduces_backward(monkeypatch, mock_local_runtime):
+    """Shard -> AllGather is identity forward and sums rank-local backward parts."""
+    del mock_local_runtime
+
+    def fake_reduce_scatter(unused_output, value, group):
+        del unused_output, group
+        half = value.shape[0] // 2
+        return value[:half] + value[half:], None
+
+    monkeypatch.setattr(style_module.comm_func, "reduce_scatter_tensor", fake_reduce_scatter)
+    mesh = _FakeMesh()
+    value = Tensor([1.0, 2.0, 1.0, 2.0])
+    weights = Tensor([1.0, 1.0, 2.0, 2.0])
+
+    def objective(input_value):
+        sharded = style_module._apply_local_transform(input_value, ShardTensor(0), mesh)
+        gathered = style_module._apply_local_transform(sharded, AllGather(0), mesh)
+        return (gathered * weights).sum()
+
+    assert ms.grad(objective)(value).asnumpy().tolist() == [3.0, 3.0, 3.0, 3.0]
+
+
+@pytest.mark.level0
+@pytest.mark.platform_x86_cpu
 def test_no_parallel_and_sequence_parallel(mock_local_runtime):
     """Replicated parameter plans and optional sequence input sharding are applied."""
     linear = Linear(4, 4, "float32", "float32", bias=True)
@@ -160,7 +185,6 @@ def test_colwise_hooks_and_parameter_plan(mock_local_runtime):
 
     with pytest.raises(NotImplementedError, match="only support"):
         ColwiseParallel()._create_weight_sharding_plan(_Identity())
-
 
 @pytest.mark.level0
 @pytest.mark.platform_x86_cpu

@@ -242,9 +242,6 @@ class DSv4HybridSelfAttention(MultiLatentAttention):
         q = self.reshape(q, (sq, bsz, self.config.num_attention_heads, self.q_head_dim))
         # Q-head RMS normalization, aligns with Megatron
         eps = self.config.layernorm_epsilon
-        # Match the MindSpeed DSV4 reference's model-dtype Q-head RMS path.
-        # Promoting this one norm to FP32 moves the BF16 rounding boundary and
-        # can flip later MoE top-k choices despite bit-identical q_up output.
         q = q * mint.rsqrt(mint.mean(q * q, dim=-1, keepdim=True) + eps)
 
         # ---- KV shared single head -----------------------------------
@@ -279,11 +276,19 @@ class DSv4HybridSelfAttention(MultiLatentAttention):
         d = self.query_projection_size // o_groups
         # core_grouped: [sq, b, o_groups, d]; wo_a_3d: [o_groups, o_lora_rank, d]
         core_grouped = self.reshape(core_out, (sq, bsz, o_groups, d))
-        wo_a_3d = self.reshape(self.linear_o_group_proj, (o_groups, o_lora_rank, d))
+        wo_a = (
+            self.linear_o_group_proj.to_local()
+            if hasattr(self.linear_o_group_proj, "to_local")
+            else self.linear_o_group_proj
+        )
+        wo_a_3d = self.reshape(wo_a, (o_groups, o_lora_rank, d))
         # einsum("...gd,grd->...gr") ==> [g, sq*b, d] @ [g, d, r] -> [g, sq*b, r] -> [sq, b, g, r].
         cg = self.permute(self.reshape(core_grouped, (sq * bsz, o_groups, d)), (1, 0, 2))
         wo = self.permute(wo_a_3d, (0, 2, 1))
-        inter = self.bmm(self.cast(cg, mstype.float32), self.cast(wo, mstype.float32))
+        # MindSpeed's grouped ``torch.einsum`` stays in the model dtype.  A
+        # FP32 promotion changes a few BF16 rounding decisions before wo_b and
+        # is enough to create long-run optimizer drift.
+        inter = self.bmm(cg, wo)
         # [g, sq*b, r] -> [sq*b, g, r] -> [sq, b, o_groups*o_lora_rank]
         intermediate = self.reshape(
             self.permute(inter, (1, 0, 2)), (sq, bsz, o_groups * o_lora_rank)
