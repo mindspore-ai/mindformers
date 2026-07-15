@@ -16,7 +16,6 @@
 import numpy as np
 import mindspore.common.dtype as mstype
 from mindspore import nn, Parameter, Tensor, mint, ops
-from mindspore.common.initializer import initializer
 from hyper_parallel import DTensor
 try:
     from hyper_parallel.custom_ops.experimental import npu_mhc_pre_sinkhorn, npu_mhc_post
@@ -127,7 +126,7 @@ class HyperConnectionOutputCell(nn.Cell):
 
 
 class HyperConnectionHead(nn.Cell):
-    """Learnable DSV4 mHC head used to collapse the final residual streams.
+    """Learnable mHC head used to collapse the final residual streams.
 
     MindSpeed applies this head before the main decoder final RMSNorm and before
     each MTP final RMSNorm.  Keeping it learnable is important for multi-step

@@ -2059,11 +2059,12 @@ class TransformerConfig:
         }
     )
 
-    enable_hc_head: bool = field(
-        default=False,
+    enable_hc_head: Optional[bool] = field(
+        default=None,
         metadata={
-            "description": "If True, use the learnable mHC head to collapse final "
-                           "residual streams. If False, use the parameter-free mean collapse.",
+            "description": "Whether to use the learnable mHC head to collapse final residual streams. "
+                           "If unset, follow enable_hyper_connections. If False, use the parameter-free "
+                           "mean collapse.",
             "usage": ParamUsage.TRAINING,
             "source": ParamSource.MF,
             "mode": ParamMode.COMMON
@@ -2154,6 +2155,8 @@ class TransformerConfig:
             raise ValueError(f"hidden_dropout should be a float within [0, 1), but get {self.hidden_dropout}.")
         if not isinstance(self.attention_dropout, float) or not 0 <= self.attention_dropout < 1:
             raise ValueError(f"attention_dropout should be a float within [0, 1), but get {self.attention_dropout}.")
+        if self.enable_hc_head is None:
+            self.enable_hc_head = self.enable_hyper_connections
         if self.enable_hc_head and not self.enable_hyper_connections:
             raise ValueError("enable_hc_head requires enable_hyper_connections to be enabled.")
         if self.enable_hyper_connections:

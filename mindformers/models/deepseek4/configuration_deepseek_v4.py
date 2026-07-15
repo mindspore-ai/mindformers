@@ -210,7 +210,6 @@ class DeepseekV4Config(PretrainedConfig):
             attention_dropout=0.0,
             experimental_attention_variant="dsv4_hybrid",
             enable_hyper_connections=True,
-            enable_hc_head=False,
             n_group=0,
             **kwargs,
     ):
@@ -259,7 +258,6 @@ class DeepseekV4Config(PretrainedConfig):
         self.hc_mult = hc_mult
         self.hc_sinkhorn_iters = hc_sinkhorn_iters
         self.enable_hyper_connections = enable_hyper_connections
-        self.enable_hc_head = enable_hc_head
 
         # Standard parameters
         self.hidden_act = hidden_act
