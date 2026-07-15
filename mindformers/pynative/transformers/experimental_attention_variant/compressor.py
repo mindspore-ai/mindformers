@@ -203,7 +203,8 @@ class Compressor(nn.Cell):
 
         # Upcast to fp32 so the addition with fp32 ape and the subsequent
         # softmax stay numerically stable (matches Megatron implicit upcast).
-        score_f32 = score.astype(mstype.float32) + self.reshape(self.ape, (1, ratio, 1, -1))
+        ape = self.ape.to_local() if hasattr(self.ape, "to_local") else self.ape
+        score_f32 = score.astype(mstype.float32) + self.reshape(ape, (1, ratio, 1, -1))
 
         if self.overlap:
             kv = self._overlap_transform(kv, fill_value=0.0)

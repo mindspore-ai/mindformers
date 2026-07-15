@@ -53,12 +53,14 @@ from mindformers.pynative.distributed.fsdp import (
     disable_fsdp_gradient_division,
 )
 from mindformers.pynative.distributed.style import (
+    ParallelStyle,
     ColwiseParallel,
     AllGather,
     PrepareModuleInput,
     PrepareModuleInputOutput,
     RowwiseParallel,
     SequenceParallel,
+    ShardTensor,
 )
 from mindformers.pynative.distributed.mc2_style import (
     MC2ColwiseParallel,
@@ -700,6 +702,59 @@ def _gqa_attention_layer_plan(self_attn, tp_mesh, enable_mc2=False):
     return plan
 
 
+class _DSv4QUpParallel(ParallelStyle):
+    """Column-shard Q-up while reducing its replicated input gradient."""
+
+    def _apply(self, module, device_mesh):
+        # Shard -> AllGather is an identity in forward.  Its backward is
+        # AllGather -> ReduceScatter, which sums the Q-up column-shard partials.
+        module = PrepareModuleInput(input_transforms=ShardTensor(0))._apply(
+            module, device_mesh
+        )
+        return ColwiseParallel(gather_input=True, gather_output=True)._apply(
+            module, device_mesh
+        )
+
+
+def _dsv4_attention_layer_plan(self_attn, tp_mesh):
+    """Build the Local-TP plan for DSV4 hybrid fused attention.
+
+    Fused CSA's indexer KL target aggregates attention probabilities over all
+    query heads before normalisation, so head-local CSA calls are not
+    mathematically decomposable.  Keep CSA/indexer/output projection replicated
+    and use TP only for Q-up, gathering its head shards before CSA.  The whole
+    attention receives a gathered sequence and returns the local sequence
+    shard, preserving sequence parallelism without changing the fused loss.
+    """
+    world = tp_mesh.size()
+    if self_attn.query_projection_size % world != 0:
+        raise ValueError(
+            f"query_projection_size ({self_attn.query_projection_size}) must be "
+            f"divisible by TP degree ({world}) for DSV4 Q-up projection."
+        )
+
+    plan = {
+        "self_attention": PrepareModuleInputOutput(
+            # Output-shard backward reconstructs the same complete CSA output
+            # gradient on every TP rank.  Therefore input backward must select
+            # the local sequence gradient, not reduce identical copies again.
+            input_transforms=AllGather(0, reduce_grad=False),
+            output_transforms=ShardTensor(0),
+        ),
+        "self_attention.linear_q_up_proj": _DSv4QUpParallel(),
+    }
+
+    core_attention = self_attn.core_attention
+    indexer = getattr(core_attention, "indexer", None)
+    if indexer is not None:
+        plan["self_attention.core_attention.indexer"] = SequenceParallel(
+            sequence_dim=0
+        )
+
+    distribute_param_plan = []
+    return plan, distribute_param_plan
+
+
 def _dense_mlp_layer_plan(enable_mc2=False):
     """Return the complete local TP plan for a dense MLP."""
     colwise = MC2ColwiseParallel() if enable_mc2 else ColwiseParallel(gather_input=True)
@@ -725,15 +780,14 @@ def _apply_layers_tp(
     """
     world = tp_mesh.size()
     self_attn = transformer_layer.self_attention
+    is_dsv4 = isinstance(self_attn, DSv4HybridSelfAttention)
     is_mla = isinstance(self_attn, MLASelfAttention)
-    if isinstance(self_attn, DSv4HybridSelfAttention):
-        raise NotImplementedError("Local TP flow does not support DSv4 hybrid attention yet.")
     if is_mla and self_attn.config.q_lora_rank is None:
         # Without q compression, q comes straight out of linear_qkv (sequence-sharded, not
         # head-sharded) with no colwise up-projection to all-gather it, so SP-native MLA
         # cannot form the full-sequence query.
         raise NotImplementedError("Local sequence-parallel MLA requires q_lora_rank (q compression).")
-    if not is_mla:
+    if not is_mla and not is_dsv4:
         # Standard GQA/MHA: the fused QKV is colwise-sharded along the group-interleaved
         # output dim, so each rank must own whole query-groups.
         num_kv_groups = self_attn.kv_num_heads
@@ -754,12 +808,15 @@ def _apply_layers_tp(
             "attn_hc": SequenceParallel(sequence_dim=0),
             "ffn_hc": SequenceParallel(sequence_dim=0),
         })
-    if is_mla:
+    distribute_param_plan = []
+    if is_dsv4:
+        dsv4_plan, dsv4_params = _dsv4_attention_layer_plan(self_attn, tp_mesh)
+        layer_plan.update(dsv4_plan)
+        distribute_param_plan.extend(dsv4_params)
+    elif is_mla:
         layer_plan.update(_mla_attention_layer_plan(self_attn, tp_mesh, enable_mc2))
     else:
         layer_plan.update(_gqa_attention_layer_plan(self_attn, tp_mesh, enable_mc2))
-
-    distribute_param_plan = []
 
     # Dense MLP.
     if isinstance(transformer_layer.mlp, MLP):
@@ -768,6 +825,13 @@ def _apply_layers_tp(
     # MoE: the router runs on local tokens (gate weight to_local'd in its construct).
     if isinstance(transformer_layer.mlp, MoELayer):
         router = transformer_layer.mlp.router
+        # Hidden states are sequence-sharded under Local TP.  Hash routing must
+        # consume the matching token-id shard instead of the full input_ids,
+        # otherwise its [tokens, top_k] expert map no longer matches the local
+        # router logits.
+        layer_plan["mlp"] = PrepareModuleInput(
+            input_kwarg_transforms={"input_ids": ShardTensor(1)}
+        )
         if getattr(router, "aux_loss_type", None) == "global_aux_loss":
             raise NotImplementedError("Local TP flow does not support global_aux_loss routing yet.")
         # Match the baseline parameter placements even for non-trainable MoE state.
@@ -775,8 +839,6 @@ def _apply_layers_tp(
         distribute_param_plan.append([transformer_layer.mlp, "tokens_per_expert", (Replicate(),)])
         if getattr(transformer_layer.mlp, "enable_expert_bias", False):
             distribute_param_plan.append([transformer_layer.mlp, "expert_bias", (Replicate(),)])
-        if getattr(router, "is_hash_layer", False):
-            distribute_param_plan.append([router, "tid2eid", (Replicate(),)])
         if not enable_ep:
             distribute_param_plan.extend([
                 [transformer_layer.mlp.experts, "weight1", (Replicate(),)],

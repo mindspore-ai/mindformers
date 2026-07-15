@@ -94,5 +94,5 @@ class PyNativeDeepseekV4ForCausalLM(TrainModelMixin, DeepseekV4PreTrainedModel):
     def get_mtp_loss(self, metric_group, metric_group_size):
         return self.model.get_mtp_loss(metric_group, metric_group_size)
 
-    def get_index_loss(self):
-        return self.model.get_index_loss()
+    def get_index_loss(self, *args, **kwargs):
+        return self.model.get_index_loss(*args, **kwargs)

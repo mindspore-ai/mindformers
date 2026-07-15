@@ -22,24 +22,272 @@ import numpy as np
 
 from mindspore import nn, Tensor, mint, ops
 from mindspore import dtype as mstype
+from mindspore.common._grad_function import _Function
 from mindspore.common.parameter import Parameter
 
 try:
-    from hyper_parallel.custom_ops.experimental import npu_sparse_attn_shared_kv
+    from hyper_parallel.custom_ops.experimental import (
+        npu_sparse_flash_mla,
+        npu_sparse_flash_mla_grad,
+        npu_sparse_lightning_indexer_kl_loss_grad,
+    )
 except ImportError:
-    # Fused DSA ops are not shipped in every hyper_parallel build.
-    # The naive path (force_unfused_dsa=True) does not need them. degrade to None and guard the fused call sites,
-    # so this module and every PyNative model that imports it (DeepSeek-V3/V4, Qwen3) still imports.
-    npu_sparse_attn_shared_kv = None
+    npu_sparse_flash_mla = None
+    npu_sparse_flash_mla_grad = None
+    npu_sparse_lightning_indexer_kl_loss_grad = None
 
 from mindformers.parallel_core.utils.spec_utils import ModuleSpec, build_module
 from mindformers.parallel_core.transformer_config import MLATransformerConfig
 from mindformers.pynative.transformers.experimental_attention_variant.indexer import (
     _IndexerLossAutoScaler,
-    FusedCSAIndexerLoss,
     UnfusedCSAIndexerLoss,
 )
 from mindformers.pynative.transformers.experimental_attention_variant.utils import  save_to_indexer_losses_tracker
+
+
+def _prepare_sparse_flash_mla(
+        ori_kv,
+        cmp_kv,
+        cmp_sparse_indices,
+        cmp_ratio,
+):
+    """Prepare compressed indices and residual for SparseFlashMla."""
+    ori_length = ori_kv.shape[1]
+    has_cmp = cmp_kv is not None
+    if has_cmp and cmp_ratio <= 0:
+        raise ValueError(f"cmp_ratio must be positive when cmp_kv is present, but got {cmp_ratio}.")
+    kernel_cmp_ratio = cmp_ratio if has_cmp else 1
+    use_sparse_indices = has_cmp and cmp_ratio == 4 and cmp_sparse_indices is not None
+    sparse_indices = mint.unsqueeze(cmp_sparse_indices, dim=2) if use_sparse_indices else None
+    # MindSpeed materializes a zero residual tensor even when no compressed-KV
+    # branch is present (``cmp_ratio == 0`` is normalized to one first).  The
+    # SparseFlashMLA forward is bit-identical with ``None``, but its backward
+    # takes a slightly different kernel path and changes a few dKV elements.
+    cmp_residual = Tensor(
+        [int(ori_length) % kernel_cmp_ratio],
+        dtype=mstype.int32,
+    )
+    return sparse_indices, cmp_residual, kernel_cmp_ratio
+
+
+class FusedSparseFlashMla(_Function):
+    """SparseFlashMla custom autograd for BSND DSV4 layers without indexer loss."""
+
+    @staticmethod
+    def forward(
+            ctx,
+            query,
+            ori_kv,
+            cmp_kv,
+            cmp_sparse_indices,
+            sinks,
+            softmax_scale,
+            cmp_ratio,
+            ori_mask_mode,
+            cmp_mask_mode,
+            ori_win_left,
+            ori_win_right,
+    ):
+        """Run SparseFlashMla forward and retain inputs for its custom backward."""
+        sparse_indices, cmp_residual, kernel_cmp_ratio = _prepare_sparse_flash_mla(
+            ori_kv, cmp_kv, cmp_sparse_indices, cmp_ratio,
+        )
+        output, softmax_lse = npu_sparse_flash_mla(
+            query,
+            ori_kv=ori_kv,
+            cmp_kv=cmp_kv,
+            cmp_sparse_indices=sparse_indices,
+            cmp_residual_kv=cmp_residual,
+            sinks=sinks,
+            softmax_scale=softmax_scale,
+            cmp_ratio=kernel_cmp_ratio,
+            ori_mask_mode=ori_mask_mode,
+            cmp_mask_mode=cmp_mask_mode,
+            ori_win_left=ori_win_left,
+            ori_win_right=ori_win_right,
+            layout="BSND",
+            return_softmax_lse=True,
+        )
+        ctx.query = query
+        ctx.ori_kv = ori_kv
+        ctx.cmp_kv = cmp_kv
+        ctx.sparse_indices = sparse_indices
+        ctx.cmp_residual = cmp_residual
+        ctx.sinks = sinks
+        ctx.output = output
+        ctx.softmax_lse = softmax_lse
+        ctx.softmax_scale = softmax_scale
+        ctx.cmp_ratio = kernel_cmp_ratio
+        ctx.ori_mask_mode = ori_mask_mode
+        ctx.cmp_mask_mode = cmp_mask_mode
+        ctx.ori_win_left = ori_win_left
+        ctx.ori_win_right = ori_win_right
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """Run SparseFlashMlaGrad and return gradients for differentiable inputs."""
+        d_query, d_ori_kv, d_cmp_kv, d_sinks, _, _ = npu_sparse_flash_mla_grad(
+            ctx.query,
+            grad_output.contiguous(),
+            ctx.output,
+            ctx.softmax_lse,
+            ori_kv=ctx.ori_kv,
+            cmp_kv=ctx.cmp_kv,
+            cmp_sparse_indices=ctx.sparse_indices,
+            cmp_residual_kv=ctx.cmp_residual,
+            sinks=ctx.sinks,
+            softmax_scale=ctx.softmax_scale,
+            cmp_ratio=ctx.cmp_ratio,
+            ori_mask_mode=ctx.ori_mask_mode,
+            cmp_mask_mode=ctx.cmp_mask_mode,
+            ori_win_left=ctx.ori_win_left,
+            ori_win_right=ctx.ori_win_right,
+            layout="BSND",
+        )
+        return (
+            d_query, d_ori_kv, d_cmp_kv if ctx.cmp_kv is not None else None,
+            None, d_sinks, None, None, None, None, None, None,
+        )
+
+
+def _compute_fused_indexer_loss(attn_softmax_l1, indexer_softmax, eps=1.0e-9):
+    """Match MindSpeed's source-level fused DSV4 indexer loss formula."""
+    norm = mint.sum(mint.abs(attn_softmax_l1), dim=-1, keepdim=True)
+    target = attn_softmax_l1 / mint.clamp(norm, min=1.0e-12)
+    target_sum = mint.sum(target, dim=-1, keepdim=True)
+    normalized_target = target / (target_sum + eps)
+    log_target = mint.log(mint.clamp(normalized_target, min=eps))
+    log_predicted = mint.log(indexer_softmax + eps)
+    return mint.mean(mint.sum((log_target - log_predicted) * target, dim=-1))
+
+
+class FusedSparseFlashMlaWithIndexerLoss(_Function):
+    """MindSpeed-equivalent SparseFlashMla and indexer-loss combined autograd."""
+
+    @staticmethod
+    def forward(
+            ctx,
+            query,
+            ori_kv,
+            cmp_kv,
+            cmp_sparse_indices,
+            query_index,
+            key_index,
+            weights,
+            sinks,
+            softmax_scale,
+            cmp_ratio,
+            ori_mask_mode,
+            cmp_mask_mode,
+            ori_win_left,
+            ori_win_right,
+            loss_coeff,
+            layer_number,
+            num_layers,
+    ):
+        """Run fused attention and save everything required by the combined backward."""
+        sparse_indices, cmp_residual, kernel_cmp_ratio = _prepare_sparse_flash_mla(
+            ori_kv, cmp_kv, cmp_sparse_indices, cmp_ratio,
+        )
+        output, softmax_lse = npu_sparse_flash_mla(
+            query,
+            ori_kv=ori_kv,
+            cmp_kv=cmp_kv,
+            cmp_sparse_indices=sparse_indices,
+            cmp_residual_kv=cmp_residual,
+            sinks=sinks,
+            softmax_scale=softmax_scale,
+            cmp_ratio=kernel_cmp_ratio,
+            ori_mask_mode=ori_mask_mode,
+            cmp_mask_mode=cmp_mask_mode,
+            ori_win_left=ori_win_left,
+            ori_win_right=ori_win_right,
+            layout="BSND",
+            return_softmax_lse=True,
+        )
+        ctx.query = query
+        ctx.ori_kv = ori_kv
+        ctx.cmp_kv = cmp_kv
+        ctx.sparse_indices = sparse_indices
+        ctx.query_index = query_index
+        ctx.key_index = key_index
+        ctx.weights = weights
+        ctx.cmp_residual = cmp_residual
+        ctx.sinks = sinks
+        ctx.output = output
+        ctx.softmax_lse = softmax_lse
+        ctx.softmax_scale = softmax_scale
+        ctx.cmp_ratio = kernel_cmp_ratio
+        ctx.ori_mask_mode = ori_mask_mode
+        ctx.cmp_mask_mode = cmp_mask_mode
+        ctx.ori_win_left = ori_win_left
+        ctx.ori_win_right = ori_win_right
+        ctx.loss_coeff = loss_coeff
+        ctx.layer_number = layer_number
+        ctx.num_layers = num_layers
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """Fuse SparseFlashMlaGrad with SparseLightningIndexerKLLossGrad."""
+        d_query, d_ori_kv, d_cmp_kv, d_sinks, _, cmp_softmax_l1 = npu_sparse_flash_mla_grad(
+            ctx.query,
+            grad_output.contiguous(),
+            ctx.output,
+            ctx.softmax_lse,
+            ori_kv=ctx.ori_kv,
+            cmp_kv=ctx.cmp_kv,
+            cmp_sparse_indices=ctx.sparse_indices,
+            cmp_residual_kv=ctx.cmp_residual,
+            sinks=ctx.sinks,
+            softmax_scale=ctx.softmax_scale,
+            cmp_ratio=ctx.cmp_ratio,
+            ori_mask_mode=ctx.ori_mask_mode,
+            cmp_mask_mode=ctx.cmp_mask_mode,
+            ori_win_left=ctx.ori_win_left,
+            ori_win_right=ctx.ori_win_right,
+            layout="BSND",
+        )
+        batch_size, query_length = ctx.query.shape[:2]
+        d_query_index, d_key_index, d_weights, indexer_softmax = (
+            npu_sparse_lightning_indexer_kl_loss_grad(
+                ctx.query_index,
+                ctx.key_index,
+                ctx.weights,
+                ctx.sparse_indices,
+                cmp_softmax_l1,
+                cmp_residual_k=ctx.cmp_residual,
+                layout="BSND",
+                mask_mode=ctx.cmp_mask_mode,
+                cmp_ratio=ctx.cmp_ratio,
+            )
+        )
+        grad_scale = (
+            _IndexerLossAutoScaler.main_loss_backward_scale
+            * ctx.loss_coeff
+            / (batch_size * query_length)
+        )
+        d_query_index = d_query_index * grad_scale
+        d_key_index = d_key_index * grad_scale
+        d_weights = d_weights * grad_scale
+        indexer_loss = _compute_fused_indexer_loss(cmp_softmax_l1, indexer_softmax)
+        save_to_indexer_losses_tracker(
+            indexer_loss * ctx.loss_coeff,
+            ctx.layer_number,
+            ctx.num_layers,
+        )
+        return (
+            d_query,
+            d_ori_kv,
+            d_cmp_kv if ctx.cmp_kv is not None else None,
+            None,
+            d_query_index,
+            d_key_index,
+            d_weights,
+            d_sinks,
+            None, None, None, None, None, None, None, None, None,
+        )
 
 
 def parse_cu_seqlens(actual_seq_len, t_global):
@@ -295,11 +543,18 @@ class CompressedSparseAttention(nn.Cell):
         self.ori_win_right = 0
         self.window_size = config.csa_window_size
         self.apply_dsa_kernel_fusion = config.apply_dsa_kernel_fusion
-        if self.apply_dsa_kernel_fusion and npu_sparse_attn_shared_kv is None:
+        required_fused_ops = (
+            npu_sparse_flash_mla,
+            npu_sparse_flash_mla_grad,
+            npu_sparse_lightning_indexer_kl_loss_grad,
+        )
+        if self.apply_dsa_kernel_fusion and any(op is None for op in required_fused_ops):
             raise ValueError(
-                "Fused DSA op 'npu_sparse_attn_shared_kv' is unavailable in this hyper_parallel build."
+                "DSV4 fused SparseFlashMla/indexer-loss ops are unavailable in this hyper_parallel build."
                 "set apply_dsa_kernel_fusion=False to use the unfused small-op implement."
             )
+        if self.apply_dsa_kernel_fusion and self.layout != "BSND":
+            raise ValueError("The DSV4 fused precision path currently supports BSND layout only.")
 
         # --- attn_sink learnable Parameter (fp32, per-head) ----------
         self.attn_sink = Parameter(
@@ -399,39 +654,48 @@ class CompressedSparseAttention(nn.Cell):
         attn_sink = self.attn_sink
         if hasattr(attn_sink, "to_local"):
             attn_sink = attn_sink.to_local()
-        output = npu_sparse_attn_shared_kv(
-            query,
-            ori_kv=key,
-            cmp_kv=compressed_kv,
-            cmp_sparse_indices=topk_indices,
-            sinks=attn_sink,
-            softmax_scale=self.softmax_scale,
-            cmp_ratio=self.compress_ratio,
-            ori_win_left=self.ori_win_left,
-            ori_win_right=self.ori_win_right,
-            ori_mask_mode=self.ori_mask_mode,
-            cmp_mask_mode=self.cmp_mask_mode,
-        )
+        # SparseFlashMla requires its sinks input in fp32.
+        attn_sink = ops.cast(attn_sink, mstype.float32)
+        if self.enable_indexer and self.training:
+            output = FusedSparseFlashMlaWithIndexerLoss.apply(
+                query,
+                key,
+                compressed_kv,
+                topk_indices,
+                ops.cast(query_index, mstype.bfloat16),
+                ops.cast(key_index, mstype.bfloat16),
+                ops.cast(weights, mstype.float32),
+                attn_sink,
+                self.softmax_scale,
+                self.compress_ratio,
+                self.ori_mask_mode,
+                self.cmp_mask_mode,
+                self.ori_win_left,
+                self.ori_win_right,
+                self.dsa_indexer_loss_coeff,
+                self.layer_number,
+                self.config.num_layers + (self.config.mtp_num_layers or 0),
+            )
+        else:
+            output = FusedSparseFlashMla.apply(
+                query,
+                key,
+                compressed_kv,
+                topk_indices,
+                attn_sink,
+                self.softmax_scale,
+                self.compress_ratio,
+                self.ori_mask_mode,
+                self.cmp_mask_mode,
+                self.ori_win_left,
+                self.ori_win_right,
+            )
         # npu_sparse_attn_shared_kv returns BSND/TND [b, sq, np, vd]/[b * sq, np, vd];
         # reshape to [b, sq, np * vd]
         # then transpose back to [sq, b, np, vd]
         output = self.reshape(output, (b, s, n, d))
         output = self.permute(output, (1, 0, 2, 3))
 
-        # --- Attach indexer KL loss to the output graph -------------
-        if self.enable_indexer and self.training:
-            indexer_loss = FusedCSAIndexerLoss.apply(query, compressed_kv,
-                                                     query_index, key_index, weights, topk_indices,
-                                                     self.softmax_scale, self.layout,
-                                                     self.compress_ratio, self.dsa_indexer_loss_coeff,
-                                                     actual_seq_len, actual_seq_len)
-            if self.dsa_indexer_loss_coeff > 0:
-                save_to_indexer_losses_tracker(
-                    indexer_loss,
-                    self.layer_number,
-                    self.config.num_layers + (self.config.mtp_num_layers or 0),
-                )
-            output = self.indexer_loss_auto_scaler.apply(output, indexer_loss)
         return output
 
     # pylint: disable=too-many-locals

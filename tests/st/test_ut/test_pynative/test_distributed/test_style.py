@@ -54,15 +54,20 @@ class TestPrepareModule:
     def test_prepare_module_input_output_validation(self):
         """
         Feature: PrepareModuleInput/Output/InputOutput
-        Description: Test positional input/output transform arity validation.
-        Expectation: mismatched transform counts raise ValueError.
+        Description: Test optional positional inputs and output arity validation.
+        Expectation: extra inputs pass through, but required transforms and output arity stay strict.
         """
         style = PrepareModuleInputOutput(
             input_transforms=(None,),
             output_transforms=(None,),
         )
-        with pytest.raises(ValueError, match="inputs and input_transforms should have same length"):
-            style.prepare_module_input._prepare_input_fn((object(), object()), None)
+        first, optional = object(), object()
+        assert style.prepare_module_input._prepare_input_fn(
+            (first, optional), None
+        ) == (first, optional)
+        required = PrepareModuleInput(input_transforms=(None, ShardTensor(0)))
+        with pytest.raises(ValueError, match="cannot omit arguments"):
+            required._prepare_input_fn((first,), None)
         with pytest.raises(ValueError, match="outputs and output_transforms should have same length"):
             style.prepare_module_output._prepare_out_fn((object(), object()), None)
 

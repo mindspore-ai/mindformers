@@ -709,6 +709,10 @@ class PrepareModuleInput(ParallelStyle):
         """Prepare a single plain-tensor input argument."""
         if transform is None:
             return inp
+        if inp is None:
+            # Optional tensor kwargs (for example ``input_ids`` on non-hash
+            # MTP MoE layers) remain absent under a parallel input transform.
+            return None
         if not isinstance(inp, ms.Tensor):
             raise ValueError(f"expecting input to be a Tensor, but got {type(inp)}")
         return _apply_local_transform(inp, transform, mesh)
@@ -720,13 +724,18 @@ class PrepareModuleInput(ParallelStyle):
         prepared_inputs = []
         if not isinstance(inputs, tuple):
             inputs = (inputs,)
-        if len(inputs) != len(self.input_transforms):
-            raise ValueError("module inputs and input_transforms should have same length!")
+        if len(inputs) < len(self.input_transforms):
+            missing_transforms = self.input_transforms[len(inputs):]
+            if any(transform is not None for transform in missing_transforms):
+                raise ValueError(
+                    "module inputs cannot omit arguments with a non-empty input transform!"
+                )
 
         for inp, transform in zip(inputs, self.input_transforms):
             prepared_inputs.append(
                 self._prepare_input_arg(inp, device_mesh, transform)
             )
+        prepared_inputs.extend(inputs[len(self.input_transforms):])
         return tuple(prepared_inputs)
 
     def _prepare_input_kwarg_fn(self, inputs, kwarg_inputs, device_mesh):
