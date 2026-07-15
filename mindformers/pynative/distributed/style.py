@@ -37,7 +37,7 @@ __all__ = [
 
 
 def _contiguous(tensor):
-    return tensor.contiguous() if hasattr(tensor, "contiguous") else tensor
+    return tensor.contiguous()
 
 
 def _normalize_dim(dim: int, ndim: int) -> int:
@@ -50,16 +50,22 @@ def _normalize_dim(dim: int, ndim: int) -> int:
 
 def _all_gather_dim(tensor, dim, group):
     """All-gather a local tensor shard along an arbitrary dimension."""
-    value = tensor.movedim(dim, 0).contiguous()
+    if dim == 0:
+        value, _ = comm_func.all_gather_into_tensor(None, _contiguous(tensor), group=group)
+        return value
+    value = _contiguous(tensor.movedim(dim, 0))
     value, _ = comm_func.all_gather_into_tensor(None, value, group=group)
-    return value.movedim(0, dim).contiguous()
+    return _contiguous(value.movedim(0, dim))
 
 
 def _reduce_scatter_dim(tensor, dim, group):
     """Reduce-scatter a tensor along an arbitrary dimension."""
-    value = tensor.movedim(dim, 0).contiguous()
+    if dim == 0:
+        value, _ = comm_func.reduce_scatter_tensor(None, _contiguous(tensor), group=group)
+        return value
+    value = _contiguous(tensor.movedim(dim, 0))
     value, _ = comm_func.reduce_scatter_tensor(None, value, group=group)
-    return value.movedim(0, dim).contiguous()
+    return _contiguous(value.movedim(0, dim))
 
 
 def _slice_dim(tensor, dim, world, rank):
@@ -79,36 +85,44 @@ class _AllReduceFunction(_Function):
     """AllReduce partial values in forward and preserve replicated gradients."""
 
     @staticmethod
-    def forward(ctx, tensor, group):  # pylint: disable=arguments-differ
-        del ctx
+    def forward(ctx, tensor, group):  # pylint: disable=arguments-differ,unused-argument
         output, _ = comm_func.all_reduce(tensor, group=group)
         return output
 
     @staticmethod
-    def backward(ctx, grad_output):  # pylint: disable=arguments-differ
-        del ctx
+    def backward(ctx, grad_output):  # pylint: disable=arguments-differ,unused-argument
         return grad_output, None
 
 
 class _AllGatherFunction(_Function):
-    """AllGather with either ReduceScatter or local-slice backward."""
+    """AllGather with ReduceScatter backward."""
 
     @staticmethod
-    def forward(ctx, tensor, dim, group, world, rank, reduce_grad):  # pylint: disable=arguments-differ
+    def forward(ctx, tensor, dim, group):  # pylint: disable=arguments-differ
         ctx.dim = dim
         ctx.group = group
-        ctx.world = world
-        ctx.rank = rank
-        ctx.reduce_grad = reduce_grad
         return _all_gather_dim(tensor, dim, group)
 
     @staticmethod
     def backward(ctx, grad_output):  # pylint: disable=arguments-differ
-        if ctx.reduce_grad:
-            grad_input = _reduce_scatter_dim(grad_output, ctx.dim, ctx.group)
-        else:
-            grad_input = _slice_dim(grad_output, ctx.dim, ctx.world, ctx.rank)
-        return grad_input, None, None, None, None, None
+        grad_input = _reduce_scatter_dim(grad_output, ctx.dim, ctx.group)
+        return grad_input, None, None
+
+
+class _AllGatherSliceFunction(_Function):
+    """AllGather with a local-slice backward for replicated outputs."""
+
+    @staticmethod
+    def forward(ctx, tensor, dim, group, world, rank):  # pylint: disable=arguments-differ
+        ctx.dim = dim
+        ctx.world = world
+        ctx.rank = rank
+        return _all_gather_dim(tensor, dim, group)
+
+    @staticmethod
+    def backward(ctx, grad_output):  # pylint: disable=arguments-differ
+        grad_input = _slice_dim(grad_output, ctx.dim, ctx.world, ctx.rank)
+        return grad_input, None, None, None, None
 
 
 class _ShardFunction(_Function):
@@ -151,27 +165,69 @@ class ShardTensor:
 TensorTransform = Union[AllGather, ShardTensor]
 
 
-def _apply_local_transform(tensor, transform, device_mesh):
-    """Apply an explicit local tensor transform on a one-dimensional mesh."""
-    if transform is None:
-        return tensor
-    if isinstance(tensor, DTensor):
-        raise TypeError("Local parallel styles expect plain Tensor activations, but got DTensor.")
+def _bind_dim(dim):
+    """Bind dimension normalization while keeping runtime rank validation."""
+    if not isinstance(dim, int):
+        raise TypeError(f"Dimension must be an int, but got {type(dim).__name__}.")
+    if dim >= 0:
+        def _resolve_positive(tensor):
+            if dim >= tensor.ndim:
+                raise ValueError(f"Dimension {dim} is out of range for a {tensor.ndim}-D tensor.")
+            return dim
+        return _resolve_positive
 
-    world = device_mesh.size()
-    group = device_mesh.get_group()
-    rank = device_mesh.get_local_rank()
+    def _resolve_negative(tensor):
+        return _normalize_dim(dim, tensor.ndim)
+    return _resolve_negative
+
+
+def _bind_local_transform(transform, device_mesh):
+    """Bind a local transform to immutable mesh metadata at parallelize time."""
+    if transform is None:
+        return None
+
+    # Keep the cached values in the per-module hook closure rather than on the
+    # style/transform object, since callers may reuse one style across meshes.
     if isinstance(transform, AllGather):
-        dim = _normalize_dim(transform.dim, tensor.ndim)
-        return _AllGatherFunction.apply(
-            tensor, dim, group, world, rank, transform.reduce_grad
-        )
+        resolve_dim = _bind_dim(transform.dim)
+        group = device_mesh.get_group()
+        if transform.reduce_grad:
+            def _apply_all_gather(tensor):
+                if isinstance(tensor, DTensor):
+                    raise TypeError("Local parallel styles expect plain Tensor activations, but got DTensor.")
+                return _AllGatherFunction.apply(tensor, resolve_dim(tensor), group)
+            return _apply_all_gather
+
+        world = device_mesh.size()
+        rank = device_mesh.get_local_rank()
+
+        def _apply_all_gather_slice(tensor):
+            if isinstance(tensor, DTensor):
+                raise TypeError("Local parallel styles expect plain Tensor activations, but got DTensor.")
+            return _AllGatherSliceFunction.apply(
+                tensor, resolve_dim(tensor), group, world, rank
+            )
+        return _apply_all_gather_slice
 
     if isinstance(transform, ShardTensor):
-        dim = _normalize_dim(transform.dim, tensor.ndim)
-        return _ShardFunction.apply(tensor, dim, group, world, rank)
+        resolve_dim = _bind_dim(transform.dim)
+        group = device_mesh.get_group()
+        world = device_mesh.size()
+        rank = device_mesh.get_local_rank()
+
+        def _apply_shard(tensor):
+            if isinstance(tensor, DTensor):
+                raise TypeError("Local parallel styles expect plain Tensor activations, but got DTensor.")
+            return _ShardFunction.apply(tensor, resolve_dim(tensor), group, world, rank)
+        return _apply_shard
 
     raise TypeError(f"Unsupported local tensor transform: {transform!r}.")
+
+
+def _apply_local_transform(tensor, transform, device_mesh):
+    """Apply one transform directly; module hooks use the bound hot-path variant."""
+    apply_transform = _bind_local_transform(transform, device_mesh)
+    return tensor if apply_transform is None else apply_transform(tensor)
 
 
 def _layout_transform(current_layout, desired_layout):
@@ -418,7 +474,7 @@ class ColwiseParallel(ParallelStyle):
     ``gather_input`` gathers a sequence-sharded input before the local matmul.
     """
 
-    def __init__(
+    def __init__(  # pylint: disable=unused-argument
         self,
         *,
         gather_input: bool = True,
@@ -427,7 +483,6 @@ class ColwiseParallel(ParallelStyle):
         use_local_output=None,
     ):
         super().__init__()
-        del output_layouts, use_local_output
         # Local flow: all-gather the sequence-sharded input before the local matmul
         # (SP). ``gather_input=False`` when the input is already full sequence.
         self.gather_input = gather_input
@@ -467,22 +522,22 @@ class ColwiseParallel(ParallelStyle):
             output_fn=None,
         )
         if self.gather_input:
-            input_transform = AllGather(0)
+            apply_input_transform = _bind_local_transform(AllGather(0), device_mesh)
 
-            def _pre_hook(unused_cell, args):
-                del unused_cell
-                gathered = _apply_local_transform(args[0], input_transform, device_mesh)
+            def _pre_hook(cell, args):  # pylint: disable=unused-argument
+                gathered = apply_input_transform(args[0])
                 return (gathered,) + tuple(args[1:])
 
             module.register_forward_pre_hook(_pre_hook)
         if self.gather_output:
             # The gathered output is replicated, so its backward is a local slice,
             # matching Megatron's gather_from_tensor_model_parallel_region.
-            output_transform = AllGather(-1, reduce_grad=False)
+            apply_output_transform = _bind_local_transform(
+                AllGather(-1, reduce_grad=False), device_mesh
+            )
 
-            def _post_hook(unused_cell, unused_args, output):
-                del unused_cell, unused_args
-                return _apply_local_transform(output, output_transform, device_mesh)
+            def _post_hook(cell, args, output):  # pylint: disable=unused-argument
+                return apply_output_transform(output)
 
             module.register_forward_hook(_post_hook)
         return module
@@ -556,17 +611,15 @@ class RowwiseParallel(ParallelStyle):
         )
         group = device_mesh.get_group()
         if not self.input_is_parallel:
-            transform = ShardTensor(-1)
+            apply_input_transform = _bind_local_transform(ShardTensor(-1), device_mesh)
 
-            def _pre_hook(unused_cell, args):
-                del unused_cell
-                sharded = _apply_local_transform(args[0], transform, device_mesh)
+            def _pre_hook(cell, args):  # pylint: disable=unused-argument
+                sharded = apply_input_transform(args[0])
                 return (sharded,) + tuple(args[1:])
 
             module.register_forward_pre_hook(_pre_hook)
 
-        def _post_hook(cell, unused_args, output):
-            del unused_args
+        def _post_hook(cell, args, output):  # pylint: disable=unused-argument
             out = _contiguous(output)
             if self.reduce_mode == "reduce_scatter":
                 out, _ = comm_func.reduce_scatter_tensor(None, out, group=group)
@@ -597,16 +650,14 @@ class RowwiseParallel(ParallelStyle):
         vocab_end = vocab_start + vocab_per_rank
         masks = []
 
-        def _pre_hook(unused_cell, args):
-            del unused_cell
+        def _pre_hook(cell, args):  # pylint: disable=unused-argument
             ids = args[0]
             in_range = mint.logical_and(ids >= vocab_start, ids < vocab_end)
             masks.append(in_range)
             local_ids = (ids - vocab_start) * in_range.to(ids.dtype)
             return (local_ids,) + tuple(args[1:])
 
-        def _post_hook(unused_cell, unused_args, output):
-            del unused_cell, unused_args
+        def _post_hook(cell, args, output):  # pylint: disable=unused-argument
             in_range = masks.pop()
             bsz, seq = in_range.shape
             output = output * in_range.reshape(bsz, seq, 1).to(output.dtype)
@@ -661,11 +712,12 @@ class SequenceParallel(NoParallel):
     def _apply(self, module: nn.Cell, device_mesh: DeviceMesh) -> nn.Cell:
         module = super()._apply(module, device_mesh)
         if not self.input_is_parallel:
-            transform = ShardTensor(self.sequence_dim)
+            apply_input_transform = _bind_local_transform(
+                ShardTensor(self.sequence_dim), device_mesh
+            )
 
-            def _pre_hook(unused_cell, args):
-                del unused_cell
-                sharded = _apply_local_transform(args[0], transform, device_mesh)
+            def _pre_hook(cell, args):  # pylint: disable=unused-argument
+                sharded = apply_input_transform(args[0])
                 return (sharded,) + tuple(args[1:])
 
             module.register_forward_pre_hook(_pre_hook)
@@ -681,7 +733,7 @@ class SequenceParallel(NoParallel):
 class PrepareModuleInput(ParallelStyle):
     """Apply explicit local transforms to positional or keyword inputs."""
 
-    def __init__(
+    def __init__(  # pylint: disable=unused-argument
         self,
         *,
         input_transforms: Optional[Union[TensorTransform, Tuple[Optional[TensorTransform], ...]]] = None,
@@ -690,7 +742,6 @@ class PrepareModuleInput(ParallelStyle):
         desired_input_layouts=None,
         use_local_input=None,
     ):
-        del use_local_input
         if input_transforms is None and input_layouts is not None:
             input_transforms = _layout_transforms(input_layouts, desired_input_layouts)
         self.input_transforms = (
@@ -700,14 +751,10 @@ class PrepareModuleInput(ParallelStyle):
         self.with_kwargs = input_kwarg_transforms is not None
         self.input_kwarg_transforms = input_kwarg_transforms or {}
 
-    def _prepare_input_arg(
-        self,
-        inp: Any,
-        mesh: DeviceMesh,
-        transform: Optional[TensorTransform],
-    ):
-        """Prepare a single plain-tensor input argument."""
-        if transform is None:
+    @staticmethod
+    def _prepare_input_arg(inp: Any, apply_transform):
+        """Prepare one input with a transform already bound to its mesh."""
+        if apply_transform is None:
             return inp
         if inp is None:
             # Optional tensor kwargs (for example ``input_ids`` on non-hash
@@ -715,39 +762,71 @@ class PrepareModuleInput(ParallelStyle):
             return None
         if not isinstance(inp, ms.Tensor):
             raise ValueError(f"expecting input to be a Tensor, but got {type(inp)}")
-        return _apply_local_transform(inp, transform, mesh)
+        return apply_transform(inp)
 
-    def _prepare_input_fn(self, inputs, device_mesh):
-        """Prepare input arguments."""
-        if self.input_transforms is None:
+    def _bind_input_transforms(self, device_mesh):
+        """Bind positional and keyword transforms once during style application."""
+        positional = None
+        if self.input_transforms is not None:
+            positional = tuple(
+                _bind_local_transform(transform, device_mesh)
+                for transform in self.input_transforms
+            )
+        keyword = {
+            key: _bind_local_transform(transform, device_mesh)
+            for key, transform in self.input_kwarg_transforms.items()
+        }
+        return positional, keyword
+
+    def _prepare_bound_inputs(self, inputs, apply_transforms):
+        """Prepare positional inputs with pre-bound transform callables."""
+        if apply_transforms is None:
             return inputs
-        prepared_inputs = []
         if not isinstance(inputs, tuple):
             inputs = (inputs,)
-        if len(inputs) < len(self.input_transforms):
-            missing_transforms = self.input_transforms[len(inputs):]
+        self._validate_input_arity(inputs, apply_transforms)
+        prepared_inputs = [
+            self._prepare_input_arg(inp, apply_transform)
+            for inp, apply_transform in zip(inputs, apply_transforms)
+        ]
+        prepared_inputs.extend(inputs[len(apply_transforms):])
+        return tuple(prepared_inputs)
+
+    @staticmethod
+    def _validate_input_arity(inputs, transforms):
+        """Reject omitted inputs only when their corresponding transform is required."""
+        if len(inputs) < len(transforms):
+            missing_transforms = transforms[len(inputs):]
             if any(transform is not None for transform in missing_transforms):
                 raise ValueError(
                     "module inputs cannot omit arguments with a non-empty input transform!"
                 )
 
-        for inp, transform in zip(inputs, self.input_transforms):
-            prepared_inputs.append(
-                self._prepare_input_arg(inp, device_mesh, transform)
-            )
-        prepared_inputs.extend(inputs[len(self.input_transforms):])
-        return tuple(prepared_inputs)
+    def _prepare_input_fn(self, inputs, device_mesh):
+        """Prepare input arguments."""
+        normalized_inputs = inputs if isinstance(inputs, tuple) else (inputs,)
+        if self.input_transforms is not None:
+            self._validate_input_arity(normalized_inputs, self.input_transforms)
+        apply_transforms, _ = self._bind_input_transforms(device_mesh)
+        return self._prepare_bound_inputs(inputs, apply_transforms)
+
+    def _prepare_bound_input_kwargs(
+        self, inputs, kwarg_inputs, positional_transforms, keyword_transforms
+    ):
+        """Prepare positional and keyword inputs with pre-bound transforms."""
+        prepared_arg_inputs = self._prepare_bound_inputs(inputs, positional_transforms)
+        prepared_kwarg_inputs = {
+            key: self._prepare_input_arg(value, keyword_transforms.get(key))
+            for key, value in kwarg_inputs.items()
+        }
+        return prepared_arg_inputs, prepared_kwarg_inputs
 
     def _prepare_input_kwarg_fn(self, inputs, kwarg_inputs, device_mesh):
         """Prepare input arguments and keyword arguments."""
-        prepared_arg_inputs = self._prepare_input_fn(inputs, device_mesh)
-        prepared_kwarg_inputs = {}
-        for kwarg_key, kwarg_val in kwarg_inputs.items():
-            prepared_kwarg_inputs[kwarg_key] = self._prepare_input_arg(
-                kwarg_val, device_mesh, self.input_kwarg_transforms.get(kwarg_key)
-            )
-
-        return (prepared_arg_inputs, prepared_kwarg_inputs)
+        positional, keyword = self._bind_input_transforms(device_mesh)
+        return self._prepare_bound_input_kwargs(
+            inputs, kwarg_inputs, positional, keyword
+        )
 
     def _apply(self, module: nn.Cell, device_mesh: DeviceMesh) -> nn.Cell:
         """
@@ -756,17 +835,22 @@ class PrepareModuleInput(ParallelStyle):
         This method registers a forward pre-hook on the module to prepare inputs
         according to the specified transforms before the module's construct method is called.
         """
+        positional_transforms, keyword_transforms = self._bind_input_transforms(device_mesh)
         if self.with_kwargs:
+            def _pre_hook_with_kwargs(cell, inputs, kwargs):  # pylint: disable=unused-argument
+                return self._prepare_bound_input_kwargs(
+                    inputs, kwargs, positional_transforms, keyword_transforms
+                )
+
             module.register_forward_pre_hook(
-                lambda _, inputs, kwargs: self._prepare_input_kwarg_fn(
-                    inputs, kwargs, device_mesh
-                ),
+                _pre_hook_with_kwargs,
                 with_kwargs=True,
             )
         else:
-            module.register_forward_pre_hook(
-                lambda _, inputs: self._prepare_input_fn(inputs, device_mesh)
-            )
+            def _pre_hook(cell, inputs):  # pylint: disable=unused-argument
+                return self._prepare_bound_inputs(inputs, positional_transforms)
+
+            module.register_forward_pre_hook(_pre_hook)
         return module
 
     def __repr__(self) -> str:
@@ -780,7 +864,7 @@ class PrepareModuleInput(ParallelStyle):
 class PrepareModuleOutput(ParallelStyle):
     """Apply explicit local transforms to module outputs."""
 
-    def __init__(
+    def __init__(  # pylint: disable=unused-argument
         self,
         *,
         output_transforms: Optional[Union[TensorTransform, Tuple[Optional[TensorTransform], ...]]] = None,
@@ -788,7 +872,6 @@ class PrepareModuleOutput(ParallelStyle):
         desired_output_layouts=None,
         use_local_output=None,
     ):
-        del use_local_output
         if output_transforms is None and output_layouts is not None:
             output_transforms = _layout_transforms(output_layouts, desired_output_layouts)
         self.output_transforms = (
@@ -796,29 +879,45 @@ class PrepareModuleOutput(ParallelStyle):
             else output_transforms
         )
 
-    def _prepare_out_fn(self, outputs, device_mesh):
-        """Prepare output arguments."""
-        prepared_outputs = []
+    def _bind_output_transforms(self, device_mesh):
+        """Bind output transforms once during style application."""
+        if self.output_transforms is None:
+            return None
+        return tuple(
+            _bind_local_transform(transform, device_mesh)
+            for transform in self.output_transforms
+        )
+
+    @staticmethod
+    def _prepare_bound_outputs(outputs, apply_transforms):
+        """Prepare outputs with transform callables already bound to their mesh."""
+        if apply_transforms is None:
+            return outputs
         if not isinstance(outputs, tuple):
             outputs = (outputs,)
-        if len(outputs) != len(self.output_transforms):
+        if len(outputs) != len(apply_transforms):
             raise ValueError(
                 "module outputs and output_transforms should have same length!"
             )
 
-        for out, transform in zip(outputs, self.output_transforms):
-            if transform is None:
+        prepared_outputs = []
+        for out, apply_transform in zip(outputs, apply_transforms):
+            if apply_transform is None:
                 prepared_outputs.append(out)
                 continue
             if not isinstance(out, ms.Tensor):
                 raise ValueError(f"expecting output to be a Tensor, but got {type(out)}")
-            prepared_outputs.append(
-                _apply_local_transform(out, transform, device_mesh)
-            )
+            prepared_outputs.append(apply_transform(out))
 
         if len(prepared_outputs) == 1:
             return prepared_outputs[0]
         return tuple(prepared_outputs)
+
+    def _prepare_out_fn(self, outputs, device_mesh):
+        """Prepare output arguments."""
+        return self._prepare_bound_outputs(
+            outputs, self._bind_output_transforms(device_mesh)
+        )
 
     def _apply(self, module: nn.Cell, device_mesh: DeviceMesh) -> nn.Cell:
         """
@@ -827,9 +926,12 @@ class PrepareModuleOutput(ParallelStyle):
         This method registers a forward hook on the module to prepare outputs
         according to the specified transforms after the module's construct method is called.
         """
-        module.register_forward_hook(
-            lambda _, inputs, outputs: self._prepare_out_fn(outputs, device_mesh)
-        )
+        apply_transforms = self._bind_output_transforms(device_mesh)
+
+        def _post_hook(cell, inputs, outputs):  # pylint: disable=unused-argument
+            return self._prepare_bound_outputs(outputs, apply_transforms)
+
+        module.register_forward_hook(_post_hook)
         return module
 
     def __repr__(self) -> str:
