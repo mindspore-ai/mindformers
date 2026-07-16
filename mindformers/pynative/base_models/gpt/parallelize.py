@@ -1502,13 +1502,25 @@ def apply_context_parallel_attention(
                     "CP feeds per-batch cos/sin to the fused RoPE op, which rejects it in tiling. "
                     "Set apply_rope_fusion=false, or enable use_eod_attn_mask_compression."
                 )
-        if async_enabled and method == "ulysses":
+        if async_enabled and method in ("ulysses", "hybrid"):
+            # Async Ulysses (and hybrid's inner Ulysses group) splits the local
+            # per-TP-rank heads. Validate that count rather than the global head
+            # count so an invalid TP x CP layout fails during setup instead of in FA.
             num_heads = getattr(model_config, "num_attention_heads", None)
-            if num_heads is not None:
-                if num_heads % ulysses_degree != 0:
+            tp_size = max(int(getattr(parallel_dims, "tp", 1)), 1)
+            if num_heads is not None and ulysses_degree:
+                if num_heads % tp_size != 0:
                     raise ValueError(
                         f"num_attention_heads ({num_heads}) must be divisible by "
-                        f"ulysses_degree ({ulysses_degree})."
+                        f"tensor_parallel ({tp_size})."
+                    )
+                heads_per_rank = num_heads // tp_size
+                if heads_per_rank % ulysses_degree != 0:
+                    raise ValueError(
+                        f"Async {method} CP requires per-TP-rank attention heads "
+                        f"(num_attention_heads // tensor_parallel = {num_heads} // {tp_size} "
+                        f"= {heads_per_rank}) to be divisible by ulysses_degree "
+                        f"({ulysses_degree})."
                     )
 
     cp_style = build_context_parallel_attention_style(
