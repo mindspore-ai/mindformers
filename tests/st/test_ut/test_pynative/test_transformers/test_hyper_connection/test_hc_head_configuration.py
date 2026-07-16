@@ -53,19 +53,44 @@ def _transformer_config(**kwargs):
 
 @pytest.mark.level0
 @pytest.mark.platform_x86_cpu
-def test_hc_head_is_disabled_by_default_and_converted():
-    """Enabling mHC alone must not silently add learnable head parameters."""
-    model_config = DeepseekV4Config(enable_hyper_connections=True, head_dim=128)
+def test_hc_head_defaults_to_hyper_connections():
+    """An unspecified head switch follows the common mHC switch."""
+    assert _transformer_config(enable_hyper_connections=False).enable_hc_head is False
+    assert _transformer_config(enable_hyper_connections=True).enable_hc_head is True
 
-    assert model_config.enable_hc_head is False
-    assert model_config.convert_to_transformer_config().enable_hc_head is False
 
-    model_config = DeepseekV4Config(
+@pytest.mark.level0
+@pytest.mark.platform_x86_cpu
+def test_hc_head_can_be_disabled_while_hyper_connections_are_enabled():
+    """Users may explicitly keep the parameter-free mean collapse with mHC."""
+    config = _transformer_config(
         enable_hyper_connections=True,
-        enable_hc_head=True,
+        enable_hc_head=False,
+    )
+
+    assert config.enable_hc_head is False
+
+
+@pytest.mark.level0
+@pytest.mark.platform_x86_cpu
+def test_model_config_conversion_preserves_common_hc_head_policy():
+    """Model conversion must preserve both the common default and an explicit opt-out."""
+    inherited = DeepseekV4Config(enable_hyper_connections=True, head_dim=128)
+    assert inherited.convert_to_transformer_config().enable_hc_head is True
+
+    disabled = DeepseekV4Config(
+        enable_hyper_connections=True,
+        enable_hc_head=False,
         head_dim=128,
     )
-    assert model_config.convert_to_transformer_config().enable_hc_head is True
+    assert disabled.convert_to_transformer_config().enable_hc_head is False
+
+    with pytest.raises(ValueError, match="enable_hc_head requires enable_hyper_connections"):
+        DeepseekV4Config(
+            enable_hyper_connections=False,
+            enable_hc_head=True,
+            head_dim=128,
+        ).convert_to_transformer_config()
 
 
 @pytest.mark.level0
@@ -81,15 +106,28 @@ def test_hc_head_requires_hyper_connections():
 
 @pytest.mark.level0
 @pytest.mark.platform_x86_cpu
-def test_hc_head_spec_is_injected_into_decoder_and_mtp():
-    """The provider-selected head spec is propagated to both output sites."""
-    config = _transformer_config(enable_hc_head=True, mtp_num_layers=1)
-    decoder_spec = get_gpt_decoder_block_spec(config, hc_head=HyperConnectionHead)
+def test_default_hc_head_spec_is_injected_into_decoder_and_mtp():
+    """The common GPT spec selects and propagates the default head to both output sites."""
+    config = _transformer_config(mtp_num_layers=1)
+    decoder_spec = get_gpt_decoder_block_spec(config)
 
     assert decoder_spec.hc_head is HyperConnectionHead
 
     mtp_spec = get_gpt_mtp_block_spec(config, decoder_spec)
     assert mtp_spec.layer_specs[0].submodules.hc_head is HyperConnectionHead
+
+
+@pytest.mark.level0
+@pytest.mark.platform_x86_cpu
+def test_disabled_hc_head_is_not_injected_into_decoder_or_mtp():
+    """The common GPT spec preserves an explicit head opt-out."""
+    config = _transformer_config(enable_hc_head=False, mtp_num_layers=1)
+    decoder_spec = get_gpt_decoder_block_spec(config)
+
+    assert decoder_spec.hc_head is None
+
+    mtp_spec = get_gpt_mtp_block_spec(config, decoder_spec)
+    assert mtp_spec.layer_specs[0].submodules.hc_head is None
 
 
 @pytest.mark.level0
@@ -118,8 +156,8 @@ def test_configured_hc_head_is_built_from_spec():
 
 @pytest.mark.level0
 @pytest.mark.platform_x86_cpu
-def test_unconfigured_hc_head_falls_back_to_mean_collapse():
-    """Without a learned head spec, preserve the original parameter-free collapse."""
+def test_disabled_hc_head_falls_back_to_mean_collapse():
+    """An explicitly disabled head uses the parameter-free mean collapse."""
     ms.set_device("CPU")
     config = _transformer_config(enable_hc_head=False)
     spec = TransformerBlockSubmodules(

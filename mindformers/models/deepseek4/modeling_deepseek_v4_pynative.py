@@ -20,7 +20,6 @@ from mindformers.pynative.base_models.gpt.gpt_model import GPTModel
 from mindformers.pynative.base_models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
 from mindformers.pynative.base_models.gpt.parallelize import parallelize_gptmodel
 from mindformers.pynative.distributed.parallelize import register_parallelize
-from mindformers.pynative.transformers.hyper_connection import HyperConnectionHead
 from mindformers.parallel_core.utils.model_mixin import TrainModelMixin
 
 from .configuration_deepseek_v4 import DeepseekV4Config
@@ -34,11 +33,7 @@ class PyNativeDeepseekV4ForCausalLM(TrainModelMixin, DeepseekV4PreTrainedModel):
         super().__init__(config, auto_prefix=False)
         transformer_config = self.convert_to_transformer_config(config, is_mla_model=True)
         if transformer_config.num_moe_experts:
-            hc_head_spec = HyperConnectionHead if transformer_config.enable_hc_head else None
-            transformer_layer_spec = get_gpt_decoder_block_spec(
-                transformer_config,
-                hc_head=hc_head_spec,
-            )
+            transformer_layer_spec = get_gpt_decoder_block_spec(transformer_config)
         else:
             raise ValueError("Only MoE model is supported in PyNativeDeepseekV4ForCausalLM.")
         self.model = GPTModel(

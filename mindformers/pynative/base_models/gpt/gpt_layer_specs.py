@@ -18,7 +18,6 @@
 # limitations under the License.
 # ============================================================================
 """GPT LayerSpec."""
-import dataclasses
 from typing import Optional, Union
 
 from mindformers.pynative.layers.linear import Linear
@@ -47,6 +46,7 @@ from mindformers.pynative.transformers.multi_token_prediction import (
     MultiTokenPredictionBlockSubmodules,
     get_mtp_layer_spec,
 )
+from mindformers.pynative.transformers.hyper_connection import HyperConnectionHead
 
 def get_mlp_module_spec(
         num_experts: Optional[int] = None,
@@ -156,16 +156,11 @@ def get_gpt_layer_local_spec(
     )
 
 
-def get_gpt_decoder_block_spec(
-        config: TransformerConfig,
-        hc_head=None,
-) -> TransformerBlockSubmodules:
+def get_gpt_decoder_block_spec(config: TransformerConfig) -> TransformerBlockSubmodules:
     """GPT block spec.
 
     Args:
         config (TransformerConfig): Transformer configuration.
-        hc_head (Union[ModuleSpec, type], optional): Learnable mHC head specification.
-            If unset, the block uses the parameter-free mean collapse.
     """
 
     # Layer specs.
@@ -223,7 +218,7 @@ def get_gpt_decoder_block_spec(
     block_spec = TransformerBlockSubmodules(
         layer_specs=layer_specs,
         layer_norm=get_norm_cls(config.normalization, config.fused_norm),
-        hc_head=hc_head,
+        hc_head=HyperConnectionHead if config.enable_hc_head else None,
     )
 
     return block_spec
