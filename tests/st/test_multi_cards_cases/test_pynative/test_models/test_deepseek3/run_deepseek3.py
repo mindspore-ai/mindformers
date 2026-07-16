@@ -15,8 +15,14 @@
 """Run DeepSeek3 training"""
 
 import argparse
+import random
+
+import numpy as np
+import mindspore as ms
 
 from mindformers.pynative.trainer import Trainer as PynativeTrainer
+
+SEED = 42
 
 
 def main():
@@ -24,6 +30,10 @@ def main():
     parser = argparse.ArgumentParser(description="Run DeepSeek3 training")
     parser.add_argument("--config", type=str, required=True, help="Path to config yaml file")
     args = parser.parse_args()
+
+    random.seed(SEED)
+    np.random.seed(SEED)
+    ms.set_seed(SEED)
 
     trainer = PynativeTrainer(config=args.config)
     trainer.train()

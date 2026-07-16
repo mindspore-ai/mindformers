@@ -15,38 +15,41 @@
 """test two cards deepseek3 training"""
 
 import os
-import random
-import subprocess
-import yaml
 import pytest
 
 from tests.st.test_multi_cards_cases.utils import TaskType
-from tests.utils.generate_dataset import generate_mindrecord_file
+from tests.utils.precision_utils import assert_expected_values_match
+from tests.st.test_multi_cards_cases.test_pynative.test_models.test_deepseek3.utils import (
+    build_case_config,
+    generate_dataset,
+    run_training_and_extract_losses,
+    save_model_checkpoints,
+)
 
-_LEVEL_0_TASK_TIME = 240
+_LEVEL_0_TASK_TIME = 120
 _LEVEL_1_TASK_TIME = 0
 _TASK_TYPE = TaskType.TWO_CARDS_TASK
 
 CUR_DIR = os.path.dirname(os.path.abspath(__file__))
 BASE_CONFIG = os.path.join(CUR_DIR, "pynative_ds3.yaml")
 DATASET_PATH = os.path.join(CUR_DIR, "train_dataset")
+CHECKPOINT_PATH = os.path.join(CUR_DIR, "deepseekv3_checkpoints")
+RUN_SCRIPT_PATH = os.path.join(CUR_DIR, "run_deepseek3.py")
 
 
-def generate_dataset():
-    """Generate mindrecord dataset for two-cards training tests."""
-    if not os.path.isdir(DATASET_PATH):
-        generate_mindrecord_file(
-            seq_length=4096,
-            batch_size=2,
-            train_steps=1000,
-            dataset_path=os.path.join(CUR_DIR, "train_dataset/dataset.mindrecord"),
-            data_schema={
-                "input_ids": {"type": "int32", "shape": [-1]},
-                "labels": {"type": "int32", "shape": [-1]},
-                "loss_mask": {"type": "int32", "shape": [-1]},
-                "position_ids": {"type": "int32", "shape": [-1]},
-            }
-        )
+def run_deepseek3_case(config_name, log_dir, worker_num, updates=None):
+    """Prepare deterministic data/checkpoint/config and run one DeepSeek3 case."""
+    save_model_checkpoints(BASE_CONFIG, CHECKPOINT_PATH)
+    generate_dataset(DATASET_PATH)
+    local_config_path = build_case_config(
+        BASE_CONFIG,
+        os.path.join(CUR_DIR, config_name),
+        CHECKPOINT_PATH,
+        DATASET_PATH,
+        updates or {},
+    )
+    assert os.path.exists(RUN_SCRIPT_PATH), f"Run script not found: {RUN_SCRIPT_PATH}"
+    return run_training_and_extract_losses(RUN_SCRIPT_PATH, local_config_path, log_dir, worker_num)
 
 
 @pytest.mark.level0
@@ -54,44 +57,16 @@ def test_fsdp_gbs2():
     """
     Feature: DeepSeek3 FSDP training
     Description: Test DeepSeek3 training with FSDP only on 2 cards, global batch size 2.
-    Expectation: msrun script exits with code 0.
+                 Verifies loss values match the expected standard.
+    Expectation: Training exits with code 0 and loss values match expected values.
     """
-    generate_dataset()
-    with open(BASE_CONFIG, "r") as fp:
-        configs = yaml.safe_load(fp)
-
-    configs["train_dataset"]["dataloader"]["dataset_files"] = [DATASET_PATH]
-    configs["training"]["local_batch_size"] = 1
-    configs["training"]["steps"] = 10
-
-    local_config_path = f"{CUR_DIR}/ds3_fsdp_gbs2.yaml"
-    with open(local_config_path, "w") as fp:
-        yaml.dump(configs, fp, indent=2)
-
-    run_script_path = os.path.join(CUR_DIR, "run_deepseek3.py")
-    port_id = int(os.environ.get("ASCEND_PORT_ID", random.randint(50000, 65535)))
-    assert os.path.exists(
-        run_script_path
-    ), f"Run script not found: {run_script_path}"
-    cmd = [
-        "msrun",
-        "--worker_num=2",
-        "--local_worker_num=2",
-        f"--master_port={port_id}",
-        f"--log_dir={CUR_DIR}/log_fsdp_gbs2",
-        "--join=True",
-        f"{run_script_path}",
-        "--config",
-        f"{local_config_path}",
+    expected_losses = [
+        11.855703, 11.849623, 11.854856, 11.821927, 11.791636,
+        11.773806, 11.766010, 11.758839, 11.687195, 11.617872,
     ]
-    result = subprocess.run(
-        cmd, shell=False, capture_output=True, text=True, check=False,
-    )
-    assert result.returncode == 0, (
-        f"DeepSeek3 training (run_deepseek3.py, config={local_config_path}) failed with non-zero exit code: "
-        f"{result.returncode}.\n"
-        f"Stdout:\n{result.stdout}\nStderr:\n{result.stderr}"
-    )
+
+    actual_losses = run_deepseek3_case("ds3_fsdp_gbs2.yaml", "log_fsdp_gbs2", worker_num=2)
+    assert_expected_values_match(actual_losses, expected_losses)
 
 
 @pytest.mark.level0
@@ -99,43 +74,18 @@ def test_fsdp_ep2_gbs2():
     """
     Feature: DeepSeek3 FSDP + Expert Parallel training
     Description: Test DeepSeek3 training with FSDP and expert parallel 2 on 2 cards,
-                 global batch size 2.
-    Expectation: msrun script exits with code 0.
+                 global batch size 2. Verifies loss values match the expected standard.
+    Expectation: Training exits with code 0 and loss values match expected values.
     """
-    generate_dataset()
-    with open(BASE_CONFIG, "r") as fp:
-        configs = yaml.safe_load(fp)
-
-    configs["train_dataset"]["dataloader"]["dataset_files"] = [DATASET_PATH]
-    configs["training"]["local_batch_size"] = 1
-    configs["parallelism"]["expert_parallel"] = 2
-    configs["training"]["steps"] = 10
-
-    local_config_path = f"{CUR_DIR}/ds3_fsdp_ep2_gbs2.yaml"
-    with open(local_config_path, "w") as fp:
-        yaml.dump(configs, fp, indent=2)
-
-    run_script_path = os.path.join(CUR_DIR, "run_deepseek3.py")
-    port_id = int(os.environ.get("ASCEND_PORT_ID", random.randint(50000, 65535)))
-    assert os.path.exists(
-        run_script_path
-    ), f"Run script not found: {run_script_path}"
-    cmd = [
-        "msrun",
-        "--worker_num=2",
-        "--local_worker_num=2",
-        f"--master_port={port_id}",
-        f"--log_dir={CUR_DIR}/log_fsdp_ep2_gbs2",
-        "--join=True",
-        f"{run_script_path}",
-        "--config",
-        f"{local_config_path}",
+    expected_losses = [
+        11.855703, 11.849949, 11.854990, 11.822470, 11.791677,
+        11.773118, 11.766552, 11.759279, 11.686920, 11.617682,
     ]
-    result = subprocess.run(
-        cmd, shell=False, capture_output=True, text=True, check=False,
+
+    actual_losses = run_deepseek3_case(
+        "ds3_fsdp_ep2_gbs2.yaml",
+        "log_fsdp_ep2_gbs2",
+        worker_num=2,
+        updates={"parallelism": {"expert_parallel": 2}},
     )
-    assert result.returncode == 0, (
-        f"DeepSeek3 training (run_deepseek3.py, config={local_config_path}) failed with non-zero exit code: "
-        f"{result.returncode}.\n"
-        f"Stdout:\n{result.stdout}\nStderr:\n{result.stderr}"
-    )
+    assert_expected_values_match(actual_losses, expected_losses)

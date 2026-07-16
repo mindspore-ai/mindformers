@@ -15,7 +15,74 @@
 """
 Precision check tool.
 """
+import glob
+import os
+import re
 import numpy as np
+
+
+def extract_field_from_log(log_dir, field_name):
+    """Extract numeric values for a given field from the last worker log file.
+
+    Scans the log directory for ``worker_*.log`` files, picks the one with the
+    highest worker index, and extracts all float values that appear after
+    ``field_name:`` (with optional whitespace).
+
+    Args:
+        log_dir (str): Path to the directory containing worker log files.
+        field_name (str): The field name to search for (e.g. ``"loss"``,
+            ``"grad_norm"``, ``"load_balancing_loss"``).
+
+    Returns:
+        list[float]: All extracted values in order of appearance.
+    """
+    values = []
+    pattern = re.compile(rf'{re.escape(field_name)}:\s+(\d+\.\d+)')
+    worker_logs = glob.glob(os.path.join(log_dir, "worker_*.log"))
+    if not worker_logs:
+        return values
+    worker_logs.sort(key=lambda p: int(re.search(r'worker_(\d+)', os.path.basename(p)).group(1)))
+    last_log = worker_logs[-1]
+    with open(last_log, 'r') as f:
+        for line in f:
+            match = pattern.search(line)
+            if match:
+                values.append(float(match.group(1)))
+    return values
+
+
+def assert_expected_values_match(actual_values, expected_values, tol=5e-3):
+    """Assert that actual values match the expected standard values.
+
+    When ``expected_values`` is empty, prints the actual values in a
+    copy-pasteable format so they can be filled in as the baseline.
+
+    Args:
+        actual_values (list[float]): Values extracted from the log.
+        expected_values (list[float]): Predefined baseline values.
+        tol (float): Allowed absolute tolerance. Defaults to 5e-4.
+
+    Raises:
+        AssertionError: If values do not match, or if ``expected_values``
+            is empty (with a copy-pasteable template).
+    """
+    assert len(actual_values) > 0, "No values found in log"
+    if not expected_values:
+        formatted = ",\n        ".join(f"{v:.6f}" for v in actual_values)
+        raise AssertionError(
+            f"expected_values is empty. Copy the following into the test case:\n"
+            f"    expected_values = [\n"
+            f"        {formatted},\n"
+            f"    ]"
+        )
+    assert len(actual_values) == len(expected_values), (
+        f"Value count mismatch: actual={len(actual_values)}, expected={len(expected_values)}"
+    )
+    for i, (actual, expected) in enumerate(zip(actual_values, expected_values)):
+        assert abs(actual - expected) < tol, (
+            f"Value mismatch at step {i}: actual={actual:.6f}, expected={expected:.6f}, "
+            f"diff={abs(actual - expected):.6e}"
+        )
 
 
 class PrecisionChecker:
