@@ -26,6 +26,7 @@ from mindspore.common import dtype as mstype
 import mindspore.dataset as ms_dataset
 from mindspore.nn.learning_rate_schedule import LearningRateSchedule
 from mindspore.mint.distributed import (
+    broadcast,
     get_world_size,
     get_rank,
 )
@@ -584,6 +585,56 @@ def _maybe_sync_embedding_grad(param, grad) -> None:
     local_grad = grad.to_local() if isinstance(grad, DTensor) else grad
     all_reduce(local_grad, op=ops.ReduceOp.SUM, group=group)
     grad._pp_replica_count = getattr(param, "_embedding_grad_sync_size", 1)
+
+
+def _sync_mtp_embedding_weights_after_init(model_parts) -> int:
+    """Synchronize PP copies of the MTP-shared embedding after delayed init.
+
+    GPT parallelization happens while parameters are on the meta device and
+    tags the input embedding copies on the first and MTP pipeline stages with
+    ``_embedding_grad_sync_group`` and ``_embedding_sync_src_rank``. The
+    subsequent ``to_empty()`` / ``init_states()`` calls initialize those two
+    copies independently, so gradient synchronization alone cannot make their
+    values equal.
+
+    Broadcast each tagged local shard from the canonical PP rank after all
+    model parts have been initialized and before the optimizer is created.
+    Localizing a DTensor preserves its TP/FSDP layout while allowing the
+    in-place collective to update the storage used by the parameter.
+
+    Args:
+        model_parts: One model cell or the model cells owned by this rank.
+
+    Returns:
+        Number of distinct embedding parameters synchronized on this rank.
+    """
+    if not isinstance(model_parts, (list, tuple)):
+        model_parts = [model_parts]
+
+    synced = 0
+    seen = set()
+    for model in model_parts:
+        for _, param in model.parameters_and_names():
+            if id(param) in seen:
+                continue
+            seen.add(id(param))
+
+            group = getattr(param, "_embedding_grad_sync_group", None)
+            src_rank = getattr(param, "_embedding_sync_src_rank", None)
+            if group is None or src_rank is None:
+                continue
+
+            local_param = param.to_local() if _is_dtensor_like(param) else param
+            broadcast(local_param, src=int(src_rank), group=group)
+            synced += 1
+
+    if synced:
+        logger.info(
+            "[MTP-EmbedSync] synchronized %d initialized embedding weight(s) "
+            "from their canonical PP rank.",
+            synced,
+        )
+    return synced
 
 
 def _get_grad_factor(grad) -> float:

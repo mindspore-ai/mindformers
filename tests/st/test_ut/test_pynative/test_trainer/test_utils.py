@@ -54,6 +54,28 @@ class ParamGroupNetWithNoWd(ParamGroupNet):
         return ["special"]
 
 
+class _FakeLocalParameter:
+    """DTensor-like parameter exposing the local shard used by collectives."""
+
+    def __init__(self):
+        self.local = object()
+        self._embedding_grad_sync_group = "mtp_embedding_group"
+        self._embedding_sync_src_rank = 0
+
+    def to_local(self):
+        return self.local
+
+
+class _FakeModelPart:
+    """Minimal model part yielding parameters for post-init synchronization."""
+
+    def __init__(self, parameters):
+        self.parameters = parameters
+
+    def parameters_and_names(self):
+        return iter(self.parameters)
+
+
 def _param_weight_decay_map(param_groups):
     """Map parameter names to their assigned weight decay."""
     result = {}
@@ -61,6 +83,33 @@ def _param_weight_decay_map(param_groups):
         for param in group["params"]:
             result[param.name] = group["weight_decay"]
     return result
+
+
+@pytest.mark.level0
+@pytest.mark.platform_x86_cpu
+def test_sync_mtp_embedding_weights_after_init(monkeypatch):
+    """The canonical PP rank is broadcast into each distinct tagged local shard."""
+    tagged = _FakeLocalParameter()
+    untagged = object()
+    model_parts = [
+        _FakeModelPart([("embedding.word_embeddings.weight", tagged)]),
+        # Repeating the same object must not launch the collective twice.
+        _FakeModelPart([
+            ("embedding.word_embeddings.weight", tagged),
+            ("decoder.weight", untagged),
+        ]),
+    ]
+    calls = []
+
+    def fake_broadcast(tensor, src, group):
+        calls.append((tensor, src, group))
+
+    monkeypatch.setattr(trainer_utils, "broadcast", fake_broadcast)
+
+    synced = trainer_utils._sync_mtp_embedding_weights_after_init(model_parts)
+
+    assert synced == 1
+    assert calls == [(tagged.local, 0, "mtp_embedding_group")]
 
 
 @pytest.mark.level0
