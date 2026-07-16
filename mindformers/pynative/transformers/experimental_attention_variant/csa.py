@@ -690,7 +690,7 @@ class CompressedSparseAttention(nn.Cell):
                 self.ori_win_left,
                 self.ori_win_right,
             )
-        # npu_sparse_attn_shared_kv returns BSND/TND [b, sq, np, vd]/[b * sq, np, vd];
+        # npu_sparse_flash_mla returns BSND/TND [b, sq, np, vd]/[b * sq, np, vd];
         # reshape to [b, sq, np * vd]
         # then transpose back to [sq, b, np, vd]
         output = self.reshape(output, (b, s, n, d))

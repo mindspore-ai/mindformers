@@ -37,6 +37,11 @@ from mindformers.pynative.distributed.parallelize import (
 )
 from mindformers.pynative.distributed.pipeline_parallel import PpLayerSetting, StageModelBuilder, _create_schedule, _infer_schedule_type, _SCHEDULE_REGISTRY, register_schedule
 from mindformers.pynative.distributed.ep_overlap import OverlapExpertParallel, apply_chunk_overlap_hooks
+from mindformers.pynative.distributed.csa_context_parallel import (
+    CPRotaryEmbeddingProxy,
+    CompressedSparseAttentionContextParallel,
+    DSv4HybridAttentionContextParallel,
+)
 
 __all__ = [
     "AllGather",
@@ -63,4 +68,7 @@ __all__ = [
     "register_schedule",
     "OverlapExpertParallel",
     "apply_chunk_overlap_hooks",
+    "CPRotaryEmbeddingProxy",
+    "CompressedSparseAttentionContextParallel",
+    "DSv4HybridAttentionContextParallel",
 ]

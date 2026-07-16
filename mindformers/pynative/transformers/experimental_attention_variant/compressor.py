@@ -172,11 +172,13 @@ class Compressor(nn.Cell):
         out = self.cat([tensor_prev, tensor_next], 1)
         return out
 
-    def construct(self, x: Tensor) -> Optional[Tensor]:
+    def construct(self, x: Tensor, rope_pos_offset: int = 0) -> Optional[Tensor]:
         """Compress the hidden states into a shorter KV sequence.
 
         Args:
             x: Tensor of shape ``[sq, b, hidden_size]``.
+            rope_pos_offset: Global source-token offset used by CP. Defaults
+                to ``0`` and preserves single-card behavior.
 
         Returns:
             ``[sq // compress_ratio, b, head_dim]`` if ``sq >= compress_ratio``,
@@ -216,17 +218,17 @@ class Compressor(nn.Cell):
         pooled = self.norm(pooled.astype(x.dtype))
 
         if self.rotary_pos_emb is not None:
-            pooled = self._apply_rope(pooled)
+            pooled = self._apply_rope(pooled, rope_pos_offset=rope_pos_offset)
 
         pooled = self.hadamard(pooled)
         pooled = self.unsqueeze(pooled, -2)
         return pooled
 
-    def _apply_rope(self, kv: Tensor) -> Tensor:
+    def _apply_rope(self, kv: Tensor, rope_pos_offset: int = 0) -> Tensor:
         """Apply RoPE to the trailing ``qk_pos_emb_head_dim`` lanes of ``kv``."""
         n_compressed, _, d = kv.shape
         total_seq_len = n_compressed * self.compress_ratio
-        freqs, _ = self.rotary_pos_emb(total_seq_len)
+        freqs, _ = self.rotary_pos_emb(total_seq_len, offset=rope_pos_offset)
         if self.compress_ratio > 1:
             freqs = freqs[:total_seq_len:self.compress_ratio][:n_compressed]
         # Add a singleton head dim so apply_rotary_pos_emb sees [s, b, 1, hd].
