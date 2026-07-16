@@ -687,6 +687,10 @@ def _calculate_global_grad_norm(
         grad = get_grad(param)
         if grad is not None:
             _maybe_sync_embedding_grad(param, grad)
+            replica_count = getattr(param, "_grad_norm_replica_count", 1)
+            if replica_count and replica_count > 1:
+                # Reuse the grad-factor carrier already used by PP embedding sync.
+                setattr(grad, "_pp_replica_count", replica_count)
             grads.append(grad)
 
     if not grads:
