@@ -3,6 +3,8 @@
 # Modified to adapt to MindSpore pynative mode.
 # Main changes: PyTorch->MindSpore, removed parallel/BDA/CUDA graph features, simplified forward pass.
 """Transformer Layer"""
+# MindSpore ``Cell.construct`` intentionally exposes model-specific signatures.
+# pylint: disable=arguments-differ
 import inspect
 from dataclasses import dataclass
 from typing import Union
@@ -223,7 +225,7 @@ class TransformerLayer(nn.Cell, BaseTransformerLayer):
             residual = hidden_states
 
         # Self-Attention
-        attention_output = self.self_attention(
+        attn_result = self.self_attention(
             input_layernorm_output,
             attention_mask=attention_mask,
             rotary_pos_emb=rotary_pos_emb,
@@ -232,6 +234,11 @@ class TransformerLayer(nn.Cell, BaseTransformerLayer):
             mscale=mscale,
             rotary_cos_sin=rotary_cos_sin
         )
+        # DSA returns (output, attention_loss); non-DSA returns output only.
+        if isinstance(attn_result, tuple):
+            attention_output = attn_result[0]
+        else:
+            attention_output = attn_result
 
         # Dropout
         dropout_output = self.hidden_states_dropout(attention_output)
@@ -309,7 +316,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         aggregated_attn, h_res_attn, h_post_attn = self.attn_hc(hidden_states)
 
         input_layernorm_output = self.input_layernorm(aggregated_attn)
-        attention_output = self.self_attention(
+        attn_result = self.self_attention(
             input_layernorm_output,
             attention_mask=attention_mask,
             rotary_pos_emb=rotary_pos_emb,
@@ -318,7 +325,10 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             mscale=mscale,
             rotary_cos_sin=rotary_cos_sin
         )
-
+        if isinstance(attn_result, tuple):
+            attention_output = attn_result[0]
+        else:
+            attention_output = attn_result
         dropout_output = self.hidden_states_dropout(attention_output)
         hidden_states = self.attn_hc.output_cell(
             h_res_attn, h_post_attn, streams_before_attn, dropout_output)
