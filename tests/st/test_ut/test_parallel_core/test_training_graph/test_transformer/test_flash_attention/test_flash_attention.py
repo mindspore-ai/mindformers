@@ -50,7 +50,7 @@ class TestFlashAttention:
                 f"Golden output:\n{golden_output}"
             )
 
-    @pytest.mark.level0
+    @pytest.mark.level1
     @pytest.mark.platform_arm_ascend910b_training # testset
     @pytest.mark.env_onecard
     def test_dropout_0_case(self):
@@ -61,7 +61,7 @@ class TestFlashAttention:
         """
         self.run_test()
 
-    @pytest.mark.level0
+    @pytest.mark.level1
     @pytest.mark.platform_arm_ascend910b_training
     @pytest.mark.env_onecard
     def test_softmax_scale_100_case(self):
@@ -72,7 +72,7 @@ class TestFlashAttention:
         """
         self.run_test(soft_max_scale=100.0)
 
-    @pytest.mark.level0
+    @pytest.mark.level1
     @pytest.mark.platform_arm_ascend910b_training
     @pytest.mark.env_onecard
     def test_dropout_0_5_case(self):

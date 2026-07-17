@@ -34,14 +34,15 @@ class TestSharedExpertMLP:
             cmd,
             shell=True,
             capture_output=True,
-            text=True
+            text=True,
+            check=False
         )
         assert result.returncode == 0, (
             f"Test script failed with non-zero exit code: "
             f"{result.returncode}.\nStdout:\n{result.stdout}\nStderr:\n{result.stderr}"
         )
 
-    @pytest.mark.level0
+    @pytest.mark.level1
     @pytest.mark.platform_arm_ascend910b_training
     @pytest.mark.env_onecard
     def test_gate_false_case(self):
@@ -52,7 +53,7 @@ class TestSharedExpertMLP:
         """
         self.run_test()
 
-    @pytest.mark.level0
+    @pytest.mark.level1
     @pytest.mark.platform_arm_ascend910b_training
     @pytest.mark.env_onecard
     def test_gate_true_case(self):

@@ -25,8 +25,8 @@ from tests.st.test_ut.test_parallel_core.test_inference.test_transformer.test_mo
 from tests.utils.precision_utils import PrecisionChecker
 
 
-_LEVEL_0_TASK_TIME = 78
-_LEVEL_1_TASK_TIME = 0
+_LEVEL_0_TASK_TIME = 0
+_LEVEL_1_TASK_TIME = 78
 _TASK_TYPE = TaskType.FOUR_CARDS_TASK
 
 MOE_CONFIG_WITH_SHARED_EXPERTS = {
@@ -103,7 +103,7 @@ class TestInferMoELayerTP(TestInferMoE):
 
 class TestInferMoELayerTPParallel(TestInferMoELayerTP):
     """Test class for InferMoELayer with tp parallel"""
-    @pytest.mark.level0
+    @pytest.mark.level1
     @pytest.mark.parametrize(FOUR_CARD_TEST_PARAM, FOUR_CARD_DP1TP4EP1_TEST_CASES)
     def test_four_cards_tp4ep1_cases(
             self, model_args, data_keys, expect_error,

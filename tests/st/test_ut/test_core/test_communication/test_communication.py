@@ -26,7 +26,7 @@ from mindformers.parallel_core.training_graph.communication import (
 )
 
 
-@pytest.mark.level0
+@pytest.mark.level1
 @pytest.mark.platform_x86_cpu
 @pytest.mark.env_onecard
 @patch("mindformers.parallel_core.training_graph.communication.create_communication_group")
@@ -57,7 +57,7 @@ def test_get_op_group_name_with_mock(mock_create_group):
     assert result == ("mock_group", [3, 7])
 
 
-@pytest.mark.level0
+@pytest.mark.level1
 @pytest.mark.platform_x86_cpu
 @pytest.mark.env_onecard
 @patch("mindformers.parallel_core.training_graph.communication.create_communication_group")
@@ -100,7 +100,7 @@ def test_get_cp_group_name_with_mock(mock_create_group):
     assert get_cp_group_name(rank_id=13, dp=2, tp=2, cp=2) == ("mock_group", [13, 15])
 
 
-@pytest.mark.level0
+@pytest.mark.level1
 @pytest.mark.platform_x86_cpu
 @pytest.mark.env_onecard
 @patch("mindformers.parallel_core.training_graph.communication.create_communication_group")

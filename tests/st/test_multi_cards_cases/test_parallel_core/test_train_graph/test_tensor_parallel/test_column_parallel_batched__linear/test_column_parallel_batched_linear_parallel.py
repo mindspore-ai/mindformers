@@ -21,13 +21,13 @@ from tests.st.test_multi_cards_cases.utils import TaskType
 
 cur_dir = os.path.dirname(os.path.abspath(__file__))
 
-_LEVEL_0_TASK_TIME = 34
-_LEVEL_1_TASK_TIME = 0
+_LEVEL_0_TASK_TIME = 0
+_LEVEL_1_TASK_TIME = 34
 _TASK_TYPE = TaskType.FOUR_CARDS_TASK
 
 class TestColumnParallelBatchedLinear:
     """A test class for testing ColumnBatchedParallelLinear"""
-    @pytest.mark.level0
+    @pytest.mark.level1
     def test_parallel_case(self):
         """
         Feature: ColumnParallelBatchedLinear
@@ -41,7 +41,7 @@ class TestColumnParallelBatchedLinear:
              f"--master_port={port_id} --log_dir={cur_dir}/log_4cards --join=True "
              f"{cur_dir}/run_column_parallel_batched_linear.py --dp 2 --tp 2 --ep 2 "),
         ]
-        result = subprocess.run(commands, shell=True, capture_output=True, text=True)
+        result = subprocess.run(commands, shell=True, capture_output=True, text=True, check=False)
         assert result.returncode == 0, (
             f"Test script failed with non-zero exit code: "
             f"{result.returncode}.\nStdout:\n{result.stdout}\nStderr:\n{result.stderr}"

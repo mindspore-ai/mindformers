@@ -252,7 +252,7 @@ class TestMultiLatentAttention:
 
 class TestMultiLatentAttentionSingleCard(TestMultiLatentAttention):
     """Test class for Multi-head Latent Attention on single card"""
-    @pytest.mark.level0
+    @pytest.mark.level1
     @pytest.mark.platform_arm_ascend910b_training
     @pytest.mark.env_onecard
     @pytest.mark.parametrize('struct', ['megatron', 'concatenated'])

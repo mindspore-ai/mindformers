@@ -20,8 +20,8 @@ from tests.st.test_multi_cards_cases.utils import TaskType
 from tests.st.test_ut.test_parallel_core.test_training_graph.test_transformer.test_transformer_layer.test_transformer_layer import TestTransformerLayer
 
 
-_LEVEL_0_TASK_TIME = 46
-_LEVEL_1_TASK_TIME = 0
+_LEVEL_0_TASK_TIME = 0
+_LEVEL_1_TASK_TIME = 46
 _TASK_TYPE = TaskType.TWO_CARDS_TASK
 
 # Test parameters for four cards (Distributed)
@@ -43,7 +43,7 @@ TWO_CARD_TEST_CASES = [
 
 class TestTransformerLayerTwoCards(TestTransformerLayer):
     """Test class for TransformerLayer with four cards configurations"""
-    @pytest.mark.level0
+    @pytest.mark.level1
     @pytest.mark.parametrize(TWO_CARD_TEST_PARAM, TWO_CARD_TEST_CASES)
     def test_multi_card_configurations(self, model_args, data_keys, expect_error, tensor_parallel, tmp_path):
         """Test four cards with various configurations for TransformerLayer."""

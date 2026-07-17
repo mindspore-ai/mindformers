@@ -30,7 +30,7 @@ from mindformers.parallel_core.transformer_config import TransformerConfig
 class TestLayerSpec:
     """test get_gpt_layer_local_spec()."""
 
-    @pytest.mark.level0
+    @pytest.mark.level1
     @pytest.mark.platform_x86_cpu
     @pytest.mark.env_onecard
     def test_dense_case(self):
@@ -91,7 +91,7 @@ class TestLayerSpec:
         assert spec.submodules.self_attention.submodules.kv_layernorm == IdentityOp
         assert spec.submodules.self_attention.module == MLASelfAttention
 
-    @pytest.mark.level0
+    @pytest.mark.level1
     @pytest.mark.platform_x86_cpu
     @pytest.mark.env_onecard
     def test_moe_case(self):
@@ -112,7 +112,7 @@ class TestLayerSpec:
 class TestBlockSpec:
     """test get_gpt_decoder_block_spec()."""
 
-    @pytest.mark.level0
+    @pytest.mark.level1
     @pytest.mark.platform_x86_cpu
     @pytest.mark.env_onecard
     def test_all_moe_case(self):
@@ -131,7 +131,7 @@ class TestBlockSpec:
             assert layer_spec.submodules.mlp.module == MoELayer
             assert layer_spec.submodules.self_attention.module == SelfAttentionContiguous
 
-    @pytest.mark.level0
+    @pytest.mark.level1
     @pytest.mark.platform_x86_cpu
     @pytest.mark.env_onecard
     def test_all_moe_with_megatron_attention_case(self):
@@ -149,7 +149,7 @@ class TestBlockSpec:
             assert layer_spec.submodules.mlp.module == MoELayer
             assert layer_spec.submodules.self_attention.module == SelfAttention
 
-    @pytest.mark.level0
+    @pytest.mark.level1
     @pytest.mark.platform_x86_cpu
     @pytest.mark.env_onecard
     def test_all_moe_with_mla_case(self):
@@ -167,7 +167,7 @@ class TestBlockSpec:
             assert layer_spec.submodules.mlp.module == MoELayer
             assert layer_spec.submodules.self_attention.module == MLASelfAttentionConcatenated
 
-    @pytest.mark.level0
+    @pytest.mark.level1
     @pytest.mark.platform_x86_cpu
     @pytest.mark.env_onecard
     def test_all_moe_with_megatron_mla_case(self):
@@ -185,7 +185,7 @@ class TestBlockSpec:
             assert layer_spec.submodules.mlp.module == MoELayer
             assert layer_spec.submodules.self_attention.module == MLASelfAttention
 
-    @pytest.mark.level0
+    @pytest.mark.level1
     @pytest.mark.platform_x86_cpu
     @pytest.mark.env_onecard
     def test_2_moe_case(self):
@@ -206,7 +206,7 @@ class TestBlockSpec:
             else:
                 assert layer_spec.submodules.mlp.module == MLPInterleaved
 
-    @pytest.mark.level0
+    @pytest.mark.level1
     @pytest.mark.platform_x86_cpu
     @pytest.mark.env_onecard
     def test_list_moe_case(self):
@@ -227,7 +227,7 @@ class TestBlockSpec:
             else:
                 assert layer_spec.submodules.mlp.module == MLPInterleaved
 
-    @pytest.mark.level0
+    @pytest.mark.level1
     @pytest.mark.platform_x86_cpu
     @pytest.mark.env_onecard
     def test_list_moe_error_value_case(self):
@@ -255,7 +255,7 @@ class TestBlockSpec:
         else:
             assert False, "Expected ValueError not raised"
 
-    @pytest.mark.level0
+    @pytest.mark.level1
     @pytest.mark.platform_x86_cpu
     @pytest.mark.env_onecard
     def test_list_moe_error_length_case(self):
@@ -286,7 +286,7 @@ class TestBlockSpec:
 class TestMtpBlockSpec:
     """test get_gpt_decoder_block_spec()."""
 
-    @pytest.mark.level0
+    @pytest.mark.level1
     @pytest.mark.platform_x86_cpu
     @pytest.mark.env_onecard
     def test_none_case(self):
@@ -301,7 +301,7 @@ class TestMtpBlockSpec:
                                    add_bias_linear=False)
         assert get_gpt_mtp_block_spec(config, spec) is None
 
-    @pytest.mark.level0
+    @pytest.mark.level1
     @pytest.mark.platform_x86_cpu
     @pytest.mark.env_onecard
     def test_input_is_layerspec_case(self):
@@ -318,7 +318,7 @@ class TestMtpBlockSpec:
         assert len(mtp_spec.layer_specs) == 1
         assert mtp_spec.layer_specs[0].submodules.transformer_layer == spec
 
-    @pytest.mark.level0
+    @pytest.mark.level1
     @pytest.mark.platform_x86_cpu
     @pytest.mark.env_onecard
     def test_input_is_blockspec_case(self):

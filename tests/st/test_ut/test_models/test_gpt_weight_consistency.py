@@ -274,7 +274,7 @@ def golden_data(weight_tester):
         return json.load(f)
 
 
-@pytest.mark.level0
+@pytest.mark.level1
 @pytest.mark.platform_arm_ascend910b_training
 @pytest.mark.env_onecard
 def test_golden_standard(weight_tester):
@@ -292,7 +292,7 @@ def test_golden_standard(weight_tester):
     assert "metadata" in data, "Golden standard should contain metadata"
 
 
-@pytest.mark.level0
+@pytest.mark.level1
 @pytest.mark.platform_arm_ascend910b_training
 @pytest.mark.env_onecard
 def test_weight_consistency_check(weight_tester):

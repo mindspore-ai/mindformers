@@ -36,7 +36,7 @@ from mindformers.core.optim.adamw import AdamW, _check_param_value
 ms.set_context(mode=0)
 
 
-@pytest.mark.level0
+@pytest.mark.level1
 @pytest.mark.platform_x86_cpu
 @pytest.mark.env_onecard
 class TestAdamW:
@@ -68,7 +68,7 @@ class SimpleNet(Cell):
         return x * self.weight + self.bias
 
 
-@pytest.mark.level0
+@pytest.mark.level1
 @pytest.mark.platform_x86_cpu
 @pytest.mark.env_onecard
 def test_adamw_init():
@@ -85,7 +85,7 @@ def test_adamw_init():
     assert np.allclose(optimizer.eps.asnumpy(), np.array([1e-8]))
 
 
-@pytest.mark.level0
+@pytest.mark.level1
 @pytest.mark.platform_x86_cpu
 @pytest.mark.env_onecard
 def test_adamw_init_with_custom_params():
@@ -113,7 +113,7 @@ def test_adamw_init_with_custom_params():
     assert np.allclose(optimizer.eps.asnumpy(), np.array([1e-7]))
 
 
-@pytest.mark.level0
+@pytest.mark.level1
 @pytest.mark.platform_x86_cpu
 @pytest.mark.env_onecard
 def test_adamw_init_with_swap():
@@ -132,7 +132,7 @@ def test_adamw_init_with_swap():
         assert param.device == 'CPU'
 
 
-@pytest.mark.level0
+@pytest.mark.level1
 @pytest.mark.platform_x86_cpu
 @pytest.mark.env_onecard
 def test_adamw_init_with_group_params():
@@ -150,7 +150,7 @@ def test_adamw_init_with_group_params():
     assert optimizer is not None
 
 
-@pytest.mark.level0
+@pytest.mark.level1
 @pytest.mark.platform_x86_cpu
 @pytest.mark.env_onecard
 def test_check_param_value():
@@ -165,7 +165,7 @@ def test_check_param_value():
     _check_param_value(betas, eps, weight_decay, "AdamW")
 
 
-@pytest.mark.level0
+@pytest.mark.level1
 @pytest.mark.platform_x86_cpu
 @pytest.mark.env_onecard
 def test_check_param_value_invalid_betas_type():
@@ -181,7 +181,7 @@ def test_check_param_value_invalid_betas_type():
         _check_param_value(betas, eps, weight_decay, "AdamW")
 
 
-@pytest.mark.level0
+@pytest.mark.level1
 @pytest.mark.platform_x86_cpu
 @pytest.mark.env_onecard
 def test_check_param_value_invalid_betas_length():
@@ -197,7 +197,7 @@ def test_check_param_value_invalid_betas_length():
         _check_param_value(betas, eps, weight_decay, "AdamW")
 
 
-@pytest.mark.level0
+@pytest.mark.level1
 @pytest.mark.platform_x86_cpu
 @pytest.mark.env_onecard
 def test_check_param_value_invalid_beta1():
@@ -213,7 +213,7 @@ def test_check_param_value_invalid_beta1():
         _check_param_value(betas, eps, weight_decay, "AdamW")
 
 
-@pytest.mark.level0
+@pytest.mark.level1
 @pytest.mark.platform_x86_cpu
 @pytest.mark.env_onecard
 def test_check_param_value_invalid_beta2():
@@ -229,7 +229,7 @@ def test_check_param_value_invalid_beta2():
         _check_param_value(betas, eps, weight_decay, "AdamW")
 
 
-@pytest.mark.level0
+@pytest.mark.level1
 @pytest.mark.platform_x86_cpu
 @pytest.mark.env_onecard
 def test_check_param_value_invalid_eps():
@@ -245,7 +245,7 @@ def test_check_param_value_invalid_eps():
         _check_param_value(betas, eps, weight_decay, "AdamW")
 
 
-@pytest.mark.level0
+@pytest.mark.level1
 @pytest.mark.platform_x86_cpu
 @pytest.mark.env_onecard
 def test_check_param_value_invalid_weight_decay():
@@ -261,7 +261,7 @@ def test_check_param_value_invalid_weight_decay():
         _check_param_value(betas, eps, weight_decay, "AdamW")
 
 
-@pytest.mark.level0
+@pytest.mark.level1
 @pytest.mark.platform_x86_cpu
 @pytest.mark.env_onecard
 def test_adamw_construct():
@@ -284,7 +284,7 @@ def test_adamw_construct():
     assert result is not None
 
 
-@pytest.mark.level0
+@pytest.mark.level1
 @pytest.mark.platform_x86_cpu
 @pytest.mark.env_onecard
 def test_adamw_construct_with_group_lr():
@@ -311,7 +311,7 @@ def test_adamw_construct_with_group_lr():
     assert result is not None
 
 
-@pytest.mark.level0
+@pytest.mark.level1
 @pytest.mark.platform_x86_cpu
 @pytest.mark.env_onecard
 def test_adamw_clone_state():
@@ -331,7 +331,7 @@ def test_adamw_clone_state():
         assert param.dtype == mstype.float32
 
 
-@pytest.mark.level0
+@pytest.mark.level1
 @pytest.mark.platform_x86_cpu
 @pytest.mark.env_onecard
 def test_adamw_clone_state_with_swap():
@@ -350,7 +350,7 @@ def test_adamw_clone_state_with_swap():
         assert param.device == 'CPU'
 
 
-@pytest.mark.level0
+@pytest.mark.level1
 @pytest.mark.platform_x86_cpu
 @pytest.mark.env_onecard
 def test_adamw_with_dynamic_weight_decay():
@@ -365,7 +365,7 @@ def test_adamw_with_dynamic_weight_decay():
     assert optimizer is not None
 
 
-@pytest.mark.level0
+@pytest.mark.level1
 @pytest.mark.platform_x86_cpu
 @pytest.mark.env_onecard
 def test_adamw_step():
@@ -391,7 +391,7 @@ def test_adamw_step():
         assert not np.all(param.asnumpy() == np.ones_like(param.asnumpy()))
 
 
-@pytest.mark.level0
+@pytest.mark.level1
 @pytest.mark.platform_x86_cpu
 @pytest.mark.env_onecard
 def test_adamw_with_zero_gradients():
@@ -418,7 +418,7 @@ def test_adamw_with_zero_gradients():
         assert not np.allclose(param.asnumpy(), np.ones_like(param.asnumpy()))
 
 
-@pytest.mark.level0
+@pytest.mark.level1
 @pytest.mark.platform_x86_cpu
 @pytest.mark.env_onecard
 def test_adamw_invalid_learning_rate():
@@ -432,7 +432,7 @@ def test_adamw_invalid_learning_rate():
         AdamW(net.trainable_params(), learning_rate="invalid")
 
 
-@pytest.mark.level0
+@pytest.mark.level1
 @pytest.mark.platform_x86_cpu
 @pytest.mark.env_onecard
 def test_adamw_large_weight_decay():
@@ -458,7 +458,7 @@ def test_adamw_large_weight_decay():
         assert np.all(param.asnumpy() < np.ones_like(param.asnumpy()))
 
 
-@pytest.mark.level0
+@pytest.mark.level1
 @pytest.mark.platform_x86_cpu
 @pytest.mark.env_onecard
 def test_adamw_small_eps():
@@ -481,7 +481,7 @@ def test_adamw_small_eps():
     assert result is not None
 
 
-@pytest.mark.level0
+@pytest.mark.level1
 @pytest.mark.platform_x86_cpu
 @pytest.mark.env_onecard
 def test_adamw_with_tuple_params():
@@ -496,7 +496,7 @@ def test_adamw_with_tuple_params():
     assert optimizer is not None
 
 
-@pytest.mark.level0
+@pytest.mark.level1
 @pytest.mark.platform_x86_cpu
 @pytest.mark.env_onecard
 def test_adamw_global_step_increase():
@@ -523,7 +523,7 @@ def test_adamw_global_step_increase():
     assert result is not None
 
 
-@pytest.mark.level0
+@pytest.mark.level1
 @pytest.mark.platform_x86_cpu
 @pytest.mark.env_onecard
 def test_adamw_with_mixed_precision_params():
@@ -551,7 +551,7 @@ def test_adamw_with_mixed_precision_params():
     assert result is not None
 
 
-@pytest.mark.level0
+@pytest.mark.level1
 @pytest.mark.platform_x86_cpu
 @pytest.mark.env_onecard
 def test_adamw_optim_filter():
@@ -577,7 +577,7 @@ def test_adamw_optim_filter():
     assert result is not None
 
 
-@pytest.mark.level0
+@pytest.mark.level1
 @pytest.mark.platform_x86_cpu
 @pytest.mark.env_onecard
 def test_adamw_construct_without_group():
@@ -603,7 +603,7 @@ def test_adamw_construct_without_group():
     assert result is not None
 
 
-@pytest.mark.level0
+@pytest.mark.level1
 @pytest.mark.platform_x86_cpu
 @pytest.mark.env_onecard
 def test_adamw_with_large_lr():
@@ -626,7 +626,7 @@ def test_adamw_with_large_lr():
     assert result is not None
 
 
-@pytest.mark.level0
+@pytest.mark.level1
 @pytest.mark.platform_x86_cpu
 @pytest.mark.env_onecard
 def test_adamw_with_tensor_lr():
@@ -641,7 +641,7 @@ def test_adamw_with_tensor_lr():
     assert optimizer is not None
 
 
-@pytest.mark.level0
+@pytest.mark.level1
 @pytest.mark.platform_x86_cpu
 @pytest.mark.env_onecard
 def test_adamw_with_iterable_lr():
@@ -656,7 +656,7 @@ def test_adamw_with_iterable_lr():
     assert optimizer is not None
 
 
-@pytest.mark.level0
+@pytest.mark.level1
 @pytest.mark.platform_x86_cpu
 @pytest.mark.env_onecard
 def test_adamw_optim_filter_false():
@@ -684,7 +684,7 @@ def test_adamw_optim_filter_false():
     assert len(result) == len(gradients)
 
 
-@pytest.mark.level0
+@pytest.mark.level1
 @pytest.mark.platform_x86_cpu
 @pytest.mark.env_onecard
 def test_adamw_get_weight_decay_and_lr():
@@ -705,7 +705,7 @@ def test_adamw_get_weight_decay_and_lr():
     assert lr is not None
 
 
-@pytest.mark.level0
+@pytest.mark.level1
 @pytest.mark.platform_x86_cpu
 @pytest.mark.env_onecard
 def test_adamw_clone_state_with_cloned_obj():
@@ -732,7 +732,7 @@ def test_adamw_clone_state_with_cloned_obj():
         assert len(old_param.param_info.cloned_obj) >= 2
 
 
-@pytest.mark.level0
+@pytest.mark.level1
 @pytest.mark.platform_x86_cpu
 @pytest.mark.env_onecard
 def test_adamw_construct_all_branches():
@@ -769,7 +769,7 @@ def test_adamw_construct_all_branches():
     assert result is not None
 
 
-@pytest.mark.level0
+@pytest.mark.level1
 @pytest.mark.platform_x86_cpu
 @pytest.mark.env_onecard
 def test_check_param_value_more_cases():
@@ -793,7 +793,7 @@ def test_check_param_value_more_cases():
     _check_param_value(betas, eps, weight_decay, "AdamW")
 
 
-@pytest.mark.level0
+@pytest.mark.level1
 @pytest.mark.platform_x86_cpu
 @pytest.mark.env_onecard
 def test_adamw_clone_state_with_ones_init():
@@ -810,7 +810,7 @@ def test_adamw_clone_state_with_ones_init():
     assert len(ones_clone) == len(optimizer.parameters)
 
 
-@pytest.mark.level0
+@pytest.mark.level1
 @pytest.mark.platform_x86_cpu
 @pytest.mark.env_onecard
 def test_adamw_with_large_learning_rate():
@@ -836,7 +836,7 @@ def test_adamw_with_large_learning_rate():
         assert not np.allclose(param.asnumpy(), np.ones_like(param.asnumpy()), atol=0.1)
 
 
-@pytest.mark.level0
+@pytest.mark.level1
 @pytest.mark.platform_x86_cpu
 @pytest.mark.env_onecard
 def test_adamw_with_very_small_learning_rate():

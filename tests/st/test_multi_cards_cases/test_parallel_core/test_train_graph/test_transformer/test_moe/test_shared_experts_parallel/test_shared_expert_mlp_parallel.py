@@ -19,8 +19,8 @@ import subprocess
 import pytest
 from tests.st.test_multi_cards_cases.utils import TaskType
 
-_LEVEL_0_TASK_TIME = 26
-_LEVEL_1_TASK_TIME = 0
+_LEVEL_0_TASK_TIME = 0
+_LEVEL_1_TASK_TIME = 26
 _TASK_TYPE = TaskType.TWO_CARDS_TASK
 cur_dir = os.path.dirname(os.path.abspath(__file__))
 port_id = int(os.environ.get("ASCEND_PORT_ID", random.randint(50000, 65535)))
@@ -28,7 +28,7 @@ port_id = int(os.environ.get("ASCEND_PORT_ID", random.randint(50000, 65535)))
 class TestSharedExpertMLPTwoCards:
     """A test class for testing MLP"""
 
-    @pytest.mark.level0
+    @pytest.mark.level1
     def test_parallel_case(self):
         """
         Feature: SharedExpertMLP
@@ -39,7 +39,7 @@ class TestSharedExpertMLPTwoCards:
             (f"msrun --worker_num=2 --local_worker_num=2 --master_port={port_id} --log_dir=log_2cards --join=True "
              f"{cur_dir}/run_shared_expert_mlp.py --tp 2 --gate"),
         ]
-        result = subprocess.run(commands, shell=True, capture_output=True, text=True)
+        result = subprocess.run(commands, shell=True, capture_output=True, text=True, check=False)
         assert result.returncode == 0, (
             f"Test script failed with non-zero exit code: "
             f"{result.returncode}.\nStdout:\n{result.stdout}\nStderr:\n{result.stderr}"

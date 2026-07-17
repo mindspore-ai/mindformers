@@ -21,8 +21,8 @@ from tests.st.test_multi_cards_cases.utils import TaskType
 from tests.st.test_ut.test_parallel_core.test_training_graph.test_transformer.test_multi_token_prediction.test_multi_token_prediction import TestMTP
 
 
-_LEVEL_0_TASK_TIME = 141
-_LEVEL_1_TASK_TIME = 0
+_LEVEL_0_TASK_TIME = 0
+_LEVEL_1_TASK_TIME = 141
 _TASK_TYPE = TaskType.TWO_CARDS_TASK
 
 BATCH_SIZE = 2
@@ -43,7 +43,7 @@ MULTI_CARD_TEST_CASES = [
 
 class TestMultiCardsMTP(TestMTP):
     """Test class for Multi-Token Prediction (MTP)"""
-    @pytest.mark.level0
+    @pytest.mark.level1
     @pytest.mark.parametrize(
         MULTI_CARD_TEST_PARAM,
         MULTI_CARD_TEST_CASES

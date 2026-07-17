@@ -71,7 +71,7 @@ def get_valid_recompute_type():
     return recompute_type
 
 
-@pytest.mark.level0
+@pytest.mark.level1
 @pytest.mark.platform_x86_cpu
 @pytest.mark.env_onecard
 def test_swap_invalid_input():
@@ -98,7 +98,7 @@ def test_swap_invalid_input():
                 exc_info.value)
 
 
-@pytest.mark.level0
+@pytest.mark.level1
 @pytest.mark.platform_x86_cpu
 @pytest.mark.env_onecard
 def test_swap_conflicts():
@@ -128,7 +128,7 @@ def test_swap_conflicts():
     assert swap_config2.to_dict() == expected
 
 
-@pytest.mark.level0
+@pytest.mark.level1
 @pytest.mark.platform_x86_cpu
 @pytest.mark.env_onecard
 def test_swap_normal():
@@ -161,7 +161,7 @@ def test_swap_normal():
         assert swap_config2.to_dict() == expected
 
 
-@pytest.mark.level0
+@pytest.mark.level1
 @pytest.mark.platform_x86_cpu
 @pytest.mark.env_onecard
 def test_skip_initialize_swap():

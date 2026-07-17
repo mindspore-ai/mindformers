@@ -86,7 +86,7 @@ class TestTensorBoard:
                                learning_rate=self.lr_schedule)
         self.callback = MFLossMonitor(learning_rate=self.lr_schedule, origin_epochs=1, dataset_size=10)
 
-    @pytest.mark.level0
+    @pytest.mark.level1
     @pytest.mark.platform_arm_ascend910b_training
     @pytest.mark.env_onecard
     def test_set_tensorboard(self):

@@ -31,7 +31,7 @@ build_context({'context': {'device_target': 'CPU'}, "use_legacy": False})
 ms.set_context(mode=ms.GRAPH_MODE)
 
 
-@pytest.mark.level0
+@pytest.mark.level1
 @pytest.mark.platform_x86_cpu
 @pytest.mark.env_onecard
 def test_full_layer_swap_logs(caplog):
@@ -67,7 +67,7 @@ def test_full_layer_swap_logs(caplog):
         f"Expected log containing '{target}', but got: {[r.message for r in caplog.records]}"
 
 
-@pytest.mark.level0
+@pytest.mark.level1
 @pytest.mark.platform_x86_cpu
 @pytest.mark.env_onecard
 def test_partial_layer_swap_logs(caplog):
@@ -103,7 +103,7 @@ def test_partial_layer_swap_logs(caplog):
         f"Expected log containing '{target}', but got: {[r.message for r in caplog.records]}"
 
 
-@pytest.mark.level0
+@pytest.mark.level1
 @pytest.mark.platform_x86_cpu
 @pytest.mark.env_onecard
 def test_op_level_swap_logs(caplog):
@@ -149,7 +149,7 @@ def test_op_level_swap_logs(caplog):
         f"Expected log containing '{target}', but got: {[r.message for r in caplog.records]}"
 
 
-@pytest.mark.level0
+@pytest.mark.level1
 @pytest.mark.platform_x86_cpu
 @pytest.mark.env_onecard
 def test_recompute_op_swap_conflict_logs(caplog):

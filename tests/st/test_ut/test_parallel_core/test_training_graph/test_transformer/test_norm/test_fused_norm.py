@@ -48,7 +48,7 @@ class TestFusedNorm:
             f"Golden output:\n{golden_output}"
         )
 
-    @pytest.mark.level0
+    @pytest.mark.level1
     @pytest.mark.platform_arm_ascend910b_training
     @pytest.mark.env_onecard
     def test_layer_norm(self):
@@ -59,7 +59,7 @@ class TestFusedNorm:
         """
         self.run_test(normalization='LayerNorm')
 
-    @pytest.mark.level0
+    @pytest.mark.level1
     @pytest.mark.platform_arm_ascend910b_training
     @pytest.mark.env_onecard
     def test_rms_norm(self):
