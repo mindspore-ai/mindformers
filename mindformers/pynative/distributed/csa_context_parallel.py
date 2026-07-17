@@ -437,9 +437,9 @@ def _call_fused_sparse_flash_mla(
             ori_kv_bsnd,
             cmp_kv_bsnd,
             cmp_sparse_indices,
-            query_index,
-            _sbnd_to_bsnd(key_index_prefix),
-            weights,
+            ops.cast(query_index, mstype.bfloat16),
+            ops.cast(_sbnd_to_bsnd(key_index_prefix), mstype.bfloat16),
+            ops.cast(weights, mstype.float32),
             attn_sink,
             cell.softmax_scale,
             cell.compress_ratio,
@@ -486,9 +486,10 @@ def _run_fused_prefix_indexer_topk(
             "Fused DSA op 'npu_lightning_indexer' is unavailable in this hyper_parallel build."
         )
     key_index_prefix = _sbnd_to_bsnd(key_index_prefix)
-    effective_topk = min(indexer.index_topk, int(key_index_prefix.shape[1]))
-    if effective_topk <= 0:
+    if int(key_index_prefix.shape[1]) <= 0:
         raise ValueError("CSA fused context parallel requires a non-empty compressed indexer prefix.")
+    # Keep K rank-invariant; LightningIndexer pads short prefixes with -1/-inf.
+    configured_topk = indexer.index_topk
     with _no_grad():
         cmp_residual_k = Tensor(
             [int(key_index_prefix.shape[1]) % indexer.compress_ratio],
@@ -498,7 +499,7 @@ def _run_fused_prefix_indexer_topk(
             indexer.cast(query_index, indexer.compute_dtype),
             indexer.cast(key_index_prefix, indexer.compute_dtype),
             indexer.cast(weights, mstype.float32),
-            effective_topk,
+            configured_topk,
             cmp_residual_k=cmp_residual_k,
             layout=indexer.input_layout,
             sparse_mode=indexer.sparse_mode,
