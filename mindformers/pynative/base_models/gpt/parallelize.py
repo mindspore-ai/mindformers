@@ -706,8 +706,16 @@ def _apply_layers_tp(
     enable_ep,
     shard_plans,
     enable_mc2=False,
+    head_shard_kv=False,
 ):
-    """Apply tensor-parallel sharding to a single GPT transformer layer."""
+    """Apply tensor-parallel sharding to a single GPT transformer layer.
+
+    ``head_shard_kv`` selects the MLA K/V up-projection layout: when True the
+    ``linear_kvb`` output is head-sharded (``Shard``) so K/V carry the same
+    per-rank head count as Q; when False they stay ``Replicate`` (the default,
+    reduce-scattered at the ``core_attention`` boundary). This is purely a TP
+    layout choice; the caller decides when to enable it.
+    """
 
     sp_layout, norm_plan, rowwise_output_plan, attn_qkv_shard = shard_plans
     colwise_parallel, prepare_module_input, prepare_module_output, prepare_module_input_output = (
@@ -765,8 +773,13 @@ def _apply_layers_tp(
         # Q arrives at core_attention as attn_input_shard (= attn_qkv_shard when LoRA
         # produces a head-sharded Q, otherwise Replicate). K/V come in as Replicate and
         # get reduce-scattered here to attn_qkv_shard.
+        # With head_shard_kv, K/V are head-sharded upstream (linear_kvb -> Shard) so
+        # they carry Q's per-rank head count already; here they arrive as Shard(head)
+        # rather than Replicate. (Enabled by the caller for async Ulysses/Hybrid CP,
+        # whose producer hooks scatter q/k/v heads at the handoffs before this boundary.)
+        attn_kv_input = attn_qkv_shard if head_shard_kv else Replicate()
         attention_kernel_plan = prepare_module_input(
-            input_layouts=(attn_input_shard, Replicate(), Replicate(), None),
+            input_layouts=(attn_input_shard, attn_kv_input, attn_kv_input, None),
             desired_input_layouts=(attn_qkv_shard, attn_qkv_shard, attn_qkv_shard, None),
             use_local_output=False,
         )
@@ -785,7 +798,8 @@ def _apply_layers_tp(
             # downstream up-projections (linear_qb / linear_kvb) carry the actual TP
             # weight sharding for this attention block.
             "self_attention.linear_qkv": NoParallel(use_local_output=False),
-            "self_attention.linear_kvb": colwise_parallel(output_layouts=Replicate(), use_local_output=False),
+            "self_attention.linear_kvb": colwise_parallel(
+                output_layouts=Shard(2) if head_shard_kv else Replicate(), use_local_output=False),
             "self_attention.k_layernorm": NoParallel(use_local_output=False),
             # NOTE: use_local_output=True so that the inputs to FlexAttention are plain Tensors
             "self_attention.core_attention": attention_kernel_plan,
@@ -914,8 +928,18 @@ def apply_non_moe_tp(
         enable_sp: bool = True,
         enable_ep: bool = False,
         enable_mc2: bool = False,
+        head_shard_kv: bool = False,
 ):
-    """Apply tensor parallelism."""
+    """Apply tensor parallelism.
+
+    Args:
+        head_shard_kv: TP layout knob for MLA attention. When True the K/V
+            up-projection (``linear_kvb``) output is head-sharded (``Shard``) so K/V
+            match Q's per-rank head count; when False they stay ``Replicate`` (the
+            default). The caller enables it for async Ulysses/Hybrid CP + TP, where
+            q/k/v must reach the attention handoffs with symmetric head counts; it has
+            no effect on colossal / sync / non-CP paths.
+    """
     # MC2 (all_gather_matmul / matmul_reduce_scatter) fuses the tensor-parallel
     # collective into the matmul and is only meaningful when the sequence is
     # sharded (sequence parallel). Disable it otherwise to keep semantics correct.
@@ -1006,6 +1030,7 @@ def apply_non_moe_tp(
             enable_ep,
             (sp_layout, norm_plan, rowwise_output_plan, attn_qkv_shard,),
             enable_mc2=enable_mc2,
+            head_shard_kv=head_shard_kv,
         )
 
     if getattr(model.model, "mtp"):
@@ -1036,6 +1061,7 @@ def apply_non_moe_tp(
                 enable_ep,
                 (sp_layout, norm_plan, rowwise_output_plan, attn_qkv_shard,),
                 enable_mc2=enable_mc2,
+                head_shard_kv=head_shard_kv,
             )
 
     if hasattr(model.model, "loss") and (hasattr(model.model.loss, "log_softmax") and
@@ -1599,13 +1625,27 @@ def apply_context_parallel_attention(
                     "CP feeds per-batch cos/sin to the fused RoPE op, which rejects it in tiling. "
                     "Set apply_rope_fusion=false, or enable use_eod_attn_mask_compression."
                 )
-        if async_enabled and method == "ulysses":
+        if async_enabled and method in ("ulysses", "hybrid"):
+            # The Ulysses head all-to-all (the inner degree for hybrid) splits the
+            # *per-TP-rank* head count, not the global one: TP already head-shards Q
+            # (and K/V, via head_shard_kv) to num_heads // tp per rank before the
+            # handoff. So the binding constraint is (num_heads // tp) % ulysses_degree.
+            # (tp defaults to 1, recovering the plain num_heads % ulysses_degree check.)
             num_heads = getattr(model_config, "num_attention_heads", None)
-            if num_heads is not None:
-                if num_heads % ulysses_degree != 0:
+            tp_size = max(int(getattr(parallel_dims, "tp", 1)), 1)
+            if num_heads is not None and ulysses_degree:
+                if num_heads % tp_size != 0:
                     raise ValueError(
                         f"num_attention_heads ({num_heads}) must be divisible by "
-                        f"ulysses_degree ({ulysses_degree})."
+                        f"tensor_parallel ({tp_size})."
+                    )
+                heads_per_rank = num_heads // tp_size
+                if heads_per_rank % ulysses_degree != 0:
+                    raise ValueError(
+                        f"Async {method} CP requires per-TP-rank attention heads "
+                        f"(num_attention_heads // tensor_parallel = {num_heads} // {tp_size} "
+                        f"= {heads_per_rank}) to be divisible by ulysses_degree "
+                        f"({ulysses_degree})."
                     )
 
     cp_style = build_context_parallel_attention_style(
@@ -1744,6 +1784,27 @@ def _apply_spmd_parallelism(
     """
     logger.info("Starting GPTModel parallelization for MCore architecture...")
 
+    # Async Ulysses/Hybrid CP localizes q/k/v to raw tensors and runs the head
+    # all-to-all at the projection handoffs, *before* core_attention's input
+    # boundary. MLA's TP plan shards Q heads (linear_qb -> Shard) but replicates
+    # K/V (linear_kvb -> Replicate); the Replicate->Shard reduce-scatter that
+    # normally equalizes them happens at that boundary, which the async producer
+    # hooks bypass. So K/V reach FlashAttention with more heads than Q (e.g. q=8,
+    # k=16) and it is rejected. Both ulysses (inner degree = cp) and hybrid
+    # (1 < inner degree < cp) run this head all-to-all, so head-shard K/V upstream
+    # for either method to keep the handoff head counts symmetric. Colossal async
+    # (no head all-to-all) and the sync path (layout-aware redistribute) are
+    # unaffected; only meaningful together with TP. This CP-driven decision is
+    # translated to the TP-domain `head_shard_kv` knob at the apply_non_moe_tp call
+    # below, so the TP pass stays CP-agnostic (and nothing is stashed on the config).
+    cp_method = str(getattr(parallelism, "context_parallel_method", "colossal")).lower()
+    cp_needs_uniform_heads = bool(
+        parallel_dims.cp_enabled
+        and parallel_dims.tp_enabled
+        and bool(getattr(parallelism, "context_parallel_async", False))
+        and cp_method in ("ulysses", "hybrid")
+    )
+
     # Phase 1: TP
     tp_mesh = None
     if parallel_dims.tp_enabled:
@@ -1755,6 +1816,7 @@ def _apply_spmd_parallelism(
                 enable_loss_parallel=getattr(parallelism, "enable_loss_parallel", False),
                 enable_ep=parallel_dims.ep_enabled,
                 enable_mc2=getattr(parallelism, "enable_mc2", False),
+                head_shard_kv=cp_needs_uniform_heads,
             )
 
     # Phase 2: EP
