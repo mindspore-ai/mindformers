@@ -13,6 +13,8 @@
 # limitations under the License.
 # ============================================================================
 """experimental_attention_variant utils."""
+# MindSpore ``Cell.construct`` intentionally exposes operator-specific signatures.
+# pylint: disable=arguments-differ
 from scipy.linalg import hadamard
 
 from mindspore import ops
@@ -22,6 +24,8 @@ from hyper_parallel.core.dtensor.dtensor import DTensor
 
 from mindspore import nn, Tensor, mint
 import mindspore.common.dtype as mstype
+
+from mindformers.pynative.distributed.activation_checkpoint import is_in_recompute
 
 
 _INDEXER_LOSS_LOGGING_TRACKER: dict = {}
@@ -36,7 +40,7 @@ def get_indexer_loss_tracker() -> dict:
 
 def save_to_indexer_losses_tracker(loss, layer_number, num_layers):
     """Record one layer's indexer loss into the module-level tracker."""
-    if layer_number is None:
+    if layer_number is None or is_in_recompute():
         return
     tracker = get_indexer_loss_tracker()
     if not tracker:
@@ -95,17 +99,44 @@ def track_indexer_metrics(group=None, group_size=None, pp_group=None,
 
 
 class Hadamard(nn.Cell):
-    """Hadamard Transform."""
-    def __init__(self, head_dim):
+    """Hadamard transform shared by CSA and DSA indexers.
+
+    ``use_butterfly=False`` preserves CSA's dense-matrix implementation.
+    DSA enables the explicit FP32 butterfly so its reduction order matches
+    the Megatron FHT reference before casting back to the input dtype.
+    """
+
+    def __init__(self, head_dim, use_butterfly=False):
         super().__init__()
         self.hadamard_mat = None
         self.linear = mint.nn.functional.linear
         self.head_dim = head_dim
+        self.use_butterfly = use_butterfly
+        if self.use_butterfly and (head_dim <= 0 or head_dim & (head_dim - 1)):
+            raise ValueError(
+                "head_dim must be a positive power of two for the Hadamard "
+                f"butterfly, but got {head_dim}."
+            )
+        self.scale = head_dim ** -0.5
 
     def construct(self, x):
         """do hadamard transform."""
+        if self.use_butterfly:
+            input_dtype = x.dtype
+            original_shape = x.shape
+            x = ops.cast(x, mstype.float32)
+            stride = 1
+            while stride < self.head_dim:
+                x = mint.reshape(x, (-1, self.head_dim // (2 * stride), 2, stride))
+                even = x[:, :, 0, :]
+                odd = x[:, :, 1, :]
+                x = mint.cat((even + odd, even - odd), dim=-1)
+                x = mint.reshape(x, original_shape)
+                stride *= 2
+            x = x * self.scale
+            return ops.cast(x, input_dtype)
         if self.hadamard_mat is None:
             self.hadamard_mat = Tensor(hadamard(self.head_dim), mstype.float32)
         x = self.linear(x, self.hadamard_mat.astype(x.dtype))
-        x = x * self.head_dim ** -0.5
+        x = x * self.scale
         return x
