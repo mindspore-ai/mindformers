@@ -25,7 +25,7 @@ from mindformers.utils.resume_ckpt_utils import get_resume_checkpoint
 
 cur_dir = os.path.dirname(os.path.abspath(__file__))
 
-@pytest.mark.level0
+@pytest.mark.level1
 @pytest.mark.platform_x86_cpu
 @pytest.mark.env_onecard
 def test_get_resume_checkpoint():

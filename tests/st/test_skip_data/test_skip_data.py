@@ -81,7 +81,7 @@ def run_trainer(args, task, model, train_dataset, check_for_global_norm):
                       train_dataset=train_dataset, callbacks=callbacks)
     trainer.train()
 
-@pytest.mark.level0
+@pytest.mark.level1
 @pytest.mark.platform_arm_ascend910b_training
 @pytest.mark.env_onecard
 def test_trainer_skip_data_and_quick_resume():
@@ -94,7 +94,7 @@ def test_trainer_skip_data_and_quick_resume():
         run_trainer(ARGS, "text_generation", MODEL, TRAIN_DATASET_FOR_TRAINER_WITH_ARGS,
                     True)
 
-@pytest.mark.level0
+@pytest.mark.level1
 @pytest.mark.platform_arm_ascend910b_training
 @pytest.mark.env_onecard
 def test_trainer_skip_data_abnormal_global_norm():

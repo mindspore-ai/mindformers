@@ -25,8 +25,8 @@ from tests.st.test_multi_cards_cases.test_parallel_core.test_train_graph.test_ba
     DEFAULT_BATCH_SIZE, DEFAULT_HIDDEN_SIZE, DEFAULT_FFN_HIDDEN_SIZE, DEFAULT_NUM_HEADS
 
 
-_LEVEL_0_TASK_TIME = 50
-_LEVEL_1_TASK_TIME = 0
+_LEVEL_0_TASK_TIME = 0
+_LEVEL_1_TASK_TIME = 50
 _TASK_TYPE = TaskType.TWO_CARDS_TASK
 
 
@@ -127,7 +127,7 @@ class TestTransformerLayer:
             logger.info(f"Loaded output from {output_file_path}. Keys: {list(output_ms_dict.keys())}")
             self.check_output_keys(output_ms_dict, data_keys)
 
-    @pytest.mark.level0
+    @pytest.mark.level1
     @pytest.mark.parametrize(TWO_CARD_TEST_PARAM, TWO_CARD_TEST_CASES)
     def test_multi_card_configurations(self, model_args, data_keys, expect_error, tensor_parallel, tmp_path):
         """Test four cards with various configurations for GPTModel."""

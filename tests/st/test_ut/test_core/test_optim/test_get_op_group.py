@@ -81,7 +81,7 @@ def build_sharded_info(local_shape, axis_fragmentations):
     )
 
 
-@pytest.mark.level0
+@pytest.mark.level1
 @pytest.mark.platform_x86_cpu
 @pytest.mark.env_onecard
 def test_gpt_model_sharded_state_dict():
@@ -100,7 +100,7 @@ def test_gpt_model_sharded_state_dict():
         assert param.shape == sharded_state_dict[param.name].global_shape
 
 
-@pytest.mark.level0
+@pytest.mark.level1
 @pytest.mark.platform_x86_cpu
 @pytest.mark.env_onecard
 @pytest.mark.parametrize(
@@ -130,7 +130,7 @@ def test_compute_repeat_num_and_model_parallel_size(axis_fragmentations, world_s
     ) == expected
 
 
-@pytest.mark.level0
+@pytest.mark.level1
 @pytest.mark.platform_x86_cpu
 @pytest.mark.env_onecard
 def test_compute_repeat_num_and_model_parallel_size_multiple_axis_error():

@@ -23,8 +23,8 @@ from mindformers.tools.logger import logger
 from tests.st.test_multi_cards_cases.utils import TaskType
 
 
-_LEVEL_0_TASK_TIME = 105
-_LEVEL_1_TASK_TIME = 0
+_LEVEL_0_TASK_TIME = 0
+_LEVEL_1_TASK_TIME = 105
 _TASK_TYPE = TaskType.FOUR_CARDS_TASK
 
 
@@ -45,7 +45,7 @@ class TestDeepseekV3WithCalculatePerTokenLossAndPrintSeparateLoss:
         self.run_script_path = self.sh_path / "run_deepseek3.py"
         assert self.run_script_path.exists(), f"Run script not found: {self.run_script_path}"
 
-    @pytest.mark.level0
+    @pytest.mark.level1
     def test_four_card_configurations_calculate_per_token_loss_and_print_seperate_loss(self):
         """Test four cards for DeepseekV3."""
         port_id = int(os.environ.get("ASCEND_PORT_ID", random.randint(50000, 65535)))
@@ -54,7 +54,7 @@ class TestDeepseekV3WithCalculatePerTokenLossAndPrintSeparateLoss:
              f"--log_dir=./msrun_log_deepseekv3_per_token "
              f"--join=True {self.run_script_path} "
              f"--mode=parallel_train_dp2_mp2_ep2_calculate_per_token_loss_and_print_seperate_loss",
-             f"./msrun_log_deepseekv3_per_token/worker_3.log"),
+             "./msrun_log_deepseekv3_per_token/worker_3.log"),
         ]
         with Pool(len(cmd_list)) as pool:
             results = list(pool.imap(run_command, cmd_list))
@@ -74,9 +74,9 @@ class TestDeepseekV3WithCalculatePerTokenLossAndPrintSeparateLoss:
                                 found_losses.add(loss)
                     else:
                         break
-        except FileNotFoundError:
-            raise AssertionError(f"log path {log_path} is not found.")
-        except Exception as e:
-            raise AssertionError(f"Error when reading log file: {e}")
+        except FileNotFoundError as exc:
+            raise AssertionError(f"log path {log_path} is not found.") from exc
+        except Exception as exc:
+            raise AssertionError(f"Error when reading log file: {exc}") from exc
 
         assert found_losses == required_losses

@@ -20,8 +20,8 @@ from tests.st.test_multi_cards_cases.utils import TaskType
 from tests.st.test_ut.test_parallel_core.test_training_graph.test_transformer.test_multi_latent_attention.test_multi_latent_attention import TestMultiLatentAttention
 
 
-_LEVEL_0_TASK_TIME = 80
-_LEVEL_1_TASK_TIME = 0
+_LEVEL_0_TASK_TIME = 0
+_LEVEL_1_TASK_TIME = 80
 _TASK_TYPE = TaskType.TWO_CARDS_TASK
 
 MULTI_CARD_TEST_PARAM = 'model_args, golden_data_key, tensor_parallel'
@@ -53,7 +53,7 @@ MULTI_CARD_TEST_CASES = [
 
 class TestMultiLatentAttentionFourCards(TestMultiLatentAttention):
     """Test class for Multi-head Latent Attention with four cards configurations."""
-    @pytest.mark.level0
+    @pytest.mark.level1
     @pytest.mark.parametrize('struct', ['megatron', 'a2'])
     @pytest.mark.parametrize(
         MULTI_CARD_TEST_PARAM,

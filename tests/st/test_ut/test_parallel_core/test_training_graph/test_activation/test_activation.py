@@ -38,7 +38,7 @@ class TestActivation:
             f"Golden output:\n{golden_output}"
         )
 
-    @pytest.mark.level0
+    @pytest.mark.level1
     @pytest.mark.platform_arm_ascend910b_training
     @pytest.mark.env_onecard
     def test_gelu(self):
@@ -49,7 +49,7 @@ class TestActivation:
         """
         self.run_test(activation=GELU())
 
-    @pytest.mark.level0
+    @pytest.mark.level1
     @pytest.mark.platform_arm_ascend910b_training
     @pytest.mark.env_onecard
     def test_gelu_unapproximate(self):
@@ -60,7 +60,7 @@ class TestActivation:
         """
         self.run_test(activation=GELU(approximate=False))
 
-    @pytest.mark.level0
+    @pytest.mark.level1
     @pytest.mark.platform_arm_ascend910b_training
     @pytest.mark.env_onecard
     def test_silu(self):
@@ -71,7 +71,7 @@ class TestActivation:
         """
         self.run_test(activation=SiLU())
 
-    @pytest.mark.level0
+    @pytest.mark.level1
     @pytest.mark.platform_arm_ascend910b_training
     @pytest.mark.env_onecard
     def test_swiglu(self):

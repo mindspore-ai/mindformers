@@ -34,7 +34,7 @@ class JitCell(Cell):
 class TestJit:
     """A test class for jit."""
 
-    @pytest.mark.level0
+    @pytest.mark.level1
     @pytest.mark.platform_arm_ascend910b_training
     @pytest.mark.env_onecard
     def test_jit_graph_mode(self):

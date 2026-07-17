@@ -20,8 +20,8 @@ from tests.st.test_multi_cards_cases.utils import TaskType
 from tests.st.test_ut.test_parallel_core.test_training_graph.test_tensor_parallel.test_row_parallel_linear_with_lora.test_row_parallel_linear_with_lora import TestRowParallelLinearWithLoRA
 
 
-_LEVEL_0_TASK_TIME = 45
-_LEVEL_1_TASK_TIME = 0
+_LEVEL_0_TASK_TIME = 0
+_LEVEL_1_TASK_TIME = 45
 _TASK_TYPE = TaskType.TWO_CARDS_TASK
 
 TWO_CARD_TEST_PARAM = "model_args, data_keys, tensor_parallel"
@@ -35,7 +35,7 @@ TWO_CARD_TEST_CASES = [
 
 class TestRowParallelLinearWithLoRATwoCards(TestRowParallelLinearWithLoRA):
     """Test class for RowParallelLinear with two cards configurations"""
-    @pytest.mark.level0
+    @pytest.mark.level1
     @pytest.mark.parametrize(
         TWO_CARD_TEST_PARAM,
         TWO_CARD_TEST_CASES

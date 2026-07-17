@@ -34,7 +34,8 @@ class TestRowParallelBatchedLinear:
             cmd,
             shell=True,
             capture_output=True,
-            text=True
+            text=True,
+            check=False
         )
         if not expected_error:
             assert result.returncode == 0, (
@@ -48,7 +49,7 @@ class TestRowParallelBatchedLinear:
             )
 
 
-    @pytest.mark.level0
+    @pytest.mark.level1
     @pytest.mark.platform_arm_ascend910b_training
     @pytest.mark.env_onecard
     def test_num_moe_experts_2_case(self):
@@ -60,7 +61,7 @@ class TestRowParallelBatchedLinear:
         args = ""
         self.run_test(args)
 
-    @pytest.mark.level0
+    @pytest.mark.level1
     @pytest.mark.platform_arm_ascend910b_training
     @pytest.mark.env_onecard
     def test_num_moe_experts_error_case(self):

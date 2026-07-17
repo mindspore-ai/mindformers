@@ -45,7 +45,7 @@ class DummyTrainer(Trainer):
         self.config.load_checkpoint = load_checkpoint
 
 
-@pytest.mark.level0
+@pytest.mark.level1
 @pytest.mark.platform_x86_cpu
 @pytest.mark.env_onecard
 def test_empty_string_checkpoint():
@@ -61,7 +61,7 @@ def test_empty_string_checkpoint():
     assert trainer.config.load_checkpoint == ""
 
 
-@pytest.mark.level0
+@pytest.mark.level1
 @pytest.mark.platform_x86_cpu
 @pytest.mark.env_onecard
 def test_empty_directory_checkpoint(tmp_path):
@@ -77,7 +77,7 @@ def test_empty_directory_checkpoint(tmp_path):
     assert trainer.config.load_checkpoint == ""
 
 
-@pytest.mark.level0
+@pytest.mark.level1
 @pytest.mark.platform_x86_cpu
 @pytest.mark.env_onecard
 def test_valid_checkpoint(tmp_path):
@@ -95,7 +95,7 @@ def test_valid_checkpoint(tmp_path):
     assert trainer.config.load_checkpoint == str(tmp_path)
 
 
-@pytest.mark.level0
+@pytest.mark.level1
 @pytest.mark.platform_x86_cpu
 @pytest.mark.env_onecard
 def test_resume_training_false():

@@ -51,7 +51,7 @@ class Net(nn.Cell):
         return output
 
 
-@pytest.mark.level0
+@pytest.mark.level1
 @pytest.mark.platform_x86_cpu
 @pytest.mark.env_onecard
 def test_get_grouped_params():
@@ -89,7 +89,7 @@ def test_get_grouped_params():
     assert grouped_params == target_dict, f"Get params {grouped_params}, but should be {target_dict}."
 
 
-@pytest.mark.level0
+@pytest.mark.level1
 @pytest.mark.platform_x86_cpu
 @pytest.mark.env_onecard
 def test_get_grouped_params_with_grouped_lr():
@@ -149,7 +149,7 @@ def test_get_grouped_params_with_grouped_lr():
     assert grouped_params == target_dict, f"Get params {grouped_params}, but should be {target_dict}."
 
 
-@pytest.mark.level0
+@pytest.mark.level1
 @pytest.mark.platform_x86_cpu
 @pytest.mark.env_onecard
 def test_get_grouped_params_with_invalid_group():

@@ -166,7 +166,7 @@ class TestRowParallelLinear:
 
 class TestRowParallelLinearSingleCard(TestRowParallelLinear):
     """Test class for RowParallelLinear with single card configurations"""
-    @pytest.mark.level0
+    @pytest.mark.level1
     @pytest.mark.platform_arm_ascend910b_training
     @pytest.mark.env_onecard
     @pytest.mark.parametrize(

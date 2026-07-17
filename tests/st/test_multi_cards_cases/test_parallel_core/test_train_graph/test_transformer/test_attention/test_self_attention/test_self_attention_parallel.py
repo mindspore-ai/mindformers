@@ -20,8 +20,8 @@ from tests.st.test_multi_cards_cases.utils import TaskType
 from tests.st.test_ut.test_parallel_core.test_training_graph.test_transformer.test_attention.test_self_attention.test_self_attention import TestSelfAttention
 
 
-_LEVEL_0_TASK_TIME = 90
-_LEVEL_1_TASK_TIME = 0
+_LEVEL_0_TASK_TIME = 0
+_LEVEL_1_TASK_TIME = 90
 _TASK_TYPE = TaskType.TWO_CARDS_TASK
 
 TWO_CARD_TEST_PARAM = "model_args, data_keys, expect_error, tensor_parallel"
@@ -49,7 +49,7 @@ TWO_CARD_TEST_CASES = [
 class TestSelfAttentionTwoCards(TestSelfAttention):
     """Test SelfAttention with parallel configurations."""
 
-    @pytest.mark.level0
+    @pytest.mark.level1
     @pytest.mark.parametrize(
         TWO_CARD_TEST_PARAM,
         TWO_CARD_TEST_CASES

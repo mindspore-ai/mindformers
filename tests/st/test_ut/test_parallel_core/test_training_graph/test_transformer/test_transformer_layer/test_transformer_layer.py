@@ -209,7 +209,7 @@ class TestTransformerLayer:
 
 class TestTransformerLayerSingleCard(TestTransformerLayer):
     """Test TransformerLayer with single card configurations"""
-    @pytest.mark.level0
+    @pytest.mark.level1
     @pytest.mark.platform_arm_ascend910b_training  # Or your specific platform
     @pytest.mark.env_onecard  # Single card environment
     @pytest.mark.parametrize(SINGLE_CARD_TEST_PARAM, SINGLE_CARD_TEST_CASES)

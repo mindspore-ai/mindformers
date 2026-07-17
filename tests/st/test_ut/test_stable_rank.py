@@ -22,7 +22,7 @@ ms.set_context(mode=1)
 ms.set_device(device_target='Ascend')
 
 
-@pytest.mark.level0
+@pytest.mark.level1
 @pytest.mark.platform_arm_ascend910b_training
 @pytest.mark.env_onecard
 def test_stable_rank():
@@ -39,7 +39,7 @@ def test_stable_rank():
     assert abs(stable_rank - stable_rank_ops) < (stable_rank * 0.05)
     assert abs(eigenvalue - eigenvalue_ops) < (eigenvalue * 0.05)
 
-@pytest.mark.level0
+@pytest.mark.level1
 @pytest.mark.platform_arm_ascend910b_training
 @pytest.mark.env_onecard
 def test_3d_param_stable_rank():
@@ -76,7 +76,7 @@ def test_3d_param_stable_rank():
     assert sr[5] == 0.0
     assert eig[5] == 0.0
 
-@pytest.mark.level0
+@pytest.mark.level1
 @pytest.mark.platform_arm_ascend910b_training
 @pytest.mark.env_onecard
 def test_2d_zero_stable_rank():
