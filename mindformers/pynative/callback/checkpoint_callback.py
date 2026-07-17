@@ -249,6 +249,9 @@ class CheckpointCallback(TrainerCallback):
         if getattr(state, "global_batch_size", None):
             common_info.global_batch_size = state.global_batch_size
 
+        # consumed_samples is persisted and used for resume data-skip.
+        common_info.consumed_samples = int(getattr(state, "consumed_samples", 0) or 0)
+
         logger.debug(
             f"Created CommonInfo: epoch={common_info.epoch_num}, "
             f"step={common_info.step_num}, global_step={common_info.global_step}"

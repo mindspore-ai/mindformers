@@ -15,7 +15,6 @@
 """Pynative Trainer Utils."""
 
 from fnmatch import fnmatch
-from functools import partial
 from typing import List, Optional, Set, Tuple, Union
 import numpy as np
 
@@ -356,18 +355,16 @@ def _build_lora_model(model, config):
 
 def _build_dataset(
     config,
-    global_batch_size: int,
     parallelism,
-    num_grad_acc: int = 1,
+    local_batch_size: int,
 ):
     """
     Build dataset and dataloader.
 
     Args:
         config: Dataset configuration.
-        global_batch_size (int): Global batch size.
-        dataset_parallel (int): Dataset parallel degree.
-        num_grad_acc (int): Gradient accumulation steps.
+        parallelism: Parallelism config.
+        local_batch_size (int): Per-rank micro-batch size.
 
     Returns:
         MindSpore Dataset instance.
@@ -402,9 +399,11 @@ def _build_dataset(
             parallelism.tensor_parallel // parallelism.context_parallel
         return dataset_parallel, shard_id
 
-    def _actual_seq_len_batch_map(*cols, micro_batch_size):
-        """
-        Adjust actual sequence length offsets under gradient accumulation.
+    def _actual_seq_len_batch_map(*cols):
+        """Adjust actual sequence length offsets across all sequences in a batch.
+
+        Each batch is one micro-batch at ``local_batch_size`` granularity, so all
+        sequences in the batch share a single accumulating offset (no group reset).
 
         This is required when using compressed EOD mask with micro-batching.
         """
@@ -415,18 +414,12 @@ def _build_dataset(
         if len(actual_seq_len) == 1:
             return columns
 
-        batch_size = len(actual_seq_len) // micro_batch_size
         cur_seq_len = []
-
-        for micro_idx in range(micro_batch_size):
-            offset = 0
-            start = micro_idx * batch_size
-            end = (micro_idx + 1) * batch_size
-
-            for seq_idx in range(start, end):
-                per_seq = actual_seq_len[seq_idx] + offset
-                offset = per_seq[-1]
-                cur_seq_len.append(per_seq)
+        offset = 0
+        for seq in actual_seq_len:
+            per_seq = seq + offset
+            offset = per_seq[-1]
+            cur_seq_len.append(per_seq)
 
         # Replace actual_seq_len column only
         columns = columns[:-1] + (cur_seq_len,)
@@ -464,12 +457,12 @@ def _build_dataset(
 
     per_batch_map_func = None
     if create_compressed_eod_mask:
-        per_batch_map_func = partial(
-            _actual_seq_len_batch_map, micro_batch_size=num_grad_acc
-        )
+        # Each batch is one micro-batch at local_batch_size granularity,
+        # so all sequences in a batch share a single accumulating offset.
+        per_batch_map_func = _actual_seq_len_batch_map
 
     dataset = dataset.batch(
-        batch_size=global_batch_size // dataset_parallel,
+        batch_size=local_batch_size,
         drop_remainder=config.drop_remainder,
         per_batch_map=per_batch_map_func,
     )
