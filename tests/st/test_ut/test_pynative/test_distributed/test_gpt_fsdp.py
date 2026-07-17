@@ -53,6 +53,51 @@ class _FakeOwner:
         return [("scale", self.scale)]
 
 
+class _FakeTensor:
+    """Small ownership-flag tensor used to isolate collective setup logic."""
+
+    def __init__(self, value, dtype=None):
+        del dtype
+        self.value = list(value)
+
+    def asnumpy(self):
+        return self.value
+
+
+class _FakeEmbeddingPart:
+    """Minimal pipeline model part with one input embedding parameter."""
+
+    def __init__(self):
+        self.weight = _FakeParameter((8, 4))
+
+    def parameters_and_names(self):
+        return [("model.embedding.word_embeddings.weight", self.weight)]
+
+
+class _FakePpMesh:
+    """Two-rank PP line used by MTP embedding synchronization setup."""
+
+    @staticmethod
+    def get_rank_list_along_axis(axis):
+        assert axis == "pp"
+        return [0, 4]
+
+    @staticmethod
+    def get_group():
+        return "pp_group"
+
+
+class _FakeParallelDims:
+    """Parallel dimensions with pipeline parallelism enabled."""
+
+    pp_enabled = True
+
+    @staticmethod
+    def get_mesh(axis):
+        assert axis == "pp"
+        return _FakePpMesh()
+
+
 @pytest.mark.level0
 @pytest.mark.platform_x86_cpu
 def test_fp32_linear_and_owner_use_separate_fsdp_groups(monkeypatch):
@@ -96,3 +141,38 @@ def test_fused_fp32_linear_is_managed_by_owner_hook(monkeypatch):
     assert [module for module, _ in calls] == [owner]
     assert calls[0][1]["replicate_params"] == [owner.scale]
     assert calls[0][1]["shard_placement_fn"](owner.proj.weight) == Shard(1)
+
+
+@pytest.mark.level0
+@pytest.mark.platform_x86_cpu
+def test_mtp_embedding_sync_uses_canonical_pp_rank(monkeypatch):
+    """MTP embedding tags carry the group and source needed after delayed init."""
+    part = _FakeEmbeddingPart()
+    config = type("Config", (), {"mtp_num_layers": 1})()
+    gpt_model = type(
+        "GptModel", (), {"get_gpt_transformer_config": lambda self: config}
+    )()
+    created_groups = []
+
+    def fake_all_gather(outputs, inputs, group):
+        _ = inputs
+        assert group == "pp_group"
+        for output in outputs:
+            output.value[0] = 1
+
+    def fake_new_group(ranks):
+        created_groups.append(ranks)
+        return "mtp_embedding_group"
+
+    monkeypatch.setattr(parallelize, "Tensor", _FakeTensor)
+    monkeypatch.setattr(parallelize, "all_gather", fake_all_gather)
+    monkeypatch.setattr(parallelize, "get_rank", lambda: 4)
+    monkeypatch.setattr(parallelize, "new_group", fake_new_group)
+    monkeypatch.setattr(parallelize, "_unwrap_gptmodel", lambda _part: gpt_model)
+
+    parallelize._setup_mtp_embedding_grad_sync([part], _FakeParallelDims())
+
+    assert created_groups == [[0, 4]]
+    assert part.weight._embedding_grad_sync_group == "mtp_embedding_group"
+    assert part.weight._embedding_grad_sync_size == 2
+    assert part.weight._embedding_sync_src_rank == 0

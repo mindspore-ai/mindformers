@@ -74,6 +74,7 @@ from .utils import (
     _calculate_global_grad_norm,
     compute_parameters,
     set_auxiliary_loss_backward_scale,
+    _sync_mtp_embedding_weights_after_init,
 )
 
 
@@ -214,6 +215,14 @@ class Trainer:
             m.to_empty()
             with _no_grad():
                 m.init_states()
+
+        # PP rebuilds separate input-embedding copies for the first stage and
+        # the MTP stage. Delayed initialization above gives those replicas
+        # different values even though their gradients are synchronized and
+        # checkpoint metadata treats them as one shared parameter. Canonicalize
+        # the initialized local shards before optimizer states are derived.
+        with _no_grad():
+            _sync_mtp_embedding_weights_after_init(self.model)
 
         # LoRA: freeze base params AFTER parallelism + init_states. During distribute_module
         # all params must be trainable so they materialise as DTensors (including frozen

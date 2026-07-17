@@ -137,10 +137,11 @@ def _setup_mtp_embedding_grad_sync(model_parts, parallel_dims):
 
     This builds a process group over the embedding-owning PP ranks (per
     dp/tp/cp/ep coordinate) and tags the local ``word_embeddings.weight`` with
-    ``_embedding_grad_sync_group`` / ``_pp_replica_count``. The grad-norm helper
-    (`_calculate_global_grad_norm` -> `_get_grad_factor`) then all-reduces the
-    tagged gradient and counts the replicated embedding exactly once, with no
-    trainer changes.
+    the group, replica count, and canonical source rank. After delayed
+    initialization the trainer broadcasts the source rank's local embedding
+    shard to the other PP copy. The grad-norm helper
+    (``_calculate_global_grad_norm`` -> ``_get_grad_factor``) then all-reduces
+    the tagged gradient and counts the replicated embedding exactly once.
 
     ``model_parts`` is the full list of virtual-pipeline chunks owned by this
     rank. Under interleaving the main and MTP embeddings live in different
@@ -201,6 +202,11 @@ def _setup_mtp_embedding_grad_sync(model_parts, parallel_dims):
     for weight in embed_weights:
         weight._embedding_grad_sync_group = group
         weight._embedding_grad_sync_size = len(embed_ranks)
+        # ``to_empty()`` / ``init_states()`` run after parallelization and
+        # initialize each PP copy independently. Remember the same canonical
+        # owner used by checkpoint replica metadata so the trainer can
+        # broadcast the initialized local shard before creating the optimizer.
+        weight._embedding_sync_src_rank = embed_ranks[0]
     logger.info(
         "[MTP-EmbedSync] rank %d tagged %d embedding weight(s) for grad-sync group %s",
         local_rank, len(embed_weights), embed_ranks,
