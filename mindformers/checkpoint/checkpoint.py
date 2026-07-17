@@ -94,6 +94,9 @@ class CommonInfo:
     global_batch_size: int = None
     """The total batch size during multi-NPU training."""
 
+    consumed_samples: int = None
+    """Total samples consumed so far — persisted and used for dynamic-batch resume data-skip."""
+
     ckpt_status: int = None
     """CkptHealthStatus class, Indicates whether the checkpoint is healthy."""
 

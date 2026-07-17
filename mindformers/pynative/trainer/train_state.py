@@ -60,6 +60,7 @@ class TrainerState:
     epoch_step: int = 0
     global_batch_size: int = 0
     num_accumulation_steps: int = 1
+    consumed_samples: int = 0
     total_flops: float = 0.0
     best_metric: Optional[float] = None
     best_model_checkpoint: Optional[str] = None
@@ -87,6 +88,7 @@ class TrainerState:
             "epoch_step": self.epoch_step,
             "global_batch_size": self.global_batch_size,
             "num_accumulation_steps": self.num_accumulation_steps,
+            "consumed_samples": self.consumed_samples,
             "total_flops": self.total_flops,
             "best_metric": self.best_metric,
             "best_model_checkpoint": self.best_model_checkpoint,

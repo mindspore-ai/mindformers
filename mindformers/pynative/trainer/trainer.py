@@ -35,12 +35,13 @@ from mindspore.mint.distributed import (
     broadcast_object_list,
 )
 from mindspore.graph.api import _no_grad
-
+from hyper_parallel.platform.mindspore.pipeline_parallel._utils import _MicroBatch
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.platform.mindspore.autograd_compat import enable_mindspore_backward_compat
 
 from mindformers.tools.logger import logger
 from mindformers.pynative.config import TrainConfig
+from mindformers.pynative.trainer.dynamic_batch import build_dynamic_scheduler
 from mindformers.models import PreTrainedModel
 from mindformers.checkpoint.checkpoint import load_checkpoint
 from mindformers.pynative.callback import (
@@ -182,7 +183,19 @@ class Trainer:
         self.has_last = True
 
         self.global_batch_size = self.config.training.global_batch_size
-        self.gradient_accumulation_steps = None
+        self.dynamic_scheduler = None
+        self._dataset_iter = None
+        # consumed_samples: total samples processed so far.
+        self._consumed_samples = 0
+        self._base_units = 0  # data_parallel * local_batch_size
+        # True when resuming (set in _load_checkpoint). On epoch-wrap iterator
+        # recreate, a resumed DYNAMIC run resets the dataset offset to 0
+        # (set_init_step(0)) so the new epoch starts at item 0 — otherwise the
+        # persisted resume offset makes the recreated iterator restart at the
+        # checkpoint position and diverge from fresh training after the first epoch.
+        self._resumed = False
+        rampup = getattr(self.config.training, "rampup_batch_size", None)
+        self.dynamic_batch_enabled = rampup is not None
         self._compute_data_parallel_size()
 
         # init data broadcast group
@@ -251,9 +264,25 @@ class Trainer:
             self.train_epoch_step = self._get_dataset_size(self.train_dataset)
         else:
             self.train_epoch_step = self.config.training.steps
-        self.train_num_epochs = max(
-            self.config.training.steps // self.train_epoch_step, 1
-        )
+        if self.dynamic_batch_enabled and self.dynamic_scheduler is not None:
+            # Dynamic batch consumes a varying (growing) number of micro-batches per
+            # optimizer step. Size num_epochs to a safe UPPER BOUND (max_steps *
+            # max_accum, +1 epoch margin) so the iterator never exhausts mid-run.
+            # A mid-run StopIteration would force an iterator recreate that restarts
+            # the data stream and diverge fresh vs resumed training (the data
+            # position is driven by consumed_samples on the trainer, not by the
+            # iterator's internal offset). The bound is safe because num_epochs only
+            # caps capacity (the iterator is lazy); the loop still stops at max_steps,
+            # and consumed + remaining <= max_steps * max_accum <= (num_epochs-1)*E.
+            max_accum = self.dynamic_scheduler.max_gbs // self._base_units
+            max_total_micros = self.config.training.steps * max_accum
+            self.train_num_epochs = max(
+                (max_total_micros + self.train_epoch_step - 1)
+                // self.train_epoch_step + 1, 1)
+        else:
+            self.train_num_epochs = max(
+                self.config.training.steps // self.train_epoch_step, 1
+            )
 
         # Create evaluate dataset
         self.eval_dataset = self._create_dataset(
@@ -469,23 +498,31 @@ class Trainer:
         )
 
         # calculate gradient accumulation steps
-        if (
-                parallelism.data_parallel * self.config.training.local_batch_size
-                > self.global_batch_size
-        ):
-            raise ValueError(
-                "The product of data_parallel and local_batch_size exceeds global_batch_size, "
-                "please increase global_batch_size or decrease local_batch_size."
+        base_units = parallelism.data_parallel * self.config.training.local_batch_size
+        self._base_units = base_units
+        if self.dynamic_batch_enabled:
+            # Dynamic batch : the scheduler maps
+            # consumed_samples -> GBS. Initial values come from consumed_samples=0.
+            self.dynamic_scheduler = build_dynamic_scheduler(self.config, self.global_batch_size, base_units)
+            self.num_accumulation_steps = self.dynamic_scheduler.num_accum_at_consumed(0)
+            self.global_batch_size = self.dynamic_scheduler.gbs_at_consumed(0)
+            logger.info(
+                "Dynamic batch enabled: initial global_batch_size=%d, "
+                "num_accumulation_steps=%d.",
+                self.global_batch_size, self.num_accumulation_steps,
             )
-
-        self.num_accumulation_steps = self.global_batch_size // (
-                parallelism.data_parallel * self.config.training.local_batch_size
-        )
+        else:
+            if base_units > self.global_batch_size:
+                raise ValueError(
+                    "The product of data_parallel and local_batch_size exceeds global_batch_size, "
+                    "please increase global_batch_size or decrease local_batch_size."
+                )
+            self.num_accumulation_steps = self.global_batch_size // base_units
+            logger.info(
+                f"Calculate global_batch_size={self.global_batch_size}, "
+                f"num_accumulation_steps={self.num_accumulation_steps}."
+            )
         parallelism.pipeline_parallel_microbatch_size = self.num_accumulation_steps
-        logger.info(
-            f"Calculate global_batch_size={self.global_batch_size}, "
-            f"num_accumulation_steps={self.num_accumulation_steps}."
-        )
 
     def _create_dataset(self, dataset, dataset_config: Optional[Dict]) -> Optional[Any]:
         """
@@ -511,9 +548,8 @@ class Trainer:
         logger.info("Building dataset from config...")
         dataset = _build_dataset(
             dataset_config,
-            self.global_batch_size,
             self.config.parallelism,
-            self.num_accumulation_steps,
+            local_batch_size=self.config.training.local_batch_size,
         )
 
         return dataset
@@ -650,7 +686,7 @@ class Trainer:
         """Register backward hooks to cast low-precision gradients to fp32 (single-card only).
 
         bf16/fp16 parameter gradients are cast to fp32 during backward so that
-        gradient accumulation operates in fp32 precision, aligning with Megatron-LM.
+        gradient accumulation operates in fp32 precision.
 
         Multi-card runs go through ``fully_shard`` instead, where HSDP's
         ``apply_grad_on_fp32_main_grad`` policy accumulates the reduced gradient onto
@@ -694,6 +730,9 @@ class Trainer:
 
         # Initialize training state
         self.state = self._init_train_state()
+        # Sync dynamic fields that were computed before state existed.
+        self.state.num_accumulation_steps = self.num_accumulation_steps
+        self.state.global_batch_size = self.global_batch_size
 
         if self.parallel_dims is not None and self.parallel_dims.pp_enabled:
             pp_mesh = self.parallel_dims.get_mesh("pp")
@@ -768,17 +807,40 @@ class Trainer:
                 raise ValueError("If no_load_optim is False, optimizer is required.")
 
             global_step = common_info.global_step
-            if common_info.global_batch_size != self.global_batch_size:
-                global_step = int(
-                    common_info.global_step
-                    * (common_info.global_batch_size / self.global_batch_size)
-                )
+            self._resumed = True
+            if self.dynamic_batch_enabled:
+                # Dynamic: skip consumed_samples // base_units micro-batches. Use the
+                # persisted consumed_samples; fall back to recomputing from global_step
+                # for old checkpoints without the field.
+                saved_consumed = getattr(common_info, "consumed_samples", None)
+                if saved_consumed is not None:
+                    self._consumed_samples = int(saved_consumed)
+                else:
+                    self._consumed_samples = self.dynamic_scheduler.consumed_samples_at_step(global_step)
+                self.state.consumed_samples = self._consumed_samples
+                skip_micros = self._consumed_samples // self._base_units
+                if skip_micros > 0:
+                    self.train_dataset.set_init_step(skip_micros)
                 logger.info(
-                    f"Scaled global step: {common_info.global_step} -> {global_step} "
-                    f"(batch size changed from {common_info.global_batch_size} to {self.global_batch_size})"
+                    "Resume dataset (dynamic batch): skip %d micro-batches "
+                    "(consumed_samples=%d, global_step=%d).",
+                    skip_micros, self._consumed_samples, global_step,
                 )
-            self.train_dataset.set_init_step(global_step)
-            logger.info(f"Resume dataset from: {global_step}")
+            else:
+                # Static: set_init_step by global_step, not consumed_samples.
+                if common_info.global_batch_size and common_info.global_batch_size != self.global_batch_size:
+                    global_step = int(
+                        common_info.global_step
+                        * (common_info.global_batch_size / self.global_batch_size)
+                    )
+                    logger.info(
+                        f"Scaled global step: {common_info.global_step} -> {global_step} "
+                        f"(batch size changed from {common_info.global_batch_size} to {self.global_batch_size})"
+                    )
+                self.train_dataset.set_init_step(global_step)
+                self._consumed_samples = global_step * self.global_batch_size
+                self.state.consumed_samples = self._consumed_samples
+                logger.info(f"Resume dataset (static batch) from: {global_step}")
 
             self.state.global_step = global_step
 
@@ -801,8 +863,11 @@ class Trainer:
         """
         Internal training loop with gradient accumulation support.
         """
-        # Create dataset iterator
-        dataset_iter = self._create_dataset_iterator(self.train_dataset)
+        # Create dataset iterator. On resume, set_init_step(skip) (called in
+        # _load_checkpoint) makes this first iterator start at the resume position.
+        # Epoch-wrap recreates (in _next_batch) reset the offset to 0 so each new
+        # epoch starts at its first item, matching fresh training.
+        self._dataset_iter = self._create_dataset_iterator(self.train_dataset)
 
         for m in self.model:
             if hasattr(m, "set_train"):
@@ -819,13 +884,12 @@ class Trainer:
                     self.callback_handler.on_epoch_begin(self.config, self.state)
                     self.state.update_epoch()
 
-                # Get batch data
-                try:
-                    inputs = self.get_batch(dataset_iter)
-                except StopIteration:
-                    # Recreate iterator if dataset exhausted
-                    dataset_iter = self._create_dataset_iterator(self.train_dataset)
-                    inputs = self.get_batch(dataset_iter)
+                # Dynamic batch (sample-driven): refresh num_accumulation_steps and
+                # derived items from consumed_samples BEFORE running this step, so the
+                # step consumes the right number of micro-batches. No-op when the
+                # accumulation value is unchanged.
+                if self.dynamic_batch_enabled:
+                    self._update_dynamic_batch(self._consumed_samples)
 
                 # Step begin callback
                 self.callback_handler.on_step_begin(self.config, self.state)
@@ -837,10 +901,15 @@ class Trainer:
                 self.monitor.record("moe_tpe_step_begin")
 
                 if self.parallel_dims and self.parallel_dims.pp_enabled:
-                    loss, grad_norm = self.training_pp_step(inputs)
+                    loss, grad_norm = self.training_pp_step()
                 else:
-                    loss, grad_norm = self.training_step(
-                        inputs, loss=loss, grad_norm=grad_norm, step=step)
+                    loss, grad_norm = self.training_step(step=step)
+
+                # Advance consumed_samples by this step's GBS (dynamic drives the
+                # schedule with it; static uses it for logging). Persisted via
+                # state.consumed_samples for dynamic-batch resume.
+                self._consumed_samples += self.global_batch_size
+                self.state.consumed_samples = self._consumed_samples
 
                 # Update state
                 self.state.global_step += 1
@@ -987,32 +1056,24 @@ class Trainer:
             return [cls._unpack_broadcast_data(v) for v in data]
         return data
 
-    def _split_micro_batch(self, inputs: Dict[str, Any], acc_step: int):
-        """
-        Split a batch of data into a micro-batch for gradient accumulation.
+    def training_step(self, step=None):
+        """Accumulate gradients over micro-batches.
+
+        Each micro-batch is fetched individually via ``_next_batch`` at
+        ``local_batch_size`` granularity. This path is shared by both static
+        (fixed ``num_accumulation_steps``) and dynamic (varying
+        ``num_accumulation_steps``) batch training.
 
         Args:
-            inputs (Dict[str, Any]): Input data dictionary.
-            acc_step (int): Current accumulation step.
+            step (int, optional): Current optimizer step for error reporting.
 
         Returns:
-            Dict[str, Any]: Dictionary containing micro-batch data.
+            Tuple[Tensor, Tensor]: Accumulated loss and global gradient norm.
         """
-        local_batch_size = self.config.training.local_batch_size
-        start_idx = acc_step * local_batch_size
-        end_idx = (acc_step + 1) * local_batch_size
-
-        micro_inputs = {
-            k: v[start_idx:end_idx] for k, v in inputs.items()
-        }
-        return micro_inputs
-
-    def training_step(self, inputs, loss, grad_norm, step):
-        """
-        Accumulate gradients over multiple micro-batches.
-        """
+        loss = 0.0
+        grad_norm = 0.0
         for micro_step in range(self.num_accumulation_steps):
-            micro_inputs = self._split_micro_batch(inputs, micro_step)
+            micro_inputs = self._next_batch()
 
             try:
                 micro_loss = self._forward_backward(self.model, micro_inputs)
@@ -1040,16 +1101,18 @@ class Trainer:
                     self.monitor.record("device_norm")
         return loss, grad_norm
 
-    def training_pp_step(self, inputs: Dict[str, Any]):
-        """
-        Perform a training step for pipeline parallelism.
+    def training_pp_step(self):
+        """Perform a training step for pipeline parallelism.
 
-        Args:
-            inputs (Dict[str, Any]): Input data dictionary.
+        Micro-batches are collected at ``local_batch_size`` granularity and
+        concatenated along dim 0 for the PP schedule to split equally by
+        ``micro_batch_num``. This path is shared by both static and dynamic
+        batch training.
 
         Returns:
             Tuple[Tensor, Tensor]: Tuple containing loss and global norm.
         """
+        inputs = self._collect_micro_batches(self.num_accumulation_steps)
         loss = self.compute_pp_loss(inputs)
         global_norm = self._optimizer_update()
 
@@ -1060,6 +1123,114 @@ class Trainer:
             loss /= self.metric_reduce_group_size
 
         return loss, global_norm
+
+
+    def _next_batch(self) -> Dict[str, Any]:
+        """Fetch the next micro-batch; on exhaustion (epoch wrap) recreate the
+        iterator and retry."""
+        try:
+            return self.get_batch(self._dataset_iter)
+        except StopIteration:
+            if self._resumed and self.dynamic_batch_enabled:
+                self.train_dataset.set_init_step(0)
+            self._dataset_iter = self._create_dataset_iterator(self.train_dataset)
+            return self.get_batch(self._dataset_iter)
+
+    def _update_dynamic_batch(self, consumed_samples: int) -> None:
+        """Refresh ``num_accumulation_steps`` and derived items per the scheduler for
+        the current ``consumed_samples``. No-op when the value is unchanged; otherwise
+        syncs state, PP microbatch size, aux-loss scale, and (for PP) the schedule."""
+        new_accum = self.dynamic_scheduler.num_accum_at_consumed(consumed_samples)
+        if new_accum == self.num_accumulation_steps:
+            return
+        new_gbs = self.dynamic_scheduler.gbs_at_consumed(consumed_samples)
+        self.num_accumulation_steps = new_accum
+        self.global_batch_size = new_gbs
+        # Sync to state so callbacks (LossCallback etc.) read the current
+        # per-step micro-batch count for aux / MTP / indexer loss division.
+        self.state.num_accumulation_steps = new_accum
+        self.state.global_batch_size = new_gbs
+        self.config.parallelism.pipeline_parallel_microbatch_size = new_accum
+        # Auxiliary loss (MoE/MTP/indexer) backward scaling includes
+        # 1/num_accumulation_steps and must be refreshed synchronously.
+        set_auxiliary_loss_backward_scale(
+            parallelism=self.config.parallelism,
+            enable_parallel=self.enable_parallel,
+            gradient_accumulation_steps=new_accum,
+        )
+        if self.parallel_dims and self.parallel_dims.pp_enabled:
+            self._update_pipeline_microbatch(new_accum)
+
+    def _update_pipeline_microbatch(self, new_num_accum: int) -> None:
+        """Update schedule micro_batch_num at runtime and rebuild exec_order for PP.
+
+        v1 supports dynamic batch under PP: update ``micro_batch_num`` and
+        ``split_micro_batch``, call ``build_exec_order`` to rebuild the 1F1B
+        schedule (overlap_b_f callbacks stored in ``_custom_fn_map`` are preserved
+        across rebuilds), and refresh ``loss_scale`` on every stage (which embeds
+        ``1/num_accumulation_steps``).
+
+        Args:
+            new_num_accum (int): New gradient accumulation steps (== PP micro_batch_num).
+        """
+        sched = self.schedule
+        if sched is None:
+            return
+        sched.micro_batch_num = new_num_accum
+        # Rebuild split_micro_batch using the same platform micro_batch factory
+        # that was used when the schedule was constructed.
+        # Must fail-fast on error: if split_micro_batch stays at the old count
+        # while micro_batch_num/exec_order have been updated, the mismatch between
+        # split_microbatches and run_microbatches counts will cause silent data
+        # corruption.
+        try:
+            sched.split_micro_batch = _MicroBatch(
+                new_num_accum, sched._args_batch_dim, sched._kwargs_batch_dim)
+        except Exception as e:
+            raise RuntimeError(
+                f"Rebuild split_micro_batch for micro_batch_num={new_num_accum} failed; "
+                f"aborting to avoid split/schedule mismatch."
+            ) from e
+        sched.build_exec_order()
+        new_loss_scale = float(get_loss_sense(
+            parallelism=self.config.parallelism,
+            enable_parallel=self.enable_parallel,
+            gradient_accumulation_steps=new_num_accum,
+            apply_gradient_accumulation=True,
+        ).asnumpy().item())
+        for stage in sched.stages:
+            stage.loss_scale = new_loss_scale
+        logger.info("Pipeline schedule rebuilt for micro_batch_num=%d.", new_num_accum)
+
+    def _collect_micro_batches(self, num_micro_batches: int) -> Dict[str, Any]:
+        """Fetch ``num_micro_batches`` micro-batches and concatenate along dim 0 into a single batch.
+
+        After stacking, batch dim = ``num_micro_batches * local_batch_size`` == ``micro_batch_num * local_batch_size``,
+        which the PP ``schedule.run`` then splits equally by ``micro_batch_num``.
+
+        Args:
+            num_micro_batches (int): Number of micro-batches (== current ``num_accumulation_steps``).
+
+        Returns:
+            Dict[str, Any]: Concatenated input dict.
+        """
+        batches = [self._next_batch() for _ in range(num_micro_batches)]
+        if not batches:
+            return {}
+        stacked = {}
+        for key in batches[0]:
+            values = [b[key] for b in batches]
+            first = values[0]
+            # Use concat along dim 0 (not stack: stack adds a new dim, turning
+            # (lbs, seq) into (n, lbs, seq), which breaks the schedule's
+            # equal-split of dim 0 by micro_batch_num).
+            if isinstance(first, Tensor):
+                stacked[key] = ops.concat(values, 0)
+            elif isinstance(first, np.ndarray):
+                stacked[key] = np.concatenate(values, axis=0)
+            else:
+                stacked[key] = values
+        return stacked
 
     def compute_loss(self, model, inputs: Dict[str, Any]):
         """

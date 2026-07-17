@@ -242,6 +242,8 @@ class LossCallback(TrainerCallback):
             "grad_norm": self._to_float(grad_norm),
             "cur_step": state.global_step,
             "max_steps": state.max_steps,
+            "consumed_samples": state.consumed_samples,
+            "global_batch_size": state.global_batch_size,
             "step_time": step_time_cost,
             "throughput": throughput,
             "learning_rate": self._parse_lr_info(
@@ -273,17 +275,23 @@ class LossCallback(TrainerCallback):
         """
         cur_step = log_info.get("cur_step", 0)
         max_steps = log_info.get("max_steps", 0)
+        consumed_samples = log_info.get("consumed_samples")
+        global_batch_size = log_info.get("global_batch_size")
         # Construct the log message parts
         loss_val = log_info.get('loss')
         if loss_val is None:
             log_parts = [
                 f"step:[{cur_step:5d}/{max_steps:5d}]",
+                f"consumed_samples: {consumed_samples}",
+                f"global_batch_size: {global_batch_size}",
                 "loss: N/A (non-last PP stage, refer to last stage for real loss)",
                 f"per_step_time: {log_info.get('step_time'):6d}ms",
             ]
         else:
             log_parts = [
                 f"step:[{cur_step:5d}/{max_steps:5d}]",
+                f"consumed_samples: {consumed_samples}",
+                f"global_batch_size: {global_batch_size}",
                 f"loss: {loss_val:10.6f}",
                 f"per_step_time: {log_info.get('step_time'):6d}ms",
             ]

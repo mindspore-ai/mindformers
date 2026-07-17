@@ -330,12 +330,56 @@ class TrainingConfig(BaseConfig):
     deterministic: bool = False
     """Enable deterministic training behavior"""
 
+    rampup_batch_size: Optional[List[int]] = None
+    """Dynamic batch rampup schedule as a 3-element list
+    ``[start_gbs, batch_size_increment, rampup_samples]`` (linear only).
+    When set, GBS grows linearly from ``start_gbs`` (the initial GBS) to
+    ``global_batch_size`` by ``batch_size_increment`` per growth interval; the
+    interval is derived from ``rampup_samples``. When ``None`` (default), the
+    static batch path is used (backward compatible)."""
+
     def __post_init__(self):
         """Post-initialization validation."""
         if self.global_batch_size <= 0:
             raise ValueError("training.global_batch_size in config must be positive")
         if self.local_batch_size <= 0:
             raise ValueError("training.local_batch_size in config must be positive")
+        if self.rampup_batch_size is not None:
+            self._validate_rampup_batch_size()
+
+    def _validate_rampup_batch_size(self):
+        """Validate ``rampup_batch_size``: 3-element int list with sane ranges.
+
+        Divisibility against ``data_parallel * local_batch_size`` is checked at
+        runtime in ``BatchSizeScheduler`` (unknown until parallelism is resolved).
+        """
+        rbs = self.rampup_batch_size
+        if not isinstance(rbs, (list, tuple)) or len(rbs) != 3:
+            raise ValueError(
+                "training.rampup_batch_size must be a 3-element list "
+                "[start_global_batch_size, batch_size_increment, rampup_samples], "
+                f"got {rbs!r}."
+            )
+        if not all(isinstance(x, int) and not isinstance(x, bool) for x in rbs):
+            raise ValueError(
+                f"training.rampup_batch_size elements must be int, got {rbs!r}."
+            )
+        start_gbs, batch_size_increment, rampup_samples = rbs
+        if start_gbs <= 0:
+            raise ValueError(
+                f"training.rampup_batch_size[0] (start_global_batch_size) must be > 0, "
+                f"got {start_gbs}."
+            )
+        if batch_size_increment <= 0:
+            raise ValueError(
+                f"training.rampup_batch_size[1] (batch_size_increment) must be > 0, "
+                f"got {batch_size_increment}."
+            )
+        if rampup_samples < 0:
+            raise ValueError(
+                f"training.rampup_batch_size[2] (rampup_samples) must be >= 0, "
+                f"got {rampup_samples}."
+            )
 
 
 @dataclass
