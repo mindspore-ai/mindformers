@@ -2164,9 +2164,9 @@ class TransformerConfig:
                 raise ValueError(
                     f"num_residual_streams should be a positive integer, but get {self.num_residual_streams}."
                 )
-            if not isinstance(self.mhc_sinkhorn_iterations, int) or self.mhc_sinkhorn_iterations <= 0:
+            if not isinstance(self.mhc_sinkhorn_iterations, int) or self.mhc_sinkhorn_iterations < 0:
                 raise ValueError(
-                    f"mhc_sinkhorn_iterations should be a positive integer, but get {self.mhc_sinkhorn_iterations}."
+                    f"mhc_sinkhorn_iterations should be a non-negative integer, but get {self.mhc_sinkhorn_iterations}."
                 )
             if not isinstance(self.mhc_init_gating_factor, (int, float)):
                 raise ValueError(
