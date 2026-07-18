@@ -760,6 +760,8 @@ class Trainer:
         # Register gradient hooks for fp32 accumulation
         self._register_grad_hooks()
 
+        self.monitor.setup(self.config, self.state)
+
         # Call train begin callback
         self.callback_handler.on_train_begin(self.config, self.state)
 
@@ -768,6 +770,8 @@ class Trainer:
 
         # Call train end callback
         self.callback_handler.on_train_end(self.config, self.state)
+
+        self.monitor.close()
 
         if self.communication_init:
             destroy_process_group()
@@ -924,6 +928,7 @@ class Trainer:
                     pp_metric_reduce_group_size=self.pp_metric_reduce_group_size,
                     has_last=self.has_last,
                 )
+                self.monitor.flush(step)
 
                 # Epoch end callback (pass loss)
                 if step % self.state.epoch_step == 0:

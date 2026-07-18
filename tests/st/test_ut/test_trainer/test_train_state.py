@@ -39,6 +39,7 @@ class TestTrainerState:
         assert state.save_steps == 0
         assert state.epoch_step == 0
         assert state.global_batch_size == 0
+        assert state.loss_scale == 1.0
         assert state.best_metric is None
         assert state.best_model_checkpoint is None
         assert not state.is_train_begin
@@ -54,6 +55,7 @@ class TestTrainerState:
             save_steps=500,
             epoch_step=200,
             global_batch_size=64,
+            loss_scale=1024.0,
             best_metric=0.95
         )
 
@@ -64,6 +66,7 @@ class TestTrainerState:
         assert state.save_steps == 500
         assert state.epoch_step == 200
         assert state.global_batch_size == 64
+        assert state.loss_scale == 1024.0
         assert state.best_metric == 0.95
 
     def test_update_epoch(self):
@@ -98,6 +101,7 @@ class TestTrainerState:
             save_steps=500,
             epoch_step=200,
             global_batch_size=64,
+            loss_scale=1024.0,
             best_metric=0.95,
             best_model_checkpoint="/path/to/ckpt"
         )
@@ -111,6 +115,7 @@ class TestTrainerState:
         assert state_dict["save_steps"] == 500
         assert state_dict["epoch_step"] == 200
         assert state_dict["global_batch_size"] == 64
+        assert state_dict["loss_scale"] == 1024.0
         assert state_dict["best_metric"] == 0.95
         assert state_dict["best_model_checkpoint"] == "/path/to/ckpt"
 
@@ -124,6 +129,7 @@ class TestTrainerState:
             "save_steps": 600,
             "epoch_step": 300,
             "global_batch_size": 128,
+            "loss_scale": 2048.0,
             "best_metric": 0.98,
             "best_model_checkpoint": "/path/to/best"
         }
@@ -137,6 +143,7 @@ class TestTrainerState:
         assert state.save_steps == 600
         assert state.epoch_step == 300
         assert state.global_batch_size == 128
+        assert state.loss_scale == 2048.0
         assert state.best_metric == 0.98
         assert state.best_model_checkpoint == "/path/to/best"
 
@@ -150,6 +157,7 @@ class TestTrainerState:
             save_steps=800,
             epoch_step=400,
             global_batch_size=256,
+            loss_scale=4096.0,
             best_metric=0.99
         )
 
@@ -167,6 +175,7 @@ class TestTrainerState:
         assert loaded_state.save_steps == original_state.save_steps
         assert loaded_state.epoch_step == original_state.epoch_step
         assert loaded_state.global_batch_size == original_state.global_batch_size
+        assert loaded_state.loss_scale == original_state.loss_scale
         assert loaded_state.best_metric == original_state.best_metric
 
     def test_repr(self):
@@ -183,6 +192,7 @@ class TestTrainerState:
         assert "epoch=2.5" in repr_str
         assert "global_step=1000" in repr_str
         assert "max_steps=5000" in repr_str
+        assert "loss_scale=1.0" in repr_str
 
     def test_global_batch_size_in_save_to_dict(self):
         """Test that global_batch_size is included in save_to_dict."""

@@ -74,8 +74,8 @@ def test_trainstate_with_checkpoint_callback():
 
     # Create CheckpointCallback
     cb = CheckpointCallback(
-        save_dir="./test_ckpts",
-        save_interval=100
+        save_path="./test_ckpts",
+        save_interleaved_steps=100
     )
 
     # Test _create_common_info
@@ -86,6 +86,7 @@ def test_trainstate_with_checkpoint_callback():
     assert common_info.epoch_num == 1, f"Expected 1, got {common_info.epoch_num}"
     assert common_info.step_num == 0, f"Expected 0, got {common_info.step_num}"
     assert common_info.global_batch_size == 64, f"Expected 64, got {common_info.global_batch_size}"
+    assert common_info.loss_scale == 1.0, f"Expected 1.0, got {common_info.loss_scale}"
 
     print("[OK] CheckpointCallback correctly uses TrainerState.global_batch_size")
     print(f"     global_batch_size: {common_info.global_batch_size}")
@@ -133,7 +134,7 @@ def test_trainstate_all_required_fields():
     """
     Feature: TrainerState required fields validation
     Description: Verify that TrainerState contains all required fields needed by various callbacks
-    Expectation: All 11 required fields (global_step, epoch, epoch_step, etc.) are present in TrainerState
+    Expectation: All 12 required fields (global_step, epoch, epoch_step, etc.) are present in TrainerState
     """
     print("\n" + "=" * 70)
     print("Test 3: TrainerState has all required fields")
@@ -146,6 +147,7 @@ def test_trainstate_all_required_fields():
         'epoch',
         'epoch_step',
         'global_batch_size',
+        'loss_scale',
         'max_steps',
         'eval_steps',
         'save_steps',
@@ -247,7 +249,7 @@ def main():
             failed += 1
             print(f"\n[FAIL] {test_func.__name__}: {e}")
             traceback.print_exc()
-        except Exception as e:
+        except Exception as e:  # pylint: disable=broad-exception-caught
             failed += 1
             print(f"\n[ERROR] {test_func.__name__}: {e}")
             traceback.print_exc()

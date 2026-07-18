@@ -82,9 +82,9 @@ monitor:
 
   tensorboard:
     # TensorBoard configuration
-    tensorboard_dir: ''          # directory to store TensorBoard logs
-    tensorboard_log_interval: 1  # logging interval (in steps)
-    tensorboard_queue_size: 1000 # maximum size of the TensorBoard event queue
+    output_dir: ''       # directory to store TensorBoard logs
+    log_interval: 1      # logging interval (in steps)
+    queue_size: 1000     # maximum size of the TensorBoard event queue
 
 callbacks:
   - type: callbackA
@@ -108,4 +108,3 @@ profiler:                     # reserved for future use
   profiler_level: 0             # profiling detail level (None/0/1/2)
   profile_memory: False         # whether to collect Tensor memory data
   with_stack: False             # whether to collect Python-side stack trace
-
