@@ -20,6 +20,10 @@ import pytest
 
 from mindspore.nn.learning_rate_schedule import LearningRateSchedule
 from mindformers.pynative.callback.loss_callback import LossCallback
+from mindformers.pynative.tools.monitor_utils import (
+    get_monitor_data_tracker,
+    reset_monitor_data_tracker,
+)
 
 
 # pylint: disable=protected-access
@@ -31,13 +35,18 @@ class TestLossCallback:
 
     @pytest.fixture(autouse=True)
     def setup(self):
+        """Create callback state and isolate the shared monitor tracker."""
+        reset_monitor_data_tracker()
         self.callback = LossCallback(log_interval=1)
         self.args = MagicMock()
         self.state = MagicMock()
         self.state.global_step = 1
         self.state.max_steps = 10
         self.state.global_batch_size = 2
+        self.state.loss_scale = 1024.0
         self.state.total_flops = 0
+        yield
+        reset_monitor_data_tracker()
 
     @staticmethod
     def _make_model_mock(
@@ -146,6 +155,7 @@ class TestLossCallback:
         assert "grad_norm:   0.500000" in call_args
         assert "lr: 1.000000e-02" in call_args
         assert "throughput:" in call_args
+        assert get_monitor_data_tracker().data["loss-scale"] == 1024.0
 
     @patch("mindformers.pynative.callback.loss_callback.logger")
     @patch("mindformers.pynative.callback.loss_callback.get_world_size")
@@ -187,6 +197,34 @@ class TestLossCallback:
         # Case 2: Not LearningRateSchedule
         lr = self.callback._parse_lr_info(None, 1)
         assert lr is None
+
+    def test_monitor_metric_names_use_hyphens(self):
+        """Test monitor metric names consistently use hyphens."""
+        self.callback._save_monitor_data({
+            "loss": 1.0,
+            "loss_scale": 1024.0,
+            "load_balancing_loss": 0.1,
+            "grad_norm": 0.5,
+            "step_time": 100,
+            "throughput": 2.0,
+            "learning_rate": 1e-5,
+            "global_batch_size": 8,
+            "indexer_loss": 0.2,
+            "mtp_loss_values": {"mtp-1-loss": 0.3},
+        })
+
+        assert set(get_monitor_data_tracker().data) == {
+            "loss",
+            "loss-scale",
+            "load-balancing-loss",
+            "grad-norm",
+            "iteration-time",
+            "throughput",
+            "learning-rate",
+            "batch-size",
+            "indexer-loss",
+            "mtp-1-loss",
+        }
 
     def test_to_float(self):
         """Test _to_float"""

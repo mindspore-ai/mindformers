@@ -14,18 +14,36 @@
 # ============================================================================
 """Test module for testing pynative monitor with CPU."""
 
+from unittest.mock import MagicMock
+
 import pytest
+import tensorboardX
 
 from mindformers.pynative.config.config import (
     TrainConfig,
     TrainStateConfig,
+    TensorboardConfig,
     MonitorConfig,
     MoeMonitorConfig,
 )
-from mindformers.pynative.tools.monitor import Monitor, TrainStateMonitor, MoeMonitor, MonitorGroup
+from mindformers.pynative.tools.monitor import (
+    Monitor,
+    TrainStateMonitor,
+    MoeMonitor,
+    TensorboardMonitor,
+    MonitorGroup,
+)
+from mindformers.pynative.tools.monitor_utils import (
+    MonitorDataTracker,
+    clear_monitor_data_tracker,
+    get_monitor_data_tracker,
+    reset_monitor_data_tracker,
+    save_monitor_data,
+)
 
 
-def _make_config(local_loss=False, local_norm="", device_loss=False, device_norm=False, moe_interval=None):
+def _make_config(local_loss=False, local_norm="", device_loss=False, device_norm=False,
+                 moe_interval=None, tensorboard_output_dir=""):
     """Helper to build a config object with given train_state settings."""
     train_state = TrainStateConfig(
         local_loss=local_loss,
@@ -35,6 +53,7 @@ def _make_config(local_loss=False, local_norm="", device_loss=False, device_norm
     )
     monitor = MonitorConfig(
         train_state=train_state,
+        tensorboard=TensorboardConfig(output_dir=tensorboard_output_dir),
         moe_monitor=MoeMonitorConfig(save_tokens_per_expert_interval=moe_interval),
     )
     config = TrainConfig(monitor=monitor)
@@ -72,6 +91,88 @@ class _FakeModel:
 
     def trainable_params(self):
         return self._params
+
+
+class TestMonitorDataTracker:
+    """Test shared backend-agnostic monitor storage."""
+
+    def teardown_method(self):
+        """Reset the process-wide tracker after each test."""
+        reset_monitor_data_tracker()
+
+    def test_singleton_generic_data_and_lifecycle(self):
+        """Verify singleton identity and step/run data lifecycles."""
+        tracker = get_monitor_data_tracker()
+        tracker.set_config({"model": "qwen"})
+        save_monitor_data("loss", 1.0, step=3, consumed_samples=12)
+        save_monitor_data("custom", {"key": "value"})
+
+        assert get_monitor_data_tracker() is tracker
+        assert MonitorDataTracker() is tracker
+        assert tracker.as_dict() == {
+            "training_state": {"step": 3, "consumed_samples": 12},
+            "data": {"loss": 1.0, "custom": {"key": "value"}},
+            "config": {"model": "qwen"},
+        }
+
+        clear_monitor_data_tracker()
+        assert tracker.as_dict() == {
+            "training_state": {},
+            "data": {},
+            "config": {"model": "qwen"},
+        }
+
+        reset_monitor_data_tracker()
+        assert tracker.as_dict() == {
+            "training_state": {},
+            "data": {},
+            "config": {},
+        }
+
+
+class TestTensorboardMonitor:
+    """Test TensorBoard monitor lifecycle and shared data consumption."""
+
+    def teardown_method(self):
+        """Reset the process-wide tracker after each test."""
+        reset_monitor_data_tracker()
+
+    @pytest.mark.level0
+    @pytest.mark.platform_x86_cpu
+    @pytest.mark.env_onecard
+    def test_flush_consumes_shared_data(self, tmp_path, monkeypatch):
+        """Verify tracked scalars are written against steps and samples."""
+        writer = MagicMock()
+        monkeypatch.setattr(tensorboardX, "SummaryWriter", lambda **_: writer)
+        monkeypatch.setattr("mindformers.pynative.tools.monitor.get_rank", lambda: 0)
+        monkeypatch.setattr("mindformers.pynative.tools.monitor.get_world_size", lambda: 1)
+
+        config = _make_config(tensorboard_output_dir=str(tmp_path))
+        monitor = TensorboardMonitor(config)
+        monitor.setup(config, MagicMock())
+        save_monitor_data("loss", 1.0, step=2, consumed_samples=8)
+        monitor.flush(step=2)
+
+        writer.add_scalar.assert_any_call("loss", 1.0, global_step=2)
+        writer.add_scalar.assert_any_call("loss vs samples", 1.0, global_step=8)
+        writer.flush.assert_called()
+        monitor.close()
+        writer.close.assert_called_once()
+
+    @pytest.mark.level0
+    @pytest.mark.platform_x86_cpu
+    @pytest.mark.env_onecard
+    def test_group_clears_shared_data_after_all_monitors(self):
+        group = MonitorGroup(_make_config())
+        tracker = get_monitor_data_tracker()
+        tracker.set_config({"model": "qwen"})
+        save_monitor_data("loss", 1.0, step=1)
+        group.flush(step=1)
+        assert tracker.as_dict() == {
+            "training_state": {},
+            "data": {},
+            "config": {"model": "qwen"},
+        }
 
 
 class TestMonitorConfigRecognition:
@@ -304,6 +405,52 @@ class TestMonitorGroup:
         group = MonitorGroup(config)
         assert group.should_record("device_norm") is True
         assert group.should_record("device_loss") is False
+
+    @pytest.mark.level0
+    @pytest.mark.platform_x86_cpu
+    @pytest.mark.env_onecard
+    def test_group_continues_after_monitor_flush_failure(self, monkeypatch):
+        """One failed monitor should not block later monitors or tracker cleanup."""
+        group = MonitorGroup(_make_config())
+        failed_monitor = MagicMock()
+        failed_monitor.flush.side_effect = RuntimeError("flush failed")
+        healthy_monitor = MagicMock()
+        group._monitors = {"failed": failed_monitor, "healthy": healthy_monitor}
+        log_error = MagicMock()
+        monkeypatch.setattr("mindformers.pynative.tools.monitor.logger.error", log_error)
+        save_monitor_data("loss", 1.0, step=1)
+
+        group.flush(step=1)
+
+        healthy_monitor.flush.assert_called_once_with(1)
+        log_error.assert_called_once()
+        tracker = get_monitor_data_tracker()
+        assert tracker.training_state == {}
+        assert tracker.data == {}
+
+    @pytest.mark.level0
+    @pytest.mark.platform_x86_cpu
+    @pytest.mark.env_onecard
+    def test_group_continues_after_monitor_close_failure(self, monkeypatch):
+        """One failed close should not block remaining monitor cleanup."""
+        group = MonitorGroup(_make_config())
+        failed_monitor = MagicMock()
+        failed_monitor.close.side_effect = RuntimeError("close failed")
+        healthy_monitor = MagicMock()
+        group._monitors = {"failed": failed_monitor, "healthy": healthy_monitor}
+        log_error = MagicMock()
+        monkeypatch.setattr("mindformers.pynative.tools.monitor.logger.error", log_error)
+        get_monitor_data_tracker().set_config({"model": "qwen"})
+
+        group.close()
+
+        healthy_monitor.close.assert_called_once_with()
+        log_error.assert_called_once()
+        assert get_monitor_data_tracker().as_dict() == {
+            "training_state": {},
+            "data": {},
+            "config": {},
+        }
 
 
 class TestMoeMonitorConfig:

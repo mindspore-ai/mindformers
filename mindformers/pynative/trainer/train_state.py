@@ -40,6 +40,8 @@ class TrainerState:
             Global batch size across all devices.
         num_accumulation_steps (int):
             Number of steps to accumulate gradients before performing an optimizer step.
+        loss_scale (float):
+            Current loss scale. PyNative training defaults to 1.0.
         total_flops (float):
             Total FLOPs for the model.
         best_metric (float):
@@ -61,6 +63,7 @@ class TrainerState:
     global_batch_size: int = 0
     num_accumulation_steps: int = 1
     consumed_samples: int = 0
+    loss_scale: float = 1.0
     total_flops: float = 0.0
     best_metric: Optional[float] = None
     best_model_checkpoint: Optional[str] = None
@@ -89,6 +92,7 @@ class TrainerState:
             "global_batch_size": self.global_batch_size,
             "num_accumulation_steps": self.num_accumulation_steps,
             "consumed_samples": self.consumed_samples,
+            "loss_scale": self.loss_scale,
             "total_flops": self.total_flops,
             "best_metric": self.best_metric,
             "best_model_checkpoint": self.best_model_checkpoint,
@@ -118,6 +122,7 @@ class TrainerState:
             f"epoch_step={self.epoch_step}, "
             f"global_batch_size={self.global_batch_size}, "
             f"num_accumulation_steps={self.num_accumulation_steps}, "
+            f"loss_scale={self.loss_scale}, "
             f"total_flops={self.total_flops}, "
             f"best_metric={self.best_metric}, "
             f"best_model_checkpoint={self.best_model_checkpoint}, "

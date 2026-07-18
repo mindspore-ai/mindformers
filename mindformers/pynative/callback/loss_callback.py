@@ -23,6 +23,7 @@ from mindspore.mint.distributed import get_world_size
 
 from mindformers.pynative.callback.callback import TrainerCallback
 from mindformers.tools.logger import logger
+from mindformers.pynative.tools.monitor_utils import save_monitor_data
 from mindformers.models.utils import (
     convert_transformer_config_to_args_for_tflops,
     num_floating_point_operations,
@@ -196,10 +197,12 @@ class LossCallback(TrainerCallback):
         if loss is None:
             log_info = {
                 "loss": None,
+                "loss_scale": self._to_float(state.loss_scale),
                 "cur_step": state.global_step,
                 "max_steps": state.max_steps,
                 "step_time": step_time_cost,
             }
+            self._save_monitor_data(log_info)
             self._print_log(log_info)
             return
 
@@ -212,17 +215,21 @@ class LossCallback(TrainerCallback):
 
         # process mtp loss
         mtp_loss = None
+        mtp_loss_values = {}
         if hasattr(model[0], "get_mtp_loss"):
             mtp_loss = model[0].get_mtp_loss(metric_group, metric_group_size)
         elif not self.logger_record["get_mtp_loss"]:
             logger.warning(f"{model_cls_name} does not have get_mtp_loss method.")
             self.logger_record["get_mtp_loss"] = True
         if mtp_loss is not None and model_config.mtp_loss_scaling_factor:
-            mtp_loss_values = []
+            mtp_loss_parts = []
             for ind, val in enumerate(mtp_loss):
                 val /= state.num_accumulation_steps
-                mtp_loss_values.append(f"mtp_{str(ind + 1)}_loss: {self._to_float(val):10.6f}")
-            mtp_loss = ", ".join(mtp_loss_values)
+                loss_name = f"mtp_{ind + 1}_loss"
+                loss_value = self._to_float(val)
+                mtp_loss_values[f"mtp-{ind + 1}-loss"] = loss_value
+                mtp_loss_parts.append(f"{loss_name}: {loss_value:10.6f}")
+            mtp_loss = ", ".join(mtp_loss_parts)
         else:
             mtp_loss = None
 
@@ -239,6 +246,7 @@ class LossCallback(TrainerCallback):
         log_info = {
             "loss": self._to_float(loss),
             "load_balancing_loss": self._to_float(load_balancing_loss),
+            "loss_scale": self._to_float(state.loss_scale),
             "grad_norm": self._to_float(grad_norm),
             "cur_step": state.global_step,
             "max_steps": state.max_steps,
@@ -250,8 +258,11 @@ class LossCallback(TrainerCallback):
                 kwargs.get("lr_scheduler"), state.global_step
             ),
             "mtp_loss": mtp_loss,
+            "mtp_loss_values": mtp_loss_values,
             "indexer_loss": self._to_float(indexer_loss)
         }
+
+        self._save_monitor_data(log_info)
 
         # Print the collected log information
         self._print_log(log_info)
@@ -324,6 +335,31 @@ class LossCallback(TrainerCallback):
 
         # Log the formatted message
         logger.info(f"{{ {', '.join(log_parts)} }}")
+
+    @staticmethod
+    def _save_monitor_data(log_info: Dict[str, Any]) -> None:
+        """Publish backend-agnostic scalar metrics for the configured monitors."""
+        step = log_info.get("cur_step")
+        consumed_samples = log_info.get("consumed_samples")
+        metric_mapping = {
+            "loss": log_info.get("loss"),
+            "loss-scale": log_info.get("loss_scale"),
+            "load-balancing-loss": log_info.get("load_balancing_loss"),
+            "grad-norm": log_info.get("grad_norm"),
+            "iteration-time": log_info.get("step_time"),
+            "throughput": log_info.get("throughput"),
+            "learning-rate": log_info.get("learning_rate"),
+            "batch-size": log_info.get("global_batch_size"),
+            "indexer-loss": log_info.get("indexer_loss"),
+        }
+        metric_mapping.update(log_info.get("mtp_loss_values") or {})
+        for name, value in metric_mapping.items():
+            save_monitor_data(
+                name,
+                value,
+                step=step,
+                consumed_samples=consumed_samples,
+            )
 
     def _parse_lr_info(self, lr_scheduler, step):
         """

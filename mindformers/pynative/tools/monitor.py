@@ -14,17 +14,38 @@
 # ============================================================================
 """Monitor for collecting and outputting training metrics during training."""
 
+from __future__ import annotations
+
 import json
 import re
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional, Tuple
 
+from mindspore.mint.distributed import get_rank, get_world_size
+
 from mindformers.tools import logger
+from mindformers.pynative.tools.monitor_utils import (
+    clear_monitor_data_tracker,
+    get_monitor_data_tracker,
+    reset_monitor_data_tracker,
+    save_monitor_data,
+)
 
 try:
     from hyper_parallel.core.dtensor import DTensor
 except ImportError:
     DTensor = None
+
+
+def _config_to_dict(config):
+    """Convert a training config into tracker-friendly key-value data."""
+    if config is None:
+        return {}
+    if hasattr(config, "to_dict"):
+        return config.to_dict()
+    if isinstance(config, dict):
+        return config
+    return vars(config) if hasattr(config, "__dict__") else {"value": config}
 
 
 class Monitor(ABC):
@@ -44,6 +65,13 @@ class Monitor(ABC):
 
     def reset(self):
         self._records = []
+
+    def setup(self, config=None, state=None):
+        """Initialize monitor resources before training starts."""
+        _ = config, state
+
+    def close(self):
+        """Release monitor resources after training ends."""
 
     def flush(self, step: int):
         self._flush_logger(self._records, step)
@@ -112,6 +140,120 @@ class Monitor(ABC):
         if hasattr(value, "item"):
             return float(value.item())
         return float(value)
+
+
+class TensorboardMonitor(Monitor):
+    """Write shared monitor data to TensorBoard."""
+
+    def __init__(self, config, model=None):
+        super().__init__(model=model)
+        tensorboard = getattr(getattr(config, "monitor", None), "tensorboard", None)
+        self._output_dir = str(getattr(tensorboard, "output_dir", "") or "").strip()
+        self._log_interval = self._positive_int(
+            getattr(tensorboard, "log_interval", 1),
+            "log_interval",
+            1,
+        )
+        self._queue_size = self._positive_int(
+            getattr(tensorboard, "queue_size", 1000),
+            "queue_size",
+            1000,
+        )
+        self._writer = None
+        self._written_texts: set[str] = set()
+
+    @property
+    def configured(self) -> bool:
+        """Return whether TensorBoard is configured, independent of rank."""
+        return bool(self._output_dir)
+
+    @property
+    def active(self) -> bool:
+        """Return whether this monitor is configured for the current run."""
+        return self.configured
+
+    def setup(self, config=None, state=None):
+        """Create the writer on the last rank and write configuration text once."""
+        _ = state
+        if not self.configured or self._writer is not None:
+            return
+
+        tracker = get_monitor_data_tracker()
+        if not tracker.config:
+            tracker.set_config(_config_to_dict(config))
+
+        try:
+            rank = get_rank()
+            world_size = get_world_size()
+        except RuntimeError:
+            rank, world_size = 0, 1
+        if rank != world_size - 1:
+            return
+
+        from tensorboardX import SummaryWriter
+
+        self._writer = SummaryWriter(log_dir=self._output_dir, max_queue=self._queue_size)
+        self._write_config()
+
+    def record(self, key: str = None, value: Any = None,
+               context: Optional[Dict[str, Any]] = None):
+        """Publish an explicitly recorded value into the shared monitor store."""
+        if key is None:
+            return
+        context = context or {}
+        training_state = dict(context.get("training_state") or {})
+        for state_name in ("step", "consumed_samples", "micro_step"):
+            if state_name in context:
+                training_state[state_name] = context[state_name]
+        save_monitor_data(key, value, **training_state)
+
+    def flush(self, step: int):
+        """Consume current-step data and flush the TensorBoard event queue."""
+        if self._writer is None or step % self._log_interval != 0:
+            return
+
+        tracker = get_monitor_data_tracker()
+        global_step = tracker.training_state.get("step")
+        if global_step is None:
+            global_step = step
+        consumed_samples = tracker.training_state.get("consumed_samples")
+
+        for name, value in tracker.data.items():
+            try:
+                value = self._to_scalar(value)
+            except (TypeError, ValueError, RuntimeError):
+                logger.warning("Skip non-scalar TensorBoard data %s with type %s.", name, type(value).__name__)
+                continue
+            self._writer.add_scalar(name, value, global_step=global_step)
+
+            if consumed_samples is not None:
+                self._writer.add_scalar(
+                    f"{name} vs samples", value, global_step=consumed_samples
+                )
+        self._writer.flush()
+
+    def close(self):
+        """Flush and close the TensorBoard writer."""
+        if self._writer is None:
+            return
+        self._writer.flush()
+        self._writer.close()
+        self._writer = None
+
+    def _write_config(self):
+        if self._writer is None:
+            return
+        for key, value in get_monitor_data_tracker().config.items():
+            self._writer.add_text(key, str(value), global_step=0)
+            self._written_texts.add(key)
+        self._writer.flush()
+
+    @staticmethod
+    def _positive_int(value, name: str, default: int) -> int:
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            logger.warning("%s must be a positive integer, got %s; use %s.", name, value, default)
+            return default
+        return value
 
 
 def _iter_models(model):
@@ -537,7 +679,7 @@ class MonitorGroup:
         self.monitor.record("local_norm", context={...})
         self.monitor.record("device_loss", loss)
         self.monitor.record("device_norm")
-        # flush is called in MonitorCallback
+        # flush is called by Trainer after all step-end callbacks complete
     """
 
     def __init__(self, config, model=None):
@@ -551,6 +693,10 @@ class MonitorGroup:
         moe_monitor = MoeMonitor(config, model=_first_model(model))
         if moe_monitor.active:
             self._monitors["moe_monitor"] = moe_monitor
+
+        tensorboard_monitor = TensorboardMonitor(config, model=model)
+        if tensorboard_monitor.configured:
+            self._monitors["tensorboard"] = tensorboard_monitor
 
     @property
     def active(self):
@@ -567,6 +713,15 @@ class MonitorGroup:
     def reset(self):
         for m in self._monitors.values():
             m.reset()
+        clear_monitor_data_tracker()
+
+    def setup(self, config=None, state=None):
+        """Initialize all configured monitor resources."""
+        tracker = get_monitor_data_tracker()
+        tracker.clear()
+        tracker.set_config(_config_to_dict(config))
+        for m in self._monitors.values():
+            m.setup(config, state)
 
     def set_model(self, model):
         """Bind a model instance to all child monitors."""
@@ -578,9 +733,39 @@ class MonitorGroup:
             monitor.set_model(model)
 
     def record(self, key: str, value: Any = None, context: Optional[Dict[str, Any]] = None):
+        """Forward one metric record to every configured monitor."""
         for m in self._monitors.values():
             m.record(key, value, context)
 
     def flush(self, step: int):
-        for m in self._monitors.values():
-            m.flush(step)
+        """Flush every monitor and clear the shared step-scoped data."""
+        try:
+            for name, monitor in self._monitors.items():
+                try:
+                    monitor.flush(step)
+                except Exception as exc:  # pylint: disable=broad-exception-caught
+                    logger.error(
+                        "Monitor %s flush failed at step %s: %s",
+                        name,
+                        step,
+                        exc,
+                        exc_info=True,
+                    )
+        finally:
+            clear_monitor_data_tracker()
+
+    def close(self):
+        """Release all monitor resources."""
+        try:
+            for name, monitor in self._monitors.items():
+                try:
+                    monitor.close()
+                except Exception as exc:  # pylint: disable=broad-exception-caught
+                    logger.error(
+                        "Monitor %s close failed: %s",
+                        name,
+                        exc,
+                        exc_info=True,
+                    )
+        finally:
+            reset_monitor_data_tracker()

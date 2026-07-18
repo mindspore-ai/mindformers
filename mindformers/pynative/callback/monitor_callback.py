@@ -12,13 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Monitor callback for outputting monitor metrics."""
+"""Monitor callback for collecting step metrics for the Trainer-owned flush."""
 
 from mindformers.pynative.callback.callback import TrainerCallback
 
 
 class MonitorCallback(TrainerCallback):
-    """Callback for outputting monitor-collected metrics at each training step end."""
+    """Collect PP-only metrics; Trainer flushes the MonitorGroup after callbacks."""
 
     def on_step_end(self, args, state, **kwargs):
         monitor = kwargs.get("monitor")
@@ -29,4 +29,3 @@ class MonitorCallback(TrainerCallback):
                     monitor.record("device_loss", loss)
                 if monitor.should_record("device_norm"):
                     monitor.record("device_norm")
-            monitor.flush(step=state.global_step)

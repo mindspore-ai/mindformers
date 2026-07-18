@@ -670,13 +670,13 @@ class TensorboardConfig(BaseConfig):
     TensorBoard logging configuration.
     """
 
-    tensorboard_dir: str = ""
+    output_dir: str = ""
     """Directory to store TensorBoard logs"""
 
-    tensorboard_log_interval: int = 1
+    log_interval: int = 1
     """Logging interval"""
 
-    tensorboard_queue_size: int = 1000
+    queue_size: int = 1000
     """Maximum size of the TensorBoard event queue"""
 
 

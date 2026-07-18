@@ -230,6 +230,11 @@ class TestConfig:
         assert config.optimizer.type == "AdamW"
         assert config.optimizer.betas == [0.9, 0.95]
 
+        # Verify TensorBoard monitor config without redundant field prefixes
+        assert config.monitor.tensorboard.output_dir == ""
+        assert config.monitor.tensorboard.log_interval == 1
+        assert config.monitor.tensorboard.queue_size == 1000
+
         # Verify Callbacks (List of dataclasses/BaseConfig)
         assert isinstance(config.callbacks, list)
         if config.callbacks:
