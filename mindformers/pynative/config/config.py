@@ -512,6 +512,11 @@ class ParallelismConfig(BaseConfig):
     with ``pipeline_parallel_overlap_b_f``. Off by default: bit-identical but wall-clock-
     neutral unless the EP counts D2H is on the critical path (large ep_degree / multi-node)."""
 
+    expert_parallel_use_safe_tokens: bool = True
+    """Prepend one zero-probability safe token per expert before EP dispatch so grouped
+    GEMM never receives an empty expert group. Disable only when the grouped GEMM kernel
+    supports zero-token experts. Enabled by default to preserve existing behavior."""
+
     def __post_init__(self):
         """Post-initialization validation."""
         if self.tensor_parallel > 1 and not self.sequence_parallel:

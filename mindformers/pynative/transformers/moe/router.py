@@ -267,13 +267,23 @@ class TopKRouter(nn.Cell):
 
         return scores_for_choice
 
+    def _compute_router_scores(self, logits: Tensor) -> Tensor:
+        """Apply the configured router score function in float32."""
+        logits = self.cast(logits, mstype.float32)
+        if self.score_func == "sigmoid":
+            return self.sigmoid(logits)
+        if self.score_func == "softmax":
+            return self.softmax(logits, dim=1)
+        if self.score_func == "sqrtsoftplus":
+            return self.sqrt(self.softplus(logits))
+        raise NotImplementedError(f"Unknown score function {self.score_func}")
+
     def _hash_routing(
-            self, logits: Tensor, input_ids: Tensor
+            self, scores: Tensor, input_ids: Tensor
     ) -> Tuple[Tensor, Tensor]:
         """Hash-based routing: expert indices come from the tid2eid lookup table.
 
-        Scores are still computed from the gating logits for weight computation,
-        but expert selection is determined by the pre-computed hash table.
+        Expert selection is determined by the pre-computed hash table.
 
         Framework adaptation : unlike Megatron, which scatters the
         result back to a dense ``[num_tokens, num_experts]`` routing_probs / routing_map,
@@ -282,7 +292,7 @@ class TopKRouter(nn.Cell):
         (no dense scatter).
 
         Args:
-            logits (Tensor): Gating logits, shape ``[num_tokens, num_experts]``.
+            scores (Tensor): Router scores, shape ``[num_tokens, num_experts]``.
             input_ids (Tensor): Token IDs, shape ``[b, s]``.
 
         Returns:
@@ -290,16 +300,6 @@ class TopKRouter(nn.Cell):
                 - top_scores (Tensor): combine weights for selected experts, ``[num_tokens, top_k]``.
                 - selected_experts_indices (Tensor): expert indices, ``[num_tokens, top_k]`` int64.
         """
-        # Scores are only used for combine weights; expert selection is from tid2eid.
-        if self.score_func == "sigmoid":
-            scores = self.sigmoid(self.cast(logits, mstype.float32))
-        elif self.score_func == "softmax":
-            scores = self.softmax(self.cast(logits, mstype.float32), dim=1)
-        elif self.score_func == "sqrtsoftplus":
-            scores = self.sqrt(self.softplus(self.cast(logits, mstype.float32)))
-        else:
-            raise NotImplementedError(f"Unknown score function {self.score_func}")
-
         # input_ids is [b, s] from the model, but hidden_states are [s, b, h] and get flattened to [s*b, h];
         # transpose then flatten to align token order.
         flat_ids = self.reshape(input_ids.T, (-1,))
@@ -362,6 +362,7 @@ class TopKRouter(nn.Cell):
         # localise for the plain-tensor matmul.
         weight = self.weight.to_local() if isinstance(self.weight, DTensor) else self.weight
         logits = self.linear(x, weight)
+        scores = self._compute_router_scores(logits)
 
         # Hash-based routing: select experts from tid2eid, weights from gating scores.
         if self.is_hash_layer:
@@ -370,7 +371,7 @@ class TopKRouter(nn.Cell):
                     "input_ids is required for hash-based routing but was None. "
                     "Ensure moe_n_hash_layers is set correctly and input_ids are passed."
                 )
-            top_scores, selected_experts_indices = self._hash_routing(logits, input_ids)
+            top_scores, selected_experts_indices = self._hash_routing(scores, input_ids)
             num_tokens_per_expert = self.cast(
                 self.histc(selected_experts_indices, bins=self.num_experts,
                            min=0, max=self.num_experts),
@@ -378,22 +379,12 @@ class TopKRouter(nn.Cell):
             )
             if self.moe_aux_loss_coeff > 0:
                 top_scores = self._compute_aux_loss(
-                    logits,
+                    scores,
                     top_scores,
                     seq_length,
                     bsz,
                 )
             return top_scores, selected_experts_indices, num_tokens_per_expert
-
-        # By default, sigmoid or softmax is performed in float32 to avoid loss explosion
-        if self.score_func == "sigmoid":
-            scores = self.sigmoid(self.cast(logits, mstype.float32))
-        elif self.score_func == "softmax":
-            scores = self.softmax(self.cast(logits, mstype.float32), dim=1)
-        elif self.score_func == "sqrtsoftplus":
-            scores = self.sqrt(self.softplus(self.cast(logits, mstype.float32)))
-        else:
-            raise NotImplementedError(f"Unknown score function {self.score_func}")
 
         scores_for_choice = scores if expert_bias is None else scores + expert_bias
         # Apply node-limited routing if configured
@@ -431,7 +422,7 @@ class TopKRouter(nn.Cell):
         # Compute auxiliary load-balancing loss and inject gradient into top_scores
         if self.moe_aux_loss_coeff > 0:
             top_scores = self._compute_aux_loss(
-                logits,
+                scores,
                 top_scores,
                 seq_length,
                 bsz,
@@ -443,7 +434,7 @@ class TopKRouter(nn.Cell):
     # pylint: disable=W0613
     def _compute_aux_loss(
             self,
-            logits: Tensor,
+            scores: Tensor,
             top_scores: Tensor,
             seq_length: int,
             bsz: int,
@@ -452,15 +443,14 @@ class TopKRouter(nn.Cell):
         """
         Compute auxiliary load-balancing loss and inject its gradient into top_scores.
 
-        Uses scores (with gradient) and routing_map (without gradient) to compute
+        Uses scores (with gradient) and top-k indices (without gradient) to compute
         the load-balancing loss. The loss gradient is injected into the computation
         graph via MoEAuxLossAutoScaler, so it flows back to the router weights during
         backpropagation without modifying the main loss scalar.
 
         Args:
-            logits (Tensor): Raw router logits before score function.
-                Used to recompute routing_map and scores_for_aux_loss via
-                ``compute_routing_scores_for_aux_loss``.
+            scores (Tensor): Router scores after the configured score function,
+                shape ``[T, E]``.
             top_scores (Tensor): Top-K routing scores for selected experts,
                 shape ``[T, K]``. The aux loss gradient will be injected into
                 this tensor via ``MoEAuxLossAutoScaler``.
@@ -473,19 +463,18 @@ class TopKRouter(nn.Cell):
             Tensor: top_scores with aux loss gradient injected.
         """
 
-        routing_map_for_aux_loss, scores_for_aux_loss = compute_routing_scores_for_aux_loss(
-            logits,
+        topk_indices_for_aux_loss, scores_for_aux_loss = compute_routing_scores_for_aux_loss(
+            scores,
             self.top_k,
             self.score_func,
         )
 
         # Match Megatron's auxiliary-loss path: hash routing, expert bias and
-        # group-limited routing all derive the auxiliary routing map from the raw
+        # group-limited routing all derive the auxiliary routing indices from the raw
         # router logits. Only the debug force-balance override uses the explicit
         # selected indices, because it replaces the normal routing decision.
         if self._debug_force_load_balance and selected_experts_indices is not None:
-            routing_map_for_aux_loss = mint.zeros_like(logits).int()
-            routing_map_for_aux_loss.scatter_(1, selected_experts_indices, 1)
+            topk_indices_for_aux_loss = selected_experts_indices
 
         aux_loss_func_map = {
             "aux_loss": self._apply_aux_loss,
@@ -498,7 +487,7 @@ class TopKRouter(nn.Cell):
             raise ValueError(f"Unknown aux_loss_type {self.aux_loss_type}")
 
         top_scores = aux_loss_func(
-            top_scores, scores_for_aux_loss, routing_map_for_aux_loss,
+            top_scores, scores_for_aux_loss, topk_indices_for_aux_loss,
             seq_length, bsz,
         )
 
@@ -522,23 +511,37 @@ class TopKRouter(nn.Cell):
         return agg_probs, tokens_per_expert
 
     def _reduce_token_sum_pair(
-            self, probs: Tensor, routing_map: Tensor, reduce_count_cp=False
+            self, probs: Tensor, topk_indices: Tensor, reduce_count_cp=False
     ) -> Tuple[Tensor, Tensor]:
         """Aggregate token-level probability and routing statistics."""
+        tokens_per_expert = self.histc(
+            topk_indices, bins=self.num_experts, min=0, max=self.num_experts
+        )
         return self._reduce_pair(
-            probs.sum(dim=0), routing_map.sum(dim=0), reduce_count_cp
+            probs.sum(dim=0), tokens_per_expert, reduce_count_cp
         )
 
     def _reduce_seq_sum_pair(
-            self, probs: Tensor, routing_map: Tensor, bsz: int, reduce_count_cp=False
+            self, probs: Tensor, topk_indices: Tensor, bsz: int, reduce_count_cp=False
     ) -> Tuple[Tensor, Tensor]:
         """Aggregate per-sequence probability and routing statistics."""
-        def seq_sum(tensor):
-            local_seq = tensor.shape[0] // bsz
-            return tensor.reshape((local_seq, bsz, -1)).sum(dim=0).reshape((-1,))
+        local_seq = probs.shape[0] // bsz
+        probs_per_sequence = probs.reshape((local_seq, bsz, -1)).sum(dim=0).reshape((-1,))
+
+        batch_indices = self.reshape(
+            self.arange(topk_indices.shape[0], dtype=topk_indices.dtype) % bsz,
+            (-1, 1),
+        )
+        encoded_indices = topk_indices + batch_indices * self.num_experts
+        tokens_per_expert = self.histc(
+            encoded_indices,
+            bins=bsz * self.num_experts,
+            min=0,
+            max=bsz * self.num_experts,
+        )
 
         return self._reduce_pair(
-            seq_sum(probs), seq_sum(routing_map), reduce_count_cp
+            probs_per_sequence, tokens_per_expert, reduce_count_cp
         )
 
     def _aux_loss_from_stats(
@@ -554,7 +557,7 @@ class TopKRouter(nn.Cell):
             self,
             top_scores: Tensor,
             scores_for_aux_loss: Tensor,
-            routing_map: Tensor,
+            topk_indices: Tensor,
             seq_length: int = 0,
             bsz: int = 0,
     ) -> Tensor:
@@ -564,7 +567,7 @@ class TopKRouter(nn.Cell):
         Args:
             top_scores (Tensor): Top-K routing scores, shape ``[T, K]``.
             scores_for_aux_loss (Tensor): Router probabilities, shape ``[T, E]``.
-            routing_map (Tensor): Token-expert assignment map (detached), shape ``[T, E]``.
+            topk_indices (Tensor): Selected expert indices (detached), shape ``[T, K]``.
             seq_length (int): Unused. Present for unified dispatch signature.
             bsz (int): Unused. Present for unified dispatch signature.
 
@@ -573,7 +576,7 @@ class TopKRouter(nn.Cell):
         """
         _ = seq_length, bsz
         agg_probs, tokens_per_expert = self._reduce_token_sum_pair(
-            scores_for_aux_loss, routing_map, reduce_count_cp=True
+            scores_for_aux_loss, topk_indices, reduce_count_cp=True
         )
         total_num_tokens = scores_for_aux_loss.shape[0] * self._tp_size * self._cp_size
         aux_loss = self._aux_loss_from_stats(
@@ -587,7 +590,7 @@ class TopKRouter(nn.Cell):
             self,
             top_scores: Tensor,
             scores_for_aux_loss: Tensor,
-            routing_map: Tensor,
+            topk_indices: Tensor,
             seq_length: int,
             bsz: int,
     ) -> Tensor:
@@ -597,7 +600,7 @@ class TopKRouter(nn.Cell):
         Args:
             top_scores (Tensor): Top-K routing scores, shape ``[T, K]``.
             scores_for_aux_loss (Tensor): Router probabilities, shape ``[T, E]``.
-            routing_map (Tensor): Token-expert assignment map (detached), shape ``[T, E]``.
+            topk_indices (Tensor): Selected expert indices (detached), shape ``[T, K]``.
             seq_length (int): Sequence length.
             bsz (int): Batch size.
 
@@ -605,7 +608,7 @@ class TopKRouter(nn.Cell):
             Tensor: top_scores with aux loss gradient injected.
         """
         agg_probs, tokens_per_expert = self._reduce_seq_sum_pair(
-            scores_for_aux_loss, routing_map, bsz, reduce_count_cp=True
+            scores_for_aux_loss, topk_indices, bsz, reduce_count_cp=True
         )
         total_num_tokens = seq_length * self._tp_size * self._cp_size
         aux_loss = self._aux_loss_from_stats(
@@ -621,7 +624,7 @@ class TopKRouter(nn.Cell):
             self,
             top_scores: Tensor,
             scores_for_aux_loss: Tensor,
-            routing_map: Tensor,
+            topk_indices: Tensor,
             seq_length: int = 0,
             bsz: int = 0,
     ) -> Tensor:
@@ -631,7 +634,7 @@ class TopKRouter(nn.Cell):
         Args:
             top_scores (Tensor): Top-K routing scores, shape ``[T, K]``.
             scores_for_aux_loss (Tensor): Router probabilities, shape ``[T, E]``.
-            routing_map (Tensor): Token-expert assignment map (detached), shape ``[T, E]``.
+            topk_indices (Tensor): Selected expert indices (detached), shape ``[T, K]``.
             seq_length (int): Unused. Present for unified dispatch signature.
             bsz (int): Unused. Present for unified dispatch signature.
 
@@ -640,7 +643,7 @@ class TopKRouter(nn.Cell):
         """
         _ = seq_length, bsz
         agg_probs, tokens_per_expert = self._reduce_token_sum_pair(
-            scores_for_aux_loss, routing_map, reduce_count_cp=True
+            scores_for_aux_loss, topk_indices, reduce_count_cp=True
         )
         self.global_tokens_per_expert += tokens_per_expert
         self.ga_steps += 1

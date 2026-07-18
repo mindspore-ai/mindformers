@@ -964,6 +964,7 @@ def apply_moe_ep_tp(
         moe_token_dispatcher_type: str = "all_to_all",
         npu_nums_per_device: int = 8,
         expert_async_d2h: bool = False,
+        use_safe_tokens: bool = True,
 ):
     """
     Apply Expert Parallelism (EP) and Tensor Parallelism (TP) to MoE layers in model.
@@ -974,6 +975,8 @@ def apply_moe_ep_tp(
         ep_mesh (DeviceMesh): The device mesh for expert parallelism.
         moe_token_dispatcher_type (str): The type of token dispatcher for MoE.
         npu_nums_per_device (int): The number of NPUs per device.
+        expert_async_d2h (bool): Whether to overlap dispatch counts D2H with token permutation.
+        use_safe_tokens (bool): Whether to prepend zero-probability safe tokens before dispatch.
 
  	MoE layer structure:
         - mlp.experts.weight1: Expert FFN first layer weights
@@ -1011,9 +1014,13 @@ def apply_moe_ep_tp(
         # Apply TP to experts: shard along the hidden dimension
         if moe_token_dispatcher_type == "alltoall":
             experts_plan = ExpertParallel(model.model.config.moe_permute_fusion,
-                                          async_d2h=expert_async_d2h)
+                                          async_d2h=expert_async_d2h,
+                                          use_safe_tokens=use_safe_tokens)
         elif moe_token_dispatcher_type == "alltoall_deredundancy":
-            experts_plan = DeredundancyExpertParallel(npu_nums_per_device)
+            experts_plan = DeredundancyExpertParallel(
+                npu_nums_per_device,
+                use_safe_tokens=use_safe_tokens,
+            )
         else:
             raise ValueError(
                 f"Unsupported moe_token_dispatcher_type: '{moe_token_dispatcher_type}'. "
@@ -1036,6 +1043,7 @@ def apply_moe_ep_overlap_tp(
         ep_mesh=None,
         moe_token_dispatcher_type: str = "alltoall",
         expert_async_d2h: bool = False,
+        use_safe_tokens: bool = True,
 ):
     """Apply EP with comm/compute overlap hooks to MoE layers in all pipeline model parts.
 
@@ -1059,6 +1067,8 @@ def apply_moe_ep_overlap_tp(
         ep_mesh:   EP device mesh.
         moe_token_dispatcher_type: Must be ``"alltoall"``; overlap is only
                    supported for the standard all-to-all dispatcher.
+        expert_async_d2h: Whether to overlap dispatch counts D2H with token permutation.
+        use_safe_tokens: Whether to prepend zero-probability safe tokens before dispatch.
 
     Returns:
         ``model`` (mutated in place).
@@ -1104,6 +1114,7 @@ def apply_moe_ep_overlap_tp(
                 # pp, no-recompute, larger ep) not yet A/B'd.
                 moe_permute_fusion=model.model.config.moe_permute_fusion,
                 async_d2h=expert_async_d2h,
+                use_safe_tokens=use_safe_tokens,
             )
             parallelize_module(
                 module=layer.mlp.experts,
@@ -1680,6 +1691,7 @@ def _apply_spmd_parallelism(
     # Phase 2: EP
     if parallel_dims.ep_enabled:
         ep_mesh = parallel_dims.get_mesh("ep")
+        use_safe_tokens = getattr(parallelism, "expert_parallel_use_safe_tokens", True)
         if overlap is not None and parallelism.moe_token_dispatcher_type == "alltoall":
             # Overlap path: OverlapExpertParallel + CHUNK_START/END hooks.
             # apply_moe_ep_overlap_tp wraps its own weight sharding in
@@ -1691,6 +1703,7 @@ def _apply_spmd_parallelism(
                 ep_mesh=ep_mesh,
                 moe_token_dispatcher_type=parallelism.moe_token_dispatcher_type,
                 expert_async_d2h=getattr(parallelism, "expert_parallel_async_d2h", False),
+                use_safe_tokens=use_safe_tokens,
             )
         else:
             with ms.DeviceCtx("meta"):
@@ -1701,6 +1714,7 @@ def _apply_spmd_parallelism(
                     moe_token_dispatcher_type=parallelism.moe_token_dispatcher_type,
                     npu_nums_per_device=parallelism.npu_nums_per_device,
                     expert_async_d2h=getattr(parallelism, "expert_parallel_async_d2h", False),
+                    use_safe_tokens=use_safe_tokens,
                 )
 
     # Phase 3: CP

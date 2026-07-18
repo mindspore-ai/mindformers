@@ -20,7 +20,6 @@ MoE Auxiliary Loss computation and gradient injection.
 from typing import Optional, Tuple, Union, List
 
 from mindspore import Tensor, mint, nn, ops
-from mindspore.common import dtype as mstype
 from mindspore.common._grad_function import _Function
 from mindspore.mint.distributed import get_world_size, all_reduce
 
@@ -342,39 +341,30 @@ class MoEAuxLossAutoScaler(nn.Cell):
 
 
 def compute_routing_scores_for_aux_loss(
-        logits: Tensor,
+        scores: Tensor,
         topk: int,
         score_function: str,
 ) -> Tuple[Tensor, Tensor]:
-    """Compute routing scores based on the score function.
+    """Normalize router scores and select experts for auxiliary loss.
 
     Args:
-        logits (Tensor): The logits tensor after gating, shape: [num_tokens, num_experts].
+        scores (Tensor): Router scores after the configured score function,
+            shape: [num_tokens, num_experts].
         topk (int): The number of top-k indices to compute.
-        score_function (str): The score function to use. Can be either "softmax" or "sigmoid".
-        fused (bool, optional): Whether to use the fused version. Defaults to False.
-        padding_mask (Tensor, optional): Boolean mask indicating non-padding tokens.
-                                         Shape in [num_tokens]. True for valid tokens,
-                                         False for padding tokens. Defaults to None.
+        score_function (str): The score function used to produce ``scores``.
 
     Returns:
-        Tuple[Tensor, Tensor]: The routing map and the normalized routing scores.
+        Tuple[Tensor, Tensor]: The compact top-k expert indices and normalized routing scores.
     """
     if score_function == "softmax":
-        scores = mint.softmax(logits, dim=-1, dtype=mstype.float32)
-    elif score_function == "sigmoid":
-        scores = mint.sigmoid(logits)
-        scores = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20)
-    elif score_function == "sqrtsoftplus":
-        scores = mint.sqrt(mint.nn.functional.softplus(ops.cast(logits, mstype.float32)))
-        scores = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20)
+        scores_for_aux_loss = scores
+    elif score_function in ("sigmoid", "sqrtsoftplus"):
+        scores_for_aux_loss = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20)
     else:
         raise ValueError(f"Invalid score_function: {score_function}")
 
-    _, top_indices = mint.topk(scores, k=topk, dim=1)
-    routing_map = mint.zeros_like(logits).int()
-    routing_map.scatter_(1, top_indices, 1).bool()
-    return routing_map, scores
+    _, top_indices = mint.topk(scores_for_aux_loss, k=topk, dim=1)
+    return top_indices, scores_for_aux_loss
 
 
 def get_moe_layer_wise_logging_tracker() -> dict:

@@ -15,7 +15,8 @@
 # ============================================================================
 """Tests for expert parallel in pynative mode."""
 import pytest
-from mindspore import context, nn
+import mindspore as ms
+from mindspore import Tensor, context, nn
 
 from hyper_parallel.core.dtensor.placement_types import Shard
 
@@ -78,6 +79,26 @@ class TestExpertParallel:
                   input_size=HIDDEN_SIZE)
         with pytest.raises(TypeError):
             self.expert_parallel._apply(mlp, self.device_mesh)
+
+    @pytest.mark.level1
+    @pytest.mark.platform_x86_cpu
+    @pytest.mark.env_onecard
+    @pytest.mark.parametrize("use_safe_tokens, expected_pad_size", [(True, EXPERT_NUM), (False, 0)])
+    def test_add_safe_tokens_respects_config(self, use_safe_tokens, expected_pad_size):
+        """Safe tokens are only prepended when use_safe_tokens is enabled."""
+        tokens = Tensor([[1.0, 2.0], [3.0, 4.0]], dtype=ms.float32)
+        probs = Tensor([[0.4, 0.6], [0.7, 0.3]], dtype=ms.float32)
+        topk_indices = Tensor([[0, 1], [2, 3]], dtype=ms.int32)
+        expert_parallel = ExpertParallel(use_safe_tokens=use_safe_tokens)
+
+        padded_tokens, padded_probs, padded_indices, pad_size = expert_parallel._add_safe_tokens(
+            tokens, probs, topk_indices, EXPERT_NUM, topk_indices.shape[-1]
+        )
+
+        assert pad_size == expected_pad_size
+        assert padded_tokens.shape[0] == tokens.shape[0] + expected_pad_size
+        assert padded_probs.shape[0] == probs.shape[0] + expected_pad_size
+        assert padded_indices.shape[0] == topk_indices.shape[0] + expected_pad_size
 
 
     @pytest.mark.level1

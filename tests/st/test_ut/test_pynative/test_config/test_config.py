@@ -230,6 +230,9 @@ class TestConfig:
         assert config.optimizer.type == "AdamW"
         assert config.optimizer.betas == [0.9, 0.95]
 
+        # Verify expert-parallel safe-token config is loaded from parallelism.
+        assert config.parallelism.expert_parallel_use_safe_tokens is False
+
         # Verify TensorBoard monitor config without redundant field prefixes
         assert config.monitor.tensorboard.output_dir == ""
         assert config.monitor.tensorboard.log_interval == 1
@@ -332,6 +335,7 @@ class TestConfig:
         assert isinstance(config.training, TrainingConfig)
         assert isinstance(config.parallelism, ParallelismConfig)
         assert config.training.steps == 1000  # Default in class definition
+        assert config.parallelism.expert_parallel_use_safe_tokens is True
 
     def test_tensor_parallel_requires_sequence_parallel(self):
         """PyNative TP degrees greater than one require sequence parallelism."""

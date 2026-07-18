@@ -14,11 +14,76 @@
 # ============================================================================
 """Tests for GPT model parallelization helpers."""
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
 
 from mindformers.pynative.base_models.gpt import parallelize
+
+
+def _build_moe_model():
+    """Build the minimal model tree consumed by the MoE parallelize helpers."""
+    layer = SimpleNamespace(mlp=SimpleNamespace(experts=object()))
+    config = SimpleNamespace(moe_permute_fusion=False)
+    inner_model = SimpleNamespace(
+        config=config,
+        decoder=SimpleNamespace(layers=[layer]),
+        mtp=None,
+    )
+    return SimpleNamespace(model=inner_model)
+
+
+@pytest.mark.level0
+@pytest.mark.platform_x86_cpu
+@pytest.mark.env_onecard
+@pytest.mark.parametrize("dispatcher", ["alltoall", "alltoall_deredundancy"])
+def test_apply_moe_ep_tp_propagates_use_safe_tokens(monkeypatch, dispatcher):
+    """The safe-token setting reaches both PyNative EP dispatchers."""
+    captured = {}
+
+    def _capture_strategy(_, **kwargs):
+        captured["use_safe_tokens"] = kwargs["use_safe_tokens"]
+        return object()
+
+    monkeypatch.setattr(parallelize, "ExpertParallel", _capture_strategy)
+    monkeypatch.setattr(parallelize, "DeredundancyExpertParallel", _capture_strategy)
+    monkeypatch.setattr(parallelize, "set_comm_ops_inplace", lambda _: None)
+    monkeypatch.setattr(parallelize, "parallelize_module", lambda **_: None)
+
+    parallelize.apply_moe_ep_tp(
+        _build_moe_model(),
+        ep_mesh=object(),
+        moe_token_dispatcher_type=dispatcher,
+        use_safe_tokens=False,
+    )
+
+    assert captured["use_safe_tokens"] is False
+
+
+@pytest.mark.level0
+@pytest.mark.platform_x86_cpu
+@pytest.mark.env_onecard
+def test_apply_moe_ep_overlap_tp_propagates_use_safe_tokens(monkeypatch):
+    """The overlap EP strategy receives the same safe-token config."""
+    captured = {}
+
+    def _capture_strategy(**kwargs):
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(parallelize, "OverlapExpertParallel", _capture_strategy)
+    monkeypatch.setattr(parallelize, "parallelize_module", lambda **_: None)
+    monkeypatch.setattr(parallelize.ms, "DeviceCtx", lambda *_: nullcontext())
+
+    parallelize.apply_moe_ep_overlap_tp(
+        _build_moe_model(),
+        overlap=SimpleNamespace(coordinator=object()),
+        ep_mesh=object(),
+        use_safe_tokens=False,
+    )
+
+    assert captured["use_safe_tokens"] is False
 
 
 @pytest.mark.level0

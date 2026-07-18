@@ -47,7 +47,12 @@ class ExpertParallel(ParallelStyle):
 
     """
 
-    def __init__(self, moe_permute_fusion: bool = False, async_d2h: bool = False):
+    def __init__(
+            self,
+            moe_permute_fusion: bool = False,
+            async_d2h: bool = False,
+            use_safe_tokens: bool = True,
+    ):
         super().__init__()
         self.ctx = None
         self.input_layout = None
@@ -74,23 +79,29 @@ class ExpertParallel(ParallelStyle):
         # (Megatron cuda_dtoh_stream + deferred cuda_sync_point). Driven by
         # ParallelismConfig.expert_parallel_async_d2h; applies to base and overlap paths.
         self.enable_async_d2h = async_d2h
+        self.use_safe_tokens = use_safe_tokens
         self._d2h_stream = None
 
     # ------------------------------------------------------------------
     # Shared building blocks (used by this class and OverlapExpertParallel).
     # Subclasses override only the comm seams (the a2a calls / sync hooks /
-    # their ordering); these helpers hold the identical pad / permute-bookkeeping
+    # their ordering); these helpers hold the identical safe-token / permute-bookkeeping
     # / split-math / resort logic so it lives in one place.
     # ------------------------------------------------------------------
 
-    def _pad_inputs(self, tokens, probs, topk_indices, num_experts, moe_router_topk):
-        """Prepend one pad row per expert so every expert receives >=1 token.
+    def _add_safe_tokens(self, tokens, probs, topk_indices, num_experts, moe_router_topk):
+        """Prepend one safe-token row per expert so every expert receives >=1 token.
 
-        Returns the padded ``(tokens, probs, topk_indices)`` plus ``pad_size``
-        (number of pad rows = ``num_experts``) to strip again in combine.
+        Returns ``(tokens, probs, topk_indices)`` plus ``pad_size``. When
+        ``use_safe_tokens`` is enabled, one row per expert is prepended and
+        ``pad_size`` equals ``num_experts``; otherwise the inputs are returned
+        unchanged with ``pad_size=0``.
 
-        NOTE: if enable pad tokens, results will be different with Megatron.
+        NOTE: enabling safe tokens can produce different results from Megatron.
         """
+        if not self.use_safe_tokens:
+            return tokens, probs, topk_indices, 0
+
         pad_tokens = mint.zeros((num_experts, tokens.shape[-1]), dtype=tokens.dtype)
         pad_probs = mint.zeros((num_experts, moe_router_topk), dtype=probs.dtype)
         pad_topk_indices = mint.arange(num_experts * moe_router_topk, dtype=topk_indices.dtype) % num_experts
@@ -286,7 +297,7 @@ class ExpertParallel(ParallelStyle):
     def _token_dispatch(self, device_mesh, cell, args):
         """Dispatch routed tokens across experts and EP ranks for MoE execution.
 
-        Thin orchestrator: unwrap -> pad -> permute -> count -> dispatch comm
+        Thin orchestrator: unwrap -> safe tokens -> permute -> count -> dispatch comm
         -> resort. The all-to-all communication lives in :meth:`_dispatch_comm`.
         """
         if self.enable_async_d2h:
@@ -301,7 +312,7 @@ class ExpertParallel(ParallelStyle):
         num_experts = num_tokens_per_expert.shape[-1]
         moe_router_topk = topk_indices.shape[-1]
 
-        tokens, probs, topk_indices, pad_size = self._pad_inputs(
+        tokens, probs, topk_indices, pad_size = self._add_safe_tokens(
             tokens, probs, topk_indices, num_experts, moe_router_topk)
         routed_input, _, topk_indices, unsort_token_indices_experts \
             = self._permute(tokens, topk_indices, self.moe_permute_fusion)
@@ -377,7 +388,7 @@ class ExpertParallel(ParallelStyle):
         num_experts = num_tokens_per_expert.shape[-1]
         moe_router_topk = topk_indices.shape[-1]
 
-        tokens, probs, topk_indices, pad_size = self._pad_inputs(
+        tokens, probs, topk_indices, pad_size = self._add_safe_tokens(
             tokens, probs, topk_indices, num_experts, moe_router_topk)
 
         # Stage 1: count + counts a2a + issue async D2H, all BEFORE the permute.
@@ -586,11 +597,12 @@ class DeredundancyExpertParallel(ExpertParallel):
 
     Args:
         npu_nums_per_device (int, optional): Number of NPUs per device. Default: ``8``.
+        use_safe_tokens (bool, optional): Whether to prepend safe tokens. Default: ``True``.
 
     """
 
-    def __init__(self, npu_nums_per_device: int = 8):
-        super().__init__()
+    def __init__(self, npu_nums_per_device: int = 8, use_safe_tokens: bool = True):
+        super().__init__(use_safe_tokens=use_safe_tokens)
         self.npu_nums_per_device = npu_nums_per_device
         self.rank_id = get_rank()
         self.local_expert_start_index = None
@@ -635,13 +647,17 @@ class DeredundancyExpertParallel(ExpertParallel):
 
         top_k = topk_indices.shape[-1]
         node_expert_num = self.local_expert_end_index - self.local_expert_start_index
-        safe_tokens = self.zeros((node_expert_num, tokens_shape[-1]), dtype=compute_dtype)
-        tokens = self.cat((safe_tokens, tokens), dim=0)
-        safe_topk_indices = self.cumsum(self.ones((node_expert_num, top_k)), dim=0)
-        safe_topk_indices = self.cast(safe_topk_indices - 1 + self.local_expert_start_index, mstype.int32)
-        topk_indices = self.cat((safe_topk_indices, topk_indices), dim=0)
-        safe_probs = self.zeros((node_expert_num, top_k), dtype=compute_dtype)
-        probs = self.cat((safe_probs, probs), dim=0)
+        pad_size = 0
+        if self.use_safe_tokens:
+            safe_tokens = self.zeros((node_expert_num, tokens_shape[-1]), dtype=compute_dtype)
+            tokens = self.cat((safe_tokens, tokens), dim=0)
+            safe_topk_indices = self.cumsum(self.ones((node_expert_num, top_k)), dim=0)
+            safe_topk_indices = self.cast(
+                safe_topk_indices - 1 + self.local_expert_start_index, mstype.int32)
+            topk_indices = self.cat((safe_topk_indices, topk_indices), dim=0)
+            safe_probs = self.zeros((node_expert_num, top_k), dtype=compute_dtype)
+            probs = self.cat((safe_probs, probs), dim=0)
+            pad_size = node_expert_num
 
         # prepare counter
         iepones = [node_expert_num // inter_ep for i in range(inter_ep)]
@@ -718,11 +734,17 @@ class DeredundancyExpertParallel(ExpertParallel):
         _, unsort_map = mint.sort(self.cast(sort_map, mstype.float32))
         routed_input = mint.index_select(routed_input, 0, sort_map)
 
-        self.ctx = (sorted_router_coeff, unsort_map, exrl, exsl, excombine_whiteboard, dispatch_idx, tokens_shape)
+        self.ctx = (
+            sorted_router_coeff, unsort_map, exrl, exsl,
+            excombine_whiteboard, dispatch_idx, tokens_shape, pad_size
+        )
         return routed_input, sorted_router_coeff, expert_ids, exgl
 
     def _token_combine(self, device_mesh, cell, args, routed_output):
-        probs, unsorted_map, exrl, exsl, excombine_whiteboard, dispatch_idx, token_orig_shape = self.ctx
+        (
+            probs, unsorted_map, exrl, exsl,
+            excombine_whiteboard, dispatch_idx, token_orig_shape, pad_size
+        ) = self.ctx
         # -4. unresort
         routed_output = self.index_select(routed_output, 0, unsorted_map)
 
@@ -752,8 +774,7 @@ class DeredundancyExpertParallel(ExpertParallel):
             input=routed_output,
             group=self.oep_group
         )
-        node_expert_num = self.local_expert_end_index - self.local_expert_start_index
-        routed_output = routed_output[node_expert_num:]
+        routed_output = routed_output[pad_size:]
         if self.input_layout is not None:
             return DTensor.from_local(
                 routed_output,
