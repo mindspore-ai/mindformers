@@ -13,7 +13,6 @@
 # limitations under the License.
 # ============================================================================
 """Attention Mask Generate"""
-import numpy as np
 import mindspore as ms
 from mindspore import nn, Tensor, ops, mint
 import mindspore.common.dtype as mstype
@@ -64,10 +63,10 @@ class CausalMaskGenerate(nn.Cell):
         if use_attn_mask_compression:
             if seq_length < 2048:
                 raise ValueError("seq_length should be larger than 2048 when use mask_compression")
-            self._lower_triangle_mask_np = np.triu(np.ones((2048, 2048), dtype=np.int8), k=1)
+            self._lower_triangle_mask_shape = (2048, 2048)
             self._lower_triangle_mask_dtype = ms.uint8
         else:
-            self._lower_triangle_mask_np = np.tril(np.ones(shape=(seq_length, seq_length), dtype=np.int8))
+            self._lower_triangle_mask_shape = (seq_length, seq_length)
             self._lower_triangle_mask_dtype = compute_type
         self._lower_triangle_mask = None
         self.cast = ops.cast
@@ -80,8 +79,15 @@ class CausalMaskGenerate(nn.Cell):
 
     @property
     def lower_triangle_mask(self):
+        """Lazily build and return a causal mask triangle on the current device."""
         if self._lower_triangle_mask is None:
-            self._lower_triangle_mask = Tensor(self._lower_triangle_mask_np, dtype=self._lower_triangle_mask_dtype)
+            # Build lazily with device ops so shared masks own their final storage before layer hooks run.
+            mask = mint.ones(self._lower_triangle_mask_shape, dtype=self._lower_triangle_mask_dtype)
+            if self.use_attn_mask_compression:
+                mask = mint.triu(mask, diagonal=1)
+            else:
+                mask = mint.tril(mask)
+            self._lower_triangle_mask = mask
         return self._lower_triangle_mask
 
     def construct(self, tokens=None, masks=None):

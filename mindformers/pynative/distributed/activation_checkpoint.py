@@ -662,34 +662,119 @@ def apply_recompute(
             _set_select_recompute(model.layers[layer_id], layer_id, comm_layer_to_modules, add_prim_attr=True)
 
 
-def _build_policy_fn_swap(config):
-    """Build swap policy from model config.
+def _tensor_storage_ptr(tensor):
+    """Return a tensor's storage pointer, or ``None`` for empty/non-tensors."""
+    if not isinstance(tensor, ms.Tensor):
+        return None
+    storage = tensor.untyped_storage()
+    if storage.size() == 0:
+        return None
+    return storage.data_ptr()
 
-    Keep attention masks on device since FlashAttention backward consumes the
-    shared local uint8 mask directly and the generic swap lifecycle may break
-    that assumption.
-    """
-    seq_length = getattr(config, "seq_length", None)
-    use_mask_compression = bool(
-        getattr(config, "use_attn_mask_compression", False)
-        or getattr(config, "use_eod_attn_mask_compression", False)
-    )
 
-    def _policy_fn_swap(x):
-        if x.dtype != ms.uint8:
-            return CheckpointPolicy.MUST_SWAP
+def _collect_tensor_storage_ptrs(tree):
+    """Collect tensor storage pointers from nested layer inputs."""
+    storage_ptrs = set()
 
-        ndim = getattr(x, "ndim", 0)
-        if ndim == 4 and x.shape[1] == 1:
-            if seq_length is None or (x.shape[2] == x.shape[3] == seq_length):
-                return CheckpointPolicy.MUST_SAVE
+    def _collect(value):
+        storage_ptr = _tensor_storage_ptr(value)
+        if storage_ptr is not None:
+            storage_ptrs.add(storage_ptr)
+            return
+        if isinstance(value, dict):
+            for item in value.values():
+                _collect(item)
+        elif isinstance(value, (tuple, list)):
+            for item in value:
+                _collect(item)
 
-        if use_mask_compression and ndim == 2 and x.shape[0] == x.shape[1]:
+    _collect(tree)
+    return storage_ptrs
+
+
+class _SwapPolicy:
+    """Keep storage owned by enclosing model inputs out of per-layer swap."""
+
+    def __init__(self):
+        self._external_input_storage_ptrs = set()
+
+    def capture_external_inputs(self, inputs):
+        """Refresh storage identities at the current enclosing model boundary."""
+        self._external_input_storage_ptrs = _collect_tensor_storage_ptrs(inputs)
+
+    def __call__(self, tensor):
+        storage_ptr = _tensor_storage_ptr(tensor)
+        if storage_ptr is not None and storage_ptr in self._external_input_storage_ptrs:
             return CheckpointPolicy.MUST_SAVE
-
         return CheckpointPolicy.MUST_SWAP
 
-    return _policy_fn_swap
+
+def _build_policy_fn_swap():
+    """Build a storage-aware layer-swap policy independent of tensor shape."""
+    return _SwapPolicy()
+
+
+class _SwapInputBoundary:
+    """Describe one enclosing input boundary and the layers governed by it."""
+
+    def __init__(self, module, layer_ids, exclude_arg_names=()):
+        self.module = module
+        self.layer_ids = frozenset(layer_ids)
+        self.exclude_arg_names = frozenset(exclude_arg_names)
+
+
+def _register_swap_input_storage_hook(boundary, policy_fn):
+    """Capture selected boundary inputs by construct argument name."""
+    module = boundary.module
+    construct_signature = inspect.signature(module.construct)
+    unknown_names = boundary.exclude_arg_names.difference(construct_signature.parameters)
+    if unknown_names:
+        raise ValueError(
+            f"Swap input boundary excludes unknown construct arguments: {sorted(unknown_names)}"
+        )
+
+    def _capture_input_storage(mod, args, kwargs):  # pylint: disable=unused-argument
+        bound_inputs = construct_signature.bind_partial(*args, **kwargs).arguments
+        selected_inputs = {
+            name: value for name, value in bound_inputs.items()
+            if name not in boundary.exclude_arg_names
+        }
+        policy_fn.capture_external_inputs(selected_inputs)
+
+    old_handle = getattr(module, "_swap_input_storage_hook_handle", None)
+    if old_handle is not None:
+        old_handle.remove()
+    handle = module.register_forward_pre_hook(_capture_input_storage, with_kwargs=True)
+    module._swap_input_storage_hook_handle = handle
+
+
+def _build_swap_boundary_policies(model, input_boundaries, active_layer_ids):
+    """Build isolated policies and map every governed layer to its boundary policy."""
+    if input_boundaries is None:
+        input_boundaries = (
+            _SwapInputBoundary(model, range(model.layer_start, model.layer_end + 1)),
+        )
+
+    default_policy = _build_policy_fn_swap()
+    policy_by_layer = {}
+    valid_layer_ids = set(range(model.layer_start, model.layer_end + 1))
+    for boundary in input_boundaries:
+        unknown_layer_ids = boundary.layer_ids.difference(valid_layer_ids)
+        if unknown_layer_ids:
+            raise ValueError(f"Swap input boundary contains unknown layer ids: {sorted(unknown_layer_ids)}")
+        governed_layer_ids = boundary.layer_ids.intersection(active_layer_ids)
+        if not governed_layer_ids:
+            continue
+        duplicate_layer_ids = governed_layer_ids.intersection(policy_by_layer)
+        if duplicate_layer_ids:
+            raise ValueError(f"Swap input boundaries overlap at layer ids: {sorted(duplicate_layer_ids)}")
+
+        policy_fn = _build_policy_fn_swap()
+        _register_swap_input_storage_hook(boundary, policy_fn)
+        for layer_id in governed_layer_ids:
+            policy_by_layer[layer_id] = policy_fn
+
+    return default_policy, policy_by_layer
 
 
 def _expand_op_swap(config_list, op_swap):
@@ -782,8 +867,9 @@ def _set_op_swap(layer, layer_id, layer_to_modules, policy_fn):
 def apply_swap(
     model: nn.Cell,
     swap: SwapConfig,
+    input_boundaries=None,
 ) -> None:
-    """Apply ``checkpoint_wrapper`` using ``swap_config``."""
+    """Apply swap wrappers using the configured policy."""
     sc = swap
     prefetch = sc.default_prefetch
     full_target_ids = _parse_layer_ids(sc.layer_swap[0].get("layers", [])) if sc.layer_swap else set()
@@ -795,13 +881,16 @@ def apply_swap(
     if sc.op_swap:
         op_swap_list = _expand_op_swap(config_list, parse_op_swap(sc.op_swap))
         layer_to_modules = _clean_and_parse_config(full_target_ids, op_swap_list, label="Swap")
-    policy_fn = _build_policy_fn_swap(model.config)
-
     if not hasattr(model, "layers"):
         raise ValueError(f"{type(model)} must have 'layers' attribute.")
+    active_layer_ids = full_target_ids.union(layer_to_modules)
+    default_policy, policy_by_layer = _build_swap_boundary_policies(
+        model, input_boundaries, active_layer_ids
+    )
 
     prefetch_pairs = set()
     for layer_id in range(model.layer_start, model.layer_end + 1):
+        policy_fn = policy_by_layer.get(layer_id, default_policy)
         if layer_id in full_target_ids:
             model.layers[layer_id] = swap_wrapper(model.layers[layer_id], policy_fn=policy_fn)
             prefetch_pairs.add((layer_id, layer_id + prefetch))
@@ -905,4 +994,15 @@ def apply_ac(
 
     if enable_swap:
         _validate_swap_config(swap, total_num_layers)
-        apply_swap(ac_model, swap)
+        input_boundaries = [
+            _SwapInputBoundary(
+                model,
+                range(model.layer_start, model.layer_end + 1),
+                exclude_arg_names={"hidden_states"},
+            )
+        ]
+        if mtp_block is not None:
+            input_boundaries.append(
+                _SwapInputBoundary(mtp_block, range(num_layers, total_num_layers))
+            )
+        apply_swap(ac_model, swap, input_boundaries=input_boundaries)
