@@ -108,14 +108,18 @@ class FusedSparseFlashMla(_Function):
             layout="BSND",
             return_softmax_lse=True,
         )
-        ctx.query = query
-        ctx.ori_kv = ori_kv
-        ctx.cmp_kv = cmp_kv
-        ctx.sparse_indices = sparse_indices
-        ctx.cmp_residual = cmp_residual
-        ctx.sinks = sinks
-        ctx.output = output
-        ctx.softmax_lse = softmax_lse
+        ctx.has_cmp_kv = cmp_kv is not None
+        ctx.has_sparse_indices = sparse_indices is not None
+        ctx.save_for_backward(*[tensor for tensor in (
+            query,
+            ori_kv,
+            cmp_kv,
+            sparse_indices,
+            cmp_residual,
+            sinks,
+            output,
+            softmax_lse,
+        ) if tensor is not None])
         ctx.softmax_scale = softmax_scale
         ctx.cmp_ratio = kernel_cmp_ratio
         ctx.ori_mask_mode = ori_mask_mode
@@ -127,16 +131,25 @@ class FusedSparseFlashMla(_Function):
     @staticmethod
     def backward(ctx, grad_output):
         """Run SparseFlashMlaGrad and return gradients for differentiable inputs."""
+        saved_tensors = iter(ctx.saved_tensors)
+        query = next(saved_tensors)
+        ori_kv = next(saved_tensors)
+        cmp_kv = next(saved_tensors) if ctx.has_cmp_kv else None
+        sparse_indices = next(saved_tensors) if ctx.has_sparse_indices else None
+        cmp_residual = next(saved_tensors)
+        sinks = next(saved_tensors)
+        output = next(saved_tensors)
+        softmax_lse = next(saved_tensors)
         d_query, d_ori_kv, d_cmp_kv, d_sinks, _, _ = npu_sparse_flash_mla_grad(
-            ctx.query,
+            query,
             grad_output.contiguous(),
-            ctx.output,
-            ctx.softmax_lse,
-            ori_kv=ctx.ori_kv,
-            cmp_kv=ctx.cmp_kv,
-            cmp_sparse_indices=ctx.sparse_indices,
-            cmp_residual_kv=ctx.cmp_residual,
-            sinks=ctx.sinks,
+            output,
+            softmax_lse,
+            ori_kv=ori_kv,
+            cmp_kv=cmp_kv,
+            cmp_sparse_indices=sparse_indices,
+            cmp_residual_kv=cmp_residual,
+            sinks=sinks,
             softmax_scale=ctx.softmax_scale,
             cmp_ratio=ctx.cmp_ratio,
             ori_mask_mode=ctx.ori_mask_mode,
@@ -146,7 +159,7 @@ class FusedSparseFlashMla(_Function):
             layout="BSND",
         )
         return (
-            d_query, d_ori_kv, d_cmp_kv if ctx.cmp_kv is not None else None,
+            d_query, d_ori_kv, d_cmp_kv if cmp_kv is not None else None,
             None, d_sinks, None, None, None, None, None, None,
         )
 
@@ -206,17 +219,21 @@ class FusedSparseFlashMlaWithIndexerLoss(_Function):
             layout="BSND",
             return_softmax_lse=True,
         )
-        ctx.query = query
-        ctx.ori_kv = ori_kv
-        ctx.cmp_kv = cmp_kv
-        ctx.sparse_indices = sparse_indices
-        ctx.query_index = query_index
-        ctx.key_index = key_index
-        ctx.weights = weights
-        ctx.cmp_residual = cmp_residual
-        ctx.sinks = sinks
-        ctx.output = output
-        ctx.softmax_lse = softmax_lse
+        ctx.has_cmp_kv = cmp_kv is not None
+        ctx.has_sparse_indices = sparse_indices is not None
+        ctx.save_for_backward(*[tensor for tensor in (
+            query,
+            ori_kv,
+            cmp_kv,
+            sparse_indices,
+            query_index,
+            key_index,
+            weights,
+            cmp_residual,
+            sinks,
+            output,
+            softmax_lse,
+        ) if tensor is not None])
         ctx.softmax_scale = softmax_scale
         ctx.cmp_ratio = kernel_cmp_ratio
         ctx.ori_mask_mode = ori_mask_mode
@@ -231,16 +248,28 @@ class FusedSparseFlashMlaWithIndexerLoss(_Function):
     @staticmethod
     def backward(ctx, grad_output):
         """Fuse SparseFlashMlaGrad with SparseLightningIndexerKLLossGrad."""
+        saved_tensors = iter(ctx.saved_tensors)
+        query = next(saved_tensors)
+        ori_kv = next(saved_tensors)
+        cmp_kv = next(saved_tensors) if ctx.has_cmp_kv else None
+        sparse_indices = next(saved_tensors) if ctx.has_sparse_indices else None
+        query_index = next(saved_tensors)
+        key_index = next(saved_tensors)
+        weights = next(saved_tensors)
+        cmp_residual = next(saved_tensors)
+        sinks = next(saved_tensors)
+        output = next(saved_tensors)
+        softmax_lse = next(saved_tensors)
         d_query, d_ori_kv, d_cmp_kv, d_sinks, _, cmp_softmax_l1 = npu_sparse_flash_mla_grad(
-            ctx.query,
+            query,
             grad_output.contiguous(),
-            ctx.output,
-            ctx.softmax_lse,
-            ori_kv=ctx.ori_kv,
-            cmp_kv=ctx.cmp_kv,
-            cmp_sparse_indices=ctx.sparse_indices,
-            cmp_residual_kv=ctx.cmp_residual,
-            sinks=ctx.sinks,
+            output,
+            softmax_lse,
+            ori_kv=ori_kv,
+            cmp_kv=cmp_kv,
+            cmp_sparse_indices=sparse_indices,
+            cmp_residual_kv=cmp_residual,
+            sinks=sinks,
             softmax_scale=ctx.softmax_scale,
             cmp_ratio=ctx.cmp_ratio,
             ori_mask_mode=ctx.ori_mask_mode,
@@ -249,15 +278,15 @@ class FusedSparseFlashMlaWithIndexerLoss(_Function):
             ori_win_right=ctx.ori_win_right,
             layout="BSND",
         )
-        batch_size, query_length = ctx.query.shape[:2]
+        batch_size, query_length = query.shape[:2]
         d_query_index, d_key_index, d_weights, indexer_softmax = (
             npu_sparse_lightning_indexer_kl_loss_grad(
-                ctx.query_index,
-                ctx.key_index,
-                ctx.weights,
-                ctx.sparse_indices,
+                query_index,
+                key_index,
+                weights,
+                sparse_indices,
                 cmp_softmax_l1,
-                cmp_residual_k=ctx.cmp_residual,
+                cmp_residual_k=cmp_residual,
                 layout="BSND",
                 mask_mode=ctx.cmp_mask_mode,
                 cmp_ratio=ctx.cmp_ratio,
@@ -280,7 +309,7 @@ class FusedSparseFlashMlaWithIndexerLoss(_Function):
         return (
             d_query,
             d_ori_kv,
-            d_cmp_kv if ctx.cmp_kv is not None else None,
+            d_cmp_kv if cmp_kv is not None else None,
             None,
             d_query_index,
             d_key_index,
