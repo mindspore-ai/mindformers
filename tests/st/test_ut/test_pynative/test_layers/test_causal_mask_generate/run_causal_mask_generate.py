@@ -84,6 +84,12 @@ class CausalMaskGenerateRunner:
         net = self.build_model()
 
         output = net(self.tokens, self.masks)
+        if self.use_attn_mask_compression:
+            cached_output = net(self.tokens, self.masks)
+            if output.device == "CPU":
+                raise AssertionError("Compressed attention mask must be generated on the active device.")
+            if output.untyped_storage().data_ptr() != cached_output.untyped_storage().data_ptr():
+                raise AssertionError("Compressed attention mask must reuse its cached device storage.")
         output_ms = {"output": output}
 
         if self.rank_id is None or int(self.rank_id) == 0:
