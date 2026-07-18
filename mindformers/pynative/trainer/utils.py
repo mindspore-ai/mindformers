@@ -48,6 +48,7 @@ def set_auxiliary_loss_backward_scale(
         parallelism,
         enable_parallel: bool,
         gradient_accumulation_steps: int = 1,
+        indexer_loss_tp_replica_size: int = 1,
 ) -> Tensor:
     """Set the backward grad scale for all auxiliary losses (aux/mtp/index).
 
@@ -67,6 +68,10 @@ def set_auxiliary_loss_backward_scale(
         parallelism: Parallelism config (provides ``pipeline_parallel``).
         enable_parallel: Whether distributed training is enabled.
         gradient_accumulation_steps: Micro-batches accumulated per optimizer step.
+        indexer_loss_tp_replica_size: Number of TP ranks that execute the same
+            complete indexer graph. Its auxiliary gradient has no TP projection
+            collective, so the common ``1 / world_size`` loss sense must exclude
+            this replicated TP factor.
 
     Returns:
         The float32 single-element loss-sense tensor that was applied.
@@ -76,6 +81,11 @@ def set_auxiliary_loss_backward_scale(
     )
     from mindformers.pynative.transformers.moe.moe_utils import _MoEAuxLossAutoScaler
     from mindformers.pynative.transformers.multi_token_prediction import _MTPLossAutoScaler
+    if indexer_loss_tp_replica_size < 1:
+        raise ValueError(
+            "indexer_loss_tp_replica_size must be at least 1, but got "
+            f"{indexer_loss_tp_replica_size}."
+        )
     main_loss_sense = get_loss_sense(
         parallelism=parallelism,
         enable_parallel=enable_parallel,
@@ -84,10 +94,15 @@ def set_auxiliary_loss_backward_scale(
     )
     _MoEAuxLossAutoScaler.set_loss_scale(main_loss_sense)
     _MTPLossAutoScaler.set_loss_scale(main_loss_sense)
-    _IndexerLossAutoScaler.set_loss_scale(main_loss_sense)
-    logger.info("Set auxiliary loss backward scale to %s "
-                "(enable_parallel=%s, gradient_accumulation_steps=%s).",
-                main_loss_sense, enable_parallel, gradient_accumulation_steps)
+    indexer_loss_sense = main_loss_sense * indexer_loss_tp_replica_size
+    _IndexerLossAutoScaler.set_loss_scale(indexer_loss_sense)
+    logger.info(
+        "Set auxiliary loss backward scale to %s and indexer loss scale to %s "
+        "(enable_parallel=%s, gradient_accumulation_steps=%s, "
+        "indexer_loss_tp_replica_size=%s).",
+        main_loss_sense, indexer_loss_sense, enable_parallel,
+        gradient_accumulation_steps, indexer_loss_tp_replica_size,
+    )
 
 
 def get_grad(param):
