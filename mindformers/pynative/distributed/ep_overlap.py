@@ -92,6 +92,7 @@ class OverlapExpertParallel(ExpertParallel):
                         rendezvous instead.  Tag the **last MoE layer in
                         each pipeline chunk** with this flag.
         moe_permute_fusion: Passed to :class:`ExpertParallel`.
+        use_safe_tokens: Whether to prepend safe tokens before dispatch.
 
     Note:
         Pass every MoE layer's experts through this strategy and tag the
@@ -106,8 +107,13 @@ class OverlapExpertParallel(ExpertParallel):
         is_last_layer: bool = False,
         moe_permute_fusion: bool = False,
         async_d2h: bool = False,
+        use_safe_tokens: bool = True,
     ) -> None:
-        super().__init__(moe_permute_fusion=moe_permute_fusion, async_d2h=async_d2h)
+        super().__init__(
+            moe_permute_fusion=moe_permute_fusion,
+            async_d2h=async_d2h,
+            use_safe_tokens=use_safe_tokens,
+        )
         self._coordinator = coordinator
         self._d_hook = "D_LAST" if is_last_layer else "D"
         # async_d2h (ParallelismConfig.expert_parallel_async_d2h) composes with the

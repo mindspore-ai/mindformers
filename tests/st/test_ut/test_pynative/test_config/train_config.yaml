@@ -36,6 +36,7 @@ parallelism: # name refers to torchtitan
   # supports uneven or interleaved layer placement
   pipeline_parallel_layers_per_stage: null
   sequence_parallel: false           # enable sequence parallelism
+  expert_parallel_use_safe_tokens: false  # disable safe tokens before EP dispatch
 
 optimizer: # name refers to torchtitan
   type: AdamW
