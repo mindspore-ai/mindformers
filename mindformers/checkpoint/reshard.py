@@ -26,11 +26,13 @@ import numpy as np
 
 from mindspore import Parameter, Tensor
 from mindspore import load_checkpoint as ms_load_checkpoint
+from mindformers.checkpoint.layout_adapter import LayoutAdapter
+from mindformers.checkpoint.safetensors_utils import load_safetensors_file
 
 from mindformers.tools.logger import logger
 from mindformers.tools.utils import get_real_rank
 from mindformers.checkpoint.sharded_tensor import ShardedTensor
-from mindformers.checkpoint.utils import get_sharded_tensor_shard_id
+from mindformers.checkpoint.utils import get_sharded_tensor_shard_id, is_hf_checkpoint
 
 
 def check_layout(layout: Optional[Any], name: str) -> None:
@@ -594,13 +596,16 @@ class ReshardLoader:
         else:
             # Hugging Face weighting scenario: using templates for mapping.
             for src_name in self.src_metas.keys():
-                dst_name = self.template.get_mf_name(src_name)[0]
-                if dst_name in self.dst_metas:
-                    src_to_dst[src_name] = dst_name
+                mf_names = self.template.get_mf_name(src_name)
+                if not isinstance(mf_names, list):
+                    mf_names = [mf_names]
+                for dst_name in mf_names:
+                    if dst_name in self.dst_metas:
+                        src_to_dst[src_name] = dst_name
 
-                    if dst_name not in dst_to_src:
-                        dst_to_src[dst_name] = []
-                    dst_to_src[dst_name].append(src_name)
+                        if dst_name not in dst_to_src:
+                            dst_to_src[dst_name] = []
+                        dst_to_src[dst_name].append(src_name)
 
         return src_to_dst, dst_to_src
 
@@ -636,13 +641,15 @@ class ReshardLoader:
         Process:
             1. Traverse dst_metas to get target parameters to be loaded on the current card.
             2. For each target parameter, get the list of all related source parameter names.
-            3. For each source parameter, create a ReshardHandler and calculate all_offset.
+            3. For MoE expert weights, pre-compute which experts this card is responsible for,
+               and skip source parameters for experts that belong to other cards.
+            4. For each source parameter, create a ReshardHandler and calculate all_offset.
 
         Returns:
             params_info: {
                 src_name: {
                     "all_offset": {rank: slice_range, ...},
-                    "reshard_handler": ReshardHandler
+                    "reshard_handler": ReshardHandler (may be the *stacked_handler*)
                 }
             }
 
@@ -650,6 +657,8 @@ class ReshardLoader:
                 and the corresponding target parameter name can be obtained via `self.get_dst_name(src_name)`.
         """
         params_info = {}
+        # Per-dst expert distribution info for preprocess_hf_weights.
+        self._expert_filter_info: Dict[str, Dict] = {}
 
         # 1. Iterate through the target parameters that need to be loaded in the current card.
         for dst_name, dst_tensor in self.dst_metas.items():
@@ -660,8 +669,35 @@ class ReshardLoader:
                 logger.warning(f"No source parameters found for dst_param: {dst_name}, skipping")
                 continue
 
-            if self.template and self.template.check_weights_for_experts(dst_name) and self.num_moe_experts is None:
+            is_expert_dst = self.template and self.template.check_weights_for_experts(dst_name)
+
+            if is_expert_dst and self.num_moe_experts is None:
                 self.num_moe_experts = self.template.get_num_moe_experts(dst_name, len(src_names))
+
+            # Pre-compute expert filter info for this dst (MoE expert parallelism).
+            expert_filter = None
+            if is_expert_dst and self.num_moe_experts is not None:
+                expert_filter = self._compute_expert_filter(dst_name, dst_tensor)
+
+            # Pre-build a stacked-view ReshardHandler + its 3-D offset for the expert
+            # group.  Individual expert tensors are 2-D; the 3-D→2-D adjustment is
+            # done per source below so that tensor-parallel sharding is captured
+            # correctly from the stacked layout.
+            stacked_handler = None
+            stacked_all_offset = None
+            if is_expert_dst:
+                ref_src = self._resolve_src_tensor(src_names[0])
+                ref_copy = copy.copy(ref_src)
+                self.template.stack_hf_experts_weight(dst_name, self.num_moe_experts, ref_copy)
+                stacked_shape = ref_copy.global_shape
+                stacked_handler = ReshardHandler(
+                    param_name=dst_name,
+                    full_shape=stacked_shape,
+                    from_layout=None,
+                    to_layout=dst_tensor.layout,
+                    to_rank_id=self.rank_id,
+                )
+                stacked_all_offset = stacked_handler.infer_all_tensor_offset()
 
             # 3. For each source parameter, calculate the offset information.
             for src_name in src_names:
@@ -674,41 +710,175 @@ class ReshardLoader:
                     logger.warning(f"Source parameter {src_name} not in src_metas, skipping")
                     continue
 
-                src_tensor_list = self.src_metas[src_name]
-                src_tensor = (
-                    src_tensor_list[0]
-                    if isinstance(src_tensor_list, list)
-                    else src_tensor_list
-                )
+                src_tensor = self._resolve_src_tensor(src_name)
 
-                if self.template and self.template.check_weights_for_experts(dst_name):
-                    src_tensor = self.template.stack_hf_experts_weight(
-                        dst_name,
-                        self.num_moe_experts,
-                        src_tensor
+                # ── MoE expert filtering: skip experts not owned by this card ──
+                if expert_filter is not None:
+                    expert_id = self.template.get_expert_id(src_name)
+                    if expert_id is None:
+                        continue
+                    if expert_id < expert_filter["expert_offset"] or \
+                            expert_id >= expert_filter["expert_offset"] + expert_filter["experts_per_card"]:
+                        continue  # This expert is not on the current card
+
+                # Save original shape before stack_hf_experts_weight inflates the view.
+                # Needed for _adjust_expert_offset_3d_to_2d to detect transposed layout.
+                orig_src_shape = src_tensor.global_shape
+
+                if is_expert_dst:
+                    # Inflate the view so the ReshardHandler entry below uses
+                    # the stacked full_shape. The 3-D→2-D adjustment happens next.
+                    src_tensor = copy.copy(src_tensor)
+                    self.template.stack_hf_experts_weight(
+                        dst_name, self.num_moe_experts, src_tensor
                     )
 
                 global_shape = src_tensor.global_shape
                 if self.template and self.template.check_weights_for_qkv(src_name):
                     global_shape = self.dst_metas[dst_name].global_shape
 
-                # Create ReshardHandler
-                # Note: Use the source parameter's `global_shape` and the target parameter's `layout`.
-                reshard_handler = ReshardHandler(
-                    param_name=src_name,
-                    full_shape=global_shape,
-                    from_layout=src_tensor.layout,
-                    to_layout=dst_tensor.layout,
-                    to_rank_id=self.rank_id
-                )
+                if is_expert_dst and stacked_all_offset is not None:
+                    # Use the pre-computed 3-D stacked offset, adjust to 2-D.
+                    reshard_handler = stacked_handler
+                    all_offset = {}
+                    for rank, offset_3d in stacked_all_offset.items():
+                        offset_2d = self._adjust_expert_offset_3d_to_2d(
+                            offset_3d, src_name,
+                            src_shape=orig_src_shape,
+                        )
+                        if offset_2d is not None:
+                            all_offset[rank] = offset_2d
+                else:
+                    reshard_handler = ReshardHandler(
+                        param_name=src_name,
+                        full_shape=global_shape,
+                        from_layout=src_tensor.layout,
+                        to_layout=dst_tensor.layout,
+                        to_rank_id=self.rank_id,
+                    )
+                    all_offset = reshard_handler.infer_all_tensor_offset()
 
-                all_offset = reshard_handler.infer_all_tensor_offset()
+                if not all_offset:
+                    continue
+
                 params_info[src_name] = {
                     "all_offset": all_offset,
-                    "reshard_handler": reshard_handler
+                    "reshard_handler": reshard_handler,
                 }
 
         return params_info
+
+    def _resolve_src_tensor(self, src_name):
+        """Return the first ShardedTensor for *src_name* from src_metas."""
+        tensor_entry = self.src_metas[src_name]
+        if isinstance(tensor_entry, list):
+            return tensor_entry[0]
+        return tensor_entry
+
+    def _adjust_expert_offset_3d_to_2d(self, offset_3d, src_name, src_shape=None):
+        """Map a 3-D stacked-tensor offset to the 2-D individual expert offset.
+
+        *offset_3d* is a tuple ``((d0_s, d0_e), (d1_s, d1_e), (d2_s, d2_e))``
+        produced by the stacked-view ReshardHandler.
+
+        For single-source experts (e.g. w2) the individual tensor maps to
+        stacked dims 1 and 2 directly::
+
+            offset_2d = (offset_3d[1], offset_3d[2])
+
+        However, HF checkpoints (especially quantised ones) may store the
+        individual expert weight transposed — i.e. ``(hidden, moe_ffn)``
+        instead of ``(moe_ffn, hidden)``.  When *src_shape* is provided the
+        method automatically swaps the output dimensions to match the actual
+        on-disk layout.
+
+        For multi-source experts (e.g. w1 + w3 → weight1) the individual
+        tensor occupies only a portion of stacked dim 2.  The portion is
+        determined by the source index within the converter's hf_names list.
+        """
+        if not self.template.is_multi_source_expert(
+                self.get_dst_name(src_name) or ""
+        ):
+            offset_2d = (offset_3d[1], offset_3d[2])
+            if src_shape is not None and len(src_shape) == 2:
+                hidden_size = getattr(self.template.mf_config, 'hidden_size', None)
+                moe_ffn = getattr(self.template.mf_config, 'moe_ffn_hidden_size', None)
+                if hidden_size is not None and moe_ffn is not None:
+                    # The 3-D shape assumes (moe_ffn, hidden), but HF checkpoints
+                    # (esp. quantised ones) may store the weight as (hidden, moe_ffn).
+                    # I8-packed INT4 weights have their last dimension halved on disk;
+                    # after unpacking the shape becomes (hidden, moe_ffn) — detect both.
+                    if src_shape[0] == hidden_size and src_shape[1] in (moe_ffn, moe_ffn // 2):
+                        offset_2d = (offset_3d[2], offset_3d[1])
+            return offset_2d
+
+        source_idx = self.template.get_expert_source_idx(src_name)
+        expert_ffn = getattr(self.template.mf_config, 'moe_ffn_hidden_size', None)
+        if source_idx is None or expert_ffn is None:
+            return (offset_3d[1], offset_3d[2])
+
+        src_portion_start = source_idx * expert_ffn
+        src_portion_end = (source_idx + 1) * expert_ffn
+        d2_s = max(offset_3d[2][0], src_portion_start)
+        d2_e = min(offset_3d[2][1], src_portion_end)
+        if d2_s >= d2_e:
+            return None
+        return (
+            (d2_s - src_portion_start, d2_e - src_portion_start),
+            offset_3d[1],
+        )
+
+    def _compute_expert_filter(self, dst_name: str, dst_tensor) -> Dict:
+        """Compute which experts this card is responsible for.
+
+        Creates a temporary ReshardHandler with the stacked (all-experts) shape
+        to determine the card's dim-0 range, which directly encodes the expert
+        index interval owned by this card.
+
+        Returns:
+            dict with keys ``expert_offset`` and ``experts_per_card``, or
+            ``None`` when expert parallelism is inactive (all experts on every card).
+        """
+        # Build a reference stacked shape without mutating actual src tensors.
+        src_names = self.get_src_names(dst_name)
+        if not src_names:
+            return None
+        ref_src = self._resolve_src_tensor(src_names[0])
+        if ref_src is None:
+            return None
+
+        # Use stack_hf_experts_weight on a copy to get the stacked shape.
+        ref_copy = copy.copy(ref_src)
+        self.template.stack_hf_experts_weight(dst_name, self.num_moe_experts, ref_copy)
+        stacked_shape = ref_copy.global_shape
+
+        temp_handler = ReshardHandler(
+            param_name=dst_name,
+            full_shape=stacked_shape,
+            from_layout=None,
+            to_layout=dst_tensor.layout,
+            to_rank_id=self.rank_id,
+        )
+        temp_handler.infer_all_tensor_offset()
+        to_area = temp_handler.to_area
+        expert_offset = int(to_area[0][0])
+        experts_per_card = int(to_area[0][1] - to_area[0][0])
+
+        self._expert_filter_info[dst_name] = {
+            "expert_offset": expert_offset,
+            "experts_per_card": experts_per_card,
+        }
+
+        # If every card owns all experts, clear the filter to avoid overhead.
+        if experts_per_card >= self.num_moe_experts:
+            return None
+
+        logger.info(
+            f"MoE expert filter for '{dst_name}': "
+            f"card owns experts [{expert_offset}, {expert_offset + experts_per_card}) "
+            f"of {self.num_moe_experts} total."
+        )
+        return self._expert_filter_info[dst_name]
 
     def _organize_file_load_info(self) -> Dict[str, List[Tuple[str, int, Tuple]]]:
         """
@@ -913,12 +1083,18 @@ class ReshardLoader:
             # using the source parameter names when reading from the weight file.
             src_names = list(set(info[0] for info in param_infos))  # `src_name` is the first character in the tuple.
 
-            # Lazy loading
-            state_dict_from_file = ms_load_checkpoint(
-                file_path,
-                format='safetensors',
-                choice_func=lambda x, src_names_local=src_names: x in src_names_local
-            )
+            if is_hf_checkpoint(self.checkpoint_dir) and LayoutAdapter.is_pynative_mode():
+                # Lazy loading with custom reader that handles F8_E8M0, BF16, etc.
+                state_dict_from_file = load_safetensors_file(
+                    file_path,
+                    filter_names=set(src_names),
+                )
+            else:
+                state_dict_from_file = ms_load_checkpoint(
+                    file_path,
+                    format='safetensors',
+                    choice_func=lambda x, src_names_local=src_names: x in src_names_local
+                )
 
             # Slicing
             for src_name, search_rank, param_slice in param_infos:
@@ -933,17 +1109,49 @@ class ReshardLoader:
 
                 if self.template and (self.template.check_weights_for_experts(src_name) or
                                       self.template.check_weights_for_qkv(src_name)):
+                    expert_offset = 0
+                    experts_per_card = self.num_moe_experts
+                    is_expert = self.template.check_weights_for_experts(src_name)
+                    if is_expert:
+                        dst_name = self.get_dst_name(src_name)
+                        if dst_name and dst_name in getattr(self, '_expert_filter_info', {}):
+                            expert_offset = self._expert_filter_info[dst_name]["expert_offset"]
+                            experts_per_card = self._expert_filter_info[dst_name]["experts_per_card"]
+                        # Slice the 2D individual expert parameter before stacking.
+                        # param_slice is 2D here, matching the individual expert
+                        # weight dimensions from the HF safetensors file.
+                        parameter = smart_slice(
+                            parameter, param_slice, need_reshard
+                        )
+
                     src_name, parameter = self.template.preprocess_hf_weights(src_name,
                                              parameter,
                                              self.experts_weights,
                                              self.qkv_weights,
-                                             self.num_moe_experts)
+                                             self.num_moe_experts,
+                                             expert_offset=expert_offset,
+                                             experts_per_card=experts_per_card)
                     if parameter is None:
                         continue
 
-                sliced_tensor = smart_slice(
-                    parameter, param_slice, need_reshard
-                )
+                    if is_expert:
+                        # Expert weights were already sliced per-expert before
+                        # stacking; the merged result already has correct dimensions.
+                        if need_reshard:
+                            sliced_tensor = copy.deepcopy(
+                                parameter.asnumpy() if isinstance(parameter, (Tensor, Parameter))
+                                else parameter
+                            )
+                        else:
+                            sliced_tensor = parameter
+                    else:
+                        sliced_tensor = smart_slice(
+                            parameter, param_slice, need_reshard
+                        )
+                else:
+                    sliced_tensor = smart_slice(
+                        parameter, param_slice, need_reshard
+                    )
 
                 if not need_reshard:
                     # Save slice results directly without resharding.
@@ -956,6 +1164,10 @@ class ReshardLoader:
                             "tensor_map": {}
                         }
                     params_info_need_reshard[src_name]["tensor_map"][search_rank] = sliced_tensor
+
+            # Free per-file state dict after processing — individual tensors have
+            # already been extracted into src_sliced_tensors or experts_weights.
+            del state_dict_from_file
 
         return params_info_need_reshard, src_sliced_tensors
 

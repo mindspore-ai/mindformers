@@ -305,6 +305,9 @@ class CheckpointConfig(BaseConfig):
     save_global_layout_cache: bool = True
     """Enable global layout cache for checkpoint saving"""
 
+    reshard_worker_num: int = 1
+    """Number of worker threads used for checkpoint resharding"""
+
 
 @dataclass
 class TrainingConfig(BaseConfig):

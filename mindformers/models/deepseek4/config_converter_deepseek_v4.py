@@ -50,6 +50,7 @@ class DeepseekV4ConfigConverter(ConfigConverter):
         # MLA
         "rope_theta": "rotary_base",
         "head_dim": "kv_channels",
+        "v_head_dim": "v_head_dim",
         "qk_nope_head_dim": "qk_head_dim",
         "qk_rope_head_dim": "qk_pos_emb_head_dim",
 

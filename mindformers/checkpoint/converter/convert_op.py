@@ -186,13 +186,15 @@ class RenameConvertOp(ConvertOp):
 @dataclass
 class ConcatConvertOp(ConvertOp):
     """
-    Concatenation operation (N:1 mapping).
+    Concatenation operation (N:1 mapping), with optional interleaving.
 
-    HF → MF: np.concatenate() concatenates multiple weights
-    MF → HF: np.split() splits into multiple weights
+    HF → MF: interleaves values along ``dim`` by default for fused gated-MLP
+    layouts; set ``interleaved=False`` for a plain ``np.concatenate`` layout.
+    MF → HF: not supported.
     """
     dim: int = 0
     split_sizes: List[int] = None  # Optional: specify size of each HF weight
+    interleaved: bool = True  # Preserve the existing fused gated-MLP layout by default.
 
     def __post_init__(self):
         super().__post_init__()
@@ -205,6 +207,9 @@ class ConcatConvertOp(ConvertOp):
             )
 
     def _hf_to_mf(self, weights: List[np.ndarray]) -> List[np.ndarray]:
+        if not self.interleaved:
+            return [np.concatenate(weights, axis=self.dim)]
+
         # Step 1: Stack along custom dimension self.dim (ndim after stacking = input_ndim + 1)
         stacked = np.stack(weights, axis=self.dim)  # Add 1 dimension for weight index
 
@@ -435,3 +440,93 @@ class QKVBiasConvertOp(ConvertOp):
     def _mf_to_hf(self, weights: List[np.ndarray]) -> List[np.ndarray]:
         """Split QKV fused bias into independent Q, K, V bias"""
         raise ValueError("Currently, QKVBiasConvertOp does not support MF → HF conversion")
+
+
+@dataclass
+class ScaleSplitConvertOp(ConvertOp):
+    """
+    Scale-split operation (1:N mapping).
+
+    Splits a single HF tensor along dim=0 into N separate MF tensors.
+
+    This is used for HyperConnection ``hc_scale`` parameters in DeepSeek-V4,
+    where the HF checkpoint stores a combined tensor (e.g. shape ``[3]``)
+    that needs to be split into separate ``alpha_pre``, ``alpha_post`` and
+    ``alpha_res`` scalars (each shape ``[1]``).
+
+    Example::
+
+        hf_names  = ["layers.{}.hc_attn_scale"]
+        mf_names  = ["decoder.layers.{}.attn_hc.alpha_pre",
+                     "decoder.layers.{}.attn_hc.alpha_post",
+                     "decoder.layers.{}.attn_hc.alpha_res"]
+
+        HF shape [3]  →  MF shapes [1], [1], [1]
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        if len(self.hf_names) != 1:
+            raise ValueError(
+                f"ScaleSplitConvertOp requires exactly 1 hf_name, "
+                f"but got {len(self.hf_names)}: `{self.hf_names}`."
+            )
+        if len(self.mf_names) < 2:
+            raise ValueError(
+                f"ScaleSplitConvertOp requires at least 2 mf_names, "
+                f"but got {len(self.mf_names)}: `{self.mf_names}`."
+            )
+
+    def _hf_to_mf(self, weights: List[np.ndarray]) -> List[np.ndarray]:
+        """Split single HF weight into N MF weights along dim=0."""
+        weight = weights[0]
+        num_splits = len(self.mf_names)
+        if weight.shape[0] != num_splits:
+            raise ValueError(
+                f"ScaleSplitConvertOp: hf weight first dimension ({weight.shape[0]}) "
+                f"must match the number of mf_names ({num_splits})."
+            )
+        splits = np.split(weight, num_splits, axis=0)
+        # np.split on [3] with 3 splits returns arrays of shape [1] each
+        return list(splits)
+
+    def _mf_to_hf(self, weights: List[np.ndarray]) -> List[np.ndarray]:
+        """Concatenate N MF weights back to single HF weight along dim=0."""
+        return [np.concatenate(weights, axis=0)]
+
+
+@dataclass
+class MatMulConvertOp(ConvertOp):
+    """
+    Matrix multiplication operation (2:1 mapping).
+
+    HF → MF: Multiplies two HF weights (A @ B) to produce one MF weight.
+    This is used when the HF checkpoint stores a low-rank decomposition
+    (e.g. wo_a and wo_b) but the MF model expects the combined weight.
+
+    Example::
+
+        wo_a.shape = [H, R],  wo_b.shape = [R, H]
+        → linear_o_group_proj = wo_a @ wo_b  shape: [H, H]
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        if len(self.hf_names) != 2:
+            raise ValueError(
+                f"MatMulConvertOp requires exactly 2 hf_names (A and B), "
+                f"but got {len(self.hf_names)}: `{self.hf_names}`."
+            )
+        if len(self.mf_names) != 1:
+            raise ValueError(
+                f"MatMulConvertOp requires exactly 1 mf_name, "
+                f"but got {len(self.mf_names)}: `{self.mf_names}`."
+            )
+
+    def _hf_to_mf(self, weights: List[np.ndarray]) -> List[np.ndarray]:
+        """Compute weights[0] @ weights[1] → MF weight"""
+        return [np.matmul(weights[0], weights[1])]
+
+    def _mf_to_hf(self, weights: List[np.ndarray]) -> List[np.ndarray]:
+        """MF → HF is not supported (low-rank decomposition is not unique)."""
+        raise ValueError("Currently, MatMulConvertOp does not support MF → HF conversion")
