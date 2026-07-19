@@ -37,7 +37,7 @@ class InnerCell(nn.Cell):
         self.b = ms.Parameter(ms.Tensor([1.0], ms.float32), name="b")
         self.c = ms.Parameter(ms.Tensor([2.0], ms.float32), name="c", requires_grad=False)
 
-    def construct(self, x):  # pylint: disable=arguments-differ
+    def construct(self, x):
         return x
 
 
@@ -48,7 +48,7 @@ class OuterCell(nn.Cell):
         self.a = InnerCell()
         self.d = ms.Parameter(ms.Tensor([3.0], ms.float32), name="d")
 
-    def construct(self, x):  # pylint: disable=arguments-differ
+    def construct(self, x):
         return x
 
 
@@ -64,8 +64,8 @@ class TestDistributeModule:
     def test_default_shard_plan_and_submodule_names(self, monkeypatch, device_mesh):
         """
         Feature: distribute_module
-        Description: Verify default shard plan fill-in includes frozen submodule parameters.
-        Expectation: Replicate plans are added for a.b and a.c, while the existing plan is preserved.
+        Description: Verify default shard plan fill-in for submodule params and skip requires_grad=False.
+        Expectation: Replicate plan added for a.b, a.c skipped, existing plan preserved.
         """
         module = OuterCell()
         captured = {}
@@ -89,12 +89,11 @@ class TestDistributeModule:
         assert shard_plan["d"] == ("custom",)
         assert "a.b" in shard_plan
         assert shard_plan["a.b"][0] == Replicate()
-        assert shard_plan["a.c"][0] == Replicate()
+        assert "a.c" not in shard_plan
         assert getattr(module, "_distribute_module_applied") is True
 
-        # Verify logger.info was called for trainable and frozen parameters.
+        # Verify logger.info was called for a.b
         assert any("Add replicate plan for a.b" in msg for msg in logger_calls)
-        assert any("Add replicate plan for a.c" in msg for msg in logger_calls)
 
     @pytest.mark.level1
     @pytest.mark.platform_x86_cpu

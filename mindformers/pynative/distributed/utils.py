@@ -77,8 +77,8 @@ def distribute_module(
         )
 
     parameter_shard_plan = parameter_shard_plan or {}
-    for name, _ in module.parameters_and_names():
-        if name in parameter_shard_plan:
+    for name, param in module.parameters_and_names():
+        if name in parameter_shard_plan or param.requires_grad is False:
             continue
         logger.info(f"Add replicate plan for {name} because it is not in parameter_shard_plan")
         parameter_shard_plan[name] = (Replicate(), )

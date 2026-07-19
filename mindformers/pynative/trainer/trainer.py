@@ -221,11 +221,6 @@ class Trainer:
             parallelism=self.config.parallelism,
             enable_parallel=self.enable_parallel,
             gradient_accumulation_steps=self.num_accumulation_steps,
-            indexer_loss_tp_replica_size=(
-                self.config.parallelism.tensor_parallel
-                if getattr(self.config.model, "experimental_attention_variant", None) == "dsa"
-                else 1
-            ),
         )
 
         # After parallelism, parameters will be reset

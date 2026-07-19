@@ -14,8 +14,7 @@
 # ============================================================================
 """Context parallel utilities and wrappers for pynative modules."""
 
-from mindspore import mint, nn, ops
-from mindspore.common import dtype as mstype
+from mindspore import mint, nn
 
 from hyper_parallel import DeviceMesh
 
@@ -23,7 +22,6 @@ from mindformers.pynative.distributed.style import (
     ParallelStyle,
     build_hp_async_cp_style,
     build_hp_cp_style,
-    build_hp_dsa_cp_style,
 )
 
 
@@ -100,44 +98,12 @@ class ContextParallelAttentionStyle(ParallelStyle):
         return module
 
 
-class DSAContextParallelAttentionStyle(ParallelStyle):
-    """Attention-side CP style for PyNative DSA core-attention modules."""
-    def __init__(self, method: str, input_layout=None,
-                 async_enabled: bool = False, use_sparse_loss: bool = True):
-        super().__init__()
-        self.method = method.lower()
-        self.input_layout = input_layout
-        self.async_enabled = async_enabled
-        self.use_sparse_loss = use_sparse_loss
-
-    def _apply(self, module: nn.Cell, device_mesh: DeviceMesh) -> nn.Cell:
-        hp_style = build_hp_dsa_cp_style(
-            method=self.method,
-            input_layout=self.input_layout,
-            async_enabled=self.async_enabled,
-            use_sparse_loss=self.use_sparse_loss,
-        )
-        return hp_style._apply(module, device_mesh)
-
-    def apply_to_attention(self, attention_module: nn.Cell, device_mesh: DeviceMesh) -> nn.Cell:
-        """Apply DSA CP to a full attention module so async producer hooks can be wired."""
-        return self._apply(attention_module, device_mesh)
-
 def build_context_parallel_attention_style(method: str,
                                            cp_size: int,
                                            ulysses_degree_in_cp=None,
                                            input_layout=None,
-                                           async_enabled: bool = False,
-                                           attention_variant=None,
-                                           dsa_use_sparse_loss: bool = True) -> ParallelStyle:
+                                           async_enabled: bool = False) -> ParallelStyle:
     """Build the MindFormers attention-side CP style."""
-    if attention_variant == "dsa":
-        return DSAContextParallelAttentionStyle(
-            method=method,
-            input_layout=input_layout,
-            async_enabled=async_enabled,
-            use_sparse_loss=dsa_use_sparse_loss,
-        )
     if async_enabled:
         return build_hp_async_cp_style(
             method=method,
@@ -167,14 +133,12 @@ class ContextParallelModelIOStyle(ParallelStyle):
     )
 
     def __init__(self, cp_mesh, cp_method: str = "colossal",
-                 ulysses_degree_in_cp: int = None, mask_type: str = "causal",
-                 build_attention_mask: bool = True):
+                 ulysses_degree_in_cp: int = None, mask_type: str = "causal"):
         super().__init__()
         self.cp_mesh = cp_mesh
         self.cp_method = cp_method
         self.ulysses_degree_in_cp = ulysses_degree_in_cp
         self.mask_type = mask_type
-        self.build_attention_mask = build_attention_mask
 
     def _prepare_inputs(self, module, args, kwargs):
         """Prepare root-model inputs for CP."""
@@ -192,7 +156,6 @@ class ContextParallelModelIOStyle(ParallelStyle):
             cp_method=self.cp_method,
             ulysses_degree_in_cp=self.ulysses_degree_in_cp,
             mask_type=self.mask_type,
-            build_attention_mask=self.build_attention_mask,
         )
 
         new_args = list(args)
@@ -216,21 +179,19 @@ class ContextParallelModelIOStyle(ParallelStyle):
         return module
 
 
-def apply_context_parallel_model_io(model: nn.Cell, parallel_dims, parallelism, model_config) -> nn.Cell:
+def apply_context_parallel_model_io(model: nn.Cell, model_config, parallel_dims, parallelism) -> nn.Cell:
     """Apply root-model CP input slicing hooks."""
     if not getattr(parallel_dims, "cp_enabled", False):
         return model
     # Context parallel relies on the model's compressed attention mask. Without it CP
     # would have to materialize a dense O(seq_len^2) causal mask, which is exactly the
     # memory blow-up we want to avoid on long sequences. Intercept early and tell the
-    # user which switch to turn on. DSA is exempt: its CP kernels consume the per-rank
-    # causal mask built in prepare_context_parallel_input instead of a compressed mask.
-    is_dsa = getattr(model_config, "experimental_attention_variant", None) == "dsa"
+    # user which switch to turn on.
     attn_mask_compressed = bool(
         getattr(model_config, "use_attn_mask_compression", False)
         or getattr(model_config, "use_eod_attn_mask_compression", False)
     )
-    if not is_dsa and not attn_mask_compressed:
+    if not attn_mask_compressed:
         raise ValueError(
             "Context parallel (context_parallel > 1) requires a compressed attention mask. "
             "Please enable use_attn_mask_compression for non-eod data, or "
@@ -241,7 +202,6 @@ def apply_context_parallel_model_io(model: nn.Cell, parallel_dims, parallelism, 
         cp_method=getattr(parallelism, "context_parallel_method", "colossal"),
         ulysses_degree_in_cp=getattr(parallelism, "ulysses_degree_in_cp", None),
         mask_type=getattr(parallelism, "context_parallel_mask_type", "causal"),
-        build_attention_mask=is_dsa,
     )._apply(model)
 
 
@@ -260,7 +220,7 @@ def attach_context_parallel_runtime_hints(model_config, parallelism_config):
     context_parallel = getattr(parallelism_config, "context_parallel", 1)
     context_parallel_method = getattr(parallelism_config, "context_parallel_method", "colossal").lower()
     async_enabled = bool(getattr(parallelism_config, "context_parallel_async", False))
-    is_dsa = getattr(model_config, "experimental_attention_variant", None) == "dsa"
+
     if context_parallel > 1 and context_parallel_method == "colossal":
         model_config.context_parallel = context_parallel
         model_config.context_parallel_size = context_parallel
@@ -269,8 +229,7 @@ def attach_context_parallel_runtime_hints(model_config, parallelism_config):
             parallel_config["context_parallel"] = context_parallel
         elif parallel_config is not None:
             setattr(parallel_config, "context_parallel", context_parallel)
-        if not is_dsa:
-            model_config.input_layout = "BSH"
+        model_config.input_layout = "BSH"
 
     requested_ulysses_degree = getattr(parallelism_config, "ulysses_degree_in_cp", None)
     if async_enabled and context_parallel_method == "ulysses":
@@ -308,13 +267,12 @@ def prepare_context_parallel_input(inputs: dict,
                                    cp_mesh=None,
                                    cp_method: str = "colossal",
                                    ulysses_degree_in_cp: int = None,
-                                   mask_type: str = "causal",
-                                   build_attention_mask: bool = True) -> dict:
-    """Slice sequence inputs for context parallel training and build the CP causal mask.
+                                   mask_type: str = "causal") -> dict:
+    """Slice sequence inputs for context parallel training.
 
-    ``build_attention_mask`` injects a per-rank causal mask sized
-    ``(bs, 1, q_seq, global_kv)``. It is meant for the DSA CP path; models using a
-    compressed attention mask rebuild it internally and must pass ``False``.
+    The attention mask itself is no longer built here: context parallel requires a
+    compressed attention mask (enforced in apply_context_parallel_model_io), which
+    GPTModel rebuilds internally, so CP only shards the sequence inputs.
     """
     if cp_mesh is None or not inputs:
         return inputs
@@ -332,7 +290,7 @@ def prepare_context_parallel_input(inputs: dict,
         raise NotImplementedError(
             f"Context parallel currently only supports pure causal mask, got {mask_type!r}."
         )
-    ulysses_degree = _validate_cp_method(cp_method, cp_size, ulysses_degree_in_cp)
+    _validate_cp_method(cp_method, cp_size, ulysses_degree_in_cp)
 
     def _get_chunk_bounds(seq_len):
         if seq_len % cp_size != 0:
@@ -356,32 +314,6 @@ def prepare_context_parallel_input(inputs: dict,
             start, end = _get_chunk_bounds(tensor.shape[0])
             return tensor[start:end]
         return _slice_seq_dim1(tensor)
-
-    def _find_seq_tensor():
-        for key in ("input_ids", "labels", "loss_mask", "position_ids"):
-            tensor = inputs.get(key)
-            if tensor is not None and hasattr(tensor, "shape") and len(tensor.shape) >= 2:
-                return tensor
-        return None
-
-    def _build_cp_causal_mask(batch_size, q_seq_len, kv_seq_len, q_offset):
-        query_positions = mint.arange(q_offset, q_offset + q_seq_len, dtype=mstype.int32)
-        key_positions = mint.arange(0, kv_seq_len, dtype=mstype.int32)
-        query_positions = mint.reshape(query_positions, (q_seq_len, 1))
-        key_positions = mint.reshape(key_positions, (1, kv_seq_len))
-        mask = ops.cast(key_positions > query_positions, mstype.uint8)
-        mask = mint.reshape(mask, (1, 1, q_seq_len, kv_seq_len))
-        return ops.broadcast_to(mask, (batch_size, 1, q_seq_len, kv_seq_len))
-
-    seq_tensor = _find_seq_tensor()
-    if seq_tensor is None:
-        raise ValueError("Context parallel input preparation requires a sequence tensor.")
-
-    batch_size = seq_tensor.shape[0]
-    global_seq_len = seq_tensor.shape[1]
-    global_tnd_len = batch_size * global_seq_len if use_tnd_actual_seq else global_seq_len
-    global_start, global_end = _get_chunk_bounds(global_tnd_len)
-    local_seq_len = global_end - global_start
 
     def _slice_tnd_flattened(tensor):
         if tensor is None or not hasattr(tensor, "shape") or len(tensor.shape) < 2:
@@ -413,24 +345,4 @@ def prepare_context_parallel_input(inputs: dict,
     if sharded.get("position_ids", None) is None:
         raise ValueError("Context parallel requires position_ids from dataset inputs.")
 
-    if use_tnd_actual_seq or not build_attention_mask:
-        return sharded
-
-    if cp_method == "colossal":
-        q_seq_len = local_seq_len
-        q_offset = cp_rank * local_seq_len
-    elif cp_method == "ulysses":
-        q_seq_len = global_seq_len
-        q_offset = 0
-    else:
-        co_rank = cp_rank // ulysses_degree
-        q_seq_len = local_seq_len * ulysses_degree
-        q_offset = co_rank * q_seq_len
-
-    sharded["attention_mask"] = _build_cp_causal_mask(
-        batch_size=batch_size,
-        q_seq_len=q_seq_len,
-        kv_seq_len=global_seq_len,
-        q_offset=q_offset,
-    )
     return sharded

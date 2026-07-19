@@ -11,17 +11,14 @@
 Multi-head Latent Attention (MLA) mechanism with KV compression and rotary position encoding.
 
 This module implements the Multi-head Latent Attention mechanism with low-rank compression
-for KV projections and rotary position encoding support. Includes DSA (DeepSeek Sparse
-Attention) support for pynative mode.
+for KV projections and rotary position encoding support.
 """
-# MindSpore ``Cell``/``_Function`` subclasses intentionally use operator-specific signatures.
-# pylint: disable=arguments-differ,abstract-method
 from dataclasses import dataclass
 from typing import Union
 import math
 
 from mindspore import nn, Tensor, mint, ops
-from mindspore.common._grad_function import _Function
+
 from hyper_parallel import DTensor, SkipDTensorDispatch
 from hyper_parallel.core.dtensor.dtensor import distribute_tensor
 
@@ -31,74 +28,6 @@ from mindformers.pynative.base_models.common.embeddings.rope_utils import ApplyR
 from mindformers.pynative.base_models.common.embeddings.yarn_rotary_pos_embedding import _yarn_get_mscale
 from mindformers.pynative.layers.identity_op import IdentityOp
 from mindformers.pynative.dtensor_compat import inplace_copy
-from mindformers.pynative.transformers.experimental_attention_variant.indexer import _IndexerLossAutoScaler
-from mindformers.pynative.transformers.experimental_attention_variant.utils import save_to_indexer_losses_tracker
-
-
-class _DSADetachFunction(_Function):
-    """Identity in forward, zero gradient in backward for DSA detach boundaries."""
-
-    @staticmethod
-    def forward(ctx, tensor):
-        """Return the input unchanged while recording no backward state."""
-        del ctx
-        return tensor
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        """Stop the gradient at the detach boundary."""
-        del ctx
-        return mint.zeros_like(grad_output)
-
-
-class _AbsorbMatmul(_Function):
-    """Memory-frugal MLA weight-absorb matmul: ``out[..., h, r] = sum_d x[..., h, d] * w[h, d, r]``.
-
-    The naive ``mint.matmul(mint.unsqueeze(x, -2), w)`` broadcasts the per-head
-    weight ``w`` across every token, so autograd materialises a per-token outer
-    product of shape ``[tokens, heads, d, r]`` in backward (e.g. 32 GB at
-    seq_local=8192 for the q/v absorb). Here forward/backward are explicit
-    batched-matmuls over the head axis, and the ``d_w`` reduction contracts the
-    token axis *inside* the bmm, so nothing larger than the activation is ever
-    held. This mirrors PR#8229's graph-mode ``ops.Morph`` absorb, ported to
-    pynative. Mathematically identical to the unsqueeze+matmul it replaces.
-    """
-
-    @staticmethod
-    def forward(ctx, x, w):
-        """Apply the head-wise absorbed matmul without token-wise weight expansion."""
-        # x: [*lead, H, D], w: [H, D, R] -> [*lead, H, R]
-        lead = tuple(x.shape[:-2])
-        h, d = x.shape[-2], x.shape[-1]
-        r = w.shape[-1]
-        t = 1
-        for s in lead:
-            t *= s
-        ctx.x = x
-        ctx.w = w
-        ctx.lead = lead
-        ctx.hdr = (h, d, r)
-        xh = mint.permute(mint.reshape(x, (t, h, d)), (1, 0, 2))  # [H, T, D]
-        out = mint.bmm(xh, w)                                     # [H, T, R]
-        out = mint.permute(out, (1, 0, 2))                        # [T, H, R]
-        return mint.reshape(out, lead + (h, r))
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        """Compute activation and weight gradients with head-wise batched matmuls."""
-        h, d, r = ctx.hdr
-        t = 1
-        for s in ctx.lead:
-            t *= s
-        w = ctx.w
-        gh = mint.permute(mint.reshape(grad_output, (t, h, r)), (1, 0, 2))  # [H, T, R]
-        xh = mint.permute(mint.reshape(ctx.x, (t, h, d)), (1, 0, 2))        # [H, T, D]
-        # d_x = g @ w^T : [H, T, R] @ [H, R, D] -> [H, T, D]
-        d_x = mint.bmm(gh, mint.permute(w, (0, 2, 1)))
-        d_x = mint.reshape(mint.permute(d_x, (1, 0, 2)), ctx.lead + (h, d))
-        # d_w = x^T @ g : [H, D, T] @ [H, T, R] -> [H, D, R]  (token axis contracted in-kernel)
-        d_w = mint.bmm(mint.permute(xh, (0, 2, 1)), gh)
-        return d_x, d_w
 
 
 @dataclass
@@ -171,9 +100,6 @@ class MultiLatentAttention(nn.Cell):
         self.v_head_dim = self.config.v_head_dim
         self.input_layout = self.config.input_layout
         self.compute_dtype = self.config.compute_dtype
-        self.use_tnd = config.input_layout == "TND"
-        self.use_dsa = getattr(config, 'experimental_attention_variant', None) == "dsa"
-        self.sparse_loss = getattr(config, 'dsa_indexer_use_sparse_loss', False) if self.use_dsa else False
 
         zero_pad_length = self.q_head_dim - self.v_head_dim
         if zero_pad_length < 0:
@@ -206,9 +132,6 @@ class MultiLatentAttention(nn.Cell):
         self.q_handoff = IdentityOp()
         self.k_handoff = IdentityOp()
         self.v_handoff = IdentityOp()
-        self.dsa_indexer_key_handoff = IdentityOp()
-        self.dsa_value_handoff = IdentityOp()
-        self.dsa_loss_key_indexer_handoff = IdentityOp()
 
     @staticmethod
     def _to_full_tensor_with_layout(tensor):
@@ -307,16 +230,14 @@ class MultiLatentAttention(nn.Cell):
         local_param = self._to_local_tensor(param)
 
         if "self_attention.linear_qb.weight" in param_name:
-            with SkipDTensorDispatch():
-                nope, pe = split_fn(param_name, local_param)
-                nope = nope * self._get_scale_broadcast(mint.sqrt(scales), self.qk_head_dim)
-                pe = pe * self._get_scale_broadcast(scales, self.qk_pos_emb_head_dim)
-                weights = merge_fn(param_name, [nope, pe])
+            nope, pe = split_fn(param_name, local_param)
+            nope = nope * self._get_scale_broadcast(mint.sqrt(scales), self.qk_head_dim)
+            pe = pe * self._get_scale_broadcast(scales, self.qk_pos_emb_head_dim)
+            weights = merge_fn(param_name, [nope, pe])
         elif "self_attention.linear_kvb.weight" in param_name:
-            with SkipDTensorDispatch():
-                k_nope, v = split_fn(param_name, local_param)
-                k_nope = k_nope * self._get_scale_broadcast(mint.sqrt(scales), self.qk_head_dim)
-                weights = merge_fn(param_name, [k_nope, v])
+            k_nope, v = split_fn(param_name, local_param)
+            k_nope = k_nope * self._get_scale_broadcast(mint.sqrt(scales), self.qk_head_dim)
+            weights = merge_fn(param_name, [k_nope, v])
         else:
             return
 
@@ -343,26 +264,23 @@ class MultiLatentAttention(nn.Cell):
         full_param, param_layout = self._to_full_tensor_with_layout(param)
 
         if "self_attention.linear_qb.weight" in param_name:
-            with SkipDTensorDispatch():
-                nope, pe = split_fn(param_name, full_param)
-                nope = nope * self._get_scale_broadcast(mint.sqrt(scales), self.qk_head_dim)
-                pe = pe * self._get_scale_broadcast(scales, self.qk_pos_emb_head_dim)
-                weights = merge_fn(param_name, [nope, pe])
+            nope, pe = split_fn(param_name, full_param)
+            nope = nope * self._get_scale_broadcast(mint.sqrt(scales), self.qk_head_dim)
+            pe = pe * self._get_scale_broadcast(scales, self.qk_pos_emb_head_dim)
+            weights = merge_fn(param_name, [nope, pe])
         elif "self_attention.linear_kvb.weight" in param_name:
-            with SkipDTensorDispatch():
-                k_nope, v = split_fn(param_name, full_param)
-                k_nope = k_nope * self._get_scale_broadcast(mint.sqrt(scales), self.qk_head_dim)
-                weights = merge_fn(param_name, [k_nope, v])
+            k_nope, v = split_fn(param_name, full_param)
+            k_nope = k_nope * self._get_scale_broadcast(mint.sqrt(scales), self.qk_head_dim)
+            weights = merge_fn(param_name, [k_nope, v])
         elif "self_attention.linear_qkv.weight" in param_name:
             # Concat MLA. With LoRA: [q_down, kv_lora, k_pe] has no per-head structure to scale.
             parts = split_fn(param_name, full_param)
             if len(parts) != 4:
                 return
             q_nope, q_pe, kv_lora, k_pe = parts
-            with SkipDTensorDispatch():
-                q_nope = q_nope * self._get_scale_broadcast(mint.sqrt(scales), self.qk_head_dim)
-                q_pe = q_pe * self._get_scale_broadcast(scales, self.qk_pos_emb_head_dim)
-                weights = merge_fn(param_name, [q_nope, q_pe, kv_lora, k_pe])
+            q_nope = q_nope * self._get_scale_broadcast(mint.sqrt(scales), self.qk_head_dim)
+            q_pe = q_pe * self._get_scale_broadcast(scales, self.qk_pos_emb_head_dim)
+            weights = merge_fn(param_name, [q_nope, q_pe, kv_lora, k_pe])
         else:
             return
 
@@ -446,188 +364,6 @@ class MultiLatentAttention(nn.Cell):
         x = self.transpose(x, 0, 1)
         x = self.reshape(x, (bs * seq_len, num_heads, -1))
         return x
-    def dsa_forward(self, x, attention_mask=None, rotary_pos_emb=None,
-                    actual_seq_len=None, attention_loss=0.):
-        """
-        Forward pass with DSA (DeepSeek Sparse Attention).
-        Two-stage training:
-        - Dense stage (sparse_loss=False): Full attention with indexer warm-up.
-        - Sparse stage (sparse_loss=True): Top-k sparse attention with MQA absorb.
-
-        Args:
-            x: Input tensor with shape (seq_length, batch_size, hidden_size).
-            attention_mask: Attention mask tensor (optional).
-            rotary_pos_emb: Rotary position embedding tensor (optional).
-            actual_seq_len: Actual sequence length (optional).
-            attention_loss: Accumulated attention loss from previous layers.
-
-        Returns:
-            Tuple[Tensor, Tensor]: (output, attention_loss).
-        """
-        ori_dtype = x.dtype
-        seq_len, bs, _ = self.shape(x)
-        qkv_combo = self.linear_qkv(x)
-
-        q_a, compressed_kv, k_pe = self.split(
-            qkv_combo,
-            [
-                self.q_rank,
-                self.kv_lora_rank,
-                self.qk_pos_emb_head_dim,
-            ],
-            dim=-1,
-        )
-
-        if self.q_layernorm is not None:
-            q_a = self.q_layernorm(q_a)
-        q_compress = q_a
-        x_detached = _DSADetachFunction.apply(x)
-        q_compress_detached = _DSADetachFunction.apply(q_compress)
-        q_index, k_index, idx_weights = self.core_attention.indexer.get_qk_index(
-            x_detached, q_compress_detached, rotary_pos_emb
-        )
-        k_index = self.dsa_indexer_key_handoff(k_index)
-        if self.sparse_loss:
-            topk_indices, _, softmax_max_index, softmax_sum_index = self.core_attention.indexer(
-                q_index, k_index, idx_weights, actual_seq_len, actual_seq_len
-            )
-        else:
-            softmax_max_index, softmax_sum_index = self.core_attention.indexer(
-                q_index, k_index, idx_weights, actual_seq_len, actual_seq_len
-            )
-            topk_indices = None
-
-        v_absorb = None
-        if self.sparse_loss:
-            query, key, value, v_absorb = self._dsa_sparse_qkv(
-                q_a, compressed_kv, k_pe, seq_len, bs, rotary_pos_emb
-            )
-        else:
-            query, key, value = self._dsa_dense_qkv(
-                q_a, compressed_kv, k_pe, seq_len, bs, rotary_pos_emb
-            )
-        if self.use_tnd:
-            query = self.sbh2tnd(query)
-            key = self.sbh2tnd(key)
-            value = self.sbh2tnd(value)
-        else:
-            query = mint.permute(query, (1, 0, 2, 3))
-            key = mint.permute(key, (1, 0, 2, 3))
-            value = mint.permute(value, (1, 0, 2, 3))
-
-        query = self.cast(query, self.compute_dtype)
-        key = self.cast(key, self.compute_dtype)
-        value = self.cast(value, self.compute_dtype)
-        value = self.dsa_value_handoff(value)
-        attn_out, softmax_max, softmax_sum = self.core_attention(
-            query, key, value, topk_indices=topk_indices, attention_mask=attention_mask,
-            actual_seq_qlen=actual_seq_len, actual_seq_kvlen=actual_seq_len
-        )
-        if self.sparse_loss and v_absorb is not None:
-            v_absorb_t = mint.permute(v_absorb, (0, 2, 1))
-            # Weight absorb (v): memory-frugal batched matmul (see _AbsorbMatmul).
-            attn_out = _AbsorbMatmul.apply(attn_out, v_absorb_t)
-            attn_out = mint.reshape(attn_out, (bs, seq_len, self.num_attention_heads, self.v_head_dim))
-            attn_out = mint.permute(attn_out, (1, 0, 2, 3))
-        elif not self.sparse_loss:
-            # FlashAttention returns BSND for the dense BSND path. Restore the
-            # model's SBH layout explicitly; reshaping BSND directly to SBH
-            # interleaves samples whenever batch size is greater than one.
-            attn_out = mint.reshape(attn_out, (bs, seq_len, -1))
-            attn_out = mint.permute(attn_out, (1, 0, 2))
-
-        attn_out = mint.reshape(attn_out, (seq_len, bs, -1))
-        output = self.linear_proj(attn_out)
-        output = self.cast(output, ori_dtype)
-
-        # Compute indexer loss. DSAIndexerLoss handles stop_gradient and
-        # gradient routing internally via _DSAIndexerLossFunction.
-        indexer_loss = self.core_attention.indexer_loss(
-            query, key, q_index, k_index, idx_weights,
-            topk_indices, softmax_max, softmax_sum,
-            softmax_max_index, softmax_sum_index,
-            actual_seq_len, actual_seq_len
-        )
-        attention_loss = attention_loss + indexer_loss
-
-        # Save indexer loss to global tracker for logging in callback.
-        save_to_indexer_losses_tracker(
-            indexer_loss,
-            self.layer_number + 1,
-            self.config.num_layers + (self.config.mtp_num_layers or 0),
-        )
-        output = _IndexerLossAutoScaler.apply(output, indexer_loss)
-        return output, attention_loss
-
-    def _dsa_dense_qkv(self, q_a, compressed_kv, k_pe, seq_len, bs, rotary_pos_emb):
-        """Generate QKV for the DSA dense warm-up stage."""
-        q = self.linear_qb(q_a)
-        q = self.reshape(q, (seq_len, bs, self.num_attention_heads, -1))
-        q_nope, q_pe = self.split(q, [self.qk_head_dim, self.qk_pos_emb_head_dim], dim=-1)
-
-        k_pe = self.reshape(k_pe, (seq_len, bs, 1, self.qk_pos_emb_head_dim))
-        compressed_kv_norm = self.k_layernorm(compressed_kv)
-        kv = self.linear_kvb(compressed_kv_norm)
-        kv = self.reshape(kv, (seq_len, bs, self.num_attention_heads, self.qk_head_dim + self.v_head_dim))
-        k_nope, value = self.split(kv, [self.qk_head_dim, self.v_head_dim], dim=-1)
-
-        if rotary_pos_emb is not None:
-            q_pe = self.apply_rotary_emb_q(
-                q_pe, rotary_pos_emb,
-                rotary_interleaved=self.config.rotary_interleaved,
-                multi_latent_attention=self.config.multi_latent_attention
-            )
-            k_pe = self.apply_rotary_emb_k(
-                k_pe, rotary_pos_emb,
-                rotary_interleaved=self.config.rotary_interleaved,
-                multi_latent_attention=self.config.multi_latent_attention
-            )
-
-        query = self.cat([q_nope, q_pe], 3)
-        k_pe = self.tile_kv(k_pe, (1, 1, self.num_attention_heads, 1))
-        key = self.cat([k_nope, k_pe], 3)
-
-        return query, key, value
-
-    def _dsa_sparse_qkv(self, q_a, compressed_kv, k_pe, seq_len, bs, rotary_pos_emb):
-        """Generate QKV for the DSA sparse stage with MQA weight absorb."""
-        q = self.linear_qb(q_a)
-        q = self.reshape(q, (seq_len, bs, self.num_attention_heads, -1))
-        q_nope, q_pe = self.split(q, [self.qk_head_dim, self.qk_pos_emb_head_dim], dim=-1)
-        k_pe = self.reshape(k_pe, (seq_len, bs, 1, self.qk_pos_emb_head_dim))
-        compressed_kv_norm = self.k_layernorm(compressed_kv)
-        k_nope = self.reshape(compressed_kv_norm, (seq_len, bs, 1, self.kv_lora_rank))
-        value = self.reshape(compressed_kv_norm, (seq_len, bs, 1, self.kv_lora_rank))
-
-        if rotary_pos_emb is not None:
-            q_pe = self.apply_rotary_emb_q(
-                q_pe, rotary_pos_emb,
-                rotary_interleaved=self.config.rotary_interleaved,
-                multi_latent_attention=self.config.multi_latent_attention
-            )
-            k_pe = self.apply_rotary_emb_k(
-                k_pe, rotary_pos_emb,
-                rotary_interleaved=self.config.rotary_interleaved,
-                multi_latent_attention=self.config.multi_latent_attention
-            )
-
-        w_kvb = self.linear_kvb.weight
-        if w_kvb.has_init:
-            w_kvb.init_data()
-        w_kvb = self.cast(w_kvb, self.compute_dtype)
-        w_kvb = mint.reshape(w_kvb, (self.num_attention_heads, self.qk_head_dim + self.v_head_dim, self.kv_lora_rank))
-        q_absorb, v_absorb = mint.split(w_kvb, [self.qk_head_dim, self.v_head_dim], dim=1)
-
-        q_nope = self.cast(q_nope, self.compute_dtype)
-        # Weight absorb (q): memory-frugal batched matmul instead of unsqueeze+broadcast-matmul,
-        # whose backward materialises a [seq*bs, heads, qk_head_dim, kv_lora_rank] outer product.
-        q_nope = _AbsorbMatmul.apply(q_nope, q_absorb)
-        q_nope = mint.reshape(q_nope, (seq_len, bs, self.num_attention_heads, self.kv_lora_rank))
-
-        query = self.cat([q_nope, q_pe], 3)
-        key = self.cat([k_nope, k_pe], 3)
-        return query, key, value, v_absorb
-
 
 
 class MLASelfAttention(MultiLatentAttention):
@@ -754,6 +490,7 @@ class MLASelfAttention(MultiLatentAttention):
         # head-sharded up-projections gather their latent inputs immediately before
         # matmul; k_pe is gathered separately at the rotary-k boundary.
         seq_len, bs, _ = self.shape(hidden_states)
+
         qkv_combo = self.linear_qkv(hidden_states)
 
         q_a, compressed_kv, k_pe = self.split(
@@ -836,28 +573,3 @@ class MLASelfAttention(MultiLatentAttention):
         key = self.k_handoff(key)
 
         return query, key, value
-
-    def construct(self, x: Tensor, attention_mask=None, rotary_pos_emb=None,
-                  prefix_keys_values=None, pad_zeros=None, actual_seq_len=None,
-                  attention_loss=0., mscale=1.0, rotary_cos_sin=None):
-        """
-        Forward pass of MLA self-attention with optional DSA support.
-
-        Args:
-            x: Input tensor with shape (seq_length, batch_size, hidden_size).
-            attention_mask: Attention mask tensor (optional).
-            rotary_pos_emb: Rotary position embedding tensor (optional).
-            prefix_keys_values: Prefix key-value pairs (optional).
-            pad_zeros: Padding zeros tensor (not used).
-            actual_seq_len: Actual sequence length for EOD mask compression (optional).
-            attention_loss: Accumulated attention loss from previous layers.
-
-        Returns:
-            Tuple[Tensor, float]: (output, attention_loss).
-        """
-        if self.use_dsa:
-            return self.dsa_forward(x, attention_mask, rotary_pos_emb, actual_seq_len, attention_loss)
-
-        return super().construct(x, attention_mask, rotary_pos_emb,
-                                 prefix_keys_values, pad_zeros, actual_seq_len, mscale,
-                                 rotary_cos_sin)
