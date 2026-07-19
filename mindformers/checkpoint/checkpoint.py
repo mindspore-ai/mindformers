@@ -657,12 +657,33 @@ def load_hf_checkpoint(
         reshard_output = reshard_loader.load()
 
         # 5. Convert:
-        # Use template.get_mf_state_dict() to convert `{hf_param_name: weight}` to `{mf_param_name: Parameter}.`
-        # Internally iterates through parameters, calling add_hf_weight() for conversion:
-        #   - Single-source weights (e.g., embed_tokens): directly rename
-        #   - Multi-source weights (e.g., QKV): temporarily store q, k, v, then concatenate after all are ready
-        # Since Reshard stage has completed slicing, no need to slice again during conversion
-        state_dict = template.get_mf_state_dict(reshard_output)
+        # Process weights incrementally: pop each entry from reshard_output as it is
+        # converted, so the source tensor can be freed immediately.  This avoids
+        # holding both the full source dict and the converted target dict in memory
+        # simultaneously, which would double peak host-memory usage.
+        state_dict = {}
+        for hf_name in list(reshard_output.keys()):
+            weight = reshard_output.pop(hf_name)
+            result = template.add_hf_weight(hf_name, weight)
+            if result is not None:
+                for mf_name, mf_weight in result.items():
+                    if not isinstance(mf_weight, Parameter):
+                        mf_weight = template._cast_weight_to_dtype(mf_name, mf_weight)
+                        mf_weight = Parameter(mf_weight, name=mf_name)
+                    state_dict[mf_name] = mf_weight
+            elif template.get_convert_op(hf_name, template.mf_name_to_converter) is not None:
+                # The name is already an MF name (e.g. preprocessed expert / QKV weights).
+                if not isinstance(weight, Parameter):
+                    weight = template._cast_weight_to_dtype(hf_name, weight)
+                    weight = Parameter(weight, name=hf_name)
+                state_dict[hf_name] = weight
+            elif hf_name not in template.name_to_weight:
+                logger.warning("hf_name: %s added but not converted (no matching converter found)", hf_name)
+            del weight
+
+        # Flush any remaining cached (unconverted) weights.
+        template.release()
+        del reshard_output
 
     # 6. Load into network
     logger.info("..........Loading State Dict into Network..........")
@@ -673,6 +694,9 @@ def load_hf_checkpoint(
         balanced_load=balanced_load,
         param_redundancy=param_redundancy
     )
+
+    # Free the conversion state dict once parameters are loaded into the network.
+    del state_dict
 
     logger.info("..........Loading Hugging Face Checkpoint Finished..........")
     logger.info(f"..........Loading Time Cost: {time() - start_load_time:.5f} s..........")

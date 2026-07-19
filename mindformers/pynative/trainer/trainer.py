@@ -43,7 +43,8 @@ from mindformers.tools.logger import logger
 from mindformers.pynative.config import TrainConfig
 from mindformers.pynative.trainer.dynamic_batch import build_dynamic_scheduler
 from mindformers.models import PreTrainedModel
-from mindformers.checkpoint.checkpoint import load_checkpoint
+from mindformers.checkpoint.checkpoint import load_checkpoint, load_hf_checkpoint
+from mindformers.checkpoint.utils import is_hf_checkpoint
 from mindformers.pynative.callback import (
     CallbackHandler,
     TrainerCallback,
@@ -796,65 +797,74 @@ class Trainer:
 
         checkpoint_path = get_checkpoint_path(checkpoint_path)
         logger.info(f"Loading checkpoint from: {checkpoint_path}")
-
-        common_file = os.path.join(checkpoint_path, "common.json")
-        common_info = CommonInfo.load_common(common_file)
-
         checkpoint = self.config.checkpoint
 
-        if not checkpoint.no_load_optim:
-            if optimizer is None:
-                raise ValueError("If no_load_optim is False, optimizer is required.")
+        if is_hf_checkpoint(checkpoint_path):
+            load_hf_checkpoint(
+                pretrained_model_dir=checkpoint_path,
+                network=model,
+                balanced_load=checkpoint.load_balanced,
+                reshard_worker_num=checkpoint.reshard_worker_num
+            )
+        else:
+            common_file = os.path.join(checkpoint_path, "common.json")
+            common_info = CommonInfo.load_common(common_file)
 
-            global_step = common_info.global_step
-            self._resumed = True
-            if self.dynamic_batch_enabled:
-                # Dynamic: skip consumed_samples // base_units micro-batches. Use the
-                # persisted consumed_samples; fall back to recomputing from global_step
-                # for old checkpoints without the field.
-                saved_consumed = getattr(common_info, "consumed_samples", None)
-                if saved_consumed is not None:
-                    self._consumed_samples = int(saved_consumed)
-                else:
-                    self._consumed_samples = self.dynamic_scheduler.consumed_samples_at_step(global_step)
-                self.state.consumed_samples = self._consumed_samples
-                skip_micros = self._consumed_samples // self._base_units
-                if skip_micros > 0:
-                    self.train_dataset.set_init_step(skip_micros)
-                logger.info(
-                    "Resume dataset (dynamic batch): skip %d micro-batches "
-                    "(consumed_samples=%d, global_step=%d).",
-                    skip_micros, self._consumed_samples, global_step,
-                )
-            else:
-                # Static: set_init_step by global_step, not consumed_samples.
-                if common_info.global_batch_size and common_info.global_batch_size != self.global_batch_size:
-                    global_step = int(
-                        common_info.global_step
-                        * (common_info.global_batch_size / self.global_batch_size)
-                    )
+            checkpoint = self.config.checkpoint
+
+            if not checkpoint.no_load_optim:
+                if optimizer is None:
+                    raise ValueError("If no_load_optim is False, optimizer is required.")
+
+                global_step = common_info.global_step
+                self._resumed = True
+                if self.dynamic_batch_enabled:
+                    # Dynamic: skip consumed_samples // base_units micro-batches. Use the
+                    # persisted consumed_samples; fall back to recomputing from global_step
+                    # for old checkpoints without the field.
+                    saved_consumed = getattr(common_info, "consumed_samples", None)
+                    if saved_consumed is not None:
+                        self._consumed_samples = int(saved_consumed)
+                    else:
+                        self._consumed_samples = self.dynamic_scheduler.consumed_samples_at_step(global_step)
+                    self.state.consumed_samples = self._consumed_samples
+                    skip_micros = self._consumed_samples // self._base_units
+                    if skip_micros > 0:
+                        self.train_dataset.set_init_step(skip_micros)
                     logger.info(
-                        f"Scaled global step: {common_info.global_step} -> {global_step} "
-                        f"(batch size changed from {common_info.global_batch_size} to {self.global_batch_size})"
+                        "Resume dataset (dynamic batch): skip %d micro-batches "
+                        "(consumed_samples=%d, global_step=%d).",
+                        skip_micros, self._consumed_samples, global_step,
                     )
-                self.train_dataset.set_init_step(global_step)
-                self._consumed_samples = global_step * self.global_batch_size
-                self.state.consumed_samples = self._consumed_samples
-                logger.info(f"Resume dataset (static batch) from: {global_step}")
+                else:
+                    # Static: set_init_step by global_step, not consumed_samples.
+                    if common_info.global_batch_size and common_info.global_batch_size != self.global_batch_size:
+                        global_step = int(
+                            common_info.global_step
+                            * (common_info.global_batch_size / self.global_batch_size)
+                        )
+                        logger.info(
+                            f"Scaled global step: {common_info.global_step} -> {global_step} "
+                            f"(batch size changed from {common_info.global_batch_size} to {self.global_batch_size})"
+                        )
+                    self.train_dataset.set_init_step(global_step)
+                    self._consumed_samples = global_step * self.global_batch_size
+                    self.state.consumed_samples = self._consumed_samples
+                    logger.info(f"Resume dataset (static batch) from: {global_step}")
 
-            self.state.global_step = global_step
+                self.state.global_step = global_step
 
-        load_checkpoint(
-            checkpoint=checkpoint_path,
-            network=model,
-            optimizer=optimizer if not checkpoint.no_load_optim else None,
-            global_step=global_step,
-            balanced_load=checkpoint.load_balanced,
-        )
+            load_checkpoint(
+                checkpoint=checkpoint_path,
+                network=model,
+                optimizer=optimizer if not checkpoint.no_load_optim else None,
+                global_step=global_step,
+                balanced_load=checkpoint.load_balanced,
+            )
 
-        # When optimizer state is not loaded (weights-only resume), the fp32 master
-        # weights still hold their pre-load init values. Refresh them from the freshly
-        # loaded model params so master and model start aligned.
+            # When optimizer state is not loaded (weights-only resume), the fp32 master
+            # weights still hold their pre-load init values. Refresh them from the freshly
+            # loaded model params so master and model start aligned.
         if checkpoint.no_load_optim and optimizer is not None:
             logger.info("no_load_optim=True: refreshing fp32 master weights from loaded model params.")
             optimizer.reload_main_params_from_model()

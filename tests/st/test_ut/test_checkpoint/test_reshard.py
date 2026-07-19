@@ -673,11 +673,11 @@ class TestReshardLoader:
         # Mock template
         mock_template = MagicMock()
         mock_template.get_mf_name = MagicMock(
-            side_effect=lambda x: ("qkv.weight",)
+            side_effect=lambda x: ["qkv.weight"]
             if "q_proj" in x
                or "k_proj" in x
                or "v_proj" in x
-            else ("other.weight",)
+            else ["other.weight"]
         )
         mock_template.check_weights_for_experts = MagicMock(return_value=False)
         mock_template.check_weights_for_qkv = MagicMock(return_value=False)

@@ -25,9 +25,14 @@ from mindspore.communication.management import get_group_size
 from mindspore.common.dtype import all_types
 from mindspore.parallel import Layout
 
+from mindformers.checkpoint.layout_adapter import LayoutAdapter
 from mindformers.tools.logger import logger
 from mindformers.tools.utils import set_safe_mode_for_file_or_dir
 from mindformers.checkpoint.sharded_tensor import build_sharded_tensor
+from mindformers.checkpoint.safetensors_utils import (
+    read_safetensors_header,
+    safetensor_dtype_to_np_meta,
+)
 from mindformers.checkpoint.utils import (
     is_hf_checkpoint,
     get_needed_hf_files,
@@ -316,16 +321,25 @@ def generate_default_metadata_from_checkpoint(checkpoint_dir: str) -> tuple[dict
         file_basename = os.path.basename(safetensor_file)
         logger.info(f"Extracting metadata from: {file_basename}")
 
-        loaded_params = ms_load_checkpoint(
-            safetensor_file,
-            format='safetensors'
-        )
+        if is_hf_checkpoint(checkpoint_dir) and LayoutAdapter.is_pynative_mode():
+            # Read the safetensors JSON header directly to avoid MindSpore dtype
+            # compatibility issues (e.g. F8_E8M0, BF16 not recognised by ms_load_checkpoint).
+            header, _ = read_safetensors_header(safetensor_file)
+            param_iter = (
+                (name, tuple(info["shape"]), safetensor_dtype_to_np_meta(info["dtype"]))
+                for name, info in header.items()
+            )
+        else:
+            loaded_params = ms_load_checkpoint(safetensor_file, format='safetensors')
+            param_iter = (
+                (name, tuple(param.shape), param.dtype)
+                for name, param in loaded_params.items()
+            )
 
-        for param_name, param in loaded_params.items():
-            param_shape = tuple(param.shape)
+        for param_name, param_shape, param_dtype in param_iter:
             sharded_tensor = build_sharded_tensor(
                 param_name=param_name,
-                param_dtype=param.dtype,
+                param_dtype=param_dtype,
                 local_shape=param_shape,
                 global_shape=param_shape,
                 global_offset=(0,),  # In multi-dimensional scenarios, each dimension is 0.
