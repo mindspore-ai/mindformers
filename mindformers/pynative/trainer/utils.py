@@ -36,6 +36,7 @@ from mindformers.dataset.dataloader.blended_megatron_dataloader import (
     BlendedMegatronDatasetDataLoader,
 )
 from mindformers.dataset.dataloader.hf_dataloader import HFDataLoader
+from mindformers.dataset.dataloader.ordered_index_dataloader import OrderedIndexDataLoader
 from mindformers.dataset.dataloader.utils import _get_mindrecord_files
 from mindformers.pynative.optimizer.adamw import AdamW
 from mindformers.pynative.optimizer import Muon
@@ -453,6 +454,10 @@ def _build_dataset(
         dataset = ms_dataset.MindDataset(**dataloader_config)
         if 'actual_seq_len' in dataset.get_col_names():
             create_compressed_eod_mask = True
+    elif dataloader_type == "OrderedIndexDataLoader":
+        create_compressed_eod_mask = dataloader_config.get('create_compressed_eod_mask', False)
+        dataloader_config['create_compressed_eod_mask'] = create_compressed_eod_mask
+        dataset = OrderedIndexDataLoader(**dataloader_config)
     else:
         raise ValueError(f"Unsupported dataloader type: {dataloader_type}")
 
