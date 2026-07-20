@@ -13,8 +13,6 @@
 # limitations under the License.
 # ============================================================================
 """Deepseek-V3 Model for training."""
-# MindSpore ``Cell.construct`` intentionally exposes model-specific signatures.
-# pylint: disable=arguments-differ
 from mindspore import Tensor
 
 from mindformers.models.deepseek3.utils import DeepseekV3PreTrainedModel

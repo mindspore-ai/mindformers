@@ -56,11 +56,11 @@ from mindformers.pynative.distributed.style import (
     ParallelStyle,
     ColwiseParallel,
     AllGather,
-    ShardTensor,
     PrepareModuleInput,
     PrepareModuleInputOutput,
     RowwiseParallel,
     SequenceParallel,
+    ShardTensor,
 )
 from mindformers.pynative.distributed.mc2_style import (
     MC2ColwiseParallel,
@@ -539,29 +539,6 @@ def _wrap_dsv4_attention_modules(self_attention, fsdp_config, reshard_after_forw
                     ignored_params=ignored, replicate_params=replicate_params)
 
 
-def _wrap_dsa_indexer_norms(self_attention, fsdp_config):
-    """Independently FSDP-wrap norms nested under a DSA indexer.
-
-    The DSA indexer's ``k_norm`` lives at
-    ``core_attention.indexer.k_norm`` — deeper than :func:`_collect_layer_norms`
-    reaches.  Gate this helper strictly to DSA so DSv4/CSA compressor norms,
-    which are handled by :func:`_wrap_dsv4_attention_modules`, are not wrapped
-    twice.
-    """
-    if isinstance(self_attention, DSv4HybridSelfAttention):
-        return
-    if getattr(self_attention.config, "experimental_attention_variant", None) != "dsa":
-        return
-    core_attention = getattr(self_attention, "core_attention", None)
-    indexer = getattr(core_attention, "indexer", None) if core_attention is not None else None
-    if indexer is None:
-        return
-    for _, module in indexer.cells_and_names():
-        if is_norm_module(module):
-            with ms.DeviceCtx("meta"):
-                fully_shard(module, **fsdp_config)
-
-
 # LoRA adapter layouts keyed by the target module's base TP role. Only the non-default
 # placement is listed: distribute_module replicates every other (trainable) param, so a
 # colwise base needs only lora_b sharded on the out-dim, a rowwise base only lora_a on the
@@ -805,19 +782,6 @@ def _tag_dsv4_tp_replicated_grad_norm_params(model):
             setattr(param, "_grad_norm_replica_count", replica_count)
 
 
-def _tag_dsa_tp_replicated_grad_norm_params(model):
-    """Tag replicated DSA-attention parameters for global grad-norm de-duplication."""
-    for _, cell in model.cells_and_names():
-        replica_count = getattr(cell, "_dsa_tp_full_attention_replica_count", 1)
-        if replica_count <= 1:
-            continue
-        for param_name, param in cell.parameters_and_names():
-            # This optional qk-clip state is explicitly sharded over TP below.
-            if param_name == "core_attention.max_logits_val":
-                continue
-            setattr(param, "_grad_norm_replica_count", replica_count)
-
-
 def _dense_mlp_layer_plan(enable_mc2=False):
     """Return the complete local TP plan for a dense MLP."""
     colwise = MC2ColwiseParallel() if enable_mc2 else ColwiseParallel(gather_input=True)
@@ -845,11 +809,6 @@ def _apply_layers_tp(
     self_attn = transformer_layer.self_attention
     is_dsv4 = isinstance(self_attn, DSv4HybridSelfAttention)
     is_mla = isinstance(self_attn, MLASelfAttention)
-    is_dsa = (
-        is_mla
-        and not is_dsv4
-        and getattr(self_attn.config, "experimental_attention_variant", None) == "dsa"
-    )
     if is_mla and self_attn.config.q_lora_rank is None:
         # Without q compression, q comes straight out of linear_qkv (sequence-sharded, not
         # head-sharded) with no colwise up-projection to all-gather it, so SP-native MLA
@@ -881,26 +840,6 @@ def _apply_layers_tp(
         dsv4_plan, dsv4_params = _dsv4_attention_layer_plan(self_attn, tp_mesh)
         layer_plan.update(dsv4_plan)
         distribute_param_plan.extend(dsv4_params)
-    elif is_dsa:
-        # The upstream native-local TP rewrite changes MLA projections to
-        # full-sequence/local-head tensors.  The current DSA path still consumes
-        # full-sequence/full-head tensors (and sparse weight absorb reads the full
-        # linear_kvb weight directly), so applying the generic MLA TP plan would
-        # silently reinterpret full-sequence/local-head data as
-        # local-sequence/global-head data.  Keep DSA attention replicated for
-        # correctness: gather the TP sequence shard at the attention boundary and
-        # select this rank's sequence shard again on output.  The gather uses a
-        # local-slice backward because every TP rank executes the same full DSA
-        # attention graph.
-        layer_plan["self_attention"] = PrepareModuleInputOutput(
-            input_transforms=(AllGather(0, reduce_grad=False),),
-            output_transforms=(ShardTensor(0), None),
-        )
-        setattr(self_attn, "_dsa_tp_full_attention_replica_count", world)
-        logger.warning(
-            "DSA attention uses a correctness-first replicated local-TP path; "
-            "the surrounding MLP/MoE blocks remain tensor parallel."
-        )
     elif is_mla:
         layer_plan.update(_mla_attention_layer_plan(self_attn, tp_mesh, enable_mc2))
     else:
@@ -1379,10 +1318,6 @@ def apply_fsdp(
             layer.self_attention, fsdp_config, reshard_after_forward, replicate_params
         )
 
-        # 2c''. Wrap DSA indexer fp32 norms independently — same dtype-isolation
-        #       reason as 2c'.
-        _wrap_dsa_indexer_norms(layer.self_attention, fsdp_config)
-
         # 2d. Wrap the transformer layer (large module)
 
         with ms.DeviceCtx("meta"):
@@ -1487,10 +1422,6 @@ def apply_fsdp(
                 mtp_replicate_params,
             )
 
-            # DSA indexer fp32 norms — same independent wrap as the main
-            # decoder layers (2c'').
-            _wrap_dsa_indexer_norms(layer.transformer_layer.self_attention, fsdp_config)
-
             # Wrap the MTP layer (remaining: eh_proj + transformer_layer residual, all bf16)
             with ms.DeviceCtx("meta"):
                 fully_shard(
@@ -1546,11 +1477,7 @@ def apply_context_parallel_attention(
     if model_config is not None:
         async_enabled = bool(getattr(model_config, "_mf_runtime_context_parallel_async", async_enabled))
     input_layout = getattr(model_config, "input_layout", None) if model_config is not None else None
-    attention_variant = (
-        getattr(model_config, "experimental_attention_variant", None)
-        if model_config is not None else None
-    )
-    if async_enabled and method == "colossal" and attention_variant != "dsa":
+    if async_enabled and method == "colossal":
         raise NotImplementedError(
             "Async context parallel currently supports 'ulysses' and 'hybrid' only. "
             "Use context_parallel_async=false for colossal CP."
@@ -1607,8 +1534,6 @@ def apply_context_parallel_attention(
         ulysses_degree_in_cp=ulysses_degree,
         input_layout=input_layout,
         async_enabled=async_enabled,
-        attention_variant=attention_variant,
-        dsa_use_sparse_loss=getattr(model_config, "dsa_indexer_use_sparse_loss", True),
     )
 
     decoder = getattr(gpt_model, "decoder", None)
@@ -1820,7 +1745,6 @@ def _apply_spmd_parallelism(
         parallelism,
     )
     _tag_dsv4_tp_replicated_grad_norm_params(model)
-    _tag_dsa_tp_replicated_grad_norm_params(model)
 
     for param_name, param in model.parameters_and_names():
         if isinstance(param, DTensor):
@@ -1830,18 +1754,13 @@ def _apply_spmd_parallelism(
 
     # Phase 6: CP root I/O hooks. Apply after FSDP so the hooks live on the final
     # model boundary called by trainer.
+    gpt_model = _unwrap_gptmodel(model)
     if parallel_dims.cp_enabled:
-        apply_context_parallel_model_io(
-            model,
-            parallel_dims,
-            parallelism,
-            _unwrap_gptmodel(model).config,
-        )
+        apply_context_parallel_model_io(model, gpt_model.config, parallel_dims, parallelism)
 
     # Scope the qk_clip max-logit all-reduce to the dp x cp (loss_mesh) domain
     # instead of the whole world: tp/pp hold different heads/layers, so reducing
     # over loss_mesh is both correct and far cheaper than a world all-reduce.
-    gpt_model = _unwrap_gptmodel(model)
     if parallel_dims.dp_cp_enabled and hasattr(gpt_model, "set_qk_clip_reduce_group"):
         try:
             gpt_model.set_qk_clip_reduce_group(parallel_dims.world_mesh.get_group("loss_mesh"))

@@ -192,6 +192,7 @@ class DSAIndexer(nn.Cell):
             dim=self.index_head_dim,
             eps=config.layernorm_epsilon,
             compute_dtype=config.layernorm_compute_dtype,
+            params_dtype=config.params_dtype,
         )
 
         self.linear_weights_proj = build_module(

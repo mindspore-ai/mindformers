@@ -1,7 +1,5 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates
 """Parallel styles for local-tensor distributed execution."""
-# MindSpore ``_Function`` subclasses use framework-managed autograd context.
-# pylint: disable=abstract-method
 from typing import Any, Optional, Tuple, Dict, Union, Literal
 from abc import ABC, abstractmethod
 
@@ -11,29 +9,19 @@ from mindspore.common._grad_function import _Function
 from mindspore.ops.function import comm_func
 
 from hyper_parallel import DTensor, DeviceMesh
-from hyper_parallel.core.context_parallel.async_context_parallel import AsyncContextParallel as HPAsyncContextParallel
-from hyper_parallel.core.context_parallel.async_dsa_context_parallel import (
-    AsyncDSAIndexerContextParallel as HPAsyncDSAIndexerContextParallel,
-    AsyncDSAIndexerLossContextParallel as HPAsyncDSAIndexerLossContextParallel,
-    AsyncDSASparseAttentionContextParallel as HPAsyncDSASparseAttentionContextParallel,
-)
 from hyper_parallel.core.context_parallel.context_parallel import ContextParallel as HPContextParallel
-from hyper_parallel.core.context_parallel.dsa_context_parallel import (
-    DSAIndexerContextParallel as HPDSAIndexerContextParallel,
-    DSAIndexerLossContextParallel as HPDSAIndexerLossContextParallel,
-    DSASparseAttentionContextParallel as HPDSASparseAttentionContextParallel,
-)
+from hyper_parallel.core.context_parallel.async_context_parallel import AsyncContextParallel as HPAsyncContextParallel
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
 
 from mindformers.pynative.layers.linear import Linear
 from mindformers.pynative.base_models.common.embeddings.vocab_embedding import VocabEmbedding
 from mindformers.pynative.distributed.utils import distribute_module
 
+
 __all__ = [
     "ParallelStyle",
     "HPContextParallelAdapter",
     "HPAsyncContextParallelAdapter",
-    "HPDSAContextParallelAdapter",
     "ColwiseParallel",
     "RowwiseParallel",
     "NoParallel",
@@ -45,7 +33,6 @@ __all__ = [
     "PrepareModuleInputOutput",
     "build_hp_cp_style",
     "build_hp_async_cp_style",
-    "build_hp_dsa_cp_style",
 ]
 
 
@@ -317,136 +304,6 @@ class HPAsyncContextParallelAdapter(ParallelStyle):
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}(hp_style={self.hp_style})"
 
-class HPDSAContextParallelAdapter(ParallelStyle):
-    """Adapter that wires HP DSA boundary hooks onto a MindFormers DSA module."""
-
-    def __init__(
-            self,
-            indexer_style: HPDSAIndexerContextParallel,
-            attention_style: ParallelStyle,
-            indexer_loss_style: Optional[HPDSAIndexerLossContextParallel] = None,
-            use_sparse_loss: bool = True,
-    ):
-        super().__init__()
-        self.indexer_style = indexer_style
-        self.attention_style = attention_style
-        self.indexer_loss_style = indexer_loss_style
-        self.use_sparse_loss = use_sparse_loss
-
-    @staticmethod
-    def _maybe_get_cell(module: Optional[nn.Cell], name: str) -> Optional[nn.Cell]:
-        """Return an optional producer cell exposed by an attention module."""
-        return getattr(module, name, None) if module is not None else None
-
-    def _resolve_dsa_boundaries(self, module: nn.Cell):
-        """Resolve and validate the DSA cells used as context-parallel boundaries."""
-        core_attention = getattr(module, "core_attention", module)
-        indexer = getattr(core_attention, "indexer", None)
-        compute_sparse_indices = getattr(indexer, "compute_sparse_indices", None) if indexer is not None else None
-        indexer_loss = getattr(core_attention, "indexer_loss", None)
-        compute_indexer_loss = (
-            getattr(indexer_loss, "compute_indexer_loss", None)
-            if indexer_loss is not None else None
-        )
-        missing = []
-        attention_attr = "sparse_flash_attention" if self.use_sparse_loss else "dense_flash_attention"
-        attention_boundary = getattr(core_attention, attention_attr, None)
-        if indexer is None:
-            missing.append("indexer")
-        if compute_sparse_indices is None:
-            missing.append("indexer.compute_sparse_indices")
-        if attention_boundary is None:
-            missing.append(attention_attr)
-        if self.indexer_loss_style is not None and indexer_loss is not None and compute_indexer_loss is None:
-            missing.append("indexer_loss.compute_indexer_loss")
-        if missing:
-            raise ValueError(
-                "DSA context parallel expects the attention module to expose "
-                f"{missing} so MindFormers can explicitly wire HP boundary hooks."
-            )
-        return core_attention, indexer, indexer_loss, compute_sparse_indices, attention_boundary, compute_indexer_loss
-
-    @staticmethod
-    def _set_dsa_dense_softmax_converter_cp_rank(core_attention: nn.Cell, device_mesh: DeviceMesh):
-        """Propagate the CP local rank to the TND dense softmax converter."""
-        converter = getattr(core_attention, "softmax_converter", None)
-        set_cp_rank = getattr(converter, "set_cp_rank", None)
-        if set_cp_rank is None:
-            return
-        set_cp_rank(device_mesh.get_local_rank())
-
-    def _apply_attention_style(self, module, core_attention, attention_boundary, device_mesh):
-        """Apply the sparse or dense main-attention CP boundary style."""
-        if isinstance(self.attention_style, HPAsyncDSASparseAttentionContextParallel):
-            value_handoff = (
-                    self._maybe_get_cell(module, "dsa_value_handoff")
-                    or self._maybe_get_cell(core_attention, "sparse_value_handoff")
-            )
-            self.attention_style.apply(
-                attention_boundary,
-                device_mesh,
-                key_handoff=self._maybe_get_cell(core_attention, "sparse_key_handoff"),
-                value_handoff=value_handoff,
-                key_rope_handoff=self._maybe_get_cell(core_attention, "sparse_key_rope_handoff"),
-            )
-        elif isinstance(self.attention_style, ParallelStyle):
-            self.attention_style._apply(attention_boundary, device_mesh)
-        else:
-            self.attention_style.apply(attention_boundary, device_mesh)
-
-
-    def _apply(self, module: nn.Cell, device_mesh: DeviceMesh) -> nn.Cell:
-        (
-            core_attention,
-            indexer,
-            indexer_loss,
-            compute_sparse_indices,
-            attention_boundary,
-            compute_indexer_loss,
-        ) = self._resolve_dsa_boundaries(module)
-        if isinstance(self.indexer_style, HPAsyncDSAIndexerContextParallel):
-            indexer_key_handoff = (
-                    self._maybe_get_cell(module, "dsa_indexer_key_handoff")
-                    or self._maybe_get_cell(indexer, "key_handoff")
-            )
-            self.indexer_style.apply(
-                compute_sparse_indices,
-                device_mesh,
-                key_handoff=indexer_key_handoff,
-            )
-        else:
-            self.indexer_style.apply(compute_sparse_indices, device_mesh)
-
-        if not self.use_sparse_loss:
-            self._set_dsa_dense_softmax_converter_cp_rank(core_attention, device_mesh)
-        self._apply_attention_style(module, core_attention, attention_boundary, device_mesh)
-
-        if self.indexer_loss_style is not None and compute_indexer_loss is not None:
-            if isinstance(self.indexer_loss_style, HPAsyncDSAIndexerLossContextParallel):
-                key_indexer_handoff = (
-                        self._maybe_get_cell(module, "dsa_loss_key_indexer_handoff")
-                        or self._maybe_get_cell(indexer_loss, "key_indexer_handoff")
-                )
-                self.indexer_loss_style.apply(
-                    compute_indexer_loss,
-                    device_mesh,
-                    key_handoff=self._maybe_get_cell(indexer_loss, "key_handoff"),
-                    key_indexer_handoff=key_indexer_handoff,
-                    key_rope_handoff=self._maybe_get_cell(indexer_loss, "key_rope_handoff"),
-                )
-            else:
-                self.indexer_loss_style.apply(compute_indexer_loss, device_mesh)
-        return module
-
-    def __repr__(self) -> str:
-        return (
-            f"{self.__class__.__name__}("
-            f"indexer_style={self.indexer_style}, "
-            f"attention_style={self.attention_style}, "
-            f"indexer_loss_style={self.indexer_loss_style}, "
-            f"use_sparse_loss={self.use_sparse_loss})"
-        )
-
 
 def build_hp_cp_style(
         method: str,
@@ -522,85 +379,6 @@ def build_hp_cp_style(
 
     raise NotImplementedError(f"unsupported context parallel method: {method}")
 
-def build_hp_dsa_cp_style(
-        method: str,
-        input_layout: Optional[str] = None,
-        async_enabled: bool = False,
-        use_sparse_loss: bool = True,
-) -> HPDSAContextParallelAdapter:
-    """Build a MindFormers wrapper for Hyper-Parallel DSA CP style.
-
-    DSA currently supports Colossal-style CP only. The DSA kernels use BSND or
-    TND layouts directly, so this builder deliberately does not apply the
-    normal FlashAttention QKV layout conversion.
-    """
-    method = method.lower()
-    if method != "colossal":
-        raise NotImplementedError("DSA context parallel currently supports only colossal CP.")
-
-    input_layout = input_layout.upper() if isinstance(input_layout, str) else input_layout
-    if input_layout in (None, "BNSD"):
-        dsa_layout = "BSND"
-    elif input_layout in ("BSND", "TND"):
-        dsa_layout = input_layout
-    else:
-        raise NotImplementedError(f"DSA context parallel expects input_layout='BSND' or 'TND', got {input_layout!r}.")
-
-    indexer_cls = HPAsyncDSAIndexerContextParallel if async_enabled else HPDSAIndexerContextParallel
-    indexer_loss_cls = HPAsyncDSAIndexerLossContextParallel if async_enabled else HPDSAIndexerLossContextParallel
-
-    indexer_style = indexer_cls(layout=dsa_layout, mode="colossal", use_local_output=False)
-    if use_sparse_loss:
-        sparse_attention_cls = (
-            HPAsyncDSASparseAttentionContextParallel if async_enabled else HPDSASparseAttentionContextParallel
-        )
-        attention_style = sparse_attention_cls(
-            layout=dsa_layout,
-            mode="colossal",
-            use_local_output=True,
-        )
-        # The sparse kernel op also consumes attention softmax_{max,sum}
-        # (forward pos 6/7), so the boundary must shard them along seq like the
-        # query side to hand the op DTensors.
-        indexer_loss_style = indexer_loss_cls(
-            layout=dsa_layout,
-            mode="colossal",
-            softmax_max_index=6,
-            softmax_sum_index=7,
-            use_local_output=True,
-        )
-    else:
-        seq_dim, head_dim = (0, 1) if dsa_layout == "TND" else (1, 2)
-        attention_style = HPContextParallelAdapter(HPContextParallel(
-            seq_dim=seq_dim,
-            head_dim=head_dim,
-            ulysses_degree=1,
-            qkv_indices=(0, 1, 2),
-            use_local_output=True,
-        ))
-        # softmax_{max,sum} (pos 6/7) and the indexer softmax (pos 10/11) are
-        # per-query-position; the boundary shards them along seq like the query
-        # side so the kernel op receives DTensors. topk_index=None disables the
-        # topk spec since dense passes topk_indices=None.
-        indexer_loss_style = indexer_loss_cls(
-            layout=dsa_layout,
-            mode="colossal",
-            topk_index=None,
-            softmax_max_index=6,
-            softmax_sum_index=7,
-            softmax_max_indexer_index=10,
-            softmax_sum_indexer_index=11,
-            query_rope_index=8,
-            key_rope_index=9,
-            use_local_output=True,
-        )
-    return HPDSAContextParallelAdapter(
-        indexer_style,
-        attention_style,
-        indexer_loss_style,
-        use_sparse_loss=use_sparse_loss,
-
-    )
 
 def build_hp_async_cp_style(
         method: str,
