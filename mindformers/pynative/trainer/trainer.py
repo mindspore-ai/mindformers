@@ -841,7 +841,17 @@ class Trainer:
                         skip_micros, self._consumed_samples, global_step,
                     )
                 else:
-                    # Static: set_init_step by global_step, not consumed_samples.
+                    saved_consumed = getattr(common_info, "consumed_samples", None)
+                    if saved_consumed is None:
+                        saved_global_batch_size = common_info.global_batch_size or self.global_batch_size
+                        saved_consumed = common_info.global_step * saved_global_batch_size
+                        logger.info(
+                            "Checkpoint has no consumed_samples; inferred %d from "
+                            "global_step=%d and global_batch_size=%d.",
+                            saved_consumed, common_info.global_step, saved_global_batch_size,
+                        )
+                    self._consumed_samples = int(saved_consumed)
+
                     if common_info.global_batch_size and common_info.global_batch_size != self.global_batch_size:
                         global_step = int(
                             common_info.global_step
@@ -851,10 +861,16 @@ class Trainer:
                             f"Scaled global step: {common_info.global_step} -> {global_step} "
                             f"(batch size changed from {common_info.global_batch_size} to {self.global_batch_size})"
                         )
-                    self.train_dataset.set_init_step(global_step)
-                    self._consumed_samples = global_step * self.global_batch_size
+
+                    skip_micros = self._consumed_samples // self._base_units
+                    if skip_micros > 0:
+                        self.train_dataset.set_init_step(skip_micros)
                     self.state.consumed_samples = self._consumed_samples
-                    logger.info(f"Resume dataset (static batch) from: {global_step}")
+                    logger.info(
+                        "Resume dataset (static batch): skip %d micro-batches "
+                        "(consumed_samples=%d, global_step=%d).",
+                        skip_micros, self._consumed_samples, global_step,
+                    )
 
                 self.state.global_step = global_step
 
