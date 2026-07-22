@@ -67,9 +67,7 @@ class _DSAIndexerGradFunction(_Function):
                 actual_seq_klen=actual_seq_klen,
                 layout=input_layout,
             )
-        ctx.d_query_index = d_query_index
-        ctx.d_key_index = d_key_index
-        ctx.d_weights = d_weights
+        ctx.save_for_backward(d_query_index, d_key_index, d_weights)
         return loss[0]
 
     @staticmethod
@@ -77,9 +75,7 @@ class _DSAIndexerGradFunction(_Function):
         """Backward pass: route pre-computed gradients to indexer inputs."""
         res_list = [None] * 12
         grad_scale = grad_output[0]
-        d_query_index = ctx.d_query_index
-        d_key_index = ctx.d_key_index
-        d_weights = ctx.d_weights
+        d_query_index, d_key_index, d_weights = ctx.saved_tensors
         # ``grad_scale`` is a device scalar (normally 1 / token_count). Do not
         # convert it to a Python bool: that synchronizes the device and creates
         # another output allocation at the peak of sparse-DSA backward. Scale

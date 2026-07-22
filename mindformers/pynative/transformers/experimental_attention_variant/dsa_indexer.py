@@ -52,18 +52,17 @@ class _DSAIndexerFunction(_Function):
     @staticmethod
     def forward(ctx, q, k, weights):
         """Forward pass: return inputs unchanged (identity function)."""
-        ctx.q = q
-        ctx.k = k
-        ctx.weights = weights
+        ctx.save_for_backward(q, k, weights)
         return q, k, weights
 
     @staticmethod
     def backward(ctx, grad_q, grad_k, grad_w):
         """Backward pass: return zero gradients to block gradient flow."""
         del grad_q, grad_k, grad_w
-        return (mint.zeros_like(ctx.q),
-                mint.zeros_like(ctx.k),
-                mint.zeros_like(ctx.weights))
+        q, k, weights = ctx.saved_tensors
+        return (mint.zeros_like(q),
+                mint.zeros_like(k),
+                mint.zeros_like(weights))
 
 
 @dataclass
@@ -192,7 +191,6 @@ class DSAIndexer(nn.Cell):
             dim=self.index_head_dim,
             eps=config.layernorm_epsilon,
             compute_dtype=config.layernorm_compute_dtype,
-            params_dtype=config.params_dtype,
         )
 
         self.linear_weights_proj = build_module(
@@ -205,8 +203,10 @@ class DSAIndexer(nn.Cell):
             bias=False,
         )
 
-        self.hadamard_q = Hadamard(self.index_head_dim, use_butterfly=True)
-        self.hadamard_k = Hadamard(self.index_head_dim, use_butterfly=True)
+        # Match Megatron's BF16 input/output and FP32 Hadamard arithmetic with
+        # one mint.nn.functional.linear call.
+        self.hadamard_q = Hadamard(self.index_head_dim, use_fp32_matrix=True)
+        self.hadamard_k = Hadamard(self.index_head_dim, use_fp32_matrix=True)
         self.compute_sparse_indices = DSAIndexerComputeSparseIndices(
             input_layout=self.input_layout,
             sparse_count=self.index_topk,

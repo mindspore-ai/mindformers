@@ -53,6 +53,29 @@ def test_hadamard_scales_after_bf16_linear():
 @pytest.mark.level0
 @pytest.mark.platform_arm_ascend910b_training
 @pytest.mark.env_onecard
+def test_hadamard_fp32_matrix_casts_back_to_input_dtype():
+    """Lock Megatron-style BF16 I/O with FP32 Hadamard arithmetic."""
+    from mindformers.pynative.transformers.experimental_attention_variant.utils import Hadamard
+
+    rng = np.random.default_rng(20260713)
+    input_value = Tensor(rng.standard_normal((2, 3, 128)).astype(np.float32), ms.bfloat16)
+    matrix = Tensor(hadamard(128), ms.float32)
+    scale = 128 ** -0.5
+
+    expected = mint.nn.functional.linear(ops.cast(input_value, ms.float32), matrix) * scale
+    expected = ops.cast(expected, ms.bfloat16)
+    actual = Hadamard(128, use_fp32_matrix=True)(input_value)
+
+    assert actual.dtype == input_value.dtype
+    np.testing.assert_array_equal(
+        ops.cast(actual, ms.float32).asnumpy(),
+        ops.cast(expected, ms.float32).asnumpy(),
+    )
+
+
+@pytest.mark.level0
+@pytest.mark.platform_arm_ascend910b_training
+@pytest.mark.env_onecard
 def test_sparse_flash_preparation_rejects_nonpositive_compress_ratio():
     """A compressed-KV branch must never reach residual modulo with a zero ratio."""
     from mindformers.pynative.transformers.experimental_attention_variant.csa import (

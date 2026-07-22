@@ -18,6 +18,8 @@
 # limitations under the License.
 # ============================================================================
 """mindformers GPT model"""
+# MindSpore ``Cell.construct`` intentionally exposes model-specific signatures.
+# pylint: disable=arguments-differ
 __all__ = ['GPTModel']
 
 from typing import Literal, Optional, Union
@@ -114,6 +116,7 @@ class GPTModel(nn.Cell):
         super().__init__()
 
         self.config = config
+        self.dsa_indexer_use_sparse_loss = config.dsa_indexer_use_sparse_loss
         self.transformer_layer_spec = transformer_layer_spec
         self.vocab_size = vocab_size
         self.max_sequence_length = max_sequence_length
@@ -281,6 +284,20 @@ class GPTModel(nn.Cell):
         self.transpose = mint.permute
         self.assign = mint.clone
 
+        if (config.experimental_attention_variant == "dsa"
+                and not config.dsa_indexer_use_sparse_loss):
+            logger.warning(
+                "`dsa_indexer_use_sparse_loss` is False: enable DSA indexer warm-up "
+                "and freeze every parameter outside the indexer."
+            )
+            self.freeze_for_dsa_indexer_warmup()
+
+    def freeze_for_dsa_indexer_warmup(self):
+        """Freeze every non-indexer parameter during the dense DSA warm-up stage."""
+        for param in self.trainable_params():
+            if "indexer" not in param.name:
+                param.requires_grad = False
+
     def _should_use_chunked_loss(self):
         """Whether current runtime state should use chunked loss."""
         return self.training and self.chunk_loss_num > 1 and not self.return_logits
@@ -318,7 +335,7 @@ class GPTModel(nn.Cell):
         # Check mindformers.dataset.blended_datasets.gpt_dataset._get_eod_attention_mask() for implement details.
 
         labels, attention_mask, loss_mask = self._preprocess_input_labels_and_masks(
-            input_ids, labels, attention_mask, loss_mask)
+            input_ids, labels, attention_mask, loss_mask, actual_seq_len)
 
         hidden_states, rotary_pos_emb, mscale = self.language_model(
             input_ids,
@@ -641,7 +658,8 @@ class GPTModel(nn.Cell):
                                            input_ids: Tensor,
                                            labels: Tensor = None,
                                            attention_mask: Tensor = None,
-                                           loss_mask: Tensor = None):
+                                           loss_mask: Tensor = None,
+                                           actual_seq_len: Tensor = None):
         """Preprocess input_ids and generate labels and masks if they are None.
         """
         if loss_mask is None:
@@ -649,6 +667,9 @@ class GPTModel(nn.Cell):
         if labels is not None:
             label_mask = self.cast(self.not_equal(labels, self.ignore_token_id), dtype.float32)
             loss_mask = self.mul(loss_mask, label_mask)
+        if (self.use_eod_attn_mask_compression and actual_seq_len is not None and attention_mask is None
+                and getattr(self.config, "input_layout", None) == "TND") and self.dsa_indexer_use_sparse_loss:
+            return labels, attention_mask, loss_mask
         if self.use_attn_mask_compression:
             attention_mask = self.casual_mask()
         elif attention_mask is None:
