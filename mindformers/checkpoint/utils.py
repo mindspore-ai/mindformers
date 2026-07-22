@@ -474,6 +474,24 @@ def is_hf_checkpoint(checkpoint_path: str) -> bool:
     return has_model_safetensors or has_index
 
 
+def has_optimizer_ckpt(checkpoint_dir: str) -> bool:
+    """Check whether optimizer checkpoint files exist in the given MS checkpoint directory.
+
+    Optimizer files follow the naming pattern ``{prefix}-opt-{rank}-{total}.safetensors``
+    or ``opt-{rank}-{total}.safetensors`` (no prefix). The function searches for files
+    matching ``*opt-*.safetensors`` in *checkpoint_dir*.
+
+    Args:
+        checkpoint_dir: Path to the MindSpore checkpoint directory.
+
+    Returns:
+        True if at least one optimizer checkpoint file exists.
+    """
+    if not os.path.isdir(checkpoint_dir):
+        raise ValueError(f"checkpoint_dir is not a directory: {checkpoint_dir}")
+    return bool(glob(os.path.join(checkpoint_dir, "*opt-*.safetensors")))
+
+
 def get_needed_hf_files(checkpoint_dir: str) -> List[str]:
     """
     Obtain the list of safetensors files that need to be loaded under the HuggingFace weights directory.
