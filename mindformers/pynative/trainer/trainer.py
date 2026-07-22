@@ -44,7 +44,7 @@ from mindformers.pynative.config import TrainConfig
 from mindformers.pynative.trainer.dynamic_batch import build_dynamic_scheduler
 from mindformers.models import PreTrainedModel
 from mindformers.checkpoint.checkpoint import load_checkpoint, load_hf_checkpoint
-from mindformers.checkpoint.utils import is_hf_checkpoint, has_optimizer_ckpt
+from mindformers.checkpoint.utils import is_hf_checkpoint, has_optimizer_ckpt, is_checkpoint_path_valid
 from mindformers.pynative.callback import (
     CallbackHandler,
     TrainerCallback,
@@ -798,6 +798,9 @@ class Trainer:
         """
         if model is None:
             raise ValueError("model is None, cannot load checkpoint.")
+
+        if not is_checkpoint_path_valid(checkpoint_path):
+            return
 
         checkpoint_path = get_checkpoint_path(checkpoint_path)
         logger.info(f"Loading checkpoint from: {checkpoint_path}")
