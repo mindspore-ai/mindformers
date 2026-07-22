@@ -16,7 +16,7 @@
 
 import os
 import numpy as np
-from mindspore.mindrecord import FileWriter
+from mindspore.mindrecord import FileWriter, MindRecordException
 
 
 def generate_mindrecord_file(
@@ -76,8 +76,90 @@ def generate_mindrecord_file(
             writer.commit()
             retry = False
             success_sig = True
-        # pylint: disable=W0718
-        except Exception as e:
+        except MindRecordException as e:
+            if os.path.exists(dataset_path):
+                os.remove(dataset_path)
+            if os.path.exists(dataset_path + ".db"):
+                os.remove(dataset_path + ".db")
+            print(f"mindrecord data initialize failed, due to \"{e}\".")
+            if count >= 3:
+                retry = False
+
+    if not success_sig:
+        raise RuntimeError(f"mindrecord data initialize failed for {count} times.")
+
+
+def generate_eod_mindrecord_file(
+    seq_length: int = 4096,
+    batch_size: int = 1,
+    train_steps: int = 1000,
+    dataset_path: str = None,
+    num_segments: int = 16,
+):
+    """
+    Generate a mindrecord file carrying a valid ``actual_seq_len`` column for EOD/TND training.
+
+    Unlike :func:`generate_mindrecord_file`, ``actual_seq_len`` and ``position_ids`` cannot be
+    random: the TND flash-attention layout interprets ``actual_seq_len`` as cumulative packing
+    boundaries (``cu_seqlens``) and ``position_ids`` must reset at every segment start. This helper
+    packs each sample into ``num_segments`` uniform segments so both are well-formed. The presence
+    of the ``actual_seq_len`` column is what makes ``MindDataset`` enable the compressed EOD mask.
+
+    Args:
+        seq_length (int): Sequence length of each sample. Must be divisible by ``num_segments``.
+        batch_size (int): Batch size used to size the total sample count.
+        train_steps (int): Number of training steps used to size the total sample count.
+        dataset_path (str): Path to save the generated mindrecord file.
+        num_segments (int): Number of packed sub-sequences per sample.
+    """
+    if dataset_path is None:
+        raise ValueError("dataset_path should be specified.")
+    if seq_length % num_segments != 0:
+        raise ValueError(
+            f"seq_length {seq_length} must be divisible by num_segments {num_segments}."
+        )
+
+    data_dir = os.path.dirname(dataset_path)
+    if data_dir:
+        os.makedirs(data_dir, exist_ok=True)
+
+    seg_len = seq_length // num_segments
+    # cumulative packing boundaries ending at seq_length, e.g. [256, 512, ..., 4096]
+    actual_seq_len = np.arange(seg_len, seq_length + seg_len, seg_len, dtype=np.int32)
+    # position ids reset to 0 at each segment start
+    position_ids = np.tile(np.arange(seg_len, dtype=np.int32), num_segments)
+
+    data_schema = {
+        "input_ids": {"type": "int32", "shape": [-1]},
+        "labels": {"type": "int32", "shape": [-1]},
+        "loss_mask": {"type": "int32", "shape": [-1]},
+        "position_ids": {"type": "int32", "shape": [-1]},
+        "actual_seq_len": {"type": "int32", "shape": [-1]},
+    }
+    data_num = batch_size * train_steps
+    np.random.seed(0)
+
+    retry = True
+    count = 0
+    success_sig = False
+    while retry:
+        try:
+            count += 1
+            writer = FileWriter(dataset_path)
+            writer.add_schema(data_schema, "test-schema")
+            for _ in range(data_num):
+                features = {
+                    "input_ids": np.random.randint(0, 1024, size=seq_length).astype(np.int32),
+                    "labels": np.random.randint(0, 1024, size=seq_length).astype(np.int32),
+                    "loss_mask": np.ones(seq_length, dtype=np.int32),
+                    "position_ids": position_ids,
+                    "actual_seq_len": actual_seq_len,
+                }
+                writer.write_raw_data([features])
+            writer.commit()
+            retry = False
+            success_sig = True
+        except MindRecordException as e:
             if os.path.exists(dataset_path):
                 os.remove(dataset_path)
             if os.path.exists(dataset_path + ".db"):

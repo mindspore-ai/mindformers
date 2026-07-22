@@ -15,9 +15,12 @@
 """test eight cards deepseek3 training"""
 
 import os
+
 import pytest
+import yaml
 
 from tests.st.test_multi_cards_cases.utils import TaskType
+from tests.utils.generate_dataset import generate_eod_mindrecord_file
 from tests.utils.precision_utils import assert_expected_values_match
 from tests.st.test_multi_cards_cases.test_pynative.test_models.test_deepseek3.utils import (
     build_case_config,
@@ -33,6 +36,7 @@ _TASK_TYPE = TaskType.EIGHT_CARDS_TASK
 CUR_DIR = os.path.dirname(os.path.abspath(__file__))
 BASE_CONFIG = os.path.join(CUR_DIR, "pynative_ds3.yaml")
 DATASET_PATH = os.path.join(CUR_DIR, "train_dataset")
+DATASET_PATH_TND = os.path.join(CUR_DIR, "train_dataset_tnd")
 CHECKPOINT_PATH = os.path.join(CUR_DIR, "deepseekv3_checkpoints")
 RUN_SCRIPT_PATH = os.path.join(CUR_DIR, "run_deepseek3.py")
 
@@ -50,6 +54,17 @@ def run_deepseek3_case(config_name, log_dir, worker_num, updates=None):
     )
     assert os.path.exists(RUN_SCRIPT_PATH), f"Run script not found: {RUN_SCRIPT_PATH}"
     return run_training_and_extract_losses(RUN_SCRIPT_PATH, local_config_path, log_dir, worker_num)
+
+
+def generate_tnd_dataset():
+    """Generate mindrecord dataset with actual_seq_len (TND/EOD layout) for eight-cards tests."""
+    if not os.path.isdir(DATASET_PATH_TND):
+        generate_eod_mindrecord_file(
+            seq_length=4096,
+            batch_size=2,
+            train_steps=1000,
+            dataset_path=os.path.join(CUR_DIR, "train_dataset_tnd/dataset.mindrecord"),
+        )
 
 
 @pytest.mark.level1
@@ -138,3 +153,49 @@ def test_fsdp_cp4_hybrid4_gbs2():
         },
     )
     assert_expected_values_match(actual_losses, expected_losses)
+
+
+@pytest.mark.level0
+def test_fsdp_cp4_hybrid4_tp2_ep2_tnd_gbs2_async():
+    """
+    Feature: DeepSeek3 FSDP + async Context Parallel (hybrid) + Tensor/Expert Parallel, TND layout
+    Description: Test DeepSeek3 training with FSDP, context parallel 4 using the hybrid method
+                 (ulysses degree 2), tensor parallel 2 and expert parallel 2 on 8 cards, with
+                 asynchronous CP (context_parallel_async=True) and EOD attn-mask compression
+                 (TND layout) enabled, global batch size 2. Guards the async Ulysses/Hybrid + TP
+                 MLA FlashAttention head-mismatch fix.
+    Expectation: msrun script exits with code 0.
+    """
+    generate_tnd_dataset()
+    local_config_path = build_case_config(
+        BASE_CONFIG,
+        os.path.join(CUR_DIR, "ds3_fsdp_cp4_hybrid4_tp2_ep2_tnd_gbs2_async.yaml"),
+        CHECKPOINT_PATH,
+        DATASET_PATH_TND,
+        updates={
+            "parallelism": {
+                "context_parallel": 4,
+                "context_parallel_method": "hybrid",
+                "context_parallel_async": True,
+                "ulysses_degree_in_cp": 2,
+                "tensor_parallel": 2,
+                "expert_parallel": 2,
+            },
+            "model": {"use_eod_attn_mask_compression": True},
+        },
+    )
+    with open(local_config_path, "r") as fp:
+        configs = yaml.safe_load(fp)
+    configs["train_dataset"]["dataloader"]["column_names"] = [
+        "input_ids", "labels", "loss_mask", "position_ids", "actual_seq_len"
+    ]
+    with open(local_config_path, "w") as fp:
+        yaml.dump(configs, fp, indent=2)
+
+    actual_losses = run_training_and_extract_losses(
+        RUN_SCRIPT_PATH,
+        local_config_path,
+        "log_fsdp_cp4_hybrid4_tp2_ep2_tnd_gbs2_async",
+        worker_num=8,
+    )
+    assert len(actual_losses) == 10
