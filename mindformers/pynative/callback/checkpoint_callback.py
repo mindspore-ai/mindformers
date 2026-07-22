@@ -173,7 +173,7 @@ class CheckpointCallback(TrainerCallback):
                 filter_func=(lambda x: x in list(model_keys)) if self.no_save_optim else None
             ) if get_real_group_size() > 1 else None
 
-        if self.opt_sharded_tensor_metas is None and get_real_group_size() > 1:
+        if self.opt_sharded_tensor_metas is None and get_real_group_size() > 1 and not self.no_save_optim:
             self.opt_sharded_tensor_metas = get_all_sharded_tensor(
                 network=optimizer,
                 filter_func=(lambda x: x in list(
