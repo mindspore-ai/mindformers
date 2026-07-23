@@ -47,6 +47,7 @@ def _mock_checkpoint_load(monkeypatch):
     """Mock checkpoint IO while exercising the real Trainer resume logic."""
     monkeypatch.setattr(trainer_module, "get_checkpoint_path", lambda path: path)
     monkeypatch.setattr(trainer_module, "is_hf_checkpoint", lambda _: False)
+    monkeypatch.setattr(trainer_module, "has_optimizer_ckpt", lambda _: True)
     load_checkpoint = Mock()
     monkeypatch.setattr(trainer_module, "load_checkpoint", load_checkpoint)
     return load_checkpoint

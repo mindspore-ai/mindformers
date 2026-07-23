@@ -44,7 +44,7 @@ from mindformers.pynative.config import TrainConfig
 from mindformers.pynative.trainer.dynamic_batch import build_dynamic_scheduler
 from mindformers.models import PreTrainedModel
 from mindformers.checkpoint.checkpoint import load_checkpoint, load_hf_checkpoint
-from mindformers.checkpoint.utils import is_hf_checkpoint
+from mindformers.checkpoint.utils import is_hf_checkpoint, has_optimizer_ckpt
 from mindformers.pynative.callback import (
     CallbackHandler,
     TrainerCallback,
@@ -804,6 +804,10 @@ class Trainer:
         checkpoint = self.config.checkpoint
 
         if is_hf_checkpoint(checkpoint_path):
+            if not checkpoint.no_load_optim:
+                raise ValueError(
+                    "Resume training (no_load_optim=False) is not supported for HuggingFace checkpoints."
+                )
             load_hf_checkpoint(
                 pretrained_model_dir=checkpoint_path,
                 network=model,
@@ -819,6 +823,13 @@ class Trainer:
             if not checkpoint.no_load_optim:
                 if optimizer is None:
                     raise ValueError("If no_load_optim is False, optimizer is required.")
+
+                if not has_optimizer_ckpt(checkpoint_path):
+                    raise ValueError(
+                        f"no_load_optim is False but no optimizer checkpoint found in {checkpoint_path}. "
+                        "Please ensure the checkpoint directory contains optimizer weight files "
+                        "(*-opt-*.safetensors), or set no_load_optim=True to skip optimizer loading."
+                    )
 
                 global_step = common_info.global_step
                 self._resumed = True
