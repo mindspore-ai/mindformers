@@ -542,6 +542,42 @@ def get_core_network(network):
     return network
 
 
+def is_checkpoint_path_valid(checkpoint_path: str) -> bool:
+    """
+    Check whether the checkpoint path is valid for loading weights.
+
+    Returns False when the path is empty or the directory exists but is empty,
+    in which case the caller should skip checkpoint loading and use random
+    initialization. Returns True otherwise, and the caller should proceed with
+    loading; if the path is invalid (e.g. does not exist), the subsequent
+    get_checkpoint_path call will raise an error.
+
+    Args:
+        checkpoint_path: The path to validate.
+
+    Returns:
+        bool: True if the path is valid for loading, False if loading should be
+        skipped in favor of random initialization.
+    """
+    if not os.path.exists(checkpoint_path):
+        logger.warning(
+            "Checkpoint path does not exist: %s. Skipping checkpoint loading, "
+            "model will use random initialization.",
+            checkpoint_path,
+        )
+        return False
+
+    if os.path.isdir(checkpoint_path) and not os.listdir(checkpoint_path):
+        logger.warning(
+            "Checkpoint directory is empty: %s. Skipping checkpoint loading, "
+            "model will use random initialization.",
+            checkpoint_path,
+        )
+        return False
+
+    return True
+
+
 def parse_iteration_from_dir_name(dir_name):
     """
     Parse iteration number from directory name.
