@@ -2482,9 +2482,6 @@ class TransformerConfig:
 
         if self.moe_n_hash_layers > 0:
             # Hash-based MoE routing validation.
-            # The PP-layout branch is replaced by a NotImplementedError
-            # because the PyNative first version only supports PP=1
-            # (input_ids is available on every stage).
             # actual_vocab_size (not padded_vocab_size) sizes the tid2eid table.
             if self.actual_vocab_size is None:
                 raise ValueError(
@@ -2499,11 +2496,6 @@ class TransformerConfig:
                 raise ValueError(
                     f"moe_n_hash_layers ({self.moe_n_hash_layers}) must not exceed "
                     f"num_layers ({self.num_layers})."
-                )
-            if self.pipeline_model_parallel_size > 1:
-                raise NotImplementedError(
-                    "Hash MoE (moe_n_hash_layers > 0) with pipeline parallelism (PP > 1) "
-                    "is not supported yet; the PyNative first version requires PP=1."
                 )
 
         if (self.moe_router_load_balancing_type is not None
