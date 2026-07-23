@@ -1204,13 +1204,17 @@ class Trainer:
             self._update_pipeline_microbatch(new_accum)
 
     def _update_pipeline_microbatch(self, new_num_accum: int) -> None:
-        """Update schedule micro_batch_num at runtime and rebuild exec_order for PP.
+        """Update schedule micro_batch_num at runtime and rebuild the PP schedule.
 
-        v1 supports dynamic batch under PP: update ``micro_batch_num`` and
-        ``split_micro_batch``, call ``build_exec_order`` to rebuild the 1F1B
-        schedule (overlap_b_f callbacks stored in ``_custom_fn_map`` are preserved
-        across rebuilds), and refresh ``loss_scale`` on every stage (which embeds
+        Mutates ``micro_batch_num``, rebuilds ``split_micro_batch`` and the exec
+        order, and refreshes ``loss_scale`` on every stage (which embeds
         ``1/num_accumulation_steps``).
+
+        For interleaved (VP) schedules the round list (``n_microbatch_per_round``)
+        is rebuilt from the new ``micro_batch_num`` BEFORE ``build_exec_order()``:
+        hyper_parallel's ``build_exec_order`` does not resize it, so without this
+        ``forward_stage_index`` / ``backward_stage_index`` would ``IndexError`` on
+        the stale round list once accum grows.
 
         Args:
             new_num_accum (int): New gradient accumulation steps (== PP micro_batch_num).
@@ -1219,6 +1223,11 @@ class Trainer:
         if sched is None:
             return
         sched.micro_batch_num = new_num_accum
+        # Rebuild n_microbatch_per_round from the new micro_batch_num BEFORE
+        # build_exec_order(), otherwise interleaved (VP) schedules IndexError on
+        # the stale round list when accum grows.
+        if hasattr(sched, '_init_round_layout'):
+            sched._init_round_layout()
         # Rebuild split_micro_batch using the same platform micro_batch factory
         # that was used when the schedule was constructed.
         # Must fail-fast on error: if split_micro_batch stays at the old count
