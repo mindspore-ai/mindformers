@@ -101,42 +101,30 @@ def track_indexer_metrics(group=None, group_size=None, pp_group=None,
 class Hadamard(nn.Cell):
     """Hadamard transform shared by CSA and DSA indexers.
 
-    ``use_butterfly=False`` preserves CSA's dense-matrix implementation.
-    DSA enables the explicit FP32 butterfly so its reduction order matches
-    the Megatron FHT reference before casting back to the input dtype.
+    The default preserves CSA's BF16 matrix implementation.
+    ``use_fp32_matrix=True`` casts BF16 input to FP32, applies one
+    ``mint.nn.functional.linear`` call with an FP32 Hadamard matrix, scales in
+    FP32, and casts the result back to the input dtype.
     """
 
-    def __init__(self, head_dim, use_butterfly=False):
+    def __init__(self, head_dim, use_fp32_matrix=False):
         super().__init__()
         self.hadamard_mat = None
         self.linear = mint.nn.functional.linear
         self.head_dim = head_dim
-        self.use_butterfly = use_butterfly
-        if self.use_butterfly and (head_dim <= 0 or head_dim & (head_dim - 1)):
-            raise ValueError(
-                "head_dim must be a positive power of two for the Hadamard "
-                f"butterfly, but got {head_dim}."
-            )
+        self.use_fp32_matrix = use_fp32_matrix
         self.scale = head_dim ** -0.5
 
     def construct(self, x):
         """do hadamard transform."""
-        if self.use_butterfly:
-            input_dtype = x.dtype
-            original_shape = x.shape
-            x = ops.cast(x, mstype.float32)
-            stride = 1
-            while stride < self.head_dim:
-                x = mint.reshape(x, (-1, self.head_dim // (2 * stride), 2, stride))
-                even = x[:, :, 0, :]
-                odd = x[:, :, 1, :]
-                x = mint.cat((even + odd, even - odd), dim=-1)
-                x = mint.reshape(x, original_shape)
-                stride *= 2
-            x = x * self.scale
-            return ops.cast(x, input_dtype)
         if self.hadamard_mat is None:
             self.hadamard_mat = Tensor(hadamard(self.head_dim), mstype.float32)
+        if self.use_fp32_matrix:
+            input_dtype = x.dtype
+            x = ops.cast(x, mstype.float32)
+            x = self.linear(x, self.hadamard_mat)
+            x = x * self.scale
+            return ops.cast(x, input_dtype)
         x = self.linear(x, self.hadamard_mat.astype(x.dtype))
         x = x * self.scale
         return x
