@@ -48,9 +48,9 @@ class VocabEmbedding(nn.Cell):
         super().__init__()
         self.num_embeddings = num_embeddings
         self.embedding_dim = embedding_dim
-        # use gather instead of embedding to avoid the error of hyper-parllel
-        self.embedding = mint.gather
-        self.tile = mint.tile
+        # Use index_select instead of embedding to avoid the error of hyper-parallel
+        # without expanding each token id across the embedding dimension.
+        self.index_select = mint.index_select
         self.reshape = mint.reshape
 
         self.init_method = init_method
@@ -65,11 +65,11 @@ class VocabEmbedding(nn.Cell):
         """
         Forward of vocab embedding.
 
-        Plain single-card gather: ``input_`` are the token ids to look up and ``weight``
+        Plain single-card index select: ``input_`` are the token ids to look up and ``weight``
         the (possibly this-rank's local shard of a Shard(0) DTensor) embedding table.
         Under vocab parallelism the ids are pre-mapped to this rank's local range and the
         output is masked + reduced by the parallelize pre/post hooks, so this stays a
-        plain per-token gather with no tensor-parallel logic.
+        plain per-token lookup with no tensor-parallel logic.
 
         input_: (B, S)
         weight: (V, H)  (V/t local shard under vocab parallelism)
@@ -80,9 +80,8 @@ class VocabEmbedding(nn.Cell):
         _, seq_len = input_.shape
         weight = self.weight.to_local() if isinstance(self.weight, DTensor) else self.weight
 
-        input_ = self.reshape(input_, (-1, 1))
-        input_ = self.tile(input_, (1, self.embedding_dim))
-        output = self.embedding(weight, 0, input_)
+        input_ = self.reshape(input_, (-1,))
+        output = self.index_select(weight, 0, input_)
         output = self.reshape(output, (-1, seq_len, self.embedding_dim))
 
         return output

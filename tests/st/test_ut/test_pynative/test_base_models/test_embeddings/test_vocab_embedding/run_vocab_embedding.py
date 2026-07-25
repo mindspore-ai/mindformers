@@ -71,10 +71,25 @@ class VocabEmbeddingRunner:
         return net
 
     def run(self):
-        """Run the model with given inputs"""
+        """Run the model and validate repeated-token gradient accumulation."""
         net = self.build_model()
 
         output = net(self.inputs)
+
+        def loss_fn(input_ids):
+            return net(input_ids).sum()
+
+        _, param_grads = ms.value_and_grad(
+            loss_fn, grad_position=None, weights=net.trainable_params()
+        )(self.inputs)
+        expected_row_counts = np.bincount(
+            self.inputs.asnumpy().reshape(-1), minlength=self.num_embeddings
+        )
+        expected_weight_grad = np.repeat(
+            expected_row_counts[:, None], self.embedding_dim, axis=1
+        )
+        np.testing.assert_array_equal(param_grads[0].asnumpy(), expected_weight_grad)
+
         output_ms = {"output": output}
 
         if self.rank_id is None or int(self.rank_id) == 0:

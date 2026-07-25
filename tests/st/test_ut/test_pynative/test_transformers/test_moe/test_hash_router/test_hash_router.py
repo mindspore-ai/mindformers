@@ -23,6 +23,7 @@ Test Procedure:
 usage:
     pytest tests/st/test_ut/test_pynative/test_transformers/test_moe/test_hash_router/test_hash_router.py -v
 """
+# pylint: disable=protected-access
 
 from pathlib import Path
 import subprocess
@@ -30,6 +31,11 @@ import subprocess
 import numpy as np
 import pytest
 
+import mindspore as ms
+from mindspore import Tensor, context
+
+from mindformers.parallel_core.transformer_config import TransformerConfig
+from mindformers.pynative.transformers.moe.router import TopKRouter
 from tests.utils.double_benchmark import DoubleBenchmarkComparator, DoubleBenchmarkStandard
 
 from .hash_routing_data_gen import (
@@ -210,4 +216,53 @@ class TestHashRouterPrecision:
         assert abs(expected_raw_aux - natural_raw_aux) > 1.0e-4
         np.testing.assert_allclose(
             output["load_balancing_loss"], natural_raw_aux, rtol=0.0, atol=2.0e-6
+        )
+
+    @pytest.mark.level0
+    @pytest.mark.platform_arm_ascend910b_training
+    @pytest.mark.env_onecard
+    def test_hash_force_balance_overrides_lookup_table(self):
+        """Hash routing honors the force-balance round-robin override."""
+        context.set_context(mode=context.PYNATIVE_MODE)
+        num_tokens, num_experts, top_k = 8, 4, 2
+        config = TransformerConfig(
+            hidden_size=16,
+            num_attention_heads=4,
+            num_layers=1,
+            num_moe_experts=num_experts,
+            moe_router_topk=top_k,
+            moe_router_score_function="sigmoid",
+            moe_router_topk_scaling_factor=0.5,
+            moe_router_dtype="float32",
+            moe_router_force_expert_balance=True,
+            moe_n_hash_layers=1,
+            actual_vocab_size=num_tokens,
+            add_bias_linear=False,
+        )
+        router = TopKRouter(config, layer_number=0)
+        router.tid2eid.set_data(
+            Tensor(np.zeros((num_tokens, top_k), dtype=np.int32))
+        )
+        scores_np = np.arange(
+            1, num_tokens * num_experts + 1, dtype=np.float32
+        ).reshape(num_tokens, num_experts)
+        input_ids = Tensor(
+            np.arange(num_tokens, dtype=np.int32).reshape(2, -1)
+        )
+
+        top_scores, selected_experts_indices = router._hash_routing(
+            Tensor(scores_np), input_ids
+        )
+
+        expected_indices = (
+            np.arange(num_tokens * top_k).reshape(num_tokens, top_k) % num_experts
+        )
+        expected_scores = np.take_along_axis(scores_np, expected_indices, axis=1)
+        expected_scores /= expected_scores.sum(axis=1, keepdims=True)
+        expected_scores *= 0.5
+        np.testing.assert_array_equal(
+            selected_experts_indices.asnumpy(), expected_indices
+        )
+        np.testing.assert_allclose(
+            top_scores.asnumpy(), expected_scores, rtol=0.0, atol=1.0e-7
         )

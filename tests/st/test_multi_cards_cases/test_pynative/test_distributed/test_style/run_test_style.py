@@ -18,16 +18,21 @@ import argparse
 import numpy as np
 
 import mindspore as ms
-from mindspore import nn, Tensor, mint
+from mindspore import nn, Parameter, Tensor, mint
 from mindspore.communication import get_rank, init
 
 from hyper_parallel import DTensor, init_device_mesh
+from hyper_parallel.core.dtensor.dtensor import distribute_tensor
+from hyper_parallel.core.dtensor.placement_types import Shard
+from mindformers.parallel_core.utils.init_method import init_method_normal
+from mindformers.pynative.base_models.common.embeddings.vocab_embedding import VocabEmbedding
 from mindformers.pynative.distributed.style import (
     ColwiseParallel,
     RowwiseParallel,
     SequenceParallel,
 )
 from mindformers.pynative.layers.linear import Linear
+from mindformers.pynative.optimizer.adamw import AdamW
 
 
 class _TwoLinear(nn.Cell):
@@ -185,6 +190,67 @@ def run_automatic_input_sharding(mesh):
     print("RowwiseParallel/SequenceParallel input sharding backward PASSED")
 
 
+def run_vocab_embedding(mesh):
+    """Validate vocab-row sharding, sequence reduction, and repeated-token gradients."""
+    rank = get_rank()
+    token_ids = Tensor([[0, 5, 1, 7], [6, 2, 5, 3]], ms.int32)
+    weight = np.arange(32, dtype=np.float32).reshape(8, 4)
+
+    def build_embedding():
+        embedding = VocabEmbedding(
+            num_embeddings=8,
+            embedding_dim=4,
+            init_method=init_method_normal(0.01, ms.float32),
+        )
+        embedding.weight.set_data(Tensor(weight))
+        return embedding
+
+    def forward_and_grads(embedding):
+        def loss_fn(input_ids):
+            return mint.sum(embedding(input_ids))
+
+        grad_fn = ms.value_and_grad(
+            loss_fn, grad_position=None, weights=embedding.trainable_params()
+        )
+        _, param_grads = grad_fn(token_ids)
+        return embedding(token_ids), param_grads
+
+    ref_output, ref_param_grads = forward_and_grads(build_embedding())
+    parallel = build_embedding()
+    RowwiseParallel()._apply(parallel, mesh)
+    output, param_grads = forward_and_grads(parallel)
+
+    np.testing.assert_allclose(
+        output.asnumpy(), np.split(ref_output.asnumpy(), 2, axis=1)[rank], rtol=1e-5, atol=1e-5
+    )
+    np.testing.assert_allclose(
+        _local(param_grads[0]).asnumpy(),
+        np.split(ref_param_grads[0].asnumpy(), 2, axis=0)[rank],
+        rtol=1e-5,
+        atol=1e-5,
+    )
+    print("VocabEmbedding RowwiseParallel forward/backward PASSED")
+
+
+def run_adamw_dtensor_master(mesh):
+    """Validate that direct fp32 master casting preserves the DTensor layout."""
+    source = Tensor(np.arange(32).reshape(8, 4), ms.bfloat16)
+    model_param = Parameter(
+        distribute_tensor(source, mesh, (Shard(0),)), name="distributed_weight"
+    )
+    optimizer = AdamW([model_param])
+    master = optimizer.fp32_params[0]
+
+    assert isinstance(master, DTensor)
+    assert isinstance(master, Parameter)
+    assert master.dtype == ms.float32
+    assert master.layout.alias_placements == model_param.layout.alias_placements
+    np.testing.assert_array_equal(
+        master.to_local().asnumpy(), model_param.to_local().float().asnumpy()
+    )
+    print("AdamW DTensor fp32 master PASSED")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Run local style distributed gradient tests")
     parser.add_argument("--tp", type=int, default=2)
@@ -197,6 +263,8 @@ def main():
     run_rowwise_all_reduce(mesh)
     run_colwise_gather_output(mesh)
     run_automatic_input_sharding(mesh)
+    run_vocab_embedding(mesh)
+    run_adamw_dtensor_master(mesh)
 
 
 if __name__ == "__main__":
