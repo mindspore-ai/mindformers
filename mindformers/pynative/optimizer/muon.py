@@ -2071,7 +2071,9 @@ class Muon(Optimizer):
             if param.dtype in _LOW_PRECISION_DTYPES:
                 is_low_precision.append(True)
                 lp_count += 1
-                main_param = Parameter(param.clone().float(), name=f"main_param.{param.name}")
+                # Let Parameter own the fp32 cast directly; clone().float() can
+                # retain the intermediate low-precision clone storage.
+                main_param = Parameter(param.float(), name=f"main_param.{param.name}")
                 fp32_params.append(main_param)
             else:
                 is_low_precision.append(False)

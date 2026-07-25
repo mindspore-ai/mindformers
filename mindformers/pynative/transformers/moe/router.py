@@ -319,7 +319,13 @@ class TopKRouter(nn.Cell):
             mstype.int64
         )
 
-        top_scores = self.gather(scores, dim=1, index=selected_experts_indices)
+        if self._debug_force_load_balance:
+            (
+                selected_experts_indices,
+                top_scores,
+            ) = self._debug_force_load_balance_routing(scores, selected_experts_indices)
+        else:
+            top_scores = self.gather(scores, dim=1, index=selected_experts_indices)
         if self.score_func != "softmax":
             denominator = self.sum(top_scores, dim=-1, keepdim=True) + 1e-20
             top_scores = self.div(top_scores, denominator)
