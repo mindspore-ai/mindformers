@@ -34,6 +34,7 @@ import pytest
 
 import mindspore as ms
 from mindspore import Tensor, Parameter, nn, mint, dtype as mstype
+from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
 
 from mindformers.pynative.optimizer import muon as muon_mod
 from mindformers.pynative.optimizer.muon import Muon, newton_schulz
@@ -131,6 +132,50 @@ class TestMuonConfig:
     @pytest.mark.level0
     @pytest.mark.platform_x86_cpu
     @pytest.mark.env_onecard
+    def test_expert_muon_redist_only_materializes_dim1(self, monkeypatch):
+        """Only a grouped 3D expert weight receives the Shard(1) compatibility path."""
+        class _FakeDTensor:
+            def __init__(self, placements):
+                self.shape = (8, 16, 32)
+                self.placements = placements
+                self.device_mesh = "expert_mesh"
+
+        monkeypatch.setattr(muon_mod, "DTensor", _FakeDTensor)
+
+        dim0_only = _FakeDTensor((Shard(0), Replicate()))
+        assert muon_mod._get_expert_muon_redist_spec(
+            dim0_only, "layers.0.mlp.experts.weight1") is None
+
+        dim1_sharded = _FakeDTensor((Shard(0), Shard(1)))
+        assert muon_mod._get_expert_muon_redist_spec(
+            dim1_sharded, "layers.0.attention.weight") is None
+        assert muon_mod._get_expert_muon_redist_spec(
+            dim1_sharded, "layers.0.mlp.experts.weight1") == (
+                "expert_mesh",
+                (Shard(0), Shard(1)),
+                (Shard(0), Replicate()),
+            )
+
+    @pytest.mark.level0
+    @pytest.mark.platform_x86_cpu
+    @pytest.mark.env_onecard
+    def test_muon_rejects_non_expert_3d_weight(self):
+        """3D Muon weights must match the grouped-expert special case."""
+        assert muon_mod._select_muon_matmul_op(
+            3, "layers.0.mlp.experts.weight1", (8, 16, 32)) is mint.bmm
+        assert muon_mod._select_muon_matmul_op(
+            3, "layers.0.mlp.experts.weight2", (8, 32, 16)) is mint.bmm
+
+        with pytest.raises(ValueError, match="only supports 3D weights from grouped experts"):
+            muon_mod._select_muon_matmul_op(
+                3, "layers.0.attention.weight", (8, 16, 32))
+        with pytest.raises(ValueError, match="only supports 3D weights from grouped experts"):
+            muon_mod._select_muon_matmul_op(
+                3, "layers.0.mlp.experts.weight3", (8, 16, 32))
+
+    @pytest.mark.level0
+    @pytest.mark.platform_x86_cpu
+    @pytest.mark.env_onecard
     def test_bound_phase4_groups(self):
         """
         Feature: memory-bounded Phase 4 Muon batching.
@@ -207,8 +252,8 @@ class TestMuonConfig:
     def test_build_muon_filter_default(self):
         """
         Feature: Muon._build_muon_filter default routing.
-        Description: 2D/3D weights take Muon; 1D weights and embedding/output-layer
-            weights take AdamW (returns False).
+        Description: 2D/3D weights take Muon; unsupported 3D weights are rejected
+            later by the update path. 1D, embedding, and output-layer weights take AdamW.
         Expectation: predicate matches the documented default behaviour.
         """
         muon_filter = Muon._build_muon_filter(None)
@@ -218,6 +263,7 @@ class TestMuonConfig:
 
         assert muon_filter(_p((4, 6), "layers.0.attention.weight")) is True
         assert muon_filter(_p((2, 4, 6), "layers.0.experts.weight")) is True
+        assert muon_filter(_p((2, 4, 6), "layers.0.attention.weight")) is True
         assert muon_filter(_p((6,), "layers.0.bias")) is False
         assert muon_filter(_p((4, 6), "embedding.word_embeddings.weight")) is False
         assert muon_filter(_p((4, 6), "head.output_layer.weight")) is False
