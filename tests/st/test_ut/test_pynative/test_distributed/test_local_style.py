@@ -14,6 +14,8 @@
 # ============================================================================
 """Unit tests for local-tensor parallel styles."""
 
+from types import SimpleNamespace
+
 import pytest
 import mindspore as ms
 from mindspore import Tensor, nn
@@ -52,9 +54,48 @@ class _FakeMesh:
         return 1
 
 
+class _CountingMesh:
+    """Track mesh metadata lookups made while binding and running hooks."""
+
+    def __init__(self):
+        self.calls = {"size": 0, "get_group": 0, "get_local_rank": 0}
+
+    def size(self):
+        self.calls["size"] += 1
+        return 2
+
+    def get_group(self):
+        self.calls["get_group"] += 1
+        return "tp-group"
+
+    def get_local_rank(self):
+        self.calls["get_local_rank"] += 1
+        return 1
+
+
+class _TraceTensor:
+    """Minimal tensor-like object recording layout-normalization operations."""
+
+    def __init__(self):
+        self.calls = []
+
+    def movedim(self, source, destination):
+        self.calls.append(("movedim", source, destination))
+        return self
+
+    def contiguous(self):
+        self.calls.append(("contiguous",))
+        return self
+
+
 class _Identity(nn.Cell):
     def construct(self, value):
         return value
+
+
+class _TwoInputIdentity(nn.Cell):
+    def construct(self, value, other):
+        return value, other
 
 
 class _FakeHPStyle:
@@ -73,21 +114,19 @@ def fixture_mock_local_runtime(monkeypatch):
     """Avoid parameter conversion and emulate two-rank collectives on CPU."""
     plans = []
 
-    def fake_distribute_module(module, device_mesh, parameter_shard_plan, input_fn, output_fn):
-        del device_mesh, input_fn, output_fn
+    def fake_distribute_module(  # pylint: disable=unused-argument
+        module, device_mesh, parameter_shard_plan, input_fn, output_fn
+    ):
         plans.append(parameter_shard_plan)
         return module
 
-    def fake_all_gather(unused_output, value, group):
-        del unused_output, group
+    def fake_all_gather(unused_output, value, group):  # pylint: disable=unused-argument
         return style_module.mint.cat((value, value), dim=0), None
 
-    def fake_reduce_scatter(unused_output, value, group):
-        del unused_output, group
+    def fake_reduce_scatter(unused_output, value, group):  # pylint: disable=unused-argument
         return value[: value.shape[0] // 2], None
 
-    def fake_all_reduce(value, group):
-        del group
+    def fake_all_reduce(value, group):  # pylint: disable=unused-argument
         return value * 2, None
 
     monkeypatch.setattr(style_module, "distribute_module", fake_distribute_module)
@@ -99,9 +138,10 @@ def fixture_mock_local_runtime(monkeypatch):
 
 @pytest.mark.level0
 @pytest.mark.platform_x86_cpu
-def test_local_transforms_cover_dims_and_validation(mock_local_runtime):
+def test_local_transforms_cover_dims_and_validation(  # pylint: disable=unused-argument
+    mock_local_runtime,
+):
     """AllGather and ShardTensor support arbitrary valid dimensions."""
-    del mock_local_runtime
     mesh = _FakeMesh()
     value = Tensor([[[0], [1]], [[2], [3]]])
 
@@ -123,12 +163,12 @@ def test_local_transforms_cover_dims_and_validation(mock_local_runtime):
 
 @pytest.mark.level0
 @pytest.mark.platform_x86_cpu
-def test_shard_then_gather_reduces_backward(monkeypatch, mock_local_runtime):
+def test_shard_then_gather_reduces_backward(  # pylint: disable=unused-argument
+    monkeypatch, mock_local_runtime
+):
     """Shard -> AllGather is identity forward and sums rank-local backward parts."""
-    del mock_local_runtime
 
-    def fake_reduce_scatter(unused_output, value, group):
-        del unused_output, group
+    def fake_reduce_scatter(unused_output, value, group):  # pylint: disable=unused-argument
         half = value.shape[0] // 2
         return value[:half] + value[half:], None
 
@@ -143,6 +183,99 @@ def test_shard_then_gather_reduces_backward(monkeypatch, mock_local_runtime):
         return (gathered * weights).sum()
 
     assert ms.grad(objective)(value).asnumpy().tolist() == [3.0, 3.0, 3.0, 3.0]
+
+
+@pytest.mark.level0
+@pytest.mark.platform_x86_cpu
+def test_local_transform_hooks_cache_mesh_metadata(  # pylint: disable=unused-argument
+    mock_local_runtime,
+):
+    """Repeated hot-path AllGather hooks reuse mesh metadata bound at apply time."""
+
+    linear_mesh = _CountingMesh()
+    linear = Linear(4, 4, "float32", "float32", bias=False)
+    value = Tensor(
+        [[[1, 1, 1, 1]], [[2, 2, 2, 2]]], dtype=linear.compute_dtype
+    )
+    ColwiseParallel(gather_input=True)._apply(linear, linear_mesh)
+    calls_after_apply = linear_mesh.calls.copy()
+    linear(value)
+    linear(value)
+    assert linear_mesh.calls == calls_after_apply
+    assert calls_after_apply == {"size": 0, "get_group": 1, "get_local_rank": 0}
+
+    prepare_mesh = _CountingMesh()
+    identity = _TwoInputIdentity()
+    PrepareModuleInput(input_transforms=(AllGather(0), None))._apply(
+        identity, prepare_mesh
+    )
+    calls_after_apply = prepare_mesh.calls.copy()
+    other = Tensor([1])
+    identity(value, other)
+    identity(value, other)
+    assert prepare_mesh.calls == calls_after_apply
+    assert calls_after_apply == {"size": 0, "get_group": 1, "get_local_rank": 0}
+
+
+@pytest.mark.level0
+@pytest.mark.platform_x86_cpu
+def test_dim_zero_collectives_skip_axis_moves(monkeypatch):
+    """The common sequence-dimension path avoids redundant movedim operations."""
+    collective_calls = []
+
+    def fake_all_gather(unused_output, value, group):  # pylint: disable=unused-argument
+        collective_calls.append(("all_gather", group))
+        return value, None
+
+    def fake_reduce_scatter(unused_output, value, group):  # pylint: disable=unused-argument
+        collective_calls.append(("reduce_scatter", group))
+        return value, None
+
+    monkeypatch.setattr(style_module.comm_func, "all_gather_into_tensor", fake_all_gather)
+    monkeypatch.setattr(style_module.comm_func, "reduce_scatter_tensor", fake_reduce_scatter)
+
+    gather_value = _TraceTensor()
+    assert style_module._all_gather_dim(gather_value, 0, "tp-group") is gather_value
+    assert gather_value.calls == [("contiguous",)]
+
+    scatter_value = _TraceTensor()
+    assert style_module._reduce_scatter_dim(scatter_value, 0, "tp-group") is scatter_value
+    assert scatter_value.calls == [("contiguous",)]
+    assert collective_calls == [
+        ("all_gather", "tp-group"),
+        ("reduce_scatter", "tp-group"),
+    ]
+
+
+@pytest.mark.level0
+@pytest.mark.platform_x86_cpu
+def test_all_gather_backward_modes(mock_local_runtime):  # pylint: disable=unused-argument
+    """AllGather uses ReduceScatter or a rank-local slice according to its contract."""
+    value = Tensor([[[0], [1]], [[2], [3]]])
+    grad_output = Tensor([[[0], [1], [2], [3]], [[4], [5], [6], [7]]])
+
+    reduce_ctx = SimpleNamespace()
+    gathered = style_module._AllGatherFunction.forward(
+        reduce_ctx, value, 1, "tp-group"
+    )
+    assert gathered.asnumpy().tolist() == [
+        [[0], [1], [0], [1]],
+        [[2], [3], [2], [3]],
+    ]
+    reduced_grad = style_module._AllGatherFunction.backward(
+        reduce_ctx, grad_output
+    )[0]
+    assert reduced_grad.asnumpy().tolist() == [[[0], [1]], [[4], [5]]]
+
+    slice_ctx = SimpleNamespace()
+    gathered = style_module._AllGatherSliceFunction.forward(
+        slice_ctx, value, 1, "tp-group", 2, 1
+    )
+    assert gathered.shape == (2, 4, 1)
+    sliced_grad = style_module._AllGatherSliceFunction.backward(
+        slice_ctx, grad_output
+    )[0]
+    assert sliced_grad.asnumpy().tolist() == [[[2], [3]], [[6], [7]]]
 
 
 @pytest.mark.level0
@@ -215,9 +348,10 @@ def test_rowwise_communication_modes(mock_local_runtime, reduce_mode, expected_s
 
 @pytest.mark.level0
 @pytest.mark.platform_x86_cpu
-def test_prepare_styles_handle_args_kwargs_and_outputs(mock_local_runtime):
+def test_prepare_styles_handle_args_kwargs_and_outputs(  # pylint: disable=unused-argument
+    mock_local_runtime,
+):
     """Prepare styles transform selected args/kwargs and preserve untouched values."""
-    del mock_local_runtime
     mesh = _FakeMesh()
     value = Tensor([[[0]], [[1]], [[2]], [[3]]])
     other = Tensor([9])
