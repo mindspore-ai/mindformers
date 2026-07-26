@@ -55,8 +55,12 @@ class TestPrepareModule:
             f"{run_script_path}",
             "--tp=2",
         ]
+        env = os.environ.copy()
+        socket_start = min(int(env.get("HCCL_IF_BASE_PORT", port_id + 1)), 65400)
+        socket_end = min(socket_start + 34, 65535)
+        env.setdefault("HCCL_NPU_SOCKET_PORT_RANGE", f"{socket_start}-{socket_end}")
         result = subprocess.run(
-            cmd, shell=False, capture_output=True, text=True, check=False,
+            cmd, shell=False, capture_output=True, text=True, check=False, env=env,
         )
         assert result.returncode == 0, (
             f"Local style script failed with non-zero exit code: "

@@ -26,8 +26,8 @@ Key design points
 -----------------
 Single HCCL stream funnel
     Every EP all-to-all on a group (counts, main token, combine — the
-    routing-map a2a is gone, the post-dispatch resort is a fixed chunk
-    permutation applied on device) routes through ``comm_func.all_to_all_single`` / the hyper_parallel
+    routing-map a2a is gone, and the post-dispatch resort is local) routes
+    through ``comm_func.all_to_all_single`` / the hyper_parallel
     platform's ``all_to_all_single`` path.  Using ``ops.AlltoAll`` /
     ``ops.AlltoAllV`` Primitives would dispatch on a *different* stream from
     ``comm_func.all_to_all_single``, so mixing them under dual-thread overlap
@@ -170,11 +170,9 @@ class OverlapExpertParallel(ExpertParallel):
         (small host list) -> async main a2a -> B hook.
 
         Reading the chunk counts consumes only the already-complete counts a2a, so
-        it does not force the async main a2a's lazy wait — the device-side
-        ``split``/``cat`` resort (:meth:`_resort_after_dispatch`) after B is what
-        consumes the async output, preserving the overlap window. Replaces the
-        routing-map a2a (a third collective) + device sort with the fixed chunk
-        permutation of :meth:`_chunk_perm`.
+        it does not force the async main a2a's lazy wait. The local fused permute
+        (or split/cat fallback) after B consumes the async output, preserving the
+        overlap window without a routing-map collective.
         """
         flat_in = self._sync_hook(flat_in, "A")
         num_tokens_per_expert_group = self._counts_a2a(num_tokens_per_expert, ep_degree)
@@ -184,8 +182,15 @@ class OverlapExpertParallel(ExpertParallel):
             num_tokens_per_expert, num_tokens_per_expert_group, ep_degree)
         num_tokens_per_expert = self._compute_group_list(num_tokens_per_expert_group, ep_degree)
         flat_out = self._main_a2a(flat_in, input_splits, output_splits, block_size)
+        # The routing map depends only on the completed counts a2a. Build it
+        # after launching the async token a2a so repeat_interleave overlaps HCCL.
+        resort_routing_map = self._build_resort_routing_map(
+            num_tokens_per_expert_group, group_counts, ep_degree)
         flat_out = self._sync_hook(flat_out, "B")
-        return flat_out, group_counts, input_splits, output_splits, num_tokens_per_expert
+        return (
+            flat_out, group_counts, input_splits, output_splits,
+            num_tokens_per_expert, resort_routing_map
+        )
 
     def _dispatch_a2a(self, flat_in, host_buf, event, num_tokens_per_expert_group,
                       num_experts, ep_degree, block_size):
@@ -204,8 +209,14 @@ class OverlapExpertParallel(ExpertParallel):
             host_buf.tolist(), num_experts, ep_degree)
         num_tokens_per_expert = self._compute_group_list(num_tokens_per_expert_group, ep_degree)
         flat_out = self._main_a2a(flat_in, input_splits, output_splits, block_size)
+        # Keep the same overlap window as the synchronous-D2H dispatch path.
+        resort_routing_map = self._build_resort_routing_map(
+            num_tokens_per_expert_group, group_counts, ep_degree)
         flat_out = self._sync_hook(flat_out, "B")
-        return flat_out, group_counts, input_splits, output_splits, num_tokens_per_expert
+        return (
+            flat_out, group_counts, input_splits, output_splits,
+            num_tokens_per_expert, resort_routing_map
+        )
 
     def _combine_comm(self, flat_in, input_splits, output_splits, block_size):
         """Overlap combine comm: C hook -> async combine a2a -> D / D_LAST hook."""
