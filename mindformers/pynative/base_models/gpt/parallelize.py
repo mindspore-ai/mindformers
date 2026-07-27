@@ -1438,8 +1438,8 @@ def apply_context_parallel_attention(
         setattr(model_config, "_mf_runtime_ulysses_degree_in_cp", ulysses_degree)
         setattr(model_config, "_mf_runtime_cp_rank_list", tuple(cp_mesh.rank_list))
         rotary_pos_emb = getattr(gpt_model, "rotary_pos_emb", None)
-        if rotary_pos_emb is not None and hasattr(rotary_pos_emb, "use_position_ids"):
-            setattr(rotary_pos_emb, "use_position_ids", True)
+        if rotary_pos_emb is not None and hasattr(rotary_pos_emb, "use_rotary_position_ids"):
+            gpt_model.set_use_rotary_position_ids(True)
             # Context parallel forces explicit position_ids, so the rotary cos/sin carries a
             # per-batch dimension. The fused interleaved RoPE op (apply_rope_fusion) does not
             # support non-broadcast batch>1 cos/sin and fails in tiling. Reject the combo early.

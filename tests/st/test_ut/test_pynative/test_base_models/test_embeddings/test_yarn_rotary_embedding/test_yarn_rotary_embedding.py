@@ -29,7 +29,7 @@ SINGLE_CARD_TEST_CASES = [
     (
         {"rotary_percent": 1, "rotary_interleaved": False, "seq_len_interpolation_factor": None,
          "original_max_position_embeddings": 4096, "beta_fast": 32, "beta_slow": 1, "mscale": 1,
-         "mscale_all_dim": 0, "use_position_ids": False},
+         "mscale_all_dim": 0, "use_rotary_position_ids": False},
         {"output": "output_1", "mscale": "mscale_1"},
     ),
 ]
@@ -37,7 +37,7 @@ SINGLE_CARD_ONLY_FUNC_TEST_CASES = [
     (
         {"rotary_percent": 1, "rotary_interleaved": False, "seq_len_interpolation_factor": None,
          "original_max_position_embeddings": 4096, "beta_fast": 32, "beta_slow": 1, "mscale": 1,
-         "mscale_all_dim": 0, "use_position_ids": True},
+         "mscale_all_dim": 0, "use_rotary_position_ids": True},
         {"output": "output_1", "mscale": "mscale_1"},
     ),
 ]
@@ -47,7 +47,7 @@ def build_msrun_command_list(
         worker_num, local_worker_num, log_dir, run_script_path,
         kv_channels, rotary_percent, rotary_interleaved, seq_len_interpolation_factor, original_max_position_embeddings,
         beta_fast, beta_slow, mscale, mscale_all_dim,
-        output_path_param, tensor_parallel, use_position_ids
+        output_path_param, tensor_parallel, use_rotary_position_ids
     ):
     """ Build the msrun command with the specified parameters. """
     if worker_num == 1 and local_worker_num == 1:
@@ -73,7 +73,7 @@ def build_msrun_command_list(
         f"--mscale_all_dim={mscale_all_dim}",
         f"--output_path={output_path_param}",
         f"--tensor_parallel={tensor_parallel}",
-        f"--use_position_ids={use_position_ids}",
+        f"--use_rotary_position_ids={use_rotary_position_ids}",
     ]
     if seq_len_interpolation_factor is not None:
         cmd_list.append(f"--seq_len_interpolation_factor={seq_len_interpolation_factor}")
@@ -141,7 +141,7 @@ class TestYarnRotaryEmbedding:
             mscale_all_dim=model_args["mscale_all_dim"],
             output_path_param=output_file_path,
             tensor_parallel=tensor_parallel,
-            use_position_ids=model_args["use_position_ids"]
+            use_rotary_position_ids=model_args["use_rotary_position_ids"]
         )
 
         result = subprocess.run(

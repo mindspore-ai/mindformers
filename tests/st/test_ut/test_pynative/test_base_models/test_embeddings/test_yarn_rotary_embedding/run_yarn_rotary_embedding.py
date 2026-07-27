@@ -38,14 +38,14 @@ class YarnRotaryEmbeddingRunner:
         self.beta_slow = self.args.beta_slow
         self.mscale = self.args.mscale
         self.mscale_all_dim = self.args.mscale_all_dim
-        self.use_position_ids = self.args.use_position_ids
+        self.use_rotary_position_ids = self.args.use_rotary_position_ids
 
         init_params = get_init_params()
 
         self.max_seq_len = init_params.get("max_seq_len")
         self.offset = init_params.get("offset")
         self.position_ids = None
-        if self.use_position_ids:
+        if self.use_rotary_position_ids:
             self.position_ids = ms.Tensor(init_params.get("position_ids"), ms.int32)
 
         # RANK_ID and worker_num are set by msrun environment
@@ -74,7 +74,7 @@ class YarnRotaryEmbeddingRunner:
             beta_slow=self.beta_slow,
             mscale=self.mscale,
             mscale_all_dim=self.mscale_all_dim,
-            use_position_ids=self.use_position_ids
+            use_rotary_position_ids=self.use_rotary_position_ids
         )
         return net
 
@@ -109,7 +109,7 @@ def main():
     parser.add_argument("--mscale_all_dim", type=float, default=0.0)
     parser.add_argument("--output_path", type=str, default="output_ms.npz")
     parser.add_argument("--tensor_parallel", type=int, default=1)
-    parser.add_argument("--use_position_ids", type=lambda x: x.lower() == "true", default=False)
+    parser.add_argument("--use_rotary_position_ids", type=lambda x: x.lower() == "true", default=False)
 
     args = parser.parse_args()
 

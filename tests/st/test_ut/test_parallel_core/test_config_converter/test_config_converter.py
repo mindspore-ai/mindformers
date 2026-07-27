@@ -96,6 +96,21 @@ def test_convert_basic_returns_transformer_config():
 @pytest.mark.level0
 @pytest.mark.platform_x86_cpu
 @pytest.mark.env_onecard
+def test_convert_use_rotary_position_ids_is_independent_from_eod_reset():
+    """PyNative explicit rotary positions use their own model-side configuration."""
+    model_config = deepcopy(_make_minimal_model_config(
+        use_rotary_position_ids=True,
+        use_eod_reset=False,
+    ))
+    result = _TestConfigConverter.convert(model_config, is_mla_model=False)
+
+    assert result.use_rotary_position_ids is True
+    assert result.use_eod_reset is False
+
+
+@pytest.mark.level0
+@pytest.mark.platform_x86_cpu
+@pytest.mark.env_onecard
 def test_convert_is_mla_model_returns_mla_transformer_config():
     """
     Feature: ConfigConverter.convert returns MLATransformerConfig when is_mla_model=True.

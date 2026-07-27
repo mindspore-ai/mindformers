@@ -35,8 +35,7 @@ class RotaryEmbedding(nn.Cell):
         rotary_base (int): The base for rotary embedding.
         rope_scaling (bool): Whether to enable dynamic RoPE scaling.
         rope_scaling_factor (float): The scaling factor used in RoPE scaling.
-        use_position_ids (bool): Whether to honor explicit position_ids when provided.
-            Only enabled automatically under context parallel; non-CP uses self-generated positions.
+        use_rotary_position_ids (bool): Whether to honor explicit position_ids when provided.
     """
 
     def __init__(self,
@@ -47,7 +46,7 @@ class RotaryEmbedding(nn.Cell):
                  rotary_base: int = 10000,
                  rope_scaling: bool = False,
                  rope_scaling_factor: float = 8.0,
-                 use_position_ids: bool = False
+                 use_rotary_position_ids: bool = False
                  ):
         super().__init__()
         dim = kv_channels
@@ -56,7 +55,7 @@ class RotaryEmbedding(nn.Cell):
         self.mscale = 1.0
         self.seq_len_interpolation_factor = seq_len_interpolation_factor
         self.rotary_interleaved = rotary_interleaved
-        self.use_position_ids = use_position_ids
+        self.use_rotary_position_ids = use_rotary_position_ids
 
         inv_freq_np = 1.0 / (rotary_base ** (np.arange(0, dim, 2, dtype=np.float32) / dim))
         if rope_scaling:
@@ -118,7 +117,7 @@ class RotaryEmbedding(nn.Cell):
             Tensor: Embeddings after applying RoPE.
             Tensor: mscale, return to match yarn interface.
         """
-        explicit_position_ids = position_ids is not None and self.use_position_ids
+        explicit_position_ids = position_ids is not None and self.use_rotary_position_ids
         if not explicit_position_ids:
             bs = 1
             seq = self.arange(max_seq_len, dtype=self.inv_freq.dtype) + offset
