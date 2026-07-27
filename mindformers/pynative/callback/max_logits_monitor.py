@@ -41,42 +41,52 @@ class MaxLogitsMonitor(TrainerCallback):
 
     Args:
         step_interval (int, optional): Emit every N steps. Default: ``1``.
+        enable_logging (bool, optional): Whether to emit max-logit logs. The
+            per-step reset remains enabled when this is ``False``. Default:
+            ``True``.
     """
 
     def __init__(
         self,
         step_interval: int = 1,
+        enable_logging: bool = True,
     ):
         super().__init__()
         if not isinstance(step_interval, int) or step_interval <= 0:
             raise ValueError(
                 f"step_interval must be a positive int, got {step_interval!r}."
             )
+        if not isinstance(enable_logging, bool):
+            raise ValueError(
+                f"enable_logging must be a bool, got {enable_logging!r}."
+            )
 
         self.step_interval = step_interval
+        self.enable_logging = enable_logging
 
     def on_step_end(self, args, state, **kwargs):
         step = getattr(state, "global_step", 0)
-        model = _unwrap_model(kwargs.get("model"))
+        model = kwargs.get("model")
         if model is None:
             return
 
-        if self.step_interval > 1 and step % self.step_interval != 0:
-            _reset_max_attention_logit(model)
-            return
+        should_log = self.enable_logging and step % self.step_interval == 0
+        models = model if isinstance(model, (list, tuple)) else (model,)
+        for m in models:
+            try:
+                if not should_log:
+                    continue
 
-        for m in model:
-            # 1) collect per-layer Parameter values.
-            params = m.get_max_attention_logit()
-            if not params:
+                # 1) collect per-layer Parameter values.
+                params = m.get_max_attention_logit()
+                if not params:
+                    continue
+
+                # 2) dump.
+                self._dump(params, state)
+            finally:
+                # Reset every step regardless of the logging policy.
                 _reset_max_attention_logit(m)
-                return
-
-            # 2) dump.
-            self._dump(params, state)
-
-            # 3) reset for the next step.
-            _reset_max_attention_logit(m)
 
     @staticmethod
     def _fmt(v):
@@ -115,7 +125,7 @@ class MaxLogitsReset(MaxLogitsMonitor):
     """Deprecated: use MaxLogitsMonitor instead."""
 
     def __init__(self):
-        super().__init__(step_interval=1)
+        super().__init__(step_interval=1, enable_logging=False)
 
 
 def configure_max_logits_tracking(config, callbacks=None, optimizer=None):
@@ -165,9 +175,10 @@ def _needs_muon_qk_clip(optimizer):
 
 
 def _has_enabled_monitor(callbacks):
-    """Return whether callbacks contain a MaxLogitsMonitor."""
+    """Return whether callbacks contain a MaxLogitsMonitor that emits logs."""
     return any(
         _is_callback_type(callback, MaxLogitsMonitor)
+        and bool(_get_value(callback, "enable_logging", True))
         for callback in callbacks or []
     )
 
