@@ -201,12 +201,12 @@ class OverlapExpertParallel(ExpertParallel):
         only bracket the *main token a2a* with the A/B rendezvous. The deferred
         ``event.synchronize()`` waits solely on this rank's side-stream counts copy
         (a tiny, by-now-complete transfer) — it is NOT a cross-thread rendezvous, so
-        it does not couple with the coordinator's A/B/C/D barriers.
+        it does not couple with the coordinator's A/B/C/D barriers. During
+        recompute, the forward's cached host splits bypass both the D2H and wait.
         """
         flat_in = self._sync_hook(flat_in, "A")
-        event.synchronize()
-        input_splits, output_splits, group_counts = self._derive_splits(
-            host_buf.tolist(), num_experts, ep_degree)
+        input_splits, output_splits, group_counts = self._finish_async_d2h(
+            host_buf, event, num_experts, ep_degree)
         num_tokens_per_expert = self._compute_group_list(num_tokens_per_expert_group, ep_degree)
         flat_out = self._main_a2a(flat_in, input_splits, output_splits, block_size)
         # Keep the same overlap window as the synchronous-D2H dispatch path.

@@ -30,6 +30,10 @@ from mindformers.pynative.distributed.activation_checkpoint import (
     apply_recompute,
     apply_swap,
     _build_exclude_op_policy,
+    get_recompute_metadata,
+    is_in_recompute,
+    recompute_context_fn,
+    save_for_recompute,
 )
 
 
@@ -167,6 +171,86 @@ class TestFullRecompute:
         apply_recompute(model, rc, rc_comm)
         assert isinstance(model.layers[0], CheckpointWrapper)
         assert isinstance(model.layers[1], CheckpointWrapper)
+
+
+@pytest.mark.level0
+@pytest.mark.platform_x86_cpu
+@pytest.mark.env_onecard
+class TestRecomputeInvocationMetadata:
+    """Test checkpoint-local Python metadata shared by forward and replay."""
+
+    def test_forward_values_are_replayed_in_call_order(self):
+        """Replay forward metadata in FIFO call order."""
+        forward_ctx, replay_ctx = recompute_context_fn()
+        key = ("ep_splits", 0)
+
+        with forward_ctx:
+            assert not is_in_recompute()
+            assert save_for_recompute(key, ("first",))
+            assert save_for_recompute(key, ("second",))
+            assert get_recompute_metadata(key) is None
+
+        with replay_ctx:
+            assert is_in_recompute()
+            assert get_recompute_metadata(key) == ("first",)
+            assert get_recompute_metadata(key) == ("second",)
+
+        assert not is_in_recompute()
+        assert get_recompute_metadata(key) is None
+
+    def test_checkpoint_invocations_keep_isolated_metadata(self):
+        """Keep metadata isolated between checkpoint invocations."""
+        first_forward, first_replay = recompute_context_fn()
+        second_forward, second_replay = recompute_context_fn()
+        key = ("ep_splits", 0)
+
+        with first_forward:
+            save_for_recompute(key, "first")
+        with second_forward:
+            save_for_recompute(key, "second")
+
+        with second_replay:
+            assert get_recompute_metadata(key) == "second"
+        with first_replay:
+            assert get_recompute_metadata(key) == "first"
+
+    def test_missing_replay_metadata_raises(self):
+        _, replay_ctx = recompute_context_fn()
+        with replay_ctx:
+            with pytest.raises(RuntimeError, match="No forward metadata"):
+                get_recompute_metadata(("missing", 0))
+
+    def test_checkpoint_wrapper_shares_metadata_with_actual_replay(self):
+        """MindSpore checkpoint enters the paired contexts around forward/replay."""
+        class MetadataCell(nn.Cell):
+            """Cell that saves metadata in forward and consumes it during replay."""
+
+            def __init__(self):
+                super().__init__()
+                self.host_calls = 0
+                self.replay_calls = 0
+                self.key = ("metadata_cell", id(self))
+
+            def construct(self, x):
+                cached = get_recompute_metadata(self.key)
+                if cached is None:
+                    self.host_calls += 1
+                    save_for_recompute(self.key, "forward-value")
+                else:
+                    assert cached == "forward-value"
+                    self.replay_calls += 1
+                hidden = x * x
+                return hidden * hidden
+
+        cell = MetadataCell()
+        wrapped = ac_mod.checkpoint_wrapper(cell, context_fn=recompute_context_fn)
+        x = ops.ones((1,), ms.float32) * 2
+
+        grad = ms.grad(lambda value: wrapped(value).sum())(x)
+
+        assert grad.asnumpy().tolist() == [32.0]
+        assert cell.host_calls == 1
+        assert cell.replay_calls == 1
 
 
 @pytest.mark.level0

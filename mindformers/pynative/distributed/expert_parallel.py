@@ -28,6 +28,11 @@ from hyper_parallel.core.dtensor.dtensor import DTensor
 
 from mindformers.pynative.distributed.style import ParallelStyle
 from mindformers.pynative.distributed.utils import distribute_module
+from mindformers.pynative.distributed.activation_checkpoint import (
+    get_recompute_metadata,
+    is_in_recompute,
+    save_for_recompute,
+)
 from mindformers.pynative.transformers.moe.experts import GroupedMLP
 
 
@@ -82,6 +87,9 @@ class ExpertParallel(ParallelStyle):
         self.enable_async_d2h = async_d2h
         self.use_safe_tokens = use_safe_tokens
         self._d2h_stream = None
+        # The key is stable for this per-layer parallel style, while the values
+        # themselves live in a per-checkpoint-invocation context.
+        self._recompute_splits_key = ("expert_parallel_host_splits", id(self))
 
     # ------------------------------------------------------------------
     # Shared building blocks (used by this class and OverlapExpertParallel).
@@ -139,10 +147,16 @@ class ExpertParallel(ParallelStyle):
         Counts are exact integers in fp32 (histogram output, well below 2**24), so
         cast-then-sum on host is bit-identical to the former on-device sum-then-cast.
         """
+        cached = get_recompute_metadata(self._recompute_splits_key)
+        if cached is not None:
+            return cached
+
         num_experts = num_tokens_per_expert.shape[-1]
         both = self.concat((num_tokens_per_expert, num_tokens_per_expert_group), dim=-1)
         both = self.cast(both, mstype.int64).tolist()
-        return self._derive_splits(both, num_experts, ep_degree)
+        splits = self._derive_splits(both, num_experts, ep_degree)
+        save_for_recompute(self._recompute_splits_key, splits)
+        return splits
 
     @staticmethod
     def _derive_splits(both_host, num_experts, ep_degree):
@@ -177,6 +191,26 @@ class ExpertParallel(ParallelStyle):
         event = ms.runtime.Event()
         event.record(self._d2h_stream)
         return host_buf, event
+
+    def _finish_async_d2h(self, host_buf, event, num_experts, ep_degree):
+        """Resolve async D2H splits, or reuse the matching forward's host metadata.
+
+        The original checkpoint forward waits for the side-stream copy, derives
+        the Python split lists and saves them in its invocation-local context.
+        Replay consumes those lists without issuing or synchronizing another D2H.
+        """
+        cached = get_recompute_metadata(self._recompute_splits_key)
+        if cached is not None:
+            return cached
+
+        if host_buf is None or event is None:
+            raise RuntimeError(
+                "Async EP split metadata is unavailable outside a matching recompute replay."
+            )
+        event.synchronize()
+        splits = self._derive_splits(host_buf.tolist(), num_experts, ep_degree)
+        save_for_recompute(self._recompute_splits_key, splits)
+        return splits
 
     def _chunk_perm(self, ep_degree, num_local_experts):
         """Fixed chunk-permutation indices for the post-dispatch resort (Megatron
@@ -387,8 +421,9 @@ class ExpertParallel(ParallelStyle):
 
     def _dispatch_preprocess(self, topk_indices, num_experts, ep_degree):
         """Dispatch stage 1 (Megatron ``dispatch_preprocess``): count + counts a2a
-        + issue the batched counts D2H async on a side stream. Runs BEFORE the
-        permute so the permute fills the copy's overlap window.
+        + issue the batched counts D2H async on a side stream during the original
+        forward. Runs BEFORE the permute so the permute fills the copy's overlap
+        window. Recompute reuses the forward's host splits and skips the D2H.
 
         Counting the padded pre-permute ``topk_indices`` is valid because ``histc``
         is permutation-invariant. Returns ``(host_buf, event, num_tokens_per_expert_group)``;
@@ -397,19 +432,25 @@ class ExpertParallel(ParallelStyle):
         num_tokens_per_expert = self._count_tokens_per_expert(topk_indices, num_experts)
         self.ep_group = get_ep_group_name(get_rank(), ep_degree)
         num_tokens_per_expert_group = self._counts_a2a(num_tokens_per_expert, ep_degree)
-        both_counts = self.concat((num_tokens_per_expert, num_tokens_per_expert_group), dim=-1)
-        host_buf, event = self._issue_async_d2h(both_counts)
+        if is_in_recompute():
+            # The matching forward saved the resolved host split lists. Keep
+            # recomputing device-side routing/counts, but do not launch another D2H.
+            host_buf, event = None, None
+        else:
+            both_counts = self.concat((num_tokens_per_expert, num_tokens_per_expert_group), dim=-1)
+            host_buf, event = self._issue_async_d2h(both_counts)
         return host_buf, event, num_tokens_per_expert_group
 
     def _dispatch_a2a(self, flat_in, host_buf, event, num_tokens_per_expert_group,
                       num_experts, ep_degree, block_size):
-        """Dispatch stage 2 (Megatron ``dispatch_all_to_all``): sync the deferred
-        counts D2H, derive host splits, main token a2a. Overridden by
-        :class:`OverlapExpertParallel` to bracket the a2a with the A/B sync hooks.
+        """Dispatch stage 2 (Megatron ``dispatch_all_to_all``).
+
+        The original forward syncs the deferred counts D2H and saves the derived
+        host splits; recompute reuses them. Overridden by
+        :class:`OverlapExpertParallel` to bracket the main a2a with A/B sync hooks.
         """
-        event.synchronize()
-        input_splits, output_splits, group_counts = self._derive_splits(
-            host_buf.tolist(), num_experts, ep_degree)
+        input_splits, output_splits, group_counts = self._finish_async_d2h(
+            host_buf, event, num_experts, ep_degree)
         num_tokens_per_expert = self._compute_group_list(num_tokens_per_expert_group, ep_degree)
         resort_routing_map = self._build_resort_routing_map(
             num_tokens_per_expert_group, group_counts, ep_degree)

@@ -15,8 +15,10 @@
 """Pynative transformer helpers (recompute)."""
 
 import contextlib
+import contextvars
 import inspect
 import re
+from collections import defaultdict, deque
 from typing import Sequence, Tuple
 
 import regex
@@ -41,6 +43,10 @@ __all__ = [
     "apply_ac",
     "apply_recompute",
     "apply_swap",
+    "get_recompute_metadata",
+    "is_in_recompute",
+    "recompute_context_fn",
+    "save_for_recompute",
 ]
 
 _LAYER_ID_SPEC_PATTERN = re.compile(r"^(\d+)(?:-(\d+))?$")
@@ -55,37 +61,99 @@ _config_list = {}
 # the selective-checkpoint policy_fn because policy_fn is a per-op save/recompute
 # decision hook present only for `select` mode, whereas this context_fn brackets the
 # whole recompute re-run uniformly for both full and select modes.
-# ``_RECOMPUTE_DEPTH`` is a nesting depth (not per-layer state): the guard only needs
-# "are we inside any recompute". PyNative runs forward/recompute sequentially and each
-# marker brackets one recompute via try/finally, so depth is balanced and never leaks
-# across layers; nested recompute simply keeps depth > 0.
-_RECOMPUTE_DEPTH = 0
+# Besides marking the backward-time replay, the context owns tiny Python metadata
+# produced during the original forward and needed again during replay. This is used
+# by EP to retain host-side split lists, avoiding a second counts D2H. The state is
+# created per checkpoint invocation (rather than stored on the module), so pipeline
+# micro-batches, nested checkpoints and concurrent forward/backward threads do not
+# overwrite one another. A queue per key supports the same module being called more
+# than once within one checkpointed region.
+class _RecomputeInvocationState:
+    """Metadata shared by one checkpoint invocation's forward and replay contexts."""
+
+    def __init__(self):
+        self.metadata = defaultdict(deque)
+
+
+_RECOMPUTE_CONTEXT = contextvars.ContextVar("mindformers_recompute_context", default=None)
 
 
 @contextlib.contextmanager
-def recompute_marker():
-    """Mark the enclosed region as a backward-time recompute re-run."""
-    global _RECOMPUTE_DEPTH
-    _RECOMPUTE_DEPTH += 1
+def _recompute_phase(state, is_recompute):
+    """Activate one invocation-local forward or replay phase."""
+    token = _RECOMPUTE_CONTEXT.set((state, is_recompute))
     try:
         yield
     finally:
-        _RECOMPUTE_DEPTH -= 1
+        _RECOMPUTE_CONTEXT.reset(token)
+
+
+@contextlib.contextmanager
+def recompute_marker(state=None):
+    """Mark the enclosed region as a backward-time recompute re-run."""
+    if state is None:
+        state = _RecomputeInvocationState()
+    with _recompute_phase(state, is_recompute=True):
+        yield
 
 
 def recompute_context_fn():
     """``context_fn`` factory for ms.recompute(use_reentrant=False) / checkpoint_wrapper.
 
-    Returns ``(forward_ctx, recompute_ctx)``: the original forward runs under a no-op
-    context (side effects happen normally) while the backward-time recompute runs under
-    the marker, so the re-run is detected and skipped.
+    Returns ``(forward_ctx, recompute_ctx)`` sharing invocation-local metadata. The
+    original forward records small non-tensor values needed by replay, while the
+    backward-time recompute consumes them and is marked so one-shot side effects are
+    skipped.
     """
-    return contextlib.nullcontext(), recompute_marker()
+    state = _RecomputeInvocationState()
+    return (
+        _recompute_phase(state, is_recompute=False),
+        recompute_marker(state),
+    )
 
 
 def is_in_recompute() -> bool:
     """Return True while inside a backward-time activation recompute re-run."""
-    return _RECOMPUTE_DEPTH > 0
+    context = _RECOMPUTE_CONTEXT.get()
+    return context is not None and context[1]
+
+
+def save_for_recompute(key, value) -> bool:
+    """Save a small Python metadata value for this checkpoint invocation's replay.
+
+    The call is a no-op outside an original checkpoint forward. Values are queued
+    by ``key`` so repeated calls are replayed in original execution order.
+
+    Returns:
+        bool: Whether the value was saved in an active checkpoint context.
+    """
+    context = _RECOMPUTE_CONTEXT.get()
+    if context is None or context[1]:
+        return False
+    state, _ = context
+    state.metadata[key].append(value)
+    return True
+
+
+def get_recompute_metadata(key):
+    """Consume metadata saved by the matching original checkpoint forward.
+
+    Returns ``None`` outside a recompute replay. During replay a missing value is
+    an invariant violation: silently performing the host operation again would
+    hide an ordering/key bug and reintroduce the synchronization being avoided.
+    """
+    context = _RECOMPUTE_CONTEXT.get()
+    if context is None or not context[1]:
+        return None
+    state, _ = context
+    values = state.metadata.get(key)
+    if not values:
+        raise RuntimeError(
+            f"No forward metadata was saved for recompute key {key!r}. "
+            "Ensure the save and replay paths use the same checkpoint-local key and call order."
+        )
+    return values.popleft()
+
 
 def _validate_recompute_config(
     recompute,
