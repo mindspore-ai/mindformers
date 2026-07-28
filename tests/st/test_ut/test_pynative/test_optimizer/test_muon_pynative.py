@@ -641,3 +641,120 @@ class TestMuonSingleCardUpdate:
         w2, m2 = _run()
         assert np.array_equal(w1, w2)
         assert np.array_equal(m1, m2)
+
+
+# --------------------------------------------------------------------------- #
+#  allgather_deredundency batched pipeline — single card, local-weight path.
+# --------------------------------------------------------------------------- #
+class _MultiWeightNet(nn.Cell):
+    """Four same-shape 2D weights (one NS group) plus an odd-shape one."""
+
+    def __init__(self, rng):
+        super().__init__()
+        for index in range(4):
+            setattr(self, f"w{index}", Parameter(
+                Tensor(rng.standard_normal((8, 12)).astype(np.float32), mstype.float32),
+                name=f"layers.{index}.weight"))
+        self.w_odd = Parameter(
+            Tensor(rng.standard_normal((16, 6)).astype(np.float32), mstype.float32),
+            name="layers.9.weight")
+        self.bias = Parameter(
+            Tensor(rng.standard_normal((6,)).astype(np.float32), mstype.float32),
+            name="layers.0.bias")
+
+
+class TestMuonDeredundencyBatchedPath:
+    """The batched ``allgather_deredundency`` update on locally-owned weights.
+
+    With a single rank no weight needs redistribution, so this drives Phase 0
+    (where the momentum is now written back), the grouped Newton-Schulz, and
+    the Phase 4 apply.  ``get_rank`` is stubbed so the strategy can be
+    constructed off-cluster.
+    """
+
+    def setup_method(self):
+        ms.set_context(mode=ms.PYNATIVE_MODE)
+        self._orig_is_legacy_model = muon_mod.core_context.is_legacy_model
+        self._orig_get_rank = muon_mod.get_rank
+        muon_mod.core_context.is_legacy_model = lambda: False
+        muon_mod.get_rank = lambda *args, **kwargs: 0
+
+    def teardown_method(self):
+        muon_mod.core_context.is_legacy_model = self._orig_is_legacy_model
+        muon_mod.get_rank = self._orig_get_rank
+
+    @staticmethod
+    def _run(momentum=0.95, seed_momentum=False):
+        """One deredundency optimiser step; returns net, opt, grads, m0, groups."""
+        rng = np.random.default_rng(11)
+        net = _MultiWeightNet(rng)
+        opt = _build_optimizer(net, comm_strategy="allgather_deredundency",
+                               momentum=momentum)
+        grad_rng = np.random.default_rng(12)
+        grads_np = [grad_rng.standard_normal(p.shape).astype(np.float32)
+                    for p in net.trainable_params()]
+        m0 = []
+        for muon_m_slot in opt.muon_m:
+            init = (grad_rng.standard_normal(muon_m_slot.shape).astype(np.float32)
+                    if seed_momentum
+                    else np.zeros(muon_m_slot.shape, np.float32))
+            muon_m_slot.copy_(Tensor(init, mstype.float32))
+            m0.append(init)
+        opt(tuple(Tensor(g, mstype.float32) for g in grads_np))
+        return (net, opt, grads_np, m0,
+                opt._muon_runtime_groups)  # pylint: disable=protected-access
+
+    @pytest.mark.level0
+    @pytest.mark.platform_arm_ascend910b_training
+    @pytest.mark.env_onecard
+    def test_local_path_is_actually_exercised(self):
+        """
+        Feature: single-card allgather_deredundency routing.
+        Description: with one rank no weight needs redistribution, so every Muon
+            weight must land on the local (no-communication) Newton-Schulz path
+            — that is what makes this class cover the batched update.
+        Expectation: local NS groups are non-empty and no 2D weight is scheduled.
+        """
+        _, _, _, _, groups = self._run()
+        assert groups['local_groups_slots'], "expected local NS groups"
+        assert not groups['flat_order_2d_slots'], "expected no redistributed weights"
+
+    @pytest.mark.level0
+    @pytest.mark.platform_arm_ascend910b_training
+    @pytest.mark.env_onecard
+    def test_momentum_written_back_in_phase0(self):
+        """
+        Feature: early momentum writeback.
+        Description: ``next_m`` is stored into ``muon_m`` at the end of Phase 0
+            rather than during the Phase 4 apply, which releases the stacked
+            FP32 Phase 0 buffer before Newton-Schulz runs.  The stored value
+            must still be the plain recurrence ``momentum * m0 + grad``.
+        Expectation: every Muon momentum buffer matches the fp32 reference.
+        """
+        net, opt, grads_np, m0, _ = self._run(seed_momentum=True)
+        muon_grads = [g for g, p in zip(grads_np, net.trainable_params())
+                      if len(p.shape) == 2]
+        assert len(muon_grads) == len(opt.muon_m)
+        for slot, grad in enumerate(muon_grads):
+            np.testing.assert_allclose(opt.muon_m[slot].asnumpy(),
+                                       0.95 * m0[slot] + grad,
+                                       rtol=1e-5, atol=1e-5)
+
+    @pytest.mark.level0
+    @pytest.mark.platform_arm_ascend910b_training
+    @pytest.mark.env_onecard
+    def test_step_is_reproducible(self):
+        """
+        Feature: deredundency batched step determinism.
+        Description: the P2P scratch buffers are now allocated per step instead
+            of being cached for the optimiser's lifetime; a fresh buffer must
+            not change the result.
+        Expectation: two identical steps agree bitwise on params and momentum.
+        """
+        net1, opt1, _, _, _ = self._run()
+        _skip_if_nonfinite(net1.trainable_params()[0].asnumpy(), "muon weight update")
+        net2, opt2, _, _, _ = self._run()
+        for first, second in zip(net1.trainable_params(), net2.trainable_params()):
+            assert np.array_equal(first.asnumpy(), second.asnumpy())
+        for first, second in zip(opt1.muon_m, opt2.muon_m):
+            assert np.array_equal(first.asnumpy(), second.asnumpy())
