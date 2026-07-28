@@ -82,6 +82,23 @@ def test_normal_execution_case():
 @pytest.mark.level0
 @pytest.mark.platform_x86_cpu
 @pytest.mark.env_onecard
+def test_use_rotary_position_ids_conversion():
+    """The legacy converter preserves the pynative rotary position switch."""
+    config = DummyConfig({
+        'num_layers': 2,
+        'hidden_size': 128,
+        'num_heads': 8,
+        'use_rotary_position_ids': True,
+    })
+
+    result = convert_to_transformer_config(config)
+
+    assert result.use_rotary_position_ids is True
+
+
+@pytest.mark.level0
+@pytest.mark.platform_x86_cpu
+@pytest.mark.env_onecard
 def test_passed_in_additional_map_case():
     """
     Feature: Test additional map case.

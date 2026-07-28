@@ -194,8 +194,7 @@ class GPTModel(nn.Cell):
         # The MTP implementation pre-computes RotaryEmbedding
         # (unlike Megatron v0.12.0's real-time generation) to minimize dynamic memory usage.
         self.use_rotary_position_embeddings = self.position_embedding_type in ['rope', 'yarn']
-        # Non-CP uses self-generated positions (use_position_ids=False); context parallel
-        # flips this to True at setup time (see apply_context_parallel_attention).
+        self.use_rotary_position_ids = bool(config.use_rotary_position_ids)
         if self.position_embedding_type == 'rope':
             if config.multi_latent_attention:
                 self.rotary_pos_emb = RotaryEmbedding(
@@ -206,7 +205,7 @@ class GPTModel(nn.Cell):
                     rotary_base=config.rotary_base,
                     rope_scaling=rope_scaling,
                     rope_scaling_factor=rope_scaling_factor,
-                    use_position_ids=False
+                    use_rotary_position_ids=self.use_rotary_position_ids
                 )
             else:
                 self.rotary_pos_emb = RotaryEmbedding(
@@ -217,7 +216,7 @@ class GPTModel(nn.Cell):
                     rotary_base=rotary_base,
                     rope_scaling=rope_scaling,
                     rope_scaling_factor=rope_scaling_factor,
-                    use_position_ids=False
+                    use_rotary_position_ids=self.use_rotary_position_ids
                 )
         elif self.position_embedding_type == 'yarn':
             self.rotary_pos_emb = YarnRotaryEmbedding(
@@ -232,7 +231,7 @@ class GPTModel(nn.Cell):
                 beta_slow=config.beta_slow,
                 mscale=config.mscale,
                 mscale_all_dim=config.mscale_all_dim,
-                use_position_ids=False
+                use_rotary_position_ids=self.use_rotary_position_ids
             )
         elif self.position_embedding_type == 'mrope':
             raise NotImplementedError("position_embedding_type = mrope is not supported now.")
@@ -292,6 +291,14 @@ class GPTModel(nn.Cell):
             )
             self.freeze_for_dsa_indexer_warmup()
 
+    def set_use_rotary_position_ids(self, enabled: bool):
+        """Set whether all model-level rotary embeddings consume explicit position ids."""
+        self.use_rotary_position_ids = bool(enabled)
+        self.config.use_rotary_position_ids = self.use_rotary_position_ids
+        rotary_pos_emb = getattr(self, "rotary_pos_emb", None)
+        if rotary_pos_emb is not None and hasattr(rotary_pos_emb, "use_rotary_position_ids"):
+            rotary_pos_emb.use_rotary_position_ids = self.use_rotary_position_ids
+
     def freeze_for_dsa_indexer_warmup(self):
         """Freeze every non-indexer parameter during the dense DSA warm-up stage."""
         for param in self.trainable_params():
@@ -327,6 +334,14 @@ class GPTModel(nn.Cell):
             are included in the loss calculation. Default is None.
             actual_seq_len (Tensor, optional): Actual sequence length tensor. Default is None.
         """
+        if self.use_rotary_position_ids and position_ids is None:
+            raise ValueError("position_ids must be provided when use_rotary_position_ids is enabled.")
+        if (self.use_rotary_position_ids and self.config.apply_rope_fusion
+                and position_ids.shape[0] > 1):
+            raise ValueError(
+                "Pynative fused RoPE does not support per-batch position_ids when batch size is greater than 1. "
+                "Set apply_rope_fusion=False or use a flattened TND input."
+            )
         if actual_seq_len is not None:
             actual_seq_len = self.reshape(actual_seq_len, (-1,))
 

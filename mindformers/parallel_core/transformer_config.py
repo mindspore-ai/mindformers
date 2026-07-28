@@ -625,6 +625,16 @@ class TransformerConfig:
         }
     )
 
+    use_rotary_position_ids: bool = field(
+        default=False,
+        metadata={
+            "description": "Whether pynative rotary embeddings use explicit position ids.",
+            "usage": ParamUsage.TRAINING,
+            "source": ParamSource.MF,
+            "mode": ParamMode.PYNATIVE
+        }
+    )
+
     print_separate_loss: bool = field(
         default=True,
         metadata={

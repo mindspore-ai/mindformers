@@ -269,6 +269,7 @@ COMMON_CONFIG_MAPPING = {
     "ignore_token_id": "ignore_token_id",
     "is_dynamic": "is_dynamic",
     "use_eod_reset": "use_eod_reset",
+    "use_rotary_position_ids": "use_rotary_position_ids",
     "use_contiguous_weight_layout_attention": "use_contiguous_weight_layout_attention",
     "use_interleaved_weight_layout_mlp": "use_interleaved_weight_layout_mlp",
     "partial_rotary_factor": "partial_rotary_factor",

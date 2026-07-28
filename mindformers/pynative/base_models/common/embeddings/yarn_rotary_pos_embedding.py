@@ -48,8 +48,7 @@ class YarnRotaryEmbedding(RotaryEmbedding):
         beta_slow (float, optional): Slow beta value for Yarn RoPE. Defaults to 1.
         mscale (float, optional): Mscale value for Yarn RoPE. Defaults to 1.
         mscale_all_dim (float, optional): Mscale all dim value for Yarn RoPE. Defaults to 0.
-        use_position_ids (bool, optional): Whether to honor explicit position_ids when provided.
-            Only enabled automatically under context parallel; non-CP uses self-generated positions.
+        use_rotary_position_ids (bool, optional): Whether to honor explicit position_ids when provided.
     """
 
     def __init__(self,
@@ -64,7 +63,7 @@ class YarnRotaryEmbedding(RotaryEmbedding):
                  beta_slow: float = 1.0,
                  mscale: float = 1.0,
                  mscale_all_dim: float = 0.0,
-                 use_position_ids: bool = False
+                 use_rotary_position_ids: bool = False
                  ):
         super().__init__(
             kv_channels=kv_channels,
@@ -72,7 +71,7 @@ class YarnRotaryEmbedding(RotaryEmbedding):
             rotary_interleaved=rotary_interleaved,
             seq_len_interpolation_factor=seq_len_interpolation_factor,
             rotary_base=rotary_base,
-            use_position_ids=use_position_ids
+            use_rotary_position_ids=use_rotary_position_ids
         )
         internal_freq_base = np.arange(0, kv_channels, 2)[: (kv_channels // 2)].astype(np.float32)
         internal_freq = 1.0 / (scaling_factor * rotary_base ** (internal_freq_base / kv_channels))
@@ -113,7 +112,7 @@ class YarnRotaryEmbedding(RotaryEmbedding):
             Tensor: Embeddings after applying RoPE.
             Tensor: mscale.
         """
-        explicit_position_ids = position_ids is not None and self.use_position_ids
+        explicit_position_ids = position_ids is not None and self.use_rotary_position_ids
         if not explicit_position_ids:
             bs = 1
             seq = self.arange(max_seq_len, dtype=self.inv_freq.dtype) + offset
