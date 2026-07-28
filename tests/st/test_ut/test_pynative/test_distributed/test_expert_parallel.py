@@ -22,12 +22,14 @@ from mindspore import Tensor, context, nn, ops
 from hyper_parallel.core.dtensor.placement_types import Shard
 
 from mindformers.pynative.distributed import utils
+import mindformers.pynative.distributed.expert_parallel as ep_mod
+from mindformers.pynative.distributed.activation_checkpoint import recompute_context_fn
 from mindformers.pynative.distributed.ep_overlap import OverlapExpertParallel
+from mindformers.pynative.distributed.expert_parallel import ExpertParallel
 from mindformers.parallel_core.transformer_config import TransformerConfig
 from mindformers.pynative.layers.linear import Linear
 from mindformers.pynative.transformers.mlp import MLP, MLPSubmodules
 from mindformers.pynative.transformers.moe.experts import GroupedMLP
-from mindformers.pynative.distributed.expert_parallel import ExpertParallel
 
 HIDDEN_SIZE = 32
 EXPERT_NUM = 4
@@ -101,6 +103,90 @@ class TestExpertParallel:
         assert padded_tokens.shape[0] == tokens.shape[0] + expected_pad_size
         assert padded_probs.shape[0] == probs.shape[0] + expected_pad_size
         assert padded_indices.shape[0] == topk_indices.shape[0] + expected_pad_size
+
+    @pytest.mark.level1
+    @pytest.mark.platform_x86_cpu
+    @pytest.mark.env_onecard
+    def test_sync_d2h_splits_are_reused_during_recompute(self):
+        """Replay returns forward host splits without touching device tensors."""
+        local_counts = Tensor([2, 1, 3, 2], dtype=ms.float32)
+        grouped_counts = Tensor([1, 2, 2, 3], dtype=ms.float32)
+        forward_ctx, replay_ctx = recompute_context_fn()
+
+        with forward_ctx:
+            expected = self.expert_parallel._host_token_splits(
+                local_counts, grouped_counts, ep_degree=2)
+
+        # None inputs prove replay returns before concat/cast/tolist.
+        with replay_ctx:
+            actual = self.expert_parallel._host_token_splits(
+                None, None, ep_degree=2)
+
+        assert actual == expected
+        assert actual == ([3, 5], [3, 5], [1, 2, 2, 3])
+
+    @pytest.mark.level1
+    @pytest.mark.platform_x86_cpu
+    @pytest.mark.env_onecard
+    def test_async_d2h_is_issued_only_by_forward(self, monkeypatch):
+        """Async replay recomputes counts but skips the D2H launch and event wait."""
+        class FakeHostBuffer:
+            def __init__(self, values):
+                self.values = values
+                self.tolist_calls = 0
+
+            def tolist(self):
+                self.tolist_calls += 1
+                return self.values
+
+        class FakeEvent:
+            def __init__(self):
+                self.synchronize_calls = 0
+
+            def synchronize(self):
+                self.synchronize_calls += 1
+
+        local_counts = Tensor([2, 1, 3, 2], dtype=ms.float32)
+        grouped_counts = Tensor([1, 2, 2, 3], dtype=ms.float32)
+        host_buf = FakeHostBuffer([2, 1, 3, 2, 1, 2, 2, 3])
+        event = FakeEvent()
+        issue_calls = []
+
+        monkeypatch.setattr(ep_mod, "get_rank", lambda: 0)
+        monkeypatch.setattr(ep_mod, "get_ep_group_name", lambda rank, degree: f"ep-{rank}-{degree}")
+        monkeypatch.setattr(
+            self.expert_parallel, "_count_tokens_per_expert",
+            lambda topk_indices, num_experts: local_counts)
+        monkeypatch.setattr(
+            self.expert_parallel, "_counts_a2a",
+            lambda counts, ep_degree: grouped_counts)
+
+        def fake_issue(counts):
+            issue_calls.append(counts)
+            return host_buf, event
+
+        monkeypatch.setattr(self.expert_parallel, "_issue_async_d2h", fake_issue)
+        forward_ctx, replay_ctx = recompute_context_fn()
+
+        with forward_ctx:
+            fwd_host, fwd_event, fwd_grouped = self.expert_parallel._dispatch_preprocess(
+                Tensor([[0, 1]], dtype=ms.int32), num_experts=4, ep_degree=2)
+            expected = self.expert_parallel._finish_async_d2h(
+                fwd_host, fwd_event, num_experts=4, ep_degree=2)
+
+        with replay_ctx:
+            replay_host, replay_event, replay_grouped = self.expert_parallel._dispatch_preprocess(
+                Tensor([[0, 1]], dtype=ms.int32), num_experts=4, ep_degree=2)
+            actual = self.expert_parallel._finish_async_d2h(
+                replay_host, replay_event, num_experts=4, ep_degree=2)
+
+        assert len(issue_calls) == 1
+        assert event.synchronize_calls == 1
+        assert host_buf.tolist_calls == 1
+        assert replay_host is None
+        assert replay_event is None
+        assert actual == expected
+        np.testing.assert_array_equal(fwd_grouped.asnumpy(), replay_grouped.asnumpy())
 
     @pytest.mark.level1
     @pytest.mark.platform_arm_ascend910b_training
