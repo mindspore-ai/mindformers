@@ -15,11 +15,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""DSv4 hybrid attention ModuleSpec builders."""
+"""ModuleSpec registry for experimental attention variants."""
+from typing import Callable, Dict
+
 from mindformers.pynative.layers.identity_op import IdentityOp
 from mindformers.pynative.layers.layer_norm import get_norm_cls
 from mindformers.pynative.layers.linear import Linear
 from mindformers.parallel_core.utils.spec_utils import ModuleSpec
+from mindformers.pynative.transformers.multi_latent_attention import MLASelfAttentionSubmodules
+from mindformers.pynative.transformers.experimental_attention_variant.dsa import (
+    DSAttention,
+    DSAttentionSubmodules,
+)
+from mindformers.pynative.transformers.experimental_attention_variant.dsa_attention import (
+    DSASelfAttention,
+)
+from mindformers.pynative.transformers.experimental_attention_variant.dsa_indexer import (
+    DSAIndexer,
+    DSAIndexerSubmodules,
+)
 from mindformers.pynative.transformers.experimental_attention_variant.compressor import (
     Compressor,
     CompressorSubmodules
@@ -38,6 +52,78 @@ from mindformers.pynative.transformers.experimental_attention_variant.deepseek_v
 )
 
 
+AttentionVariantSpecBuilder = Callable[[bool, bool, str], ModuleSpec]
+_ATTENTION_VARIANT_SPEC_BUILDERS: Dict[str, AttentionVariantSpecBuilder] = {}
+
+
+def register_attention_variant(name: str):
+    """Register a ModuleSpec builder for one experimental attention variant."""
+    if not name:
+        raise ValueError("Attention variant name must not be empty.")
+
+    def decorator(builder: AttentionVariantSpecBuilder):
+        if name in _ATTENTION_VARIANT_SPEC_BUILDERS:
+            raise ValueError(f"Attention variant {name!r} is already registered.")
+        _ATTENTION_VARIANT_SPEC_BUILDERS[name] = builder
+        return builder
+
+    return decorator
+
+
+def get_attention_variant_module_spec(
+        name: str,
+        qk_layernorm: bool = False,
+        fused_norm: bool = True,
+        normalization: str = "RMSNorm",
+) -> ModuleSpec:
+    """Build the top-level ModuleSpec registered for ``name``."""
+    try:
+        builder = _ATTENTION_VARIANT_SPEC_BUILDERS[name]
+    except KeyError as exc:
+        supported = ", ".join(sorted(_ATTENTION_VARIANT_SPEC_BUILDERS))
+        raise ValueError(
+            f"Unsupported experimental attention variant {name!r}. "
+            f"Registered variants: {supported or 'none'}."
+        ) from exc
+    return builder(qk_layernorm, fused_norm, normalization)
+
+
+@register_attention_variant("dsa")
+def get_dsa_module_spec(
+        qk_layernorm: bool = False,
+        fused_norm: bool = True,
+        normalization: str = "RMSNorm",
+) -> ModuleSpec:
+    """Build the complete DSA self-attention ModuleSpec."""
+    norm_cls = get_norm_cls(normalization, fused_norm)
+    return ModuleSpec(
+        module=DSASelfAttention,
+        submodules=MLASelfAttentionSubmodules(
+            linear_qkv=Linear,
+            linear_qb=Linear,
+            linear_kvb=Linear,
+            core_attention=ModuleSpec(
+                module=DSAttention,
+                submodules=DSAttentionSubmodules(
+                    indexer=ModuleSpec(
+                        module=DSAIndexer,
+                        submodules=DSAIndexerSubmodules(
+                            linear_wq_b=Linear,
+                            linear_wk=Linear,
+                            k_norm=get_norm_cls("LayerNorm", fused_norm),
+                            linear_weights_proj=Linear,
+                        ),
+                    ),
+                ),
+            ),
+            linear_proj=Linear,
+            q_layernorm=norm_cls if qk_layernorm else IdentityOp,
+            k_layernorm=norm_cls if qk_layernorm else IdentityOp,
+        ),
+    )
+
+
+@register_attention_variant("dsv4_hybrid")
 def get_dsv4_hybrid_module_spec(
         qk_layernorm: bool = False,
         fused_norm: bool = True,
