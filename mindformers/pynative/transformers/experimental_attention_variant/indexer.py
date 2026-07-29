@@ -273,7 +273,7 @@ class _IndexerLossAutoScaler(_Function):
     @staticmethod
     def forward(ctx, output, indexer_loss):
         """Preserve `indexer_loss` on ctx; return `output` unchanged."""
-        ctx.indexer_loss = indexer_loss
+        ctx.indexer_loss = indexer_loss.detach()
         return output
 
     @staticmethod
