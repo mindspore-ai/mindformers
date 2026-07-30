@@ -522,7 +522,10 @@ class MultiTokenPredictionBlock(nn.Cell):
                 mtp_loss = mtp_loss + mtp_layer_loss
 
         if self.calculate_per_token_loss:
-            return (numerator, denominator), extra_loss, attention_loss
+            # Return a flat tuple on purpose: a nested MakeTuple breaks the MakeTuple/TupleGetItem
+            # pairing in MindSpore's RedistributionNextNode (it tracks only one make_tuple_index),
+            # which shows up as "The index out of range ... GetTensorInLayout" during StepParallel.
+            return numerator, denominator, extra_loss, attention_loss
         return mtp_loss, extra_loss, attention_loss
 
 
@@ -542,6 +545,7 @@ class MtpSharedVocabParallelEmbedding(VocabParallelEmbedding):
         # use shared embedding weights instead
         del self.weight
 
+    # pylint: disable=W0221
     def construct(self, weight, input_ids):
         """Forward of vocab embedding."""
         output = self.embedding_morph(input_ids, weight)
@@ -593,6 +597,7 @@ class MtpSharedLanguageModelEmbedding(LanguageModelEmbedding):
         else:
             self.tokentype_embeddings = None
 
+    # pylint: disable=W0221
     def construct(
             self,
             input_ids,
