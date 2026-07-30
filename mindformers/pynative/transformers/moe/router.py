@@ -651,7 +651,7 @@ class TopKRouter(nn.Cell):
         agg_probs, tokens_per_expert = self._reduce_token_sum_pair(
             scores_for_aux_loss, topk_indices, reduce_count_cp=True
         )
-        self.global_tokens_per_expert += tokens_per_expert
+        self.global_tokens_per_expert += tokens_per_expert.detach()
         self.ga_steps += 1
         averated_tokens_per_expert = self.global_tokens_per_expert / self.ga_steps
         total_num_tokens = (

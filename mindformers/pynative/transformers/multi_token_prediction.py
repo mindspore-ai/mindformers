@@ -57,7 +57,13 @@ class _MTPLossAutoScaler(_Function):
 
     @staticmethod
     def forward(ctx, output: Tensor, mtp_loss: Tensor):
-        """Preserve the mtp by storing it in the context to avoid garbage collection.
+        """Store a detached copy of ``mtp_loss`` to avoid a reference cycle that
+        prevents garbage collection during activation recomputation.
+
+        ``detach()`` breaks the link to the computation graph so the graph can
+        be freed, while keeping the tensor for ``ones_like`` expansion in
+        backward (needed when ``calculate_per_token_loss=True`` passes a
+        per-token loss tensor).
 
         Args:
             output (Tensor): The output tensor.
@@ -66,7 +72,7 @@ class _MTPLossAutoScaler(_Function):
         Returns:
             Tensor: The output tensor.
         """
-        ctx.mtp_loss = mtp_loss
+        ctx.mtp_loss = mtp_loss.detach()
         return output
 
     @staticmethod
@@ -641,7 +647,7 @@ def process_mtp_loss(
             mtp_logits = mtp_logits.transpose(0, 1)
             mtp_loss = compute_language_model_loss(mtp_labels, mtp_logits, mtp_loss_mask)
             save_to_mtp_losses_tracker(
-                mtp_loss_scale * mtp_loss,
+                mtp_loss,
                 mtp_layer_number,
                 config.mtp_num_layers,
             )
@@ -657,7 +663,7 @@ def process_mtp_loss(
             num_tokens = mtp_loss_mask.sum()
             mtp_loss_scale = config.mtp_loss_scaling_factor / config.mtp_num_layers
             save_to_mtp_losses_tracker(
-                mtp_loss_scale * mtp_loss_sum / num_tokens,
+                mtp_loss_sum / num_tokens,
                 mtp_layer_number,
                 config.mtp_num_layers,
             )

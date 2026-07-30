@@ -282,7 +282,7 @@ class _MoEAuxLossAutoScaler(_Function):
 
     @staticmethod
     def forward(ctx, output: Tensor, aux_loss: Tensor) -> Tensor:
-        """Preserve the aux_loss by storing it in the context to avoid garbage collection.
+        """Preserve the type of aux_loss by storing it in the context to avoid garbage collection.
 
         Args:
             output (Tensor): The output tensor.
@@ -291,30 +291,27 @@ class _MoEAuxLossAutoScaler(_Function):
         Returns:
             Tensor: The output tensor.
         """
-        ctx.aux_loss = aux_loss
+        ctx.aux_loss_dtype = aux_loss.dtype
         return output
 
     @staticmethod
     def backward(ctx, grad_output: Tensor):
-        """Compute and scale the gradient for auxiliary loss..
+        """Compute the gradient and scale for auxiliary loss.
 
         Args:
             grad_output (Tensor): The gradient of the output.
 
         Returns:
-            Tuple[Tensor, Tensor]: The gradient of the output, scaled auxiliary loss gradient.
+            Tuple[Tensor, Tensor]: The gradient of the output, the scale for auxiliary loss.
         """
-        aux_loss = ctx.aux_loss
         if _MoEAuxLossAutoScaler.main_loss_backward_scale is None:
-            # Prefer mint operator to create Tensor
             _MoEAuxLossAutoScaler.main_loss_backward_scale = Tensor(
-                1.0, dtype=aux_loss.dtype
+                1.0, dtype=ctx.aux_loss_dtype
             )
 
-        aux_loss_backward_scale = _MoEAuxLossAutoScaler.main_loss_backward_scale
-        aux_loss = aux_loss.to_local() if isinstance(aux_loss, DTensor) else aux_loss
-        scaled_aux_loss_grad = mint.ones_like(aux_loss) * aux_loss_backward_scale
-        return grad_output, scaled_aux_loss_grad
+        scale = _MoEAuxLossAutoScaler.main_loss_backward_scale
+        scale = scale.to_local() if isinstance(scale, DTensor) else scale
+        return grad_output, scale
 
     @staticmethod
     def set_loss_scale(scale: Tensor) -> None:
