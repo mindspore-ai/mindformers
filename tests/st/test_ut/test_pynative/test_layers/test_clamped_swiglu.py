@@ -93,6 +93,56 @@ class TestClampedSwiGlu:
     @pytest.mark.level0
     @pytest.mark.platform_arm_ascend910b_training
     @pytest.mark.env_onecard
+    def test_delay_init_materializes_bounds(self):
+        """
+        Feature: ClampedSwiGlu
+        Description: Meta-device bounds are recreated by init_states before the first forward.
+        Exception: AssertionError
+        """
+        from mindspore import nn
+        from mindformers.parallel_core.utils.model_mixin import TrainModelMixin
+        from mindformers.pynative.layers.activation import ClampedSwiGlu
+
+        class DelayInitModel(TrainModelMixin, nn.Cell):
+            """Minimal model following Trainer's delayed-initialization workflow."""
+
+            def __init__(self, clamp_value):
+                super().__init__()
+                self.model = ClampedSwiGlu(clamp_value)
+
+        clamp_value = 0.5
+        with ms.DeviceCtx("meta"):
+            model = DelayInitModel(clamp_value)
+
+        assert model.model.lower_bound.is_meta
+        assert model.model.upper_bound.is_meta
+
+        model.to_empty()
+        model.init_states()
+
+        assert not model.model.lower_bound.is_meta
+        assert not model.model.upper_bound.is_meta
+        assert not model.model.state_dict()
+        np.testing.assert_array_equal(
+            model.model.lower_bound.asnumpy(),
+            np.array(-clamp_value, dtype=np.float32),
+        )
+        np.testing.assert_array_equal(
+            model.model.upper_bound.asnumpy(),
+            np.array(clamp_value, dtype=np.float32),
+        )
+
+        x_np = np.array(
+            [[-1.0, 0.5, 1.0, -0.5, -1.0, 0.5, 1.0, -0.5]],
+            dtype=np.float32,
+        )
+        out = model.model(Tensor(x_np, dtype=ms.float32)).asnumpy()
+        expected = _clamped_swiglu_ref(x_np, clamp_value)
+        np.testing.assert_allclose(out, expected, atol=1e-4, rtol=1e-4)
+
+    @pytest.mark.level0
+    @pytest.mark.platform_arm_ascend910b_training
+    @pytest.mark.env_onecard
     def test_clamp_takes_effect(self):
         """
         Feature: ClampedSwiGlu
