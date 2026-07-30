@@ -13,12 +13,52 @@
 # limitations under the License.
 # ============================================================================
 """Activation functions for transformer."""
+# MindSpore ``Cell``/``_Function`` subclasses intentionally use operator-specific signatures.
+# pylint: disable=arguments-differ,abstract-method
 __all__ = ["FusedSwiGlu", "ClampedSwiGlu", "GELU", "SiLU"]
 
 import mindspore as ms
 from mindspore import nn, Tensor
 from mindspore import mint
 from mindspore import ops
+from mindspore.common._grad_function import _Function
+from mindspore.ops.auto_generate import SwigluGrad
+
+
+_swiglu_grad = SwigluGrad()
+
+
+class _ClampedSwiGluFunction(_Function):
+    """Memory-efficient ClampedSwiGlu with an explicit backward."""
+
+    @staticmethod
+    def forward(ctx, x, lower_bound, upper_bound, dim):
+        """Clamp and activate without recording the internal autograd graph."""
+        ori_dtype = x.dtype
+        gate, linear = mint.chunk(x.to(ms.float32), 2, dim)
+
+        gate_mask = mint.le(gate, upper_bound)
+        linear_mask = mint.logical_and(
+            mint.ge(linear, lower_bound),
+            mint.le(linear, upper_bound),
+        )
+        gate = mint.clamp(gate, None, upper_bound)
+        linear = mint.clamp(linear, lower_bound, upper_bound)
+        clamped = mint.cat((gate, linear), dim=dim)
+        clamp_mask = mint.cat((gate_mask, linear_mask), dim=dim)
+
+        ctx.save_for_backward(clamped, clamp_mask)
+        ctx.ori_dtype = ori_dtype
+        ctx.dim = dim
+        return ops.swiglu(clamped, dim).to(ori_dtype)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """Compute the input gradient while preserving inclusive clamp boundaries."""
+        clamped, clamp_mask = ctx.saved_tensors
+        grad_input = _swiglu_grad(grad_output.to(ms.float32), clamped, ctx.dim)
+        grad_input = grad_input * clamp_mask.to(ms.float32)
+        return grad_input.to(ctx.ori_dtype), None, None, None
 
 
 class FusedSwiGlu(nn.Cell):
@@ -93,19 +133,17 @@ class ClampedSwiGlu(nn.Cell):
     def __init__(self, clamp_value: float):
         super().__init__()
         self.clamp_value = clamp_value
-        self.silu = mint.nn.functional.silu
-        self.chunk = mint.chunk
-        self.clamp = mint.clamp
+        self.lower_bound = Tensor(-clamp_value, ms.float32)
+        self.upper_bound = Tensor(clamp_value, ms.float32)
 
     def construct(self, x: Tensor, dim: int = -1) -> Tensor:
         """Apply the clamped SwiGLU activation."""
-        ori_dtype = x.dtype
-        x = x.to(ms.float32)
-        gate, linear = self.chunk(x, 2, dim)
-        gate = self.clamp(gate, None, self.clamp_value)
-        linear = self.clamp(linear, -self.clamp_value, self.clamp_value)
-        out = self.silu(gate) * linear
-        return out.to(ori_dtype)
+        return _ClampedSwiGluFunction.apply(
+            x,
+            self.lower_bound,
+            self.upper_bound,
+            dim,
+        )
 
 
 class GELU(nn.Cell):
