@@ -27,6 +27,7 @@ import mindspore as ms
 from mindspore import nn
 from hyper_parallel.core.activation_checkpoint import(
     CheckpointPolicy,
+    checkpoint_exclude_wrapper,
     checkpoint_wrapper,
     swap_wrapper,
     SwapManager,
@@ -172,25 +173,40 @@ def _validate_recompute_config(
     if need_comm:
         _validate_recompute_comm_structure(rc_comm)
         _validate_recompute_comm_layer_specs(rc_comm, num_layers)
-    _validate_exclude_op(rc)
+    _validate_exclude_op(rc, num_layers, need_recompute)
 
 
-def _validate_exclude_op(recompute_cfg: RecomputeConfig) -> None:
-    """Validate the ``exclude_op`` op-name list."""
+def _validate_exclude_op(recompute_cfg: RecomputeConfig, num_layers: int, recompute_enabled: bool = True) -> None:
+    """Validate the ``exclude_op`` config."""
     pfx = "TrainConfig.recompute.exclude_op"
     names = recompute_cfg.exclude_op
     if names is None:
         return
-    if not isinstance(names, (list, tuple)):
-        logger.error(f"[Recompute Config] {pfx} must be a list/tuple of op-name strings, "
+    if not recompute_enabled and names:
+        logger.warning("[Recompute Config] exclude_op is configured but recompute mode is 'None'; "
+                       "exclude_op has no effect without recompute.")
+    if not isinstance(names, dict):
+        logger.error(f"[Recompute Config] {pfx} must be a dict "
+                     f"(module path -> list of layer ranges), "
                      f"got {type(names).__name__}")
         raise TypeError(
-            f"{pfx} must be a list/tuple of op-name strings, got {type(names).__name__}"
+            f"{pfx} must be a dict "
+            f"(module path -> list of layer ranges), "
+            f"got {type(names).__name__}"
         )
-    for i, name in enumerate(names):
-        if not isinstance(name, str) or not name.strip():
-            logger.error(f"[Recompute Config] {pfx}[{i}]: must be a non-empty string, got {name!r}")
-            raise ValueError(f"{pfx}[{i}]: must be a non-empty string, got {name!r}")
+    for key, ranges in names.items():
+        if not isinstance(key, str) or not key.strip():
+            logger.error(f"[Recompute Config] {pfx}: invalid module path key {key!r}")
+            raise ValueError(f"{pfx}: invalid module path key {key!r}")
+        if not isinstance(ranges, (list, tuple)):
+            logger.error(f"[Recompute Config] {pfx}[{key!r}]: "
+                         f"value must be a list or tuple of layer ranges, "
+                         f"got {type(ranges).__name__}")
+            raise TypeError(
+                f"{pfx}[{key!r}]: value must be a list or tuple of layer ranges, "
+                f"got {type(ranges).__name__}"
+            )
+        _validate_layer_specs(ranges, f"{pfx}[{key!r}]", num_layers)
 
 
 def _validate_recompute_structure(recompute_cfg: RecomputeConfig) -> None:
@@ -463,21 +479,65 @@ def _parse_layer_ids(specs: Sequence[str]) -> set:
     return out
 
 
+def _iter_class_owned_callable_attrs(layer, excluded_names):
+    """Yield replaceable callable descriptors declared by custom Cell classes.
+
+    Stop before MindSpore's ``nn.Cell`` base so framework methods are not
+    exposed as ``exclude_op`` targets. Read-only properties are intentionally
+    skipped because the exclusion wrapper cannot be installed back on them.
+    """
+    seen = set(excluded_names)
+    for cls in type(layer).__mro__:
+        if cls in (nn.Cell, object):
+            break
+        for attr, descriptor in vars(cls).items():
+            if attr in seen or attr.startswith('_') or attr == "construct":
+                continue
+            if isinstance(descriptor, property):
+                if descriptor.fset is None:
+                    continue
+            elif not (
+                    inspect.isfunction(descriptor)
+                    or isinstance(descriptor, (staticmethod, classmethod))):
+                continue
+            try:
+                value = getattr(layer, attr)
+            except (AttributeError, RuntimeError, TypeError, ValueError):
+                continue
+            if callable(value):
+                seen.add(attr)
+                yield attr
+
+
 def _get_single_layer_whitelist(layer, whitelist, info=''):
     """Recursively get all modules and operators in a single layer."""
     cell_names = set(layer._cells.keys())
-    # Collect operators: non-cell attributes that are functions
-    for attr in dir(layer):
+
+    # Collect comm ops from the registry.
+    if hasattr(layer, '_comm_ops'):
+        for name in layer._comm_ops:
+            op_path = f"{info}.{name}" if info else name
+            whitelist.append(op_path)
+
+    # Collect instance-owned callable attributes. Restricting this to
+    # ``__dict__`` avoids exposing inherited Cell methods such as ``construct``
+    # and ``set_train``, while still covering Python functions, ``mint.*``
+    # functions, Primitive instances, and user callable objects assigned to a
+    # Cell attribute.
+    for attr, value in vars(layer).items():
         if attr.startswith('_') or attr in cell_names:
             continue
+        if callable(value):
+            op_path = f"{info}.{attr}" if info else attr
+            whitelist.append(op_path)
 
-        try:
-            value = getattr(layer, attr)
-            if inspect.isfunction(value):
-                op_path = f"{info}.{attr}" if info else attr
-                whitelist.append(op_path)
-        except AttributeError:
-            continue
+    # Collect bound methods and replaceable callable properties declared on
+    # custom Cell classes. Instance attributes above take precedence.
+    instance_names = set(vars(layer))
+    for attr in _iter_class_owned_callable_attrs(
+            layer, cell_names.union(instance_names)):
+        op_path = f"{info}.{attr}" if info else attr
+        whitelist.append(op_path)
 
     # Collect child cells and recurse into them
     for name, cell in layer._cells.items():
@@ -499,11 +559,11 @@ def _get_modules_and_ops_list(model):
     return layer_configs
 
 
-def _expand_select_module(config_list, select_module):
-    """Expand wildcard patterns in select_module against the model whitelist."""
+def _expand_select_module(config_list, module_dict, label="select_module", config_name="recompute config"):
+    """Expand wildcard patterns against the model whitelist."""
     layer_to_modules = {}
 
-    for module_name, raw_ranges_str in select_module.items():
+    for module_name, raw_ranges_str in module_dict.items():
         raw_layer_ids = _parse_layer_ids(raw_ranges_str)
         matched = False
 
@@ -519,8 +579,8 @@ def _expand_select_module(config_list, select_module):
                         layer_to_modules[layer_id].append(item)
 
         if not matched:
-            logger.warning(f"select_module pattern '{module_name}' did not match any module in the model, "
-                           "please check your recompute config.")
+            logger.warning(f"{label} pattern '{module_name}' did not match any module in the model, "
+                           f"please check your {config_name}.")
 
     return layer_to_modules
 
@@ -545,9 +605,9 @@ def _add_modules_dedup(module_names, layer_id, layer_to_modules, parent_modules=
 
 def _clean_and_parse_config(full_target_ids, select_module, label=None):
     """
-    Deduplicate the expanded select_module into a Layer ID -> [Module Names] map.
+    Deduplicate the expanded module pattern dict into a Layer ID -> [Module Names] map.
     Parents are processed before children. Children are skipped if their parent is configured.
-    Assumes select_module is already in {layer_id: [module_names]} format.
+    Assumes input is already in {layer_id: [module_names]} format.
     """
     layer_to_modules = {}
 
@@ -559,7 +619,7 @@ def _clean_and_parse_config(full_target_ids, select_module, label=None):
         _add_modules_dedup(sorted_names, layer_id, layer_to_modules)
 
     if label:
-        logger.info(f"--- Final Select {label} Configuration Map---")
+        logger.info(f"--- Final {label} Configuration Map---")
         for layer_id in sorted(layer_to_modules.keys()):
             modules = layer_to_modules[layer_id]
             logger.info(f"layer{layer_id}: {', '.join(modules) if modules else '(No Module)'}")
@@ -586,40 +646,12 @@ def _clean_and_parse_comm_config(full_target_ids, select_layer_to_modules, comm_
     return layer_to_modules
 
 
-def _build_exclude_op_policy(exclude_op):
-    """Build a selective-checkpoint ``policy_fn`` that keeps (does NOT recompute) any op -- compute
-    or communication -- whose name contains one of ``exclude_op`` as a case-insensitive substring;
-    every other op is recomputed.
-
-    A matched op returns ``CheckpointPolicy.MUST_SAVE`` -- its forward output is cached and reused
-    in the backward pass instead of being re-executed (e.g. ``['matmul']`` keeps matmul outputs;
-    ``['allgather', ...]`` avoids re-issuing collectives like ``InnerCommAllGather`` during
-    recompute). Matching is on the dispatched op name only, so it is global within the recomputed
-    cell -- not scoped to a module path. Note: the MindSpore selective-checkpoint dispatch only
-    accepts ``MUST_SAVE`` / ``PREFER_SAVE`` / ``MUST_SWAP`` / ``MUST_RECOMPUTE``; ``PREFER_RECOMPUTE``
-    raises at dispatch time, so the non-matching branch returns ``MUST_RECOMPUTE``.
-    """
-    needles = tuple(name.lower() for name in exclude_op)
-
-    def _policy_fn(ctx, func, *args, **kwargs):  # pylint: disable=W0613
-        op_name = (getattr(func, "name", "") or "").lower()
-        if any(needle in op_name for needle in needles):
-            return CheckpointPolicy.MUST_SAVE
-        return CheckpointPolicy.MUST_RECOMPUTE
-
-    return _policy_fn
-
-
-def _wrap_cell_recompute(cell, policy_fn):
-    """``checkpoint_wrapper`` a cell under the recompute marker, attaching the exclude-op SAC
-    policy when provided. ``checkpoint`` composes ``policy_fn`` and ``context_fn``, so the
-    per-op MUST_SAVE decision and the backward-re-run marker stay active together."""
-    if policy_fn is not None:
-        return checkpoint_wrapper(cell, policy_fn=policy_fn, context_fn=recompute_context_fn)
+def _wrap_cell_recompute(cell):
+    """``checkpoint_wrapper`` a cell under the recompute marker."""
     return checkpoint_wrapper(cell, context_fn=recompute_context_fn)
 
 
-def _set_pattern_recompute(layer, p_list, add_prim_attr=False, policy_fn=None, info=''):
+def _set_pattern_recompute(layer, p_list, add_prim_attr=False, info=''):
     """Recursively traverse layer cells along p_list path and apply checkpoint_wrapper."""
     log_list = []
     log = ''
@@ -629,15 +661,12 @@ def _set_pattern_recompute(layer, p_list, add_prim_attr=False, policy_fn=None, i
     else:
         return info
     if p_list:
-        # Still have path segments left: recurse into matching child cells
-        # pylint: disable=W0212
         for name, cell in layer._cells.items():
             if p == name:
-                log = _set_pattern_recompute(cell, p_list, add_prim_attr, policy_fn, info + f'.{name}')
+                log = _set_pattern_recompute(cell, p_list, add_prim_attr, info + f'.{name}')
                 if log:
                     log_list.append(log[1:])
     else:
-        # Last path segment: apply checkpoint_wrapper to the target
         for name, cell in layer._cells.items():
             if p == name:
                 if add_prim_attr:
@@ -645,7 +674,7 @@ def _set_pattern_recompute(layer, p_list, add_prim_attr=False, policy_fn=None, i
                                 "is expected to be operation but got cell, "
                                 "this configuration will not be effective.")
                     continue
-                setattr(layer, name, _wrap_cell_recompute(cell, policy_fn))
+                setattr(layer, name, _wrap_cell_recompute(cell))
                 log = f"{info}.{name}"
         for attr in dir(layer):
             if p == attr:
@@ -660,18 +689,103 @@ def _set_pattern_recompute(layer, p_list, add_prim_attr=False, policy_fn=None, i
     return log
 
 
-def _set_select_recompute(layer, layer_id, layer_to_modules, add_prim_attr=False, policy_fn=None):
+def _set_select_recompute(layer, layer_id, layer_to_modules, add_prim_attr=False):
     """Set select recompute or comm recompute for a layer."""
     if layer_id in layer_to_modules:
         log_ops = []
         for pattern in layer_to_modules[layer_id]:
-            log = _set_pattern_recompute(layer, pattern.split(r'.'), add_prim_attr, policy_fn)
+            log = _set_pattern_recompute(layer, pattern.split(r'.'), add_prim_attr)
             if log:
                 log_ops.append(log[1:])
         log_ops_str = ', '.join(log_ops)
         if log_ops_str:
             comm = 'comm ' if add_prim_attr else ''
             logger.info(f"Set select {comm}recompute at layer {layer_id}: {log_ops_str}")
+
+
+def _install_callable_exclude_wrapper(layer, name, operator):
+    """Replace an instance callable, bound method, or settable property."""
+    wrapped = checkpoint_exclude_wrapper(operator)
+    if name in vars(layer):
+        setattr(layer, name, wrapped)
+        return
+
+    descriptor = inspect.getattr_static(layer, name, None)
+    if isinstance(descriptor, property):
+        descriptor.fset(layer, wrapped)
+        return
+    if inspect.isfunction(descriptor) or isinstance(
+            descriptor, (staticmethod, classmethod)):
+        # ``nn.Cell.__setattr__`` rejects a child Cell whose name is already a
+        # class method. Shadow the non-data descriptor on this instance.
+        object.__setattr__(layer, name, wrapped)
+        return
+    setattr(layer, name, wrapped)
+
+
+def _set_pattern_exclude(layer, p_list, info=''):
+    """Apply ``checkpoint_exclude_wrapper`` to a module path within a layer.
+
+    Matches two target types at the final path segment:
+    1. Cell in ``_cells``
+    2. Comm op in ``_comm_ops`` registry
+    3. Replaceable callable attribute or custom-class descriptor
+    """
+    log_list = []
+    log = ''
+    if p_list:
+        p = p_list.pop(0)
+    else:
+        return info
+    if p_list:
+        # Compound slot match (e.g. "input" + "allgather" → "input.allgather").
+        slot = p + '.' + '.'.join(p_list)
+        if hasattr(layer, '_comm_ops') and slot in layer._comm_ops:
+            entry = layer._comm_ops[slot]
+            entry['fn'] = checkpoint_exclude_wrapper(entry['fn'])
+            log = f"{info}.{slot}"
+            p_list.clear()
+        else:
+            for name, cell in layer._cells.items():
+                if p == name:
+                    log = _set_pattern_exclude(cell, p_list, info + f'.{name}')
+                    if log:
+                        log_list.append(log[1:])
+    else:
+        # Leaf segment: match cells, comm ops, then functional operators.
+        for name, cell in layer._cells.items():
+            if p == name:
+                setattr(layer, name, checkpoint_exclude_wrapper(cell))
+                log = f"{info}.{name}"
+        if hasattr(layer, '_comm_ops') and p in layer._comm_ops:
+            entry = layer._comm_ops[p]
+            entry['fn'] = checkpoint_exclude_wrapper(entry['fn'])
+            log = f"{info}.{p}"
+        if not log and p not in layer._cells and hasattr(layer, p):
+            operator = getattr(layer, p)
+            if callable(operator):
+                _install_callable_exclude_wrapper(layer, p, operator)
+                log = f"{info}.{p}"
+
+    # Restore p_list so the caller's list is unchanged after recursion
+    p_list.insert(0, p)
+    if log_list:
+        return " " + ", ".join(log_list)
+    return log
+
+
+def _set_exclude_recompute(layer, layer_id, exclude_layer_to_modules):
+    """Apply exclude recompute (checkpoint_exclude_wrapper) to the specified layer."""
+    if layer_id not in exclude_layer_to_modules:
+        return
+    log_ops = []
+    for pattern in exclude_layer_to_modules[layer_id]:
+        log = _set_pattern_exclude(layer, pattern.split(r'.'))
+        if log:
+            log_ops.append(log[1:])
+    log_ops_str = ', '.join(log_ops)
+    if log_ops_str:
+        logger.info(f"Set exclude recompute at layer {layer_id}: {log_ops_str}")
 
 
 def apply_recompute(
@@ -689,15 +803,10 @@ def apply_recompute(
     need_recompute = rc.mode != "None"
     need_comm = rc_comm.enable
 
-    # SAC policy that keeps the configured ops' outputs (MUST_SAVE) instead of recomputing
-    # them; ``None`` when ``exclude_op`` is unset, so the recompute path is unchanged.
-    policy_fn = _build_exclude_op_policy(rc.exclude_op) if rc.exclude_op else None
-    if policy_fn is not None:
-        logger.info(f"Ops excluded from recompute (MUST_SAVE): {list(rc.exclude_op)}")
-
     full_target_ids = set()
     layer_to_modules = {}
     comm_layer_to_modules = {}
+    exclude_layer_to_modules = {}
 
     if _config_list:
         config_list = _config_list
@@ -710,25 +819,35 @@ def apply_recompute(
             select_module_list = _expand_select_module(config_list, rc.select_module)
             layer_to_modules = _clean_and_parse_config(full_target_ids, select_module_list, label="Recompute")
 
+    # Expand exclude_op patterns against the whitelist (same pipeline as select_module).
+    if need_recompute and isinstance(rc.exclude_op, dict) and rc.exclude_op:
+        exclude_layer_to_modules = _clean_and_parse_config(
+            set(), _expand_select_module(config_list, rc.exclude_op, label="exclude_op"), label="ExcludeOp")
+
     if need_comm:
-        comm_select_module_list = _expand_select_module(config_list, rc_comm.select_module)
+        comm_select_module_list = _expand_select_module(config_list, rc_comm.select_module, label="comm_select_module")
         comm_layer_to_modules = _clean_and_parse_comm_config(full_target_ids, layer_to_modules, comm_select_module_list)
 
     if not hasattr(model, "layers"):
         raise ValueError(f"{type(model)} must have 'layers' attribute.")
 
     for layer_id in range(model.layer_start, model.layer_end + 1):
+        # Step 1: exclude (must be before checkpoint_wrapper)
+        if exclude_layer_to_modules:
+            _set_exclude_recompute(model.layers[layer_id], layer_id, exclude_layer_to_modules)
+
+        # Step 2: full recompute
         if need_recompute and layer_id in full_target_ids:
-            model.layers[layer_id] = _wrap_cell_recompute(model.layers[layer_id], policy_fn)
+            model.layers[layer_id] = _wrap_cell_recompute(model.layers[layer_id])
             logger.info(f"Set full recompute at layer {layer_id}")
 
+        # Step 3: select recompute
         if need_recompute and rc.mode == "select":
-            _set_select_recompute(model.layers[layer_id], layer_id, layer_to_modules,
-                                  add_prim_attr=False, policy_fn=policy_fn)
+            _set_select_recompute(model.layers[layer_id], layer_id, layer_to_modules)
 
+        # Step 4: comm recompute
         if need_comm:
             _set_select_recompute(model.layers[layer_id], layer_id, comm_layer_to_modules, add_prim_attr=True)
-
 
 def _tensor_storage_ptr(tensor):
     """Return a tensor's storage pointer, or ``None`` for empty/non-tensors."""
@@ -846,30 +965,11 @@ def _build_swap_boundary_policies(model, input_boundaries, active_layer_ids):
 
 
 def _expand_op_swap(config_list, op_swap):
-    """Expand wildcard patterns in select_module against the model whitelist."""
-    layer_to_modules = {}
-
+    """Expand wildcard patterns in op_swap against the model whitelist."""
+    op_swap_dict = {}
     for item in op_swap:
-        module_name, raw_ranges_str = list(item.items())[0]
-        raw_layer_ids = _parse_layer_ids(raw_ranges_str)
-        matched = False
-
-        for layer_id in raw_layer_ids:
-            if layer_id not in config_list:
-                continue
-            for item in config_list[layer_id]:
-                if regex_match(module_name, item):
-                    matched = True
-                    if layer_id not in layer_to_modules:
-                        layer_to_modules[layer_id] = []
-                    if item not in layer_to_modules[layer_id]:
-                        layer_to_modules[layer_id].append(item)
-
-        if not matched:
-            logger.warning(f"op swap pattern '{module_name}' did not match any module in the model, "
-                           "please check your swap config.")
-
-    return layer_to_modules
+        op_swap_dict.update(item)
+    return _expand_select_module(config_list, op_swap_dict, label="op_swap", config_name="swap config")
 
 
 def parse_op_swap(op_swap) -> list:
