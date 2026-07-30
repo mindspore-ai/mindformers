@@ -94,6 +94,24 @@ def _slice_dim(tensor, dim, world, rank):
     return tensor[tuple(slices)]
 
 
+def register_comm_op(module, name, fn, domain):
+    """Register a communication operator on *module* for exclude_op discovery.
+
+    Each slot (e.g. ``input.allgather``, ``output.reducescatter``) gets its
+    own named entry so multiple transforms on the same module never overwrite
+    each other.  The *domain* (``tp`` / ``ep`` / ``cp``) is stored as metadata
+    and does not appear in the configuration key.
+    """
+    if not hasattr(module, '_comm_ops'):
+        module._comm_ops = {}
+    module._comm_ops[name] = {'fn': fn, 'domain': domain}
+
+
+def _call_comm_op(cell, name, *args, **kwargs):
+    """Call a registered comm op by name through *cell*'s registry."""
+    return cell._comm_ops[name]['fn'](*args, **kwargs)
+
+
 class _AllReduceFunction(_Function):
     """AllReduce partial values in forward and preserve replicated gradients."""
 
@@ -744,22 +762,29 @@ class ColwiseParallel(ParallelStyle):
             output_fn=None,
         )
         if self.gather_input:
-            apply_input_transform = _bind_local_transform(AllGather(0), device_mesh)
+            apply_ag = _bind_local_transform(AllGather(0), device_mesh)
 
-            def _pre_hook(cell, args):  # pylint: disable=unused-argument
-                gathered = apply_input_transform(args[0])
+            def _ag_fn(tensor):
+                return apply_ag(tensor)
+            register_comm_op(module, "input.allgather", _ag_fn, "tp")
+
+            def _pre_hook(cell, args):
+                gathered = _call_comm_op(cell, "input.allgather", args[0])
                 return (gathered,) + tuple(args[1:])
 
             module.register_forward_pre_hook(_pre_hook)
         if self.gather_output:
-            # The gathered output is replicated, so its backward is a local slice,
-            # matching Megatron's gather_from_tensor_model_parallel_region.
-            apply_output_transform = _bind_local_transform(
-                AllGather(-1, reduce_grad=False), device_mesh
+            apply_ag_out = _bind_local_transform(
+                AllGather(-1, reduce_grad=False), device_mesh,
             )
 
-            def _post_hook(cell, args, output):  # pylint: disable=unused-argument
-                return apply_output_transform(output)
+            def _ag_out_fn(tensor):
+                return apply_ag_out(tensor)
+            register_comm_op(module, "output.allgather", _ag_out_fn, "tp")
+
+            def _post_hook(cell, unused_args, output):
+                del unused_args
+                return _call_comm_op(cell, "output.allgather", output)
 
             module.register_forward_hook(_post_hook)
         return module
@@ -841,12 +866,24 @@ class RowwiseParallel(ParallelStyle):
 
             module.register_forward_pre_hook(_pre_hook)
 
-        def _post_hook(cell, args, output):  # pylint: disable=unused-argument
+        # Register comm ops for discovery.
+        if self.reduce_mode == "reduce_scatter":
+            def _rs_fn(tensor):
+                out, _ = comm_func.reduce_scatter_tensor(None, tensor, group=group)
+                return out
+            register_comm_op(module, "output.reducescatter", _rs_fn, "tp")
+        else:
+            def _ar_fn(tensor):
+                return _AllReduceFunction.apply(tensor, group)
+            register_comm_op(module, "output.allreduce", _ar_fn, "tp")
+
+        def _post_hook(cell, unused_args, output):
+            del unused_args
             out = _contiguous(output)
             if self.reduce_mode == "reduce_scatter":
-                out, _ = comm_func.reduce_scatter_tensor(None, out, group=group)
+                out = _call_comm_op(cell, "output.reducescatter", out)
             else:
-                out = _AllReduceFunction.apply(out, group)
+                out = _call_comm_op(cell, "output.allreduce", out)
             if getattr(cell, "has_bias", False) and getattr(cell, "skip_add_bias", False):
                 bias = cell.bias.to_local() if isinstance(cell.bias, DTensor) else cell.bias
                 out = out + cell.cast(bias, out.dtype)
@@ -879,15 +916,27 @@ class RowwiseParallel(ParallelStyle):
             local_ids = (ids - vocab_start) * in_range.to(ids.dtype)
             return (local_ids,) + tuple(args[1:])
 
-        def _post_hook(cell, args, output):  # pylint: disable=unused-argument
+        def _post_hook(cell, unused_args, output):
+            del unused_args
             in_range = masks.pop()
             bsz, seq = in_range.shape
             output = output * in_range.reshape(bsz, seq, 1).to(output.dtype)
             if self.reduce_mode == "all_reduce":
-                return _AllReduceFunction.apply(output.contiguous(), group)
+                return _call_comm_op(cell, "output.allreduce", output.contiguous())
             output = output.transpose(0, 1).contiguous()
-            output, _ = comm_func.reduce_scatter_tensor(None, output, group=group)
+            output = _call_comm_op(cell, "output.reducescatter", output)
             return output.transpose(0, 1).contiguous()
+
+        # Register comm ops for discovery.
+        if self.reduce_mode == "reduce_scatter":
+            def _rs_fn(tensor):
+                out, _ = comm_func.reduce_scatter_tensor(None, tensor, group=group)
+                return out
+            register_comm_op(module, "output.reducescatter", _rs_fn, "tp")
+        else:
+            def _ar_fn(tensor):
+                return _AllReduceFunction.apply(tensor, group)
+            register_comm_op(module, "output.allreduce", _ar_fn, "tp")
 
         module.register_forward_pre_hook(_pre_hook)
         module.register_forward_hook(_post_hook)
@@ -973,17 +1022,48 @@ class PrepareModuleInput(ParallelStyle):
         self.with_kwargs = input_kwarg_transforms is not None
         self.input_kwarg_transforms = input_kwarg_transforms or {}
 
+    def _comm_slots(self):
+        """Return stable registry slots for positional and keyword AllGather transforms."""
+        targets = []
+        for index, transform in enumerate(self.input_transforms or ()):
+            if isinstance(transform, AllGather):
+                targets.append(("positional", index))
+        for key, transform in self.input_kwarg_transforms.items():
+            if isinstance(transform, AllGather):
+                targets.append(("keyword", key))
+
+        positional_slots = {}
+        keyword_slots = {}
+        use_legacy_slot = len(targets) == 1
+        for kind, identifier in targets:
+            if use_legacy_slot:
+                slot = "input.allgather"
+            elif kind == "positional":
+                slot = f"input.{identifier}.allgather"
+            else:
+                slot = f"input.kw.{identifier}.allgather"
+            if kind == "positional":
+                positional_slots[identifier] = slot
+            else:
+                keyword_slots[identifier] = slot
+        return positional_slots, keyword_slots
+
     @staticmethod
-    def _prepare_input_arg(inp: Any, apply_transform):
-        """Prepare one input with a transform already bound to its mesh."""
+    def _prepare_input_arg(inp: Any, apply_transform, cell=None, comm_slot=None):
+        """Prepare one input with a transform already bound to its mesh.
+
+        When *comm_slot* is given and *cell* has a matching comm-op registry
+        entry, the slot is called so ``checkpoint_exclude_wrapper`` can
+        intercept it.
+        """
         if apply_transform is None:
             return inp
         if inp is None:
-            # Optional tensor kwargs (for example ``input_ids`` on non-hash
-            # MTP MoE layers) remain absent under a parallel input transform.
             return None
         if not isinstance(inp, ms.Tensor):
             raise ValueError(f"expecting input to be a Tensor, but got {type(inp)}")
+        if comm_slot is not None and cell is not None and hasattr(cell, '_comm_ops'):
+            return _call_comm_op(cell, comm_slot, inp)
         return apply_transform(inp)
 
     def _bind_input_transforms(self, device_mesh):
@@ -1000,17 +1080,28 @@ class PrepareModuleInput(ParallelStyle):
         }
         return positional, keyword
 
-    def _prepare_bound_inputs(self, inputs, apply_transforms):
+    def _prepare_bound_inputs(self, inputs, apply_transforms, cell=None):
         """Prepare positional inputs with pre-bound transform callables."""
         if apply_transforms is None:
             return inputs
         if not isinstance(inputs, tuple):
             inputs = (inputs,)
         self._validate_input_arity(inputs, apply_transforms)
-        prepared_inputs = [
-            self._prepare_input_arg(inp, apply_transform)
-            for inp, apply_transform in zip(inputs, apply_transforms)
-        ]
+        raw_transforms = self.input_transforms
+        if not isinstance(raw_transforms, tuple):
+            raw_transforms = (raw_transforms,)
+        positional_slots, _ = self._comm_slots()
+        prepared_inputs = []
+        for index, (inp, apply_transform, _) in enumerate(
+                zip(inputs, apply_transforms, raw_transforms)):
+            prepared_inputs.append(
+                self._prepare_input_arg(
+                    inp,
+                    apply_transform,
+                    cell=cell,
+                    comm_slot=positional_slots.get(index),
+                )
+            )
         prepared_inputs.extend(inputs[len(apply_transforms):])
         return tuple(prepared_inputs)
 
@@ -1024,30 +1115,38 @@ class PrepareModuleInput(ParallelStyle):
                     "module inputs cannot omit arguments with a non-empty input transform!"
                 )
 
-    def _prepare_input_fn(self, inputs, device_mesh):
+    def _prepare_input_fn(self, inputs, device_mesh, cell=None):
         """Prepare input arguments."""
         normalized_inputs = inputs if isinstance(inputs, tuple) else (inputs,)
         if self.input_transforms is not None:
             self._validate_input_arity(normalized_inputs, self.input_transforms)
         apply_transforms, _ = self._bind_input_transforms(device_mesh)
-        return self._prepare_bound_inputs(inputs, apply_transforms)
+        return self._prepare_bound_inputs(inputs, apply_transforms, cell=cell)
 
     def _prepare_bound_input_kwargs(
-        self, inputs, kwarg_inputs, positional_transforms, keyword_transforms
+        self, inputs, kwarg_inputs, positional_transforms, keyword_transforms, cell=None,
     ):
         """Prepare positional and keyword inputs with pre-bound transforms."""
-        prepared_arg_inputs = self._prepare_bound_inputs(inputs, positional_transforms)
+        prepared_arg_inputs = self._prepare_bound_inputs(
+            inputs, positional_transforms, cell=cell,
+        )
+        _, keyword_slots = self._comm_slots()
         prepared_kwarg_inputs = {
-            key: self._prepare_input_arg(value, keyword_transforms.get(key))
+            key: self._prepare_input_arg(
+                value,
+                keyword_transforms.get(key),
+                cell=cell,
+                comm_slot=keyword_slots.get(key),
+            )
             for key, value in kwarg_inputs.items()
         }
         return prepared_arg_inputs, prepared_kwarg_inputs
 
-    def _prepare_input_kwarg_fn(self, inputs, kwarg_inputs, device_mesh):
+    def _prepare_input_kwarg_fn(self, inputs, kwarg_inputs, device_mesh, cell=None):
         """Prepare input arguments and keyword arguments."""
         positional, keyword = self._bind_input_transforms(device_mesh)
         return self._prepare_bound_input_kwargs(
-            inputs, kwarg_inputs, positional, keyword
+            inputs, kwarg_inputs, positional, keyword, cell=cell,
         )
 
     def _apply(self, module: nn.Cell, device_mesh: DeviceMesh) -> nn.Cell:
@@ -1058,10 +1157,27 @@ class PrepareModuleInput(ParallelStyle):
         according to the specified transforms before the module's construct method is called.
         """
         positional_transforms, keyword_transforms = self._bind_input_transforms(device_mesh)
+        positional_slots, keyword_slots = self._comm_slots()
+
+        # Register every AllGather callsite separately. Keep the legacy
+        # ``input.allgather`` slot when there is only one AllGather in total.
+        if positional_transforms is not None:
+            for index, apply_fn in enumerate(positional_transforms):
+                slot = positional_slots.get(index)
+                if slot is not None and apply_fn is not None:
+                    def _ag_fn(tensor, fn=apply_fn):
+                        return fn(tensor)
+                    register_comm_op(module, slot, _ag_fn, "tp")
+        for key, apply_fn in (keyword_transforms or {}).items():
+            slot = keyword_slots.get(key)
+            if slot is not None and apply_fn is not None:
+                def _ag_kw_fn(tensor, fn=apply_fn):
+                    return fn(tensor)
+                register_comm_op(module, slot, _ag_kw_fn, "tp")
         if self.with_kwargs:
-            def _pre_hook_with_kwargs(cell, inputs, kwargs):  # pylint: disable=unused-argument
+            def _pre_hook_with_kwargs(cell, inputs, kwargs):
                 return self._prepare_bound_input_kwargs(
-                    inputs, kwargs, positional_transforms, keyword_transforms
+                    inputs, kwargs, positional_transforms, keyword_transforms, cell=cell,
                 )
 
             module.register_forward_pre_hook(
@@ -1069,8 +1185,8 @@ class PrepareModuleInput(ParallelStyle):
                 with_kwargs=True,
             )
         else:
-            def _pre_hook(cell, inputs):  # pylint: disable=unused-argument
-                return self._prepare_bound_inputs(inputs, positional_transforms)
+            def _pre_hook(cell, inputs):
+                return self._prepare_bound_inputs(inputs, positional_transforms, cell=cell)
 
             module.register_forward_pre_hook(_pre_hook)
         return module
@@ -1111,8 +1227,27 @@ class PrepareModuleOutput(ParallelStyle):
         )
 
     @staticmethod
-    def _prepare_bound_outputs(outputs, apply_transforms):
-        """Prepare outputs with transform callables already bound to their mesh."""
+    def _comm_slots(raw_transforms):
+        """Return stable registry slots for output AllGather transforms."""
+        if raw_transforms is None:
+            return {}
+        transforms = raw_transforms if isinstance(raw_transforms, tuple) else (raw_transforms,)
+        indexes = [
+            index for index, transform in enumerate(transforms)
+            if isinstance(transform, AllGather)
+        ]
+        if len(indexes) == 1:
+            return {indexes[0]: "output.allgather"}
+        return {index: f"output.{index}.allgather" for index in indexes}
+
+    @staticmethod
+    def _prepare_bound_outputs(outputs, apply_transforms, cell=None, raw_transforms=None):
+        """Prepare outputs with transform callables already bound to their mesh.
+
+        When *cell* has a registered comm-op slot matching an AllGather
+        transform, the slot is called so ``checkpoint_exclude_wrapper`` can
+        intercept it.
+        """
         if apply_transforms is None:
             return outputs
         if not isinstance(outputs, tuple):
@@ -1122,23 +1257,32 @@ class PrepareModuleOutput(ParallelStyle):
                 "module outputs and output_transforms should have same length!"
             )
 
+        if raw_transforms is not None and not isinstance(raw_transforms, tuple):
+            raw_transforms = (raw_transforms,)
+        comm_slots = PrepareModuleOutput._comm_slots(raw_transforms)
+
         prepared_outputs = []
-        for out, apply_transform in zip(outputs, apply_transforms):
+        for i, (out, apply_transform) in enumerate(zip(outputs, apply_transforms)):
             if apply_transform is None:
                 prepared_outputs.append(out)
                 continue
             if not isinstance(out, ms.Tensor):
                 raise ValueError(f"expecting output to be a Tensor, but got {type(out)}")
-            prepared_outputs.append(apply_transform(out))
+            slot = comm_slots.get(i)
+            if slot is not None and cell is not None and hasattr(cell, '_comm_ops'):
+                prepared_outputs.append(_call_comm_op(cell, slot, out))
+            else:
+                prepared_outputs.append(apply_transform(out))
 
         if len(prepared_outputs) == 1:
             return prepared_outputs[0]
         return tuple(prepared_outputs)
 
-    def _prepare_out_fn(self, outputs, device_mesh):
+    def _prepare_out_fn(self, outputs, device_mesh, cell=None):
         """Prepare output arguments."""
         return self._prepare_bound_outputs(
-            outputs, self._bind_output_transforms(device_mesh)
+            outputs, self._bind_output_transforms(device_mesh), cell=cell,
+            raw_transforms=self.output_transforms,
         )
 
     def _apply(self, module: nn.Cell, device_mesh: DeviceMesh) -> nn.Cell:
@@ -1149,9 +1293,22 @@ class PrepareModuleOutput(ParallelStyle):
         according to the specified transforms after the module's construct method is called.
         """
         apply_transforms = self._bind_output_transforms(device_mesh)
+        comm_slots = self._comm_slots(self.output_transforms)
+
+        # Register every output AllGather callsite separately.
+        # Reuse an already-bound output transform if one exists, so no extra
+        # ``get_group()`` call beyond ``_bind_output_transforms`` above.
+        if apply_transforms is not None:
+            for index, apply_fn in enumerate(apply_transforms):
+                slot = comm_slots.get(index)
+                if slot is not None and apply_fn is not None:
+                    def _ag_fn(tensor, fn=apply_fn):
+                        return fn(tensor)
+                    register_comm_op(module, slot, _ag_fn, "tp")
 
         def _post_hook(cell, inputs, outputs):  # pylint: disable=unused-argument
-            return self._prepare_bound_outputs(outputs, apply_transforms)
+            return self._prepare_bound_outputs(outputs, apply_transforms, cell=cell,
+                                                raw_transforms=self.output_transforms)
 
         module.register_forward_hook(_post_hook)
         return module

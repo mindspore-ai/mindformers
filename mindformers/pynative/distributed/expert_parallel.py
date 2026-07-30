@@ -26,7 +26,7 @@ from hyper_parallel import DeviceMesh
 from hyper_parallel.core.dtensor.placement_types import Shard
 from hyper_parallel.core.dtensor.dtensor import DTensor
 
-from mindformers.pynative.distributed.style import ParallelStyle
+from mindformers.pynative.distributed.style import ParallelStyle, register_comm_op, _call_comm_op
 from mindformers.pynative.distributed.utils import distribute_module
 from mindformers.pynative.distributed.activation_checkpoint import (
     get_recompute_metadata,
@@ -304,48 +304,77 @@ class ExpertParallel(ParallelStyle):
 
     # ---- a2a primitives (small, single-collective; overridden for overlap) ----
 
-    def _counts_a2a(self, num_tokens_per_expert, ep_degree):
-        """All-to-all the per-expert token counts; return the grouped counts."""
+    def _counts_a2a(self, num_tokens_per_expert, ep_degree, cell=None):
+        """All-to-all the per-expert token counts; return the grouped counts.
+
+        Routes through the registry slot ``expert_counts.alltoall`` when available.
+        """
         chunk_size = num_tokens_per_expert.shape[-1] // ep_degree
         input_tensor_list = self.split(num_tokens_per_expert, chunk_size, dim=-1)
         output_shape = list(num_tokens_per_expert.shape)
         output_shape[-1] = output_shape[-1] // ep_degree
         output_tensor_list = [mint.zeros(output_shape, dtype=num_tokens_per_expert.dtype) for _ in range(ep_degree)]
-        output_tensor_list, _ = self.all_to_all(
-            output_tensor_list=output_tensor_list,
-            input_tensor_list=input_tensor_list,
-            group=self.ep_group)
+        if cell is not None and hasattr(cell, '_comm_ops'):
+            output_tensor_list, _ = _call_comm_op(cell, "expert_counts.alltoall",
+                output_tensor_list=output_tensor_list,
+                input_tensor_list=input_tensor_list,
+                group=self.ep_group)
+        else:
+            output_tensor_list, _ = self.all_to_all(
+                output_tensor_list=output_tensor_list,
+                input_tensor_list=input_tensor_list,
+                group=self.ep_group)
         return self.concat(output_tensor_list, dim=-1)
 
-    def _main_a2a(self, flat_in, input_splits, output_splits, block_size):
+    def _main_a2a(self, flat_in, input_splits, output_splits, block_size, cell=None):
         """All-to-all the routed token payload; return a flat tensor.
 
         ``input_splits``/``output_splits`` are host ``int`` lists (from
-        :meth:`_host_token_splits`), scaled to element counts on host — no D2H here."""
-        global_input_tokens, _ = self.all_to_all_single(
-            output=None,
-            input=flat_in,
-            output_split_sizes=[s * block_size for s in output_splits],
-            input_split_sizes=[s * block_size for s in input_splits],
-            group=self.ep_group)
+        :meth:`_host_token_splits`), scaled to element counts on host — no D2H here.
+        Routes through the registry slot ``input.alltoallsingle`` when available.
+        """
+        if cell is not None and hasattr(cell, '_comm_ops'):
+            global_input_tokens, _ = _call_comm_op(cell, "input.alltoallsingle",
+                output=None,
+                input=flat_in,
+                output_split_sizes=[s * block_size for s in output_splits],
+                input_split_sizes=[s * block_size for s in input_splits],
+                group=self.ep_group)
+        else:
+            global_input_tokens, _ = self.all_to_all_single(
+                output=None,
+                input=flat_in,
+                output_split_sizes=[s * block_size for s in output_splits],
+                input_split_sizes=[s * block_size for s in input_splits],
+                group=self.ep_group)
         return global_input_tokens
 
-    def _combine_a2a(self, flat_in, send_splits, recv_splits, block_size):
+    def _combine_a2a(self, flat_in, send_splits, recv_splits, block_size, cell=None):
         """Reverse-direction all-to-all of expert outputs; return a flat tensor.
 
-        Reuses the same host split lists computed in dispatch — no extra D2H."""
-        permutated_local_input_tokens, _ = self.all_to_all_single(
-            output=None,
-            input=flat_in,
-            output_split_sizes=[s * block_size for s in recv_splits],
-            input_split_sizes=[s * block_size for s in send_splits],
-            group=self.ep_group)
+        Reuses the same host split lists computed in dispatch — no extra D2H.
+        Routes through the registry slot ``output.alltoallsingle`` when available.
+        """
+        if cell is not None and hasattr(cell, '_comm_ops'):
+            permutated_local_input_tokens, _ = _call_comm_op(cell, "output.alltoallsingle",
+                output=None,
+                input=flat_in,
+                output_split_sizes=[s * block_size for s in recv_splits],
+                input_split_sizes=[s * block_size for s in send_splits],
+                group=self.ep_group)
+        else:
+            permutated_local_input_tokens, _ = self.all_to_all_single(
+                output=None,
+                input=flat_in,
+                output_split_sizes=[s * block_size for s in recv_splits],
+                input_split_sizes=[s * block_size for s in send_splits],
+                group=self.ep_group)
         return permutated_local_input_tokens
 
     # ---- communication segments (the part OverlapExpertParallel re-implements
     # to add A/B/C/D sync hooks and async a2a; the base class is plain sync) ----
 
-    def _dispatch_comm(self, flat_in, num_tokens_per_expert, ep_degree, block_size):
+    def _dispatch_comm(self, flat_in, num_tokens_per_expert, ep_degree, block_size, cell=None):
         """Dispatch comm segment: counts a2a -> splits -> main token a2a.
 
         No routing-map a2a is needed: the per-chunk counts are enough to build
@@ -354,14 +383,14 @@ class ExpertParallel(ParallelStyle):
         Returns ``(flat_out, group_counts, input_splits, output_splits,
         num_tokens_per_expert, resort_routing_map)``.
         """
-        num_tokens_per_expert_group = self._counts_a2a(num_tokens_per_expert, ep_degree)
+        num_tokens_per_expert_group = self._counts_a2a(num_tokens_per_expert, ep_degree, cell=cell)
         # Single batched D2H for all host splits; group_list stays on device.
         input_splits, output_splits, group_counts = self._host_token_splits(
             num_tokens_per_expert, num_tokens_per_expert_group, ep_degree)
         num_tokens_per_expert = self._compute_group_list(num_tokens_per_expert_group, ep_degree)
         resort_routing_map = self._build_resort_routing_map(
             num_tokens_per_expert_group, group_counts, ep_degree)
-        flat_out = self._main_a2a(flat_in, input_splits, output_splits, block_size)
+        flat_out = self._main_a2a(flat_in, input_splits, output_splits, block_size, cell=cell)
         return (
             flat_out, group_counts, input_splits, output_splits,
             num_tokens_per_expert, resort_routing_map
@@ -399,7 +428,7 @@ class ExpertParallel(ParallelStyle):
         (
             flat_out, group_counts, input_splits, output_splits,
             num_tokens_per_expert, resort_routing_map
-        ) = self._dispatch_comm(flat_in, num_tokens_per_expert, ep_degree, cell.hidden_size)
+        ) = self._dispatch_comm(flat_in, num_tokens_per_expert, ep_degree, cell.hidden_size, cell=cell)
         global_input_tokens = self.reshape(flat_out, (1, -1, cell.hidden_size))
 
         if self.moe_permute_fusion:
@@ -419,7 +448,7 @@ class ExpertParallel(ParallelStyle):
         )
         return global_input_tokens, probs, topk_indices, num_tokens_per_expert
 
-    def _dispatch_preprocess(self, topk_indices, num_experts, ep_degree):
+    def _dispatch_preprocess(self, topk_indices, num_experts, ep_degree, cell=None):
         """Dispatch stage 1 (Megatron ``dispatch_preprocess``): count + counts a2a
         + issue the batched counts D2H async on a side stream during the original
         forward. Runs BEFORE the permute so the permute fills the copy's overlap
@@ -431,7 +460,7 @@ class ExpertParallel(ParallelStyle):
         """
         num_tokens_per_expert = self._count_tokens_per_expert(topk_indices, num_experts)
         self.ep_group = get_ep_group_name(get_rank(), ep_degree)
-        num_tokens_per_expert_group = self._counts_a2a(num_tokens_per_expert, ep_degree)
+        num_tokens_per_expert_group = self._counts_a2a(num_tokens_per_expert, ep_degree, cell=cell)
         if is_in_recompute():
             # The matching forward saved the resolved host split lists. Keep
             # recomputing device-side routing/counts, but do not launch another D2H.
@@ -442,7 +471,7 @@ class ExpertParallel(ParallelStyle):
         return host_buf, event, num_tokens_per_expert_group
 
     def _dispatch_a2a(self, flat_in, host_buf, event, num_tokens_per_expert_group,
-                      num_experts, ep_degree, block_size):
+                      num_experts, ep_degree, block_size, cell=None):
         """Dispatch stage 2 (Megatron ``dispatch_all_to_all``).
 
         The original forward syncs the deferred counts D2H and saves the derived
@@ -454,7 +483,7 @@ class ExpertParallel(ParallelStyle):
         num_tokens_per_expert = self._compute_group_list(num_tokens_per_expert_group, ep_degree)
         resort_routing_map = self._build_resort_routing_map(
             num_tokens_per_expert_group, group_counts, ep_degree)
-        flat_out = self._main_a2a(flat_in, input_splits, output_splits, block_size)
+        flat_out = self._main_a2a(flat_in, input_splits, output_splits, block_size, cell=cell)
         return (
             flat_out, group_counts, input_splits, output_splits,
             num_tokens_per_expert, resort_routing_map
@@ -486,7 +515,7 @@ class ExpertParallel(ParallelStyle):
 
         # Stage 1: count + counts a2a + issue async D2H, all BEFORE the permute.
         host_buf, d2h_event, num_tokens_per_expert_group = self._dispatch_preprocess(
-            topk_indices, num_experts, ep_degree)
+            topk_indices, num_experts, ep_degree, cell=cell)
 
         # Expensive permute runs on the main stream, overlapping the D2H copy.
         routed_input, _, topk_indices, unsort_token_indices_experts \
@@ -500,7 +529,7 @@ class ExpertParallel(ParallelStyle):
             num_tokens_per_expert, resort_routing_map
         ) = self._dispatch_a2a(
             flat_in, host_buf, d2h_event, num_tokens_per_expert_group,
-            num_experts, ep_degree, cell.hidden_size)
+            num_experts, ep_degree, cell.hidden_size, cell=cell)
         global_input_tokens = self.reshape(flat_out, (1, -1, cell.hidden_size))
 
         if self.moe_permute_fusion:
@@ -664,9 +693,9 @@ class ExpertParallel(ParallelStyle):
             )
         return routed_output
 
-    def _combine_comm(self, flat_in, input_splits, output_splits, block_size):
+    def _combine_comm(self, flat_in, input_splits, output_splits, block_size, cell=None):
         """Combine comm segment: reverse-direction token a2a. Returns a flat tensor."""
-        return self._combine_a2a(flat_in, output_splits, input_splits, block_size)
+        return self._combine_a2a(flat_in, output_splits, input_splits, block_size, cell=cell)
 
     # performing all-to-all combine on the output
     # pylint: disable=unused-argument
@@ -684,7 +713,7 @@ class ExpertParallel(ParallelStyle):
         routed_output = self._unsort_for_combine(routed_output, resort_ctx, cell.hidden_size)
 
         flat_in = self.reshape(routed_output, (-1,))
-        flat_out = self._combine_comm(flat_in, input_splits, output_splits, cell.hidden_size)
+        flat_out = self._combine_comm(flat_in, input_splits, output_splits, cell.hidden_size, cell=cell)
         permutated_local_input_tokens = self.reshape(flat_out, original_shape)
 
         # AlltoAll output back to original token order, weight, strip pad
@@ -696,13 +725,29 @@ class ExpertParallel(ParallelStyle):
         if not isinstance(module, GroupedMLP):
             raise TypeError(f"Expert parallel only supports GroupedMLP, but got {type(module)}")
 
-        return distribute_module(
+        module = distribute_module(
             module,
             device_mesh,
             parameter_shard_plan=self._get_parameter_shard_plan(),
             input_fn=self._token_dispatch,
             output_fn=self._token_combine,
         )
+        # Register comm ops in the registry for exclude_op discovery.
+        def _a2as_fn(output, input,  # pylint: disable=W0622
+                     output_split_sizes, input_split_sizes, group):
+            return comm.all_to_all_single(
+                output=output, input=input,
+                output_split_sizes=output_split_sizes,
+                input_split_sizes=input_split_sizes, group=group)
+        register_comm_op(module, "input.alltoallsingle", _a2as_fn, "ep")
+        register_comm_op(module, "output.alltoallsingle", _a2as_fn, "ep")
+
+        def _a2a_fn(output_tensor_list, input_tensor_list, group):
+            return comm.all_to_all(
+                output_tensor_list=output_tensor_list,
+                input_tensor_list=input_tensor_list, group=group)
+        register_comm_op(module, "expert_counts.alltoall", _a2a_fn, "ep")
+        return module
 
 
 class DeredundancyExpertParallel(ExpertParallel):
@@ -731,8 +776,43 @@ class DeredundancyExpertParallel(ExpertParallel):
         self.unsqueeze = mint.unsqueeze
         self.logical_and = mint.logical_and
         self.nonzero = mint.nonzero
-        self.all_gather = comm.all_gather_into_tensor
-        self.reduce_scatter = comm.reduce_scatter_tensor
+
+    # Helper that routes through a named registry slot when available.
+    @staticmethod
+    def _call_slot(cell, slot_name, fallback, *args, **kwargs):
+        """Call *slot_name* via registry if registered, otherwise *fallback*."""
+        if cell is not None and hasattr(cell, '_comm_ops'):
+            return _call_comm_op(cell, slot_name, *args, **kwargs)
+        return fallback(*args, **kwargs)
+
+    def _apply(self, module: nn.Cell, device_mesh: DeviceMesh) -> nn.Cell:
+        module = super()._apply(module, device_mesh)
+        # Replace base-class registrations with Deredundancy-specific slots.
+        module._comm_ops.clear()
+
+        def _ag_fn(output_tensor, input_tensor, group):
+            return comm.all_gather_into_tensor(
+                output_tensor=output_tensor, input_tensor=input_tensor, group=group)
+        register_comm_op(module, "expert_ids.allgather", _ag_fn, "ep")
+        register_comm_op(module, "router_probs.allgather", _ag_fn, "ep")
+        register_comm_op(module, "input.allgather", _ag_fn, "ep")
+
+        def _a2as_fn(output, input,  # pylint: disable=W0622
+                     output_split_sizes, input_split_sizes, group):
+            return comm.all_to_all_single(
+                output=output, input=input,
+                output_split_sizes=output_split_sizes,
+                input_split_sizes=input_split_sizes, group=group)
+        register_comm_op(module, "expert_counts.alltoallsingle", _a2as_fn, "ep")
+        register_comm_op(module, "input.alltoallsingle", _a2as_fn, "ep")
+        register_comm_op(module, "output.alltoallsingle", _a2as_fn, "ep")
+        register_comm_op(module, "expert_ids.alltoallsingle", _a2as_fn, "ep")
+
+        def _rs_fn(output, input, group):  # pylint: disable=W0622
+            return comm.reduce_scatter_tensor(
+                output=output, input=input, group=group)
+        register_comm_op(module, "output.reducescatter", _rs_fn, "ep")
+        return module
 
     def _token_dispatch(self, device_mesh, cell, args):
         tokens, probs, topk_indices, num_tokens_per_expert = args
@@ -777,18 +857,19 @@ class DeredundancyExpertParallel(ExpertParallel):
 
         # prepare counter
         iepones = [node_expert_num // inter_ep for i in range(inter_ep)]
-        expert_ids, _ = self.all_gather(output_tensor=None, input_tensor=topk_indices, group=self.oep_group)
+        expert_ids, _ = self._call_slot(cell, "expert_ids.allgather",
+            comm.all_gather_into_tensor, output_tensor=None, input_tensor=topk_indices, group=self.oep_group)
         expert_ids = self.reshape(expert_ids, (-1, top_k))
         excounter = self.histc(self.reshape(expert_ids, (-1,)), bins=num_experts, min=0, max=num_experts)
         excounter = excounter[self.local_expert_start_index: self.local_expert_end_index]
         excounter_reshaped = self.reshape(excounter, (inter_ep, -1))
-        local_excounter, _ = self.all_to_all_single(
+        local_excounter, _ = self._call_slot(cell, "expert_counts.alltoallsingle",
+            comm.all_to_all_single,
             output=None,
             input=excounter.reshape(-1),
             output_split_sizes=iepones,
             input_split_sizes=iepones,
-            group=self.iep_group
-        )
+            group=self.iep_group)
         local_excounter_reshaped = self.reshape(local_excounter, (inter_ep, -1))
         exrl = self.sum(local_excounter_reshaped, dim=1, keepdim=False)
         exrl = self.cast(exrl, mstype.int64) # [outer_ep]
@@ -798,7 +879,8 @@ class DeredundancyExpertParallel(ExpertParallel):
         exsl = self.cast(exsl, mstype.int64) # [outer_ep]
 
         # 1. allgather
-        output_tensor, _ = self.all_gather(output_tensor=None, input_tensor=probs, group=self.oep_group)
+        output_tensor, _ = self._call_slot(cell, "router_probs.allgather",
+            comm.all_gather_into_tensor, output_tensor=None, input_tensor=probs, group=self.oep_group)
         permuted_probs = self.reshape(output_tensor, (-1, top_k))
 
         # 2. exdispatch
@@ -812,7 +894,8 @@ class DeredundancyExpertParallel(ExpertParallel):
         mask = self.logical_and(
             sorted_expert_ids >= self.local_expert_start_index, sorted_expert_ids < self.local_expert_end_index
         )
-        routed_input, _ = self.all_gather(output_tensor=None, input_tensor=tokens, group=self.oep_group)
+        routed_input, _ = self._call_slot(cell, "input.allgather",
+            comm.all_gather_into_tensor, output_tensor=None, input_tensor=tokens, group=self.oep_group)
         routed_input = self.reshape(routed_input, (-1, hidden_size))
         idx = self.reshape(self.nonzero(self.reshape(mask, (-1,))), (-1,))
         dispatch_idx = self.index_select(dispatch_idx_floordiv_k, 0, idx)
@@ -827,23 +910,23 @@ class DeredundancyExpertParallel(ExpertParallel):
         real_input_splits = (exsl * block_size).tolist()
         real_output_splits = (exrl * block_size).tolist()
 
-        routed_input, _ = self.all_to_all_single(
+        routed_input, _ = self._call_slot(cell, "input.alltoallsingle",
+            comm.all_to_all_single,
             output=None,
             input=self.reshape(routed_input, (-1,)),
             output_split_sizes=real_output_splits,
             input_split_sizes=real_input_splits,
-            group=self.iep_group
-        )
+            group=self.iep_group)
         routed_input = self.reshape(routed_input, (-1, hidden_size))
         real_input_splits = exsl.tolist()
         real_output_splits = exrl.tolist()
-        sorted_expert_ids, _ = self.all_to_all_single(
+        sorted_expert_ids, _ = self._call_slot(cell, "expert_ids.alltoallsingle",
+            comm.all_to_all_single,
             output=None,
             input=self.reshape(sorted_expert_ids, (-1,)),
             output_split_sizes=real_output_splits,
             input_split_sizes=real_input_splits,
-            group=self.iep_group
-        )
+            group=self.iep_group)
 
         # 4. resort
         _, sort_map = mint.sort(self.cast(sorted_expert_ids, mstype.float32))
@@ -870,13 +953,13 @@ class DeredundancyExpertParallel(ExpertParallel):
         block_size = hidden_size
         real_input_splits = (exrl * block_size).tolist()
         real_output_splits = (exsl * block_size).tolist()
-        routed_output, _ = self.all_to_all_single(
+        routed_output, _ = self._call_slot(cell, "output.alltoallsingle",
+            comm.all_to_all_single,
             output=None,
             input=self.reshape(routed_output, (-1,)),
             output_split_sizes=real_output_splits,
             input_split_sizes=real_input_splits,
-            group=self.iep_group
-        )
+            group=self.iep_group)
         routed_output = self.reshape(routed_output, (-1, hidden_size))
 
         # -2. excombine
@@ -885,11 +968,11 @@ class DeredundancyExpertParallel(ExpertParallel):
         routed_output = excombine_whiteboard.index_add_(0, self.reshape(dispatch_idx, (-1,)), routed_output)
 
         # -1 reduce scatter
-        routed_output, _ = self.reduce_scatter(
+        routed_output, _ = self._call_slot(cell, "output.reducescatter",
+            comm.reduce_scatter_tensor,
             output=None,
             input=routed_output,
-            group=self.oep_group
-        )
+            group=self.oep_group)
         routed_output = routed_output[pad_size:]
         if self.input_layout is not None:
             return DTensor.from_local(

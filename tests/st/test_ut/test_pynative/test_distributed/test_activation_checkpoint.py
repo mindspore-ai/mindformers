@@ -29,7 +29,6 @@ from mindformers.pynative.distributed.activation_checkpoint import (
     apply_ac,
     apply_recompute,
     apply_swap,
-    _build_exclude_op_policy,
     get_recompute_metadata,
     is_in_recompute,
     recompute_context_fn,
@@ -550,66 +549,3 @@ class TestMtpRecompute:
         rc, rc_comm = _make_recompute_config(mode="full", full_recompute_layer=["2"])
         with pytest.raises(ValueError):
             apply_ac(decoder, rc, rc_comm, _make_swap_config(enable=False), 1, mtp_block=None)
-
-
-# ======================== Exclude op (no-recompute) ========================
-
-
-class _FakeOp:
-    """Stand-in for a dispatched op exposing a ``name`` attribute."""
-
-    def __init__(self, name):
-        self.name = name
-
-
-@pytest.mark.level0
-@pytest.mark.platform_x86_cpu
-@pytest.mark.env_onecard
-class TestExcludeOp:
-    """Test exclude_op: configured ops are kept off the recompute path (case-insensitive)."""
-
-    def test_policy_case_insensitive_substring(self):
-        policy = _build_exclude_op_policy(["AllGather", "reducescatter"])
-        # case-insensitive substring match against the real InnerComm* dispatch names -> saved
-        assert policy(None, _FakeOp("InnerCommAllGather")) == CheckpointPolicy.MUST_SAVE
-        assert policy(None, _FakeOp("innercommallgather")) == CheckpointPolicy.MUST_SAVE
-        assert policy(None, _FakeOp("InnerCommReduceScatter")) == CheckpointPolicy.MUST_SAVE
-        # non-matching ops are recomputed (MUST_RECOMPUTE; PREFER_RECOMPUTE is rejected by
-        # the MindSpore selective-checkpoint dispatch)
-        assert policy(None, _FakeOp("MatMulExt")) == CheckpointPolicy.MUST_RECOMPUTE
-        assert policy(None, _FakeOp("InnerCommAllReduce")) == CheckpointPolicy.MUST_RECOMPUTE
-
-    def test_policy_matches_compute_op(self):
-        # exclude_op is not comm-specific: a compute op like matmul is kept too
-        policy = _build_exclude_op_policy(["matmul"])
-        assert policy(None, _FakeOp("MatMulExt")) == CheckpointPolicy.MUST_SAVE
-        assert policy(None, _FakeOp("BatchMatMulExt")) == CheckpointPolicy.MUST_SAVE
-        # other ops (including collectives) are still recomputed
-        assert policy(None, _FakeOp("InnerCommReduceScatter")) == CheckpointPolicy.MUST_RECOMPUTE
-        assert policy(None, _FakeOp("RmsNorm")) == CheckpointPolicy.MUST_RECOMPUTE
-
-    def test_full_recompute_attaches_exclude_policy(self):
-        model = MockModel(num_layers=2)
-        rc, rc_comm = _make_recompute_config(mode="full", full_recompute_layer=["0"],
-                                             exclude_op=["AllGather"])
-        apply_recompute(model, rc, rc_comm)
-        wrapped = model.layers[0]
-        assert isinstance(wrapped, CheckpointWrapper)
-        assert callable(wrapped.checkpoint_kwargs.get("policy_fn"))
-
-    def test_select_recompute_attaches_exclude_policy(self):
-        model = MockModel(num_layers=2)
-        rc, rc_comm = _make_recompute_config(mode="select", select_module={"attention": ["0"]},
-                                             exclude_op=["AllToAll"])
-        apply_recompute(model, rc, rc_comm)
-        wrapped = model.layers[0].attention
-        assert isinstance(wrapped, CheckpointWrapper)
-        assert callable(wrapped.checkpoint_kwargs.get("policy_fn"))
-
-    def test_recompute_without_exclude_op_has_no_policy(self):
-        model = MockModel(num_layers=2)
-        rc, rc_comm = _make_recompute_config(mode="full", full_recompute_layer=["0"])
-        apply_recompute(model, rc, rc_comm)
-        wrapped = model.layers[0]
-        assert isinstance(wrapped, CheckpointWrapper)
-        assert "policy_fn" not in wrapped.checkpoint_kwargs

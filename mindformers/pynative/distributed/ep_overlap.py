@@ -64,12 +64,14 @@ Recompute compatibility
 """
 
 import mindspore as ms
-from mindspore import mint
+from mindspore import mint, nn
 
+from hyper_parallel import DeviceMesh
 from hyper_parallel.platform import get_platform
 from hyper_parallel.core.pipeline_parallel.hook_coordinator import HookCoordinator
 
 from mindformers.pynative.distributed.expert_parallel import ExpertParallel
+from mindformers.pynative.distributed.style import register_comm_op, _call_comm_op
 
 _platform = get_platform()
 
@@ -120,6 +122,25 @@ class OverlapExpertParallel(ExpertParallel):
         # dual-thread overlap: the staged dispatch keeps the A/B hooks at the a2a-segment
         # boundary (see _dispatch_a2a), so the side-stream counts D2H fits underneath.
 
+    def _apply(self, module: nn.Cell, device_mesh: DeviceMesh) -> nn.Cell:
+        module = super()._apply(module, device_mesh)
+        # Replace base-class sync registrations with overlap async versions.
+        module._comm_ops.clear()
+
+        style_self = self
+
+        def _counts_fn(output, input_tensor, group):
+            result = style_self.all_to_all_single(output, input_tensor, group=group)
+            return result if isinstance(result, ms.Tensor) else result[0]
+        register_comm_op(module, "expert_counts.alltoallsingle", _counts_fn, "ep")
+
+        def _async_fn(flat_input, send_splits, recv_splits, block_size):
+            return style_self._async_a2a(flat_input, send_splits, recv_splits, block_size)
+        register_comm_op(module, "input.alltoallsingle", _async_fn, "ep")
+        register_comm_op(module, "output.alltoallsingle", _async_fn, "ep")
+
+        return module
+
     # ------------------------------------------------------------------
     # Overlap seams — the only logic added on top of the synchronous base.
     # The inherited _token_dispatch / _token_combine orchestrators call the
@@ -151,21 +172,50 @@ class OverlapExpertParallel(ExpertParallel):
     # _single_ variant (the base counts path uses the list-based comm.all_to_all,
     # which would dispatch on a different stream). ----
 
-    def _counts_a2a(self, num_tokens_per_expert, ep_degree):  # pylint: disable=unused-argument
+    def _counts_a2a(self, num_tokens_per_expert, ep_degree, cell=None):  # pylint: disable=unused-argument
+        if (cell is not None and hasattr(cell, '_comm_ops')
+                and "expert_counts.alltoallsingle" in cell._comm_ops):
+            counts_size = int(num_tokens_per_expert.shape[0])
+            output = mint.empty((counts_size,), dtype=num_tokens_per_expert.dtype)
+            result = _call_comm_op(cell, "expert_counts.alltoallsingle",
+                                    output, num_tokens_per_expert, group=self.ep_group)
+            return result if isinstance(result, ms.Tensor) else result[0]
         counts_size = int(num_tokens_per_expert.shape[0])
         output = mint.empty((counts_size,), dtype=num_tokens_per_expert.dtype)
         result = self.all_to_all_single(output, num_tokens_per_expert, group=self.ep_group)
         return result if isinstance(result, ms.Tensor) else result[0]
 
-    def _main_a2a(self, flat_in, input_splits, output_splits, block_size):
+    def _main_a2a(self, flat_in, input_splits, output_splits, block_size, cell=None):
+        if (cell is not None and hasattr(cell, '_comm_ops')
+                and "input.alltoallsingle" in cell._comm_ops):
+            result = _call_comm_op(
+                cell,
+                "input.alltoallsingle",
+                flat_in,
+                input_splits,
+                output_splits,
+                block_size,
+            )
+            return result[0] if isinstance(result, tuple) else result
         return self._async_a2a(flat_in, input_splits, output_splits, block_size)
 
-    def _combine_a2a(self, flat_in, send_splits, recv_splits, block_size):
+    def _combine_a2a(self, flat_in, send_splits, recv_splits, block_size, cell=None):
+        if (cell is not None and hasattr(cell, '_comm_ops')
+                and "output.alltoallsingle" in cell._comm_ops):
+            result = _call_comm_op(
+                cell,
+                "output.alltoallsingle",
+                flat_in,
+                send_splits,
+                recv_splits,
+                block_size,
+            )
+            return result[0] if isinstance(result, tuple) else result
         return self._async_a2a(flat_in, send_splits, recv_splits, block_size)
 
     # ---- communication segments: wrap the a2a with the A/B/C/D sync hooks ----
 
-    def _dispatch_comm(self, flat_in, num_tokens_per_expert, ep_degree, block_size):
+    def _dispatch_comm(self, flat_in, num_tokens_per_expert, ep_degree, block_size, cell=None):
         """Overlap dispatch comm: A hook -> counts -> splits -> chunk counts
         (small host list) -> async main a2a -> B hook.
 
@@ -175,13 +225,15 @@ class OverlapExpertParallel(ExpertParallel):
         overlap window without a routing-map collective.
         """
         flat_in = self._sync_hook(flat_in, "A")
-        num_tokens_per_expert_group = self._counts_a2a(num_tokens_per_expert, ep_degree)
+        num_tokens_per_expert_group = self._counts_a2a(
+            num_tokens_per_expert, ep_degree, cell=cell)
         # Single batched D2H (consumes only the already-complete counts a2a, not the
         # async main a2a below — the overlap window is preserved); group_list on device.
         input_splits, output_splits, group_counts = self._host_token_splits(
             num_tokens_per_expert, num_tokens_per_expert_group, ep_degree)
         num_tokens_per_expert = self._compute_group_list(num_tokens_per_expert_group, ep_degree)
-        flat_out = self._main_a2a(flat_in, input_splits, output_splits, block_size)
+        flat_out = self._main_a2a(
+            flat_in, input_splits, output_splits, block_size, cell=cell)
         # The routing map depends only on the completed counts a2a. Build it
         # after launching the async token a2a so repeat_interleave overlaps HCCL.
         resort_routing_map = self._build_resort_routing_map(
@@ -193,7 +245,7 @@ class OverlapExpertParallel(ExpertParallel):
         )
 
     def _dispatch_a2a(self, flat_in, host_buf, event, num_tokens_per_expert_group,
-                      num_experts, ep_degree, block_size):
+                      num_experts, ep_degree, block_size, cell=None):
         """Async-D2H stage 2 with A/B hooks (used when expert_parallel_async_d2h is on).
 
         The counts a2a + the async counts D2H were already issued in
@@ -208,7 +260,8 @@ class OverlapExpertParallel(ExpertParallel):
         input_splits, output_splits, group_counts = self._finish_async_d2h(
             host_buf, event, num_experts, ep_degree)
         num_tokens_per_expert = self._compute_group_list(num_tokens_per_expert_group, ep_degree)
-        flat_out = self._main_a2a(flat_in, input_splits, output_splits, block_size)
+        flat_out = self._main_a2a(
+            flat_in, input_splits, output_splits, block_size, cell=cell)
         # Keep the same overlap window as the synchronous-D2H dispatch path.
         resort_routing_map = self._build_resort_routing_map(
             num_tokens_per_expert_group, group_counts, ep_degree)
@@ -218,10 +271,11 @@ class OverlapExpertParallel(ExpertParallel):
             num_tokens_per_expert, resort_routing_map
         )
 
-    def _combine_comm(self, flat_in, input_splits, output_splits, block_size):
+    def _combine_comm(self, flat_in, input_splits, output_splits, block_size, cell=None):
         """Overlap combine comm: C hook -> async combine a2a -> D / D_LAST hook."""
         flat_in = self._sync_hook(flat_in, "C")
-        flat_out = self._combine_a2a(flat_in, output_splits, input_splits, block_size)
+        flat_out = self._combine_a2a(
+            flat_in, output_splits, input_splits, block_size, cell=cell)
         return self._sync_hook(flat_out, self._d_hook)
 
 
