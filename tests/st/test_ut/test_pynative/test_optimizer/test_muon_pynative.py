@@ -202,6 +202,81 @@ class TestMuonConfig:
     @pytest.mark.level0
     @pytest.mark.platform_x86_cpu
     @pytest.mark.env_onecard
+    def test_bound_ns_groups(self):
+        """
+        Feature: memory-bounded Newton-Schulz Muon batching.
+        Description: a large-matrix same-shape group is chunked by its estimated
+            NS transient bytes; a small-matrix group with tiny per-slot bytes is
+            never split; chunks keep >=2 slots so no weight leaves the bmm path.
+        Expectation: only the large group splits, preserving slot order, keyed by
+            ``(group_sig, chunk_index)``.
+        """
+        big = ("big", (3584, 3584))
+        small = ("small", (16, 16))
+        big_bytes = muon_mod._estimate_ns_peak_bytes_for_shape((3584, 3584))
+        small_bytes = muon_mod._estimate_ns_peak_bytes_for_shape((16, 16))
+        assert big_bytes > small_bytes
+        groups = {big: [0, 1, 2, 3], small: [4, 5, 6, 7]}
+        slot_bytes = {big: big_bytes, small: small_bytes}
+
+        # Budget = 2 big slots -> big splits 2+2; small (tiny bytes) stays whole.
+        bounded = muon_mod._bound_ns_groups(
+            groups, slot_bytes, max_temp_bytes=2 * big_bytes)
+        assert bounded[(big, 0)] == [0, 1]
+        assert bounded[(big, 1)] == [2, 3]
+        assert bounded[(small, 0)] == [4, 5, 6, 7]
+
+        # Even a 1-byte budget never drops below two slots per chunk (bmm path).
+        bounded = muon_mod._bound_ns_groups(groups, slot_bytes, max_temp_bytes=1)
+        assert bounded[(big, 0)] == [0, 1]
+        assert bounded[(big, 1)] == [2, 3]
+        assert all(len(chunk) >= 2 for chunk in bounded.values())
+
+        # A pre-existing singleton group is preserved (stays on the mm path).
+        bounded = muon_mod._bound_ns_groups(
+            {big: [0]}, {big: big_bytes}, max_temp_bytes=1)
+        assert bounded == {(big, 0): [0]}
+
+    @pytest.mark.level0
+    @pytest.mark.platform_x86_cpu
+    @pytest.mark.env_onecard
+    def test_resolve_batch_memory_bytes(self):
+        """
+        Feature: configurable Muon batch memory budgets.
+        Description: the ``*_batch_memory_gb`` options are given in GB and convert
+            to bytes; ``None`` keeps the built-in default; non-positive or
+            non-numeric values are rejected. A larger budget must batch more
+            slots per chunk than a smaller one.
+        Expectation: conversion, defaulting and validation all behave as stated.
+        """
+        gb = 1024 ** 3
+        # Integer and fractional GB both convert to bytes.
+        assert muon_mod._resolve_batch_memory_bytes(2, "x") == 2 * gb
+        assert muon_mod._resolve_batch_memory_bytes(0.5, "x") == gb // 2
+        # Invalid values are rejected.
+        for bad in (0, -1):
+            with pytest.raises(ValueError):
+                muon_mod._resolve_batch_memory_bytes(bad, "x")
+        for bad in ("1", True, None):
+            with pytest.raises(TypeError):
+                muon_mod._resolve_batch_memory_bytes(bad, "x")
+
+        # The budget actually drives how many slots share a chunk.
+        sig = ("big", (1024, 1024))
+        slot_bytes = {sig: gb // 4}
+        groups = {sig: [0, 1, 2, 3, 4, 5, 6, 7]}
+        small = muon_mod._bound_ns_groups(
+            dict(groups), slot_bytes,
+            max_temp_bytes=muon_mod._resolve_batch_memory_bytes(0.5, "x"))
+        large = muon_mod._bound_ns_groups(
+            dict(groups), slot_bytes,
+            max_temp_bytes=muon_mod._resolve_batch_memory_bytes(2, "x"))
+        assert max(len(c) for c in small.values()) < max(len(c) for c in large.values())
+
+
+    @pytest.mark.level0
+    @pytest.mark.platform_x86_cpu
+    @pytest.mark.env_onecard
     def test_normalize_ns_schedule_flat(self):
         """
         Feature: Muon._normalize_ns_schedule flat-triple form.
@@ -425,6 +500,36 @@ class TestNewtonSchulz:
         out1 = self._run_ns(mat)
         out2 = self._run_ns(mat)
         assert np.array_equal(out1, out2)
+
+    @pytest.mark.level1
+    @pytest.mark.platform_arm_ascend910b_training
+    @pytest.mark.env_onecard
+    def test_batched_ns_split_is_bitwise_invariant(self):
+        """
+        Feature: memory-bounded NS group splitting (``_bound_ns_groups``).
+        Description: the bmm batch dimension carries independent weights, so
+            running Newton-Schulz on a stack of K weights must give byte-for-byte
+            the same per-weight result as running it on any sub-batch of them.
+            This is the precision guarantee that lets large expert groups split.
+        Expectation: full-batch NS output equals the concatenation of chunked-NS
+            outputs with rtol=0, atol=0 (bitwise).
+        """
+        rng = np.random.default_rng(7)
+        k, m, n = 6, 20, 28
+        stack = rng.standard_normal((k, m, n)).astype(np.float32)
+        x_full = Tensor(stack, mstype.float32)
+        out_full = newton_schulz(
+            x_full, m, n, 1e-7, 5, _NS_SCHED_5, mint.bmm).asnumpy()
+
+        # Split the batch dim into 2 + 2 + 2 (mirrors _bound_ns_groups chunks).
+        pieces = []
+        for start in range(0, k, 2):
+            x_chunk = Tensor(stack[start:start + 2], mstype.float32)
+            pieces.append(newton_schulz(
+                x_chunk, m, n, 1e-7, 5, _NS_SCHED_5, mint.bmm).asnumpy())
+        out_chunked = np.concatenate(pieces, axis=0)
+
+        assert np.array_equal(out_full, out_chunked)
 
 
 # --------------------------------------------------------------------------- #

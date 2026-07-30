@@ -165,6 +165,84 @@ def _bound_phase4_groups(groups, max_temp_bytes=_PHASE4_BATCH_TEMP_MEMORY_LIMIT)
     return bounded
 
 
+# Byte size of an FP32 element, used to size the Phase 0 stacking transient.
+_FP32_BYTES = 4
+_BYTES_PER_GB = 1024 * 1024 * 1024
+
+
+def _resolve_batch_memory_bytes(value_gb, name):
+    """Convert a batch memory budget given in GB (see ``Muon`` docstring) to bytes.
+
+    The budget caps the temporaries a single batched group may materialise: a
+    smaller value splits large same-shape groups into more chunks (less peak
+    memory, more kernel launches), a larger value keeps them batched.
+    """
+    if not isinstance(value_gb, (int, float)) or isinstance(value_gb, bool):
+        raise TypeError(f"{name} must be a number of GB, but got {type(value_gb).__name__}.")
+    if value_gb <= 0:
+        raise ValueError(f"{name} must be positive, but got {value_gb}.")
+    return int(value_gb * _BYTES_PER_GB)
+
+
+def _dtype_size(dtype):
+    """Return the byte size of a MindSpore dtype (defaults to FP32)."""
+    return {
+        mstype.float16: 2, mstype.bfloat16: 2, mstype.float32: 4,
+        mstype.float64: 8, mstype.int8: 1, mstype.int16: 2,
+        mstype.int32: 4, mstype.int64: 8, mstype.uint8: 1,
+    }.get(dtype, _FP32_BYTES)
+
+
+def _estimate_ns_peak_bytes_for_shape(shape, bytes_per_element=4):
+    """Estimate concurrent FP32 Newton-Schulz working-set bytes for one piece."""
+    if len(shape) == 2:
+        batch = 1
+        dim_a, dim_b = int(shape[0]), int(shape[1])
+    elif len(shape) == 3:
+        batch = int(shape[0])
+        dim_a, dim_b = int(shape[-2]), int(shape[-1])
+    else:
+        return _shape_numel(shape) * bytes_per_element
+    short_dim = min(dim_a, dim_b)
+    long_dim = max(dim_a, dim_b)
+    per_slot = 2 * short_dim * long_dim + 3 * short_dim * short_dim
+    return int(batch * per_slot * bytes_per_element)
+
+
+def _estimate_ns_peak_bytes(param_name, shape, muon_split_fn):
+    """Estimate per-slot Newton-Schulz transient bytes across all split pieces."""
+    piece_shapes = _estimate_muon_piece_shapes(param_name, shape, muon_split_fn)
+    return sum(_estimate_ns_peak_bytes_for_shape(piece_shape) for piece_shape in piece_shapes)
+
+
+def _bound_ns_groups(groups, slot_bytes, max_temp_bytes):
+    """Split same-shape local NS groups to cap batched-NS transients.
+
+    ``groups`` maps ``group_sig -> [slot, ...]``; ``slot_bytes`` maps
+    ``group_sig`` to the estimated per-slot NS working-set bytes.  Returns a
+    dict keyed by ``(group_sig, chunk_index)`` so each chunk becomes its own
+    bmm-batched Newton-Schulz call.  Mirrors :func:`_bound_phase4_groups`:
+    groups with more than one slot keep at least two per chunk so no weight
+    falls back to the ``mm`` singleton numerical path.
+    """
+    bounded = {}
+    for sig, slots in groups.items():
+        bytes_per_slot = max(1, int(slot_bytes.get(sig, 1)))
+        slots_per_batch = max(1, int(max_temp_bytes) // bytes_per_slot)
+        if len(slots) > 1:
+            slots_per_batch = max(2, slots_per_batch)
+        chunks = [slots[start:start + slots_per_batch]
+                  for start in range(0, len(slots), slots_per_batch)]
+        if len(chunks) > 1 and len(chunks[-1]) == 1:
+            if len(chunks[-2]) > 2:
+                chunks[-1].insert(0, chunks[-2].pop())
+            else:
+                chunks[-2].extend(chunks.pop())
+        for chunk_index, chunk in enumerate(chunks):
+            bounded[(sig, chunk_index)] = chunk
+    return bounded
+
+
 class _ShapeOnlyTensor:
     """Tiny shape carrier for schema callables used during cost estimation."""
 
@@ -1581,6 +1659,17 @@ def _run_muon_batched(
             else:
                 local_groups.setdefault(sig, []).append(info)
 
+    # Local weights own their Newton-Schulz input outright (``ns_inputs_full``
+    # is ``ns_inputs_local`` for them, and nothing downstream reads it once the
+    # result exists), so drop it as soon as each group is done.  Otherwise every
+    # input stays alive next to its output until Phase 4 consumes the latter,
+    # which keeps two full copies of the Muon weights resident across the whole
+    # stage.  This only releases references -- the allocator reclaims the blocks
+    # and later groups reuse them -- so it costs nothing.
+    def _release_ns_input(info):
+        info['ns_inputs_full'] = None
+        info['ns_inputs_local'] = None
+
     for info in local_singletons:
         info['x_ret'] = _apply_muon_ns(
             info['ns_inputs_full'],
@@ -1588,6 +1677,7 @@ def _run_muon_batched(
             eps, ns_steps, ns_coefficients,
             info['matmul_op'],
             info['lr'], matched_adamw_rms)
+        _release_ns_input(info)
 
     for sig, infos in local_groups.items():
         if len(infos) == 1:
@@ -1598,6 +1688,7 @@ def _run_muon_batched(
                 eps, ns_steps, ns_coefficients,
                 info['matmul_op'],
                 info['lr'], matched_adamw_rms)
+            _release_ns_input(info)
             continue
         full_tensors = [info['ns_inputs_full'] for info in infos]
         x_rets = _apply_muon_ns_batched(
@@ -1607,8 +1698,10 @@ def _run_muon_batched(
             muon_split_fn, muon_merge_fn,
             eps, ns_steps, ns_coefficients, matched_adamw_rms,
         )
+        full_tensors.clear()
         for info, x_ret in zip(infos, x_rets):
             info['x_ret'] = x_ret
+            _release_ns_input(info)
 
     if overlap_callback is not None:
         overlap_callback()
@@ -1836,6 +1929,21 @@ class Muon(Optimizer):
             Muon. This replaces the model-side ``get_muon_filter`` hook. When
             ``None`` it defaults to ``["*word_embeddings*", "*output_layer*"]``,
             reproducing the historical behaviour. Default: ``None``.
+        phase0_batch_memory_gb (float): Memory budget in GB for the temporaries a
+            single batched Phase 0 (momentum prep) group may materialize. Phase 0
+            is the first large stacking after forward/backward, so this budget
+            mainly controls the memory pool's reserved high-water: a smaller
+            value splits large same-shape groups so their contiguous stacks can
+            reuse fragmented free memory instead of forcing new device
+            reservations. Default: ``1``.
+        ns_batch_memory_gb (float): Memory budget in GB for the temporaries a
+            single bmm-batched Newton-Schulz group may materialize. Controls the
+            allocated peak of the NS stage: large expert matrices are compute
+            saturated, so splitting them lowers the peak at neutral speed, while
+            small launch-bound matrices stay fully batched. Default: ``1``.
+        phase4_batch_memory_gb (float): Memory budget in GB for the temporaries a
+            single batched Phase 4 (parameter apply) group may materialize.
+            Default: ``4``.
     """
 
     def __init__(
@@ -1857,9 +1965,18 @@ class Muon(Optimizer):
         comm_strategy="allgather",
         use_fused_adamw=False,
         adamw_include=None,
+        phase0_batch_memory_gb=1,
+        ns_batch_memory_gb=1,
+        phase4_batch_memory_gb=4,
         **kwargs,
     ):
         super().__init__(learning_rate, params, weight_decay)
+        self.phase0_batch_memory_bytes = _resolve_batch_memory_bytes(
+            phase0_batch_memory_gb, "phase0_batch_memory_gb")
+        self.ns_batch_memory_bytes = _resolve_batch_memory_bytes(
+            ns_batch_memory_gb, "ns_batch_memory_gb")
+        self.phase4_batch_memory_bytes = _resolve_batch_memory_bytes(
+            phase4_batch_memory_gb, "phase4_batch_memory_gb")
         if kwargs.get('swap', False):
             raise ValueError("Muon does not support swap.")
 
@@ -2378,10 +2495,12 @@ class Muon(Optimizer):
             param_idx_for_slot.append(i)
 
         phase0_groups = {}
+        phase0_group_slot_bytes = {}  # p0_key -> per-slot Phase 0 transient bytes
         phase4_groups_local = {}  # non-redist slots — applied while scatter is in flight
         phase4_groups_2d = {}     # needs_redist slots — applied after scatter wait
         flat_order_2d_slots = []
         local_groups_slots = {}
+        local_group_slot_bytes = {}  # group_sig -> per-slot NS transient bytes
 
         for slot, param_idx in enumerate(param_idx_for_slot):
             param = self._parameters[param_idx]
@@ -2395,6 +2514,14 @@ class Muon(Optimizer):
                 p0_key = (tuple(int(d) for d in grad_local.shape),
                           grad_local.dtype, m_local.dtype)
                 phase0_groups.setdefault(p0_key, []).append(slot)
+                if p0_key not in phase0_group_slot_bytes:
+                    # Phase 0 stacks the gradient and momentum and materialises
+                    # a new FP32 ``next_m`` per weight; the stacked buffers are
+                    # what scale with the same-shape layer count.
+                    numel = _shape_numel(grad_local.shape)
+                    phase0_group_slot_bytes[p0_key] = numel * (
+                        _dtype_size(grad_local.dtype) + _dtype_size(m_local.dtype)
+                        + _FP32_BYTES)
 
             p4_key = (tuple(int(d) for d in param_local.shape),
                       param_local.dtype, m_local.dtype)
@@ -2409,6 +2536,12 @@ class Muon(Optimizer):
                 phase4_groups_local.setdefault(p4_key, []).append(slot)
                 if group_sig is not None:
                     local_groups_slots.setdefault(group_sig, []).append(slot)
+                    if group_sig not in local_group_slot_bytes:
+                        ns_shape = grad_local.shape if grad_local is not None \
+                            else param_local.shape
+                        local_group_slot_bytes[group_sig] = _estimate_ns_peak_bytes(
+                            self.param_name_tuple[param_idx], ns_shape,
+                            self.muon_split_fn)
 
         # Same sort key as the previously per-step sort in _run_muon_batched.
         def _sort_key(slot):
@@ -2419,8 +2552,28 @@ class Muon(Optimizer):
         # Batched apply materializes several stacked FP32 tensors.  Bounding
         # groups here keeps the hot path free of shape arithmetic and prevents
         # large repeated expert weights from multiplying the peak by layer count.
-        phase4_groups_local = _bound_phase4_groups(phase4_groups_local)
-        phase4_groups_2d = _bound_phase4_groups(phase4_groups_2d)
+        phase4_groups_local = _bound_phase4_groups(
+            phase4_groups_local, max_temp_bytes=self.phase4_batch_memory_bytes)
+        phase4_groups_2d = _bound_phase4_groups(
+            phase4_groups_2d, max_temp_bytes=self.phase4_batch_memory_bytes)
+
+        # Split large same-shape NS groups (e.g. per-layer expert weights) so
+        # the batched Newton-Schulz a_mat/b_mat transients stop scaling with the
+        # same-shape layer count.  Byte-budgeted: only large-matrix groups split
+        # (speed-neutral, they are compute-saturated), small groups stay fully
+        # batched (launch-bound, batching is essential).
+        local_groups_slots = _bound_ns_groups(
+            local_groups_slots, local_group_slot_bytes,
+            max_temp_bytes=self.ns_batch_memory_bytes)
+
+        # Phase 0 is the first large stacking after forward/backward, so its
+        # contiguous momentum/gradient stacks are the ones that cannot fit the
+        # fragmented free holes and force the memory pool to over-reserve.
+        # Bounding them by byte budget lets the stacks reuse existing idle
+        # memory, lowering the reserved high-water without changing the math.
+        phase0_groups = _bound_ns_groups(
+            phase0_groups, phase0_group_slot_bytes,
+            max_temp_bytes=self.phase0_batch_memory_bytes)
 
         return {
             'param_idx_for_slot': param_idx_for_slot,
