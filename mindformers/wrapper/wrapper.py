@@ -566,6 +566,7 @@ class GradAccumulationCellWithMultiOutputs(nn.Cell):
         ret3 = None
         ret4 = None
         ret5 = None
+        ret6 = None
         output = None
         for i in range(self.micro_size):
             micro_input = self.micro_inputs[i](i, *inputs)
@@ -607,6 +608,12 @@ class GradAccumulationCellWithMultiOutputs(nn.Cell):
                 else:
                     ret5 = output[4]
 
+            if len(output) >= 6:
+                if ret6 is not None:
+                    ret6 = self.add_list[i](ret6, output[5])
+                else:
+                    ret6 = output[5]
+
         if not isinstance(output, tuple):
             return ret
         if len(output) == 2:
@@ -617,6 +624,8 @@ class GradAccumulationCellWithMultiOutputs(nn.Cell):
             return ret, ret2, ret3, ret4
         if len(output) == 5:
             return ret, ret2, ret3, ret4, ret5
+        if len(output) == 6:
+            return ret, ret2, ret3, ret4, ret5, ret6
         return ret
 
 
@@ -737,6 +746,7 @@ class PipelineCellWithMultiOutputs(nn.Cell):
         ret3 = None
         ret4 = None
         ret5 = None
+        ret6 = None
         output = None
         for i in range(self.micro_size):
             micro_input = self.micro_inputs[i](i, *inputs)
@@ -778,6 +788,11 @@ class PipelineCellWithMultiOutputs(nn.Cell):
                 else:
                     ret5 = output[4]
 
+            if len(output) >= 6:
+                if ret6 is not None:
+                    ret6 = self.add_list[i](ret6, output[5])
+                else:
+                    ret6 = output[5]
 
         if not isinstance(output, tuple):
             return ret
@@ -789,6 +804,8 @@ class PipelineCellWithMultiOutputs(nn.Cell):
             return ret, ret2, ret3, ret4
         if len(output) == 5:
             return ret, ret2, ret3, ret4, ret5
+        if len(output) == 6:
+            return ret, ret2, ret3, ret4, ret5, ret6
         return ret
 
 
