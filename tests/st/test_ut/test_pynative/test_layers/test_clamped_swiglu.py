@@ -46,6 +46,25 @@ def _clamped_swiglu_ref(x_np: np.ndarray, clamp_value: float) -> np.ndarray:
     return out.astype(orig_dtype)
 
 
+def _clamped_swiglu_grad_ref(x_np: np.ndarray, clamp_value: float) -> np.ndarray:
+    """Numpy input gradient for a summed ClampedSwiGlu output."""
+    orig_dtype = x_np.dtype
+    x64 = x_np.astype(np.float64)
+    half = x64.shape[-1] // 2
+    gate = x64[..., :half]
+    linear = x64[..., half:]
+
+    gate_clamped = np.minimum(gate, clamp_value)
+    linear_clamped = np.clip(linear, -clamp_value, clamp_value)
+    sigmoid = 1.0 / (1.0 + np.exp(-gate_clamped))
+    silu = gate_clamped * sigmoid
+    silu_grad = sigmoid * (1.0 + gate_clamped * (1.0 - sigmoid))
+
+    gate_grad = linear_clamped * silu_grad * (gate <= clamp_value)
+    linear_grad = silu * ((linear >= -clamp_value) & (linear <= clamp_value))
+    return np.concatenate((gate_grad, linear_grad), axis=-1).astype(orig_dtype)
+
+
 class TestClampedSwiGlu:
     """UT for ClampedSwiGlu cell (numeric path runs on Ascend NPU)."""
 
@@ -143,6 +162,110 @@ class TestClampedSwiGlu:
         x2 = Tensor(np.random.randn(8, 4).astype(np.float32), dtype=ms.float32)
         out2 = act(x2, dim=0)
         assert out2.shape == (4, 4)
+
+    @pytest.mark.level0
+    @pytest.mark.platform_arm_ascend910b_training
+    @pytest.mark.env_onecard
+    def test_backward_preserves_inclusive_clamp_boundaries(self):
+        """
+        Feature: ClampedSwiGlu explicit backward
+        Description: Input gradients match clamp semantics, including gradient
+                     propagation at exactly +/-clamp_value.
+        Exception: AssertionError
+        """
+        from mindformers.pynative.layers.activation import ClampedSwiGlu
+
+        clamp_value = 1.0
+        gate = np.array([[-2.0, -1.0, 0.5, 1.0, 2.0]], dtype=np.float32)
+        linear = np.array([[-2.0, -1.0, 0.5, 1.0, 2.0]], dtype=np.float32)
+        x_np = np.concatenate((gate, linear), axis=-1)
+        expected = _clamped_swiglu_grad_ref(x_np, clamp_value)
+
+        act = ClampedSwiGlu(clamp_value)
+        grad_fn = ms.value_and_grad(lambda tensor: act(tensor).sum())
+        _, actual = grad_fn(Tensor(x_np, dtype=ms.float32))
+
+        np.testing.assert_allclose(actual.asnumpy(), expected, atol=1e-6, rtol=1e-6)
+        # gate == upper and linear == +/-bound must retain non-zero gradients.
+        assert actual[0, 3].asnumpy() != 0
+        assert actual[0, 6].asnumpy() != 0
+        assert actual[0, 8].asnumpy() != 0
+
+    @pytest.mark.level0
+    @pytest.mark.platform_arm_ascend910b_training
+    @pytest.mark.env_onecard
+    def test_backward_preserves_bf16_dtype(self):
+        """
+        Feature: ClampedSwiGlu explicit backward
+        Description: BF16 input gradients are returned in BF16.
+        Exception: AssertionError
+        """
+        from mindformers.pynative.layers.activation import ClampedSwiGlu
+
+        x = Tensor(np.random.randn(2, 10).astype(np.float32), dtype=ms.bfloat16)
+        act = ClampedSwiGlu(0.8)
+        grad_fn = ms.value_and_grad(lambda tensor: act(tensor).sum())
+        _, grad = grad_fn(x)
+
+        assert grad.dtype == ms.bfloat16
+
+    @pytest.mark.level0
+    @pytest.mark.platform_arm_ascend910b_training
+    @pytest.mark.env_onecard
+    def test_backward_supports_non_default_dim(self):
+        """
+        Feature: ClampedSwiGlu explicit backward
+        Description: Input gradients match the native clamp composition when split on dim=0.
+        Exception: AssertionError
+        """
+        from mindspore import mint
+        from mindformers.pynative.layers.activation import ClampedSwiGlu
+
+        clamp_value = 1.0
+        x = Tensor(np.random.randn(8, 4).astype(np.float32), dtype=ms.float32)
+        act = ClampedSwiGlu(clamp_value)
+
+        def reference(tensor):
+            gate, linear = mint.chunk(tensor.to(ms.float32), 2, dim=0)
+            gate = mint.clamp(gate, None, clamp_value)
+            linear = mint.clamp(linear, -clamp_value, clamp_value)
+            return (mint.nn.functional.silu(gate) * linear).sum()
+
+        _, expected = ms.value_and_grad(reference)(x)
+        _, actual = ms.value_and_grad(lambda tensor: act(tensor, dim=0).sum())(x)
+
+        np.testing.assert_allclose(actual.asnumpy(), expected.asnumpy(), atol=1e-6, rtol=1e-6)
+
+    @pytest.mark.level0
+    @pytest.mark.platform_arm_ascend910b_training
+    @pytest.mark.env_onecard
+    def test_backward_supports_activation_recompute(self):
+        """
+        Feature: ClampedSwiGlu explicit backward
+        Description: Recomputed and direct execution produce identical input gradients.
+        Exception: AssertionError
+        """
+        from mindformers.pynative.distributed.activation_checkpoint import recompute_context_fn
+        from mindformers.pynative.layers.activation import ClampedSwiGlu
+
+        x_np = np.array(
+            [[-2.0, -1.0, 0.5, 1.0, 2.0, -2.0, -1.0, 0.5, 1.0, 2.0]],
+            dtype=np.float32,
+        )
+        x = Tensor(x_np, dtype=ms.float32)
+        act = ClampedSwiGlu(1.0)
+
+        direct = ms.grad(lambda tensor: act(tensor).sum())(x)
+        recomputed = ms.grad(
+            lambda tensor: ms.recompute(
+                act,
+                tensor,
+                use_reentrant=False,
+                context_fn=recompute_context_fn,
+            ).sum()
+        )(x)
+
+        np.testing.assert_allclose(recomputed.asnumpy(), direct.asnumpy(), atol=1e-6, rtol=1e-6)
 
 
 class TestClampedSwiGluConfigValidation:
