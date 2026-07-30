@@ -36,7 +36,7 @@ from mindformers.parallel_core.transformer_config import TransformerConfig
 from mindformers.parallel_core.utils.spec_utils import ModuleSpec
 from mindformers.pynative.base_models.gpt.moe_module_specs import get_moe_module_spec
 from mindformers.pynative.base_models.gpt.experimental_attention_variant_module_specs import (
-    get_dsv4_hybrid_module_spec,
+    get_attention_variant_module_spec,
 )
 from mindformers.pynative.transformers.multi_latent_attention import (
     MLASelfAttention,
@@ -47,46 +47,6 @@ from mindformers.pynative.transformers.multi_token_prediction import (
     get_mtp_layer_spec,
 )
 from mindformers.pynative.transformers.hyper_connection import HyperConnectionHead
-from mindformers.pynative.transformers.experimental_attention_variant.dsa import (
-    DSAttention,
-    DSAttentionSubmodules,
-)
-from mindformers.pynative.transformers.experimental_attention_variant.dsa_indexer import (
-    DSAIndexer,
-    DSAIndexerSubmodules,
-)
-
-
-def get_attention_module_spec(
-        sparse_attention: Optional[bool] = False,
-        fused_norm: Optional[bool] = True,
-) -> ModuleSpec:
-    """Helper function to get module spec for Core Attention.
-
-    Args:
-        sparse_attention: If True, use DSAttention with DSAIndexer for sparse attention.
-        fused_norm: Whether to use fused normalization.
-
-    Returns:
-        ModuleSpec for core attention (DSAttention or FlashAttention).
-    """
-    if sparse_attention:
-        return ModuleSpec(
-            module=DSAttention,
-            submodules=DSAttentionSubmodules(
-                indexer=ModuleSpec(
-                    module=DSAIndexer,
-                    submodules=DSAIndexerSubmodules(
-                        linear_wq_b=Linear,
-                        linear_wk=Linear,
-                        k_norm=get_norm_cls("LayerNorm", fused_norm),
-                        linear_weights_proj=Linear,
-                    ),
-                )
-            ),
-        )
-    return FlashAttention
-
 def get_mlp_module_spec(
         num_experts: Optional[int] = None,
         moe_grouped_gemm: Optional[bool] = True,
@@ -113,10 +73,9 @@ def get_gpt_layer_local_spec(
         qk_layernorm: Optional[bool] = False,
         multi_latent_attention: Optional[bool] = False,
         enable_hyper_connections: Optional[bool] = False,
-        sparse_attention: Optional[bool] = False,
+        attention_variant: Optional[str] = None,
         fused_norm: Optional[bool] = True,
         normalization: Optional[str] = "RMSNorm",
-        is_dsv4_hybrid: Optional[bool] = False
 ) -> ModuleSpec:
     """Use this spec for an implementation using only modules in Megatron-Core.
 
@@ -128,6 +87,7 @@ def get_gpt_layer_local_spec(
         multi_latent_attention (bool, optional): To use MultiLatentAttention. Defaults to False.
         enable_hyper_connections (bool, optional): Whether to build HyperConnectionTransformerLayer.
             Defaults to False.
+        attention_variant (str, optional): Registered experimental attention variant.
         fused_norm (bool): Whether to use fused-normalization. Defaults to True.
         normalization (str): The type of the norm. Defaults to RMSNorm.
     Returns:
@@ -140,40 +100,35 @@ def get_gpt_layer_local_spec(
     )
     layer_cls = HyperConnectionTransformerLayer if enable_hyper_connections else TransformerLayer
 
-    # DSv4 hybrid attention selects its self-attention spec directly here, rather than rebuilding a base layer
-    # and swapping the self_attention slot afterwards.
-    if is_dsv4_hybrid:
-        return ModuleSpec(
-            module=layer_cls,
-            submodules=TransformerLayerSubmodules(
-                input_layernorm=get_norm_cls(normalization, fused_norm),
-                self_attention=get_dsv4_hybrid_module_spec(qk_layernorm, fused_norm, normalization),
-                pre_mlp_layernorm=get_norm_cls(normalization, fused_norm),
-                mlp=mlp,
-            ),
+    if attention_variant:
+        self_attention = get_attention_variant_module_spec(
+            attention_variant,
+            qk_layernorm,
+            fused_norm,
+            normalization,
         )
-
-    if multi_latent_attention:
-        core_attention = get_attention_module_spec(sparse_attention, fused_norm)
+    elif multi_latent_attention:
         self_attention = ModuleSpec(
             module=MLASelfAttention,
             submodules=MLASelfAttentionSubmodules(
                 linear_qkv=Linear,
                 linear_qb=Linear,
                 linear_kvb=Linear,
-                core_attention=core_attention,
+                core_attention=FlashAttention,
                 linear_proj=Linear,
                 q_layernorm=get_norm_cls(normalization, fused_norm) if qk_layernorm else IdentityOp,
                 k_layernorm=get_norm_cls(normalization, fused_norm) if qk_layernorm else IdentityOp,
             ),
         )
-        return ModuleSpec(
-            module=layer_cls,
-            submodules=TransformerLayerSubmodules(
-                input_layernorm=get_norm_cls(normalization, fused_norm),
-                self_attention=self_attention,
-                pre_mlp_layernorm=get_norm_cls(normalization, fused_norm),
-                mlp=mlp,
+    else:
+        self_attention = ModuleSpec(
+            module=SelfAttention,
+            submodules=SelfAttentionSubmodules(
+                linear_qkv=Linear,
+                core_attention=FlashAttention,
+                linear_proj=Linear,
+                q_layernorm=get_norm_cls(normalization, fused_norm) if qk_layernorm else IdentityOp,
+                k_layernorm=get_norm_cls(normalization, fused_norm) if qk_layernorm else IdentityOp,
             ),
         )
 
@@ -181,16 +136,7 @@ def get_gpt_layer_local_spec(
         module=layer_cls,
         submodules=TransformerLayerSubmodules(
             input_layernorm=get_norm_cls(normalization, fused_norm),
-            self_attention=ModuleSpec(
-                module=SelfAttention,
-                submodules=SelfAttentionSubmodules(
-                    linear_qkv=Linear,
-                    core_attention=FlashAttention,
-                    linear_proj=Linear,
-                    q_layernorm=get_norm_cls(normalization, fused_norm) if qk_layernorm else IdentityOp,
-                    k_layernorm=get_norm_cls(normalization, fused_norm) if qk_layernorm else IdentityOp,
-                ),
-            ),
+            self_attention=self_attention,
             pre_mlp_layernorm=get_norm_cls(normalization, fused_norm),
             mlp=mlp
         )
@@ -205,16 +151,14 @@ def get_gpt_decoder_block_spec(config: TransformerConfig) -> TransformerBlockSub
     """
 
     # Layer specs.
-    sparse_attention = getattr(config, "experimental_attention_variant", None) == "dsa"
     dense_layer_spec = get_gpt_layer_local_spec(
         num_experts=None,
         moe_grouped_gemm=False,
         qk_layernorm=config.qk_layernorm,
         multi_latent_attention=config.multi_latent_attention,
         enable_hyper_connections=config.enable_hyper_connections,
-        sparse_attention=sparse_attention,
+        attention_variant=config.experimental_attention_variant,
         fused_norm=config.fused_norm,
-        is_dsv4_hybrid=config.experimental_attention_variant == "dsv4_hybrid",
     )
 
     moe_layer_spec = get_gpt_layer_local_spec(
@@ -223,9 +167,8 @@ def get_gpt_decoder_block_spec(config: TransformerConfig) -> TransformerBlockSub
         qk_layernorm=config.qk_layernorm,
         multi_latent_attention=config.multi_latent_attention,
         enable_hyper_connections=config.enable_hyper_connections,
-        sparse_attention=sparse_attention,
+        attention_variant=config.experimental_attention_variant,
         fused_norm=config.fused_norm,
-        is_dsv4_hybrid=config.experimental_attention_variant == "dsv4_hybrid",
     )
 
     # Parse config.moe_layer_freq to determine the pattern of expert/dense layers.
