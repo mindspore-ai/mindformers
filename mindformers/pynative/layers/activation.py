@@ -133,8 +133,24 @@ class ClampedSwiGlu(nn.Cell):
     def __init__(self, clamp_value: float):
         super().__init__()
         self.clamp_value = clamp_value
-        self.lower_bound = Tensor(-clamp_value, ms.float32)
-        self.upper_bound = Tensor(clamp_value, ms.float32)
+        self._init_bounds()
+
+    def _init_bounds(self):
+        """Create non-persistent bounds on the current device."""
+        self.register_buffer(
+            "lower_bound",
+            Tensor(-self.clamp_value, ms.float32),
+            persistent=False,
+        )
+        self.register_buffer(
+            "upper_bound",
+            Tensor(self.clamp_value, ms.float32),
+            persistent=False,
+        )
+
+    def reset_parameter(self):
+        """Recreate clamp bounds after delayed meta-device initialization."""
+        self._init_bounds()
 
     def construct(self, x: Tensor, dim: int = -1) -> Tensor:
         """Apply the clamped SwiGLU activation."""
