@@ -499,43 +499,6 @@ def _build_hc_head_fsdp_policy(hc_head, shard_size):
     )
 
 
-def _wrap_layer_fp32_modules(layer, fsdp_config):
-    """Isolate layer FP32 modules from the parent BF16 FSDP group."""
-    self_attention = layer.self_attention
-
-    norms = []
-    for attr_name in ("input_layernorm", "pre_mlp_layernorm", "pre_cross_attn_layernorm"):
-        norm = getattr(layer, attr_name, None)
-        if is_norm_module(norm):
-            norms.append(norm)
-    for attr_name in ("q_layernorm", "k_layernorm"):
-        norm = getattr(self_attention, attr_name, None)
-        if is_norm_module(norm):
-            norms.append(norm)
-
-    indexer = getattr(getattr(self_attention, "core_attention", None), "indexer", None)
-    if isinstance(self_attention, DSASelfAttention) and indexer is not None:
-        norms.extend(
-            module for _, module in indexer.cells_and_names()
-            if is_norm_module(module)
-        )
-
-    for norm in dict.fromkeys(norms):
-        with ms.DeviceCtx("meta"):
-            fully_shard(norm, **fsdp_config)
-
-    router = getattr(layer.mlp, "router", None)
-    if router is not None:
-        with ms.DeviceCtx("meta"):
-            fully_shard(router, **fsdp_config)
-
-    shared_experts = getattr(layer.mlp, "shared_experts", None)
-    shared_gate = getattr(shared_experts, "shared_experts_gate", None)
-    if shared_gate is not None:
-        with ms.DeviceCtx("meta"):
-            fully_shard(shared_gate, **fsdp_config)
-
-
 # LoRA adapter layouts keyed by the target module's base TP role. Only the non-default
 # placement is listed: distribute_module replicates every other (trainable) param, so a
 # colwise base needs only lora_b sharded on the out-dim, a rowwise base only lora_a on the
@@ -1320,10 +1283,6 @@ def apply_fsdp(
                     replicate_params=expert_replicate_params,
                 )
 
-        # FP32 norms and routers cannot share an HSDP parameter group with the
-        # remaining BF16 layer parameters.
-        _wrap_layer_fp32_modules(layer, fsdp_config)
-
         layer_shard_plan, replicate_params = _build_layer_fsdp_policy(
             layer, dense_shard_degree
         )
@@ -1371,14 +1330,6 @@ def apply_fsdp(
                         reshard_after_forward=reshard_after_forward,
                         replicate_params=expert_replicate_params,
                     )
-
-            _wrap_layer_fp32_modules(layer.transformer_layer, fsdp_config)
-
-            for norm_attr in ("enorm", "hnorm", "final_layernorm"):
-                norm = getattr(layer, norm_attr, None)
-                if is_norm_module(norm):
-                    with ms.DeviceCtx("meta"):
-                        fully_shard(norm, **fsdp_config)
 
             layer_shard_plan, mtp_replicate_params = _build_mtp_fsdp_policy(
                 layer, dense_shard_degree
