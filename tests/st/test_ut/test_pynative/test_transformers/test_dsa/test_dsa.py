@@ -58,8 +58,22 @@ def test_dsa_uses_registered_top_level_attention_class():
     mla_layer_spec = get_gpt_layer_local_spec(multi_latent_attention=True)
     assert mla_layer_spec.submodules.self_attention.module is MLASelfAttention
 
+    legacy_mla_layer_spec = get_gpt_layer_local_spec(
+        multi_latent_attention=True,
+        attention_variant="mla",
+    )
+    assert legacy_mla_layer_spec.submodules.self_attention.module is MLASelfAttention
+
     dsv4_spec = get_attention_variant_module_spec("dsv4_hybrid")
     assert dsv4_spec.module is DSv4HybridSelfAttention
+
+
+@pytest.mark.level0
+@pytest.mark.platform_x86_cpu
+def test_legacy_mla_variant_requires_multi_latent_attention():
+    """The legacy MLA alias must not silently select standard attention."""
+    with pytest.raises(ValueError, match="multi_latent_attention must be True"):
+        get_gpt_layer_local_spec(attention_variant="mla")
 
 
 @pytest.mark.level0
