@@ -88,6 +88,7 @@ def get_gpt_layer_local_spec(
         enable_hyper_connections (bool, optional): Whether to build HyperConnectionTransformerLayer.
             Defaults to False.
         attention_variant (str, optional): Registered experimental attention variant.
+            The legacy value ``"mla"`` selects the regular MLA implementation.
         fused_norm (bool): Whether to use fused-normalization. Defaults to True.
         normalization (str): The type of the norm. Defaults to RMSNorm.
     Returns:
@@ -99,6 +100,13 @@ def get_gpt_layer_local_spec(
         moe_grouped_gemm=moe_grouped_gemm,
     )
     layer_cls = HyperConnectionTransformerLayer if enable_hyper_connections else TransformerLayer
+
+    if attention_variant == "mla":
+        if not multi_latent_attention:
+            raise ValueError(
+                "When attention_variant is 'mla', multi_latent_attention must be True."
+            )
+        attention_variant = None
 
     if attention_variant:
         self_attention = get_attention_variant_module_spec(
