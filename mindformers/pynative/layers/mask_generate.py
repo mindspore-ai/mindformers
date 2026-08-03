@@ -73,7 +73,6 @@ class CausalMaskGenerate(nn.Cell):
         self.reshape = mint.reshape
         self.not_equal = mint.not_equal
         self.expand_dim = mint.unsqueeze
-        self.slice = ops.strided_slice
         self.mul = mint.mul
         self.sub = mint.sub
 
@@ -121,7 +120,7 @@ class CausalMaskGenerate(nn.Cell):
         else:
             # Context-parallel input slicing can shorten the local sequence even
             # when the model config still carries the global seq_length.
-            lower_triangle_mask = self.slice(self.lower_triangle_mask, (0, 0), (seq_len, seq_len), (1, 1))
+            lower_triangle_mask = self.lower_triangle_mask[:seq_len, :seq_len]
             lower_triangle = self.expand_dim(lower_triangle_mask, 0)
 
         # the returned shape is [bs, 1, seq_len, seq_len] (seq_len may differ from seq_length when is_dynamic=True)

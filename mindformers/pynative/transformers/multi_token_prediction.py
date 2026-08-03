@@ -532,7 +532,6 @@ class MultiTokenPredictionBlock(nn.Cell):
         self.cast = ops.cast
         self.cat = mint.cat
         self.shape = ops.shape
-        self.slice = ops.strided_slice
         self.zeros = mint.zeros
         self.transpose = mint.transpose
         self.reshape = mint.reshape
