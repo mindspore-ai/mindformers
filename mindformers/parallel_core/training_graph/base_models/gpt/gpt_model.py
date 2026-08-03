@@ -417,6 +417,7 @@ class GPTModel(nn.Cell):
             self.shard(config)
 
     def update_weight(self, rules):
+        """Re-initialize the weights whose name matches the pattern in the given rules."""
         logger.info(f"update weight with rules {rules}")
         for rule_ in rules:
             pattern = rule_['target']
@@ -428,7 +429,8 @@ class GPTModel(nn.Cell):
                         param.set_data(init_method_normal(init_method_std)(weight_shape))
                         logger.info(f"{param_name} initial weight will be updated, new init_std: {init_method_std}")
                 except TimeoutError as e:
-                    raise TimeoutError(f"Regex matching for '{param_name}' exceeded {MAX_REGEX_MATCH_TIME} seconds") from e
+                    raise TimeoutError(f"Regex matching for '{param_name}' "
+                                       f"exceeded {MAX_REGEX_MATCH_TIME} seconds") from e
 
     def construct(
             self,
@@ -472,7 +474,7 @@ class GPTModel(nn.Cell):
         mtp_loss = self.init_mtp_loss
         numerator1, denominator1 = self.init_numerator1, self.init_denominator1
         if self.mtp_process:
-            mtp_loss, extra_loss, attention_loss = self.mtp(
+            mtp_outputs = self.mtp(
                 input_ids,
                 position_ids,
                 hidden_states,
@@ -489,7 +491,9 @@ class GPTModel(nn.Cell):
                 attention_loss=attention_loss
             )
             if self.calculate_per_token_loss:
-                numerator1, denominator1 = mtp_loss
+                numerator1, denominator1, extra_loss, attention_loss = mtp_outputs
+            else:
+                mtp_loss, extra_loss, attention_loss = mtp_outputs
 
         # logits and loss
         output_weight = None
