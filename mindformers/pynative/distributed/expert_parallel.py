@@ -73,7 +73,6 @@ class ExpertParallel(ParallelStyle):
         self.sum = mint.sum
         self.cumsum = mint.cumsum
         self.mul = mint.mul
-        self.strided_slice = ops.strided_slice
         self.moe_permute_fusion = moe_permute_fusion
         self.split = mint.split
         self.all_to_all = comm.all_to_all
@@ -681,10 +680,7 @@ class ExpertParallel(ParallelStyle):
             routed_output = self.mul(routed_output, self.cast(probs, routed_output.dtype))
             routed_output = self.sum(routed_output, dim=1, keepdim=False)
 
-        routed_output = self.strided_slice(
-            routed_output, (pad_size, 0),
-            (routed_output.shape[0], routed_output.shape[-1]), (1, 1)
-        )
+        routed_output = routed_output[pad_size:]
         if self.input_layout is not None:
             return DTensor.from_local(
                 routed_output,
