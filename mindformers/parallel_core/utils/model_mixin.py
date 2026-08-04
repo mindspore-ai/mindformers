@@ -736,6 +736,11 @@ class TrainModelMixin:
         model = self.check_and_get_model()
         return model.synced_max_attention_logit_fires(*args, **kwargs)
 
+    def take_qk_clip_count(self):
+        """Consume the device-side QK-clip count produced by the optimizer."""
+        model = self.check_and_get_model()
+        return model.take_qk_clip_count()
+
     def apply_qk_clip_scaling(self, *args, **kwargs):
         """Apply QK clip scaling to parameters."""
         model = self.check_and_get_model()

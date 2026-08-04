@@ -15,10 +15,36 @@
 """Tests for pynative GPT model-level behavior."""
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
+import numpy as np
 import pytest
+from mindspore import Tensor, dtype
 
 from mindformers.pynative.base_models.gpt.gpt_model import GPTModel
+
+
+@pytest.mark.level0
+@pytest.mark.platform_x86_cpu
+@pytest.mark.env_onecard
+def test_synced_max_logits_caches_strict_device_count():
+    """Reuse the already-synchronized logits for a strict-``>`` device count."""
+    stacked = Tensor([[99.0, 100.0], [101.0, 150.0]], dtype=dtype.float32)
+    writeback = Mock()
+    model = SimpleNamespace(
+        _stacked_synced_max_logits=Mock(
+            return_value=([object(), object()], None, None, stacked)),
+        _writeback_synced_max_logits=writeback,
+        _qk_clip_count_cache=[None],
+    )
+
+    assert GPTModel.synced_max_attention_logit_fires(
+        model, Tensor([100.0], dtype=dtype.float32)) is True
+
+    count = GPTModel.take_qk_clip_count(model)
+    assert np.array_equal(count.asnumpy(), np.array([2], np.int32))
+    assert GPTModel.take_qk_clip_count(model) is None
+    writeback.assert_called_once()
 
 
 @pytest.mark.level0
