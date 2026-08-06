@@ -1,6 +1,6 @@
 # 欢迎来到MindSpore Transformers（MindFormers）
 
-[![LICENSE](https://img.shields.io/github/license/mindspore-lab/mindformers.svg?style=flat-square)](https://github.com/mindspore-lab/mindformers/blob/master/LICENSE)
+[![LICENSE](https://img.shields.io/badge/License-Apache)](https://gitcode.com/mindspore/mindformers/blob/master/LICENSE)
 [![Downloads](https://static.pepy.tech/badge/mindformers)](https://pepy.tech/project/mindformers)
 [![PyPI](https://badge.fury.io/py/mindformers.svg)](https://badge.fury.io/py/mindformers)
 
@@ -10,6 +10,7 @@ MindSpore Transformers套件的目标是构建一个大模型预训练、微调�
 
 MindSpore Transformers套件基于MindSpore内置的多维混合并行技术和组件化设计，具备如下特点：
 
+- 支持动态图（PyNative）模式，基于 DTensor 实现多维分布式并行，提供动静一致的计算接口，适配多种大语言模型预训练。
 - 配置化一键启动大模型预训练、微调、评测、推理、部署流程。
 - 对接Hugging Face、Megatron-LM、vLLM、OpenCompass等主流生态。
 - 提供丰富的多维混合并行和调试调优能力，支持万亿规格模型训练。
@@ -20,10 +21,7 @@ MindSpore Transformers套件基于MindSpore内置的多维混合并行技术和�
 
 欲获取MindSpore Transformers相关使用教程以及API文档，请参阅[**MindSpore Transformers文档**](https://www.mindspore.cn/mindformers/docs/zh-CN/master/index.html)，以下提供部分内容的快速跳转链接：
 
-- 📝 [大模型预训练](https://www.mindspore.cn/mindformers/docs/zh-CN/master/guide/pre_training.html)
-- 📝 [大模型微调](https://www.mindspore.cn/mindformers/docs/zh-CN/master/guide/supervised_fine_tuning.html)
-- 📝 [大模型评测](https://www.mindspore.cn/mindformers/docs/zh-CN/master/guide/evaluation.html)
-- 📝 [服务化部署](https://www.mindspore.cn/mindformers/docs/zh-CN/master/guide/deployment.html)
+- 📝 [大模型预训练指南](https://www.mindspore.cn/mindformers/docs/zh-CN/master/guide/training.html)
 
 如果您对MindSpore Transformers有任何建议，请通过issue与我们联系，我们将及时处理。
 
@@ -33,64 +31,72 @@ MindSpore Transformers套件基于MindSpore内置的多维混合并行技术和�
 
 当前MindSpore Transformers全量的模型列表如下：
 
-| 模型名                                                                                                               | 支持规格                          |   模型类型   |     模型架构     |   最新支持版本   |
-|:------------------------------------------------------------------------------------------------------------------|:------------------------------|:--------:|:------------:|:----------:|
-| [TeleChat3](https://atomgit.com/mindspore/mindformers/blob/r1.9.0/configs/telechat3) `🔥HOT`                      | 36B                           |  稠密LLM   |    Mcore     | 1.9.0、在研版本 |
-| [TeleChat3-MoE](https://atomgit.com/mindspore/mindformers/blob/r1.9.0/configs/telechat3_moe) `🔥HOT`              | 105B-A4.7B                    |  稀疏LLM   |    Mcore     | 1.9.0、在研版本 |
-| [Qwen3](https://atomgit.com/mindspore/mindformers/blob/r1.9.0/configs/qwen3) `🔥HOT`                              | 0.6B/1.7B/4B/8B/14B/32B       |  稠密LLM   |    Mcore     | 1.9.0、在研版本 |
-| [Qwen3-MoE](https://atomgit.com/mindspore/mindformers/blob/r1.9.0/configs/qwen3_moe) `🔥HOT`                      | 30B-A3B/235B-A22B             |  稀疏LLM   |    Mcore     | 1.9.0、在研版本 |
-| [DeepSeek-V3](https://atomgit.com/mindspore/mindformers/blob/r1.9.0/research/deepseek3) `🔥HOT`                   | 671B                          |  稀疏LLM   | Mcore/Legacy | 1.9.0、在研版本 |
-| [GLM4.5](https://atomgit.com/mindspore/mindformers/blob/r1.9.0/configs/glm4_moe) `🔥HOT`                          | 106B-A12B/355B-A32B           |  稀疏LLM   |    Mcore     | 1.9.0、在研版本 |
-| [GLM4](https://atomgit.com/mindspore/mindformers/blob/r1.9.0/configs/glm4) `🔥HOT`                                | 9B                            |  稠密LLM   | Mcore/Legacy | 1.9.0、在研版本 |
-| [Qwen2.5](https://atomgit.com/mindspore/mindformers/blob/r1.9.0/research/qwen2_5) `🔥HOT`                         | 0.5B/1.5B/7B/14B/32B/72B      |  稠密LLM   |    Legacy    | 1.9.0、在研版本 |
-| [TeleChat2](https://atomgit.com/mindspore/mindformers/blob/r1.9.0/research/telechat2) `🔥HOT`                     | 7B/35B/115B                   |  稠密LLM   | Mcore/Legacy | 1.9.0、在研版本 |
-| [Llama3.1](https://atomgit.com/mindspore/mindformers/blob/r1.7.0/research/llama3_1) `⚠️EOL`                       | 8B/70B                        |  稠密LLM   |    Legacy    |   1.7.0    |
-| [Mixtral](https://atomgit.com/mindspore/mindformers/blob/r1.7.0/research/mixtral) `⚠️EOL`                         | 8x7B                          |  稀疏LLM   |    Legacy    |   1.7.0    |
-| [CodeLlama](https://atomgit.com/mindspore/mindformers/blob/r1.5.0/docs/model_cards/codellama.md) `⚠️EOL`          | 34B                           |  稠密LLM   |    Legacy    |   1.5.0    |
-| [CogVLM2-Image](https://atomgit.com/mindspore/mindformers/blob/r1.5.0/docs/model_cards/cogvlm2_image.md) `⚠️EOL`  | 19B                           |    MM    |    Legacy    |   1.5.0    |
-| [CogVLM2-Video](https://atomgit.com/mindspore/mindformers/blob/r1.5.0/docs/model_cards/cogvlm2_video.md) `⚠️EOL`  | 13B                           |    MM    |    Legacy    |   1.5.0    |
-| [DeepSeek-V2](https://atomgit.com/mindspore/mindformers/blob/r1.5.0/research/deepseek2) `⚠️EOL`                   | 236B                          |  稀疏LLM   |    Legacy    |   1.5.0    |
-| [DeepSeek-Coder-V1.5](https://atomgit.com/mindspore/mindformers/blob/r1.5.0/research/deepseek1_5) `⚠️EOL`         | 7B                            |  稠密LLM   |    Legacy    |   1.5.0    |
-| [DeepSeek-Coder](https://atomgit.com/mindspore/mindformers/blob/r1.5.0/research/deepseek) `⚠️EOL`                 | 33B                           |  稠密LLM   |    Legacy    |   1.5.0    |
-| [GLM3-32K](https://atomgit.com/mindspore/mindformers/blob/r1.5.0/research/glm32k) `⚠️EOL`                         | 6B                            |  稠密LLM   |    Legacy    |   1.5.0    |
-| [GLM3](https://atomgit.com/mindspore/mindformers/blob/r1.5.0/docs/model_cards/glm3.md) `⚠️EOL`                    | 6B                            |  稠密LLM   |    Legacy    |   1.5.0    |
-| [InternLM2](https://atomgit.com/mindspore/mindformers/blob/r1.5.0/research/internlm2) `⚠️EOL`                     | 7B/20B                        |  稠密LLM   |    Legacy    |   1.5.0    |
-| [Llama3.2](https://atomgit.com/mindspore/mindformers/blob/r1.5.0/docs/model_cards/llama3_2.md) `⚠️EOL`            | 3B                            |  稠密LLM   |    Legacy    |   1.5.0    |
-| [Llama3.2-Vision](https://atomgit.com/mindspore/mindformers/blob/r1.5.0/docs/model_cards/mllama.md) `⚠️EOL`       | 11B                           |    MM    |    Legacy    |   1.5.0    |
-| [Llama3](https://atomgit.com/mindspore/mindformers/blob/r1.5.0/research/llama3) `⚠️EOL`                           | 8B/70B                        |  稠密LLM   |    Legacy    |   1.5.0    |
-| [Qwen2](https://atomgit.com/mindspore/mindformers/blob/r1.5.0/research/qwen2) `⚠️EOL`                             | 0.5B/1.5B/7B/57B/57B-A14B/72B | 稠密/稀疏LLM |    Legacy    |   1.5.0    |
-| [Qwen1.5](https://atomgit.com/mindspore/mindformers/blob/r1.5.0/research/qwen1_5) `⚠️EOL`                         | 7B/14B/72B                    |  稠密LLM   |    Legacy    |   1.5.0    |
-| [Qwen-VL](https://atomgit.com/mindspore/mindformers/blob/r1.5.0/research/qwenvl) `⚠️EOL`                          | 9.6B                          |    MM    |    Legacy    |   1.5.0    |
-| [TeleChat](https://atomgit.com/mindspore/mindformers/blob/r1.5.0/research/telechat) `⚠️EOL`                       | 7B/12B/52B                    |  稠密LLM   |    Legacy    |   1.5.0    |
-| [Whisper](https://atomgit.com/mindspore/mindformers/blob/r1.5.0/docs/model_cards/whisper.md) `⚠️EOL`              | 1.5B                          |    MM    |    Legacy    |   1.5.0    |
-| [Yi](https://atomgit.com/mindspore/mindformers/blob/r1.5.0/research/yi) `⚠️EOL`                                   | 6B/34B                        |  稠密LLM   |    Legacy    |   1.5.0    |
-| [YiZhao](https://atomgit.com/mindspore/mindformers/blob/r1.5.0/research/yizhao) `⚠️EOL`                           | 12B                           |  稠密LLM   |    Legacy    |   1.5.0    |
-| [Llama2](https://atomgit.com/mindspore/mindformers/blob/r1.3.0/docs/model_cards/llama2.md) `⚠️EOL`                | 7B/13B/70B                    |  稠密LLM   |    Legacy    |   1.3.2    |
-| [Baichuan2](https://atomgit.com/mindspore/mindformers/blob/r1.3.0/research/baichuan2/baichuan2.md) `⚠️EOL`        | 7B/13B                        |  稠密LLM   |    Legacy    |   1.3.2    |
-| [GLM2](https://atomgit.com/mindspore/mindformers/blob/r1.3.0/docs/model_cards/glm2.md) `⚠️EOL`                    | 6B                            |  稠密LLM   |    Legacy    |   1.3.2    |
-| [GPT2](https://atomgit.com/mindspore/mindformers/blob/r1.3.0/docs/model_cards/gpt2.md) `⚠️EOL`                    | 124M/13B                      |  稠密LLM   |    Legacy    |   1.3.2    |
-| [InternLM](https://atomgit.com/mindspore/mindformers/blob/r1.3.0/research/internlm/internlm.md) `⚠️EOL`           | 7B/20B                        |  稠密LLM   |    Legacy    |   1.3.2    |
-| [Qwen](https://atomgit.com/mindspore/mindformers/blob/r1.3.0/research/qwen/qwen.md) `⚠️EOL`                       | 7B/14B                        |  稠密LLM   |    Legacy    |   1.3.2    |
-| [CodeGeex2](https://atomgit.com/mindspore/mindformers/blob/r1.1.0/docs/model_cards/codegeex2.md) `⚠️EOL`          | 6B                            |  稠密LLM   |    Legacy    |   1.1.0    |
-| [WizardCoder](https://atomgit.com/mindspore/mindformers/blob/r1.1.0/research/wizardcoder/wizardcoder.md) `⚠️EOL`  | 15B                           |  稠密LLM   |    Legacy    |   1.1.0    |
-| [Baichuan](https://atomgit.com/mindspore/mindformers/blob/r1.0/research/baichuan/baichuan.md) `⚠️EOL`             | 7B/13B                        |  稠密LLM   |    Legacy    |    1.0     |
-| [Blip2](https://atomgit.com/mindspore/mindformers/blob/r1.0/docs/model_cards/blip2.md) `⚠️EOL`                    | 8.1B                          |    MM    |    Legacy    |    1.0     |
-| [Bloom](https://atomgit.com/mindspore/mindformers/blob/r1.0/docs/model_cards/bloom.md) `⚠️EOL`                    | 560M/7.1B/65B/176B            |  稠密LLM   |    Legacy    |    1.0     |
-| [Clip](https://atomgit.com/mindspore/mindformers/blob/r1.0/docs/model_cards/clip.md) `⚠️EOL`                      | 149M/428M                     |    MM    |    Legacy    |    1.0     |
-| [CodeGeex](https://atomgit.com/mindspore/mindformers/blob/r1.0/research/codegeex/codegeex.md) `⚠️EOL`             | 13B                           |  稠密LLM   |    Legacy    |    1.0     |
-| [GLM](https://atomgit.com/mindspore/mindformers/blob/r1.0/docs/model_cards/glm.md) `⚠️EOL`                        | 6B                            |  稠密LLM   |    Legacy    |    1.0     |
-| [iFlytekSpark](https://atomgit.com/mindspore/mindformers/blob/r1.0/research/iflytekspark/iflytekspark.md) `⚠️EOL` | 13B                           |  稠密LLM   |    Legacy    |    1.0     |
-| [Llama](https://atomgit.com/mindspore/mindformers/blob/r1.0/docs/model_cards/llama.md) `⚠️EOL`                    | 7B/13B                        |  稠密LLM   |    Legacy    |    1.0     |
-| [MAE](https://atomgit.com/mindspore/mindformers/blob/r1.0/docs/model_cards/mae.md) `⚠️EOL`                        | 86M                           |    MM    |    Legacy    |    1.0     |
-| [Mengzi3](https://atomgit.com/mindspore/mindformers/blob/r1.0/research/mengzi3/mengzi3.md) `⚠️EOL`                | 13B                           |  稠密LLM   |    Legacy    |    1.0     |
-| [PanguAlpha](https://atomgit.com/mindspore/mindformers/blob/r1.0/docs/model_cards/pangualpha.md) `⚠️EOL`          | 2.6B/13B                      |  稠密LLM   |    Legacy    |    1.0     |
-| [SAM](https://atomgit.com/mindspore/mindformers/blob/r1.0/docs/model_cards/sam.md) `⚠️EOL`                        | 91M/308M/636M                 |    MM    |    Legacy    |    1.0     |
-| [Skywork](https://atomgit.com/mindspore/mindformers/blob/r1.0/research/skywork/skywork.md) `⚠️EOL`                | 13B                           |  稠密LLM   |    Legacy    |    1.0     |
-| [Swin](https://atomgit.com/mindspore/mindformers/blob/r1.0/docs/model_cards/swin.md) `⚠️EOL`                      | 88M                           |    MM    |    Legacy    |    1.0     |
-| [T5](https://atomgit.com/mindspore/mindformers/blob/r1.0/docs/model_cards/t5.md) `⚠️EOL`                          | 14M/60M                       |  稠密LLM   |    Legacy    |    1.0     |
-| [VisualGLM](https://atomgit.com/mindspore/mindformers/blob/r1.0/research/visualglm/visualglm.md) `⚠️EOL`          | 6B                            |    MM    |    Legacy    |    1.0     |
-| [Ziya](https://atomgit.com/mindspore/mindformers/blob/r1.0/research/ziya/ziya.md) `⚠️EOL`                         | 13B                           |  稠密LLM   |    Legacy    |    1.0     |
-| [Bert](https://atomgit.com/mindspore/mindformers/blob/r0.8/docs/model_cards/bert.md) `⚠️EOL`                      | 4M/110M                       |  稠密LLM   |    Legacy    |    0.8     |
+动态图支持列表：
+
+| 模型名                                                                                             | 支持规格 |  模型类型  |  模型架构  |   最新支持版本    |
+|:------------------------------------------------------------------------------------------------|:-----|:------:|:------:|:-----------:|
+| [DeepSeek-V3](https://atomgit.com/mindspore/mindformers/tree/r2.0.0/configs/deepseek3) `🔥HOT`  | 1B   | 稠密LLM  | Mcore  | 2.0.0、在研版本  |
+
+静态图支持列表：
+
+| 模型名                                                                                                               | 支持规格                          |   模型类型   |     模型架构     |  最新支持版本   |
+|:------------------------------------------------------------------------------------------------------------------|:------------------------------|:--------:|:------------:|:---------:|
+| [TeleChat3](https://atomgit.com/mindspore/mindformers/blob/r2.0.0/configs/telechat3)                              | 36B                           |  稠密LLM   |    Mcore     |   2.0.0   |
+| [TeleChat3-MoE](https://atomgit.com/mindspore/mindformers/blob/r2.0.0/configs/telechat3_moe)                      | 105B-A4.7B                    |  稀疏LLM   |    Mcore     |   2.0.0   |
+| [Qwen3](https://atomgit.com/mindspore/mindformers/blob/r2.0.0/configs/qwen3)                                      | 0.6B/1.7B/4B/8B/14B/32B       |  稠密LLM   |    Mcore     |   2.0.0   |
+| [Qwen3-MoE](https://atomgit.com/mindspore/mindformers/blob/r2.0.0/configs/qwen3_moe)                              | 30B-A3B/235B-A22B             |  稀疏LLM   |    Mcore     |   2.0.0   |
+| [DeepSeek-V3](https://atomgit.com/mindspore/mindformers/blob/r2.0.0/research/deepseek3)                           | 671B                          |  稀疏LLM   | Mcore/Legacy |   2.0.0   |
+| [GLM4.5](https://atomgit.com/mindspore/mindformers/blob/r2.0.0/configs/glm4_moe)                                  | 106B-A12B/355B-A32B           |  稀疏LLM   |    Mcore     |   2.0.0   |
+| [GLM4](https://atomgit.com/mindspore/mindformers/blob/r2.0.0/configs/glm4)                                        | 9B                            |  稠密LLM   | Mcore/Legacy |   2.0.0   |
+| [Qwen2.5](https://atomgit.com/mindspore/mindformers/blob/r2.0.0/research/qwen2_5)                                 | 0.5B/1.5B/7B/14B/32B/72B      |  稠密LLM   |    Legacy    |   2.0.0   |
+| [TeleChat2](https://atomgit.com/mindspore/mindformers/blob/r2.0.0/research/telechat2)                             | 7B/35B/115B                   |  稠密LLM   | Mcore/Legacy |   2.0.0   |
+| [Llama3.1](https://atomgit.com/mindspore/mindformers/blob/r1.7.0/research/llama3_1) `⚠️EOL`                       | 8B/70B                        |  稠密LLM   |    Legacy    |   1.7.0   |
+| [Mixtral](https://atomgit.com/mindspore/mindformers/blob/r1.7.0/research/mixtral) `⚠️EOL`                         | 8x7B                          |  稀疏LLM   |    Legacy    |   1.7.0   |
+| [CodeLlama](https://atomgit.com/mindspore/mindformers/blob/r1.5.0/docs/model_cards/codellama.md) `⚠️EOL`          | 34B                           |  稠密LLM   |    Legacy    |   1.5.0   |
+| [CogVLM2-Image](https://atomgit.com/mindspore/mindformers/blob/r1.5.0/docs/model_cards/cogvlm2_image.md) `⚠️EOL`  | 19B                           |    MM    |    Legacy    |   1.5.0   |
+| [CogVLM2-Video](https://atomgit.com/mindspore/mindformers/blob/r1.5.0/docs/model_cards/cogvlm2_video.md) `⚠️EOL`  | 13B                           |    MM    |    Legacy    |   1.5.0   |
+| [DeepSeek-V2](https://atomgit.com/mindspore/mindformers/blob/r1.5.0/research/deepseek2) `⚠️EOL`                   | 236B                          |  稀疏LLM   |    Legacy    |   1.5.0   |
+| [DeepSeek-Coder-V1.5](https://atomgit.com/mindspore/mindformers/blob/r1.5.0/research/deepseek1_5) `⚠️EOL`         | 7B                            |  稠密LLM   |    Legacy    |   1.5.0   |
+| [DeepSeek-Coder](https://atomgit.com/mindspore/mindformers/blob/r1.5.0/research/deepseek) `⚠️EOL`                 | 33B                           |  稠密LLM   |    Legacy    |   1.5.0   |
+| [GLM3-32K](https://atomgit.com/mindspore/mindformers/blob/r1.5.0/research/glm32k) `⚠️EOL`                         | 6B                            |  稠密LLM   |    Legacy    |   1.5.0   |
+| [GLM3](https://atomgit.com/mindspore/mindformers/blob/r1.5.0/docs/model_cards/glm3.md) `⚠️EOL`                    | 6B                            |  稠密LLM   |    Legacy    |   1.5.0   |
+| [InternLM2](https://atomgit.com/mindspore/mindformers/blob/r1.5.0/research/internlm2) `⚠️EOL`                     | 7B/20B                        |  稠密LLM   |    Legacy    |   1.5.0   |
+| [Llama3.2](https://atomgit.com/mindspore/mindformers/blob/r1.5.0/docs/model_cards/llama3_2.md) `⚠️EOL`            | 3B                            |  稠密LLM   |    Legacy    |   1.5.0   |
+| [Llama3.2-Vision](https://atomgit.com/mindspore/mindformers/blob/r1.5.0/docs/model_cards/mllama.md) `⚠️EOL`       | 11B                           |    MM    |    Legacy    |   1.5.0   |
+| [Llama3](https://atomgit.com/mindspore/mindformers/blob/r1.5.0/research/llama3) `⚠️EOL`                           | 8B/70B                        |  稠密LLM   |    Legacy    |   1.5.0   |
+| [Qwen2](https://atomgit.com/mindspore/mindformers/blob/r1.5.0/research/qwen2) `⚠️EOL`                             | 0.5B/1.5B/7B/57B/57B-A14B/72B | 稠密/稀疏LLM |    Legacy    |   1.5.0   |
+| [Qwen1.5](https://atomgit.com/mindspore/mindformers/blob/r1.5.0/research/qwen1_5) `⚠️EOL`                         | 7B/14B/72B                    |  稠密LLM   |    Legacy    |   1.5.0   |
+| [Qwen-VL](https://atomgit.com/mindspore/mindformers/blob/r1.5.0/research/qwenvl) `⚠️EOL`                          | 9.6B                          |    MM    |    Legacy    |   1.5.0   |
+| [TeleChat](https://atomgit.com/mindspore/mindformers/blob/r1.5.0/research/telechat) `⚠️EOL`                       | 7B/12B/52B                    |  稠密LLM   |    Legacy    |   1.5.0   |
+| [Whisper](https://atomgit.com/mindspore/mindformers/blob/r1.5.0/docs/model_cards/whisper.md) `⚠️EOL`              | 1.5B                          |    MM    |    Legacy    |   1.5.0   |
+| [Yi](https://atomgit.com/mindspore/mindformers/blob/r1.5.0/research/yi) `⚠️EOL`                                   | 6B/34B                        |  稠密LLM   |    Legacy    |   1.5.0   |
+| [YiZhao](https://atomgit.com/mindspore/mindformers/blob/r1.5.0/research/yizhao) `⚠️EOL`                           | 12B                           |  稠密LLM   |    Legacy    |   1.5.0   |
+| [Llama2](https://atomgit.com/mindspore/mindformers/blob/r1.3.0/docs/model_cards/llama2.md) `⚠️EOL`                | 7B/13B/70B                    |  稠密LLM   |    Legacy    |   1.3.2   |
+| [Baichuan2](https://atomgit.com/mindspore/mindformers/blob/r1.3.0/research/baichuan2/baichuan2.md) `⚠️EOL`        | 7B/13B                        |  稠密LLM   |    Legacy    |   1.3.2   |
+| [GLM2](https://atomgit.com/mindspore/mindformers/blob/r1.3.0/docs/model_cards/glm2.md) `⚠️EOL`                    | 6B                            |  稠密LLM   |    Legacy    |   1.3.2   |
+| [GPT2](https://atomgit.com/mindspore/mindformers/blob/r1.3.0/docs/model_cards/gpt2.md) `⚠️EOL`                    | 124M/13B                      |  稠密LLM   |    Legacy    |   1.3.2   |
+| [InternLM](https://atomgit.com/mindspore/mindformers/blob/r1.3.0/research/internlm/internlm.md) `⚠️EOL`           | 7B/20B                        |  稠密LLM   |    Legacy    |   1.3.2   |
+| [Qwen](https://atomgit.com/mindspore/mindformers/blob/r1.3.0/research/qwen/qwen.md) `⚠️EOL`                       | 7B/14B                        |  稠密LLM   |    Legacy    |   1.3.2   |
+| [CodeGeex2](https://atomgit.com/mindspore/mindformers/blob/r1.1.0/docs/model_cards/codegeex2.md) `⚠️EOL`          | 6B                            |  稠密LLM   |    Legacy    |   1.1.0   |
+| [WizardCoder](https://atomgit.com/mindspore/mindformers/blob/r1.1.0/research/wizardcoder/wizardcoder.md) `⚠️EOL`  | 15B                           |  稠密LLM   |    Legacy    |   1.1.0   |
+| [Baichuan](https://atomgit.com/mindspore/mindformers/blob/r1.0/research/baichuan/baichuan.md) `⚠️EOL`             | 7B/13B                        |  稠密LLM   |    Legacy    |    1.0    |
+| [Blip2](https://atomgit.com/mindspore/mindformers/blob/r1.0/docs/model_cards/blip2.md) `⚠️EOL`                    | 8.1B                          |    MM    |    Legacy    |    1.0    |
+| [Bloom](https://atomgit.com/mindspore/mindformers/blob/r1.0/docs/model_cards/bloom.md) `⚠️EOL`                    | 560M/7.1B/65B/176B            |  稠密LLM   |    Legacy    |    1.0    |
+| [Clip](https://atomgit.com/mindspore/mindformers/blob/r1.0/docs/model_cards/clip.md) `⚠️EOL`                      | 149M/428M                     |    MM    |    Legacy    |    1.0    |
+| [CodeGeex](https://atomgit.com/mindspore/mindformers/blob/r1.0/research/codegeex/codegeex.md) `⚠️EOL`             | 13B                           |  稠密LLM   |    Legacy    |    1.0    |
+| [GLM](https://atomgit.com/mindspore/mindformers/blob/r1.0/docs/model_cards/glm.md) `⚠️EOL`                        | 6B                            |  稠密LLM   |    Legacy    |    1.0    |
+| [iFlytekSpark](https://atomgit.com/mindspore/mindformers/blob/r1.0/research/iflytekspark/iflytekspark.md) `⚠️EOL` | 13B                           |  稠密LLM   |    Legacy    |    1.0    |
+| [Llama](https://atomgit.com/mindspore/mindformers/blob/r1.0/docs/model_cards/llama.md) `⚠️EOL`                    | 7B/13B                        |  稠密LLM   |    Legacy    |    1.0    |
+| [MAE](https://atomgit.com/mindspore/mindformers/blob/r1.0/docs/model_cards/mae.md) `⚠️EOL`                        | 86M                           |    MM    |    Legacy    |    1.0    |
+| [Mengzi3](https://atomgit.com/mindspore/mindformers/blob/r1.0/research/mengzi3/mengzi3.md) `⚠️EOL`                | 13B                           |  稠密LLM   |    Legacy    |    1.0    |
+| [PanguAlpha](https://atomgit.com/mindspore/mindformers/blob/r1.0/docs/model_cards/pangualpha.md) `⚠️EOL`          | 2.6B/13B                      |  稠密LLM   |    Legacy    |    1.0    |
+| [SAM](https://atomgit.com/mindspore/mindformers/blob/r1.0/docs/model_cards/sam.md) `⚠️EOL`                        | 91M/308M/636M                 |    MM    |    Legacy    |    1.0    |
+| [Skywork](https://atomgit.com/mindspore/mindformers/blob/r1.0/research/skywork/skywork.md) `⚠️EOL`                | 13B                           |  稠密LLM   |    Legacy    |    1.0    |
+| [Swin](https://atomgit.com/mindspore/mindformers/blob/r1.0/docs/model_cards/swin.md) `⚠️EOL`                      | 88M                           |    MM    |    Legacy    |    1.0    |
+| [T5](https://atomgit.com/mindspore/mindformers/blob/r1.0/docs/model_cards/t5.md) `⚠️EOL`                          | 14M/60M                       |  稠密LLM   |    Legacy    |    1.0    |
+| [VisualGLM](https://atomgit.com/mindspore/mindformers/blob/r1.0/research/visualglm/visualglm.md) `⚠️EOL`          | 6B                            |    MM    |    Legacy    |    1.0    |
+| [Ziya](https://atomgit.com/mindspore/mindformers/blob/r1.0/research/ziya/ziya.md) `⚠️EOL`                         | 13B                           |  稠密LLM   |    Legacy    |    1.0    |
+| [Bert](https://atomgit.com/mindspore/mindformers/blob/r0.8/docs/model_cards/bert.md) `⚠️EOL`                      | 4M/110M                       |  稠密LLM   |    Legacy    |    0.8    |
 
 `⚠️EOL` 表示模型已经从主干分支下线，可以通过对应最新支持版本（如1.7.0）进行使用。
 
@@ -124,21 +130,22 @@ Mcore架构模型按照训练和推理各分为5个级别，分别代表该模�
 
 当前套件建议使用的Python版本为3.11.4。
 
-| MindSpore Transformers | MindSpore | CANN | 固件与驱动 |
-|:----------------------:|:---------:|:----:|:-----:|
-|          在研版本          |   在研版本    | 在研版本 | 在研版本  |
+| MindSpore Transformers | MindSpore | CANN  | 固件与驱动  |
+|:----------------------:|:---------:|:-----:|:------:|
+|         2.0.0          |  2.10.0   | 9.1.0 | 26.1.0 |
 
 历史版本配套关系：
 
-| MindSpore Transformers |                   MindSpore                   |                                                      CANN                                                      |                                                      固件与驱动                                                      |
-|:----------------------:|:---------------------------------------------:|:--------------------------------------------------------------------------------------------------------------:|:---------------------------------------------------------------------------------------------------------------:|
-|         1.8.0          |   [2.7.2](https://www.mindspore.cn/install)   |   [8.5.0](https://www.hiascend.com/document/detail/zh/canncommercial/850/softwareinst/instg/instg_0000.html)   |   [25.5.0](https://www.hiascend.com/document/detail/zh/canncommercial/850/softwareinst/instg/instg_0000.html)   |
-|         1.7.0          |   [2.7.1](https://www.mindspore.cn/install)   | [8.3.RC1](https://www.hiascend.com/document/detail/zh/canncommercial/83RC1/softwareinst/instg/instg_0000.html) | [25.3.RC1](https://www.hiascend.com/document/detail/zh/canncommercial/83RC1/softwareinst/instg/instg_0000.html) |
-|         1.6.0          |   [2.7.0](https://www.mindspore.cn/install)   | [8.2.RC1](https://www.hiascend.com/document/detail/zh/canncommercial/82RC1/softwareinst/instg/instg_0000.html) |  [25.2.0](https://www.hiascend.com/document/detail/zh/canncommercial/82RC1/softwareinst/instg/instg_0000.html)  |
-|         1.5.0          | [2.6.0-rc1](https://www.mindspore.cn/install) | [8.1.RC1](https://www.hiascend.com/document/detail/zh/canncommercial/81RC1/softwareinst/instg/instg_0000.html) | [25.0.RC1](https://www.hiascend.com/document/detail/zh/canncommercial/81RC1/softwareinst/instg/instg_0000.html) |
-|         1.3.2          |  [2.4.10](https://www.mindspore.cn/versions)  |   [8.0.0](https://www.hiascend.com/document/detail/zh/canncommercial/800/softwareinst/instg/instg_0000.html)   |   [24.1.0](https://www.hiascend.com/document/detail/zh/canncommercial/800/softwareinst/instg/instg_0000.html)   |
-|         1.3.0          |  [2.4.0](https://www.mindspore.cn/versions)   | [8.0.RC3](https://www.hiascend.com/document/detail/zh/canncommercial/80RC3/softwareinst/instg/instg_0000.html) | [24.1.RC3](https://www.hiascend.com/document/detail/zh/canncommercial/80RC3/softwareinst/instg/instg_0000.html) |
-|         1.2.0          |  [2.3.0](https://www.mindspore.cn/versions)   | [8.0.RC2](https://www.hiascend.com/document/detail/zh/canncommercial/80RC2/softwareinst/instg/instg_0000.html) | [24.1.RC2](https://www.hiascend.com/document/detail/zh/canncommercial/80RC2/softwareinst/instg/instg_0000.html) |
+| MindSpore Transformers |                   MindSpore                    |                                                      CANN                                                      |                                                                     固件与驱动                                                                      |
+|:----------------------:|:----------------------------------------------:|:--------------------------------------------------------------------------------------------------------------:|:----------------------------------------------------------------------------------------------------------------------------------------------:|
+|         1.9.0          |   [2.9.0](https://www.mindspore.cn/install)    |   [9.0.0](https://www.hiascend.com/document/detail/zh/canncommercial/900/softwareinst/instg/instg_0000.html)   | [26.0.0](https://www.hiascend.com/document/detail/zh/canncommercial/latest/softwareinst/instg/instg_0107.html?OS=openEuler&InstallType=netyum) |
+|         1.8.0          |   [2.7.2](https://www.mindspore.cn/versions)   |   [8.5.0](https://www.hiascend.com/document/detail/zh/canncommercial/850/softwareinst/instg/instg_0000.html)   |                  [25.5.0](https://www.hiascend.com/document/detail/zh/canncommercial/850/softwareinst/instg/instg_0000.html)                   |
+|         1.7.0          |   [2.7.1](https://www.mindspore.cn/versions)   | [8.3.RC1](https://www.hiascend.com/document/detail/zh/canncommercial/83RC1/softwareinst/instg/instg_0000.html) |                [25.3.RC1](https://www.hiascend.com/document/detail/zh/canncommercial/83RC1/softwareinst/instg/instg_0000.html)                 |
+|         1.6.0          |   [2.7.0](https://www.mindspore.cn/versions)   | [8.2.RC1](https://www.hiascend.com/document/detail/zh/canncommercial/82RC1/softwareinst/instg/instg_0000.html) |                 [25.2.0](https://www.hiascend.com/document/detail/zh/canncommercial/82RC1/softwareinst/instg/instg_0000.html)                  |
+|         1.5.0          | [2.6.0-rc1](https://www.mindspore.cn/versions) | [8.1.RC1](https://www.hiascend.com/document/detail/zh/canncommercial/81RC1/softwareinst/instg/instg_0000.html) |                [25.0.RC1](https://www.hiascend.com/document/detail/zh/canncommercial/81RC1/softwareinst/instg/instg_0000.html)                 |
+|         1.3.2          |  [2.4.10](https://www.mindspore.cn/versions)   |   [8.0.0](https://www.hiascend.com/document/detail/zh/canncommercial/800/softwareinst/instg/instg_0000.html)   |                  [24.1.0](https://www.hiascend.com/document/detail/zh/canncommercial/800/softwareinst/instg/instg_0000.html)                   |
+|         1.3.0          |   [2.4.0](https://www.mindspore.cn/versions)   | [8.0.RC3](https://www.hiascend.com/document/detail/zh/canncommercial/80RC3/softwareinst/instg/instg_0000.html) |                [24.1.RC3](https://www.hiascend.com/document/detail/zh/canncommercial/80RC3/softwareinst/instg/instg_0000.html)                 |
+|         1.2.0          |   [2.3.0](https://www.mindspore.cn/versions)   | [8.0.RC2](https://www.hiascend.com/document/detail/zh/canncommercial/80RC2/softwareinst/instg/instg_0000.html) |                [24.1.RC2](https://www.hiascend.com/document/detail/zh/canncommercial/80RC2/softwareinst/instg/instg_0000.html)                 |
 
 ### 源码编译安装
 
@@ -172,9 +179,10 @@ MindSpore Transformers已发布版本维护策略：
 
 | **MindSpore Transformers版本** | **对应标签** | **当前状态** |  **发布时间**  |      **后续状态**       | **EOL日期**  |
 |:----------------------------:|:--------:|:--------:|:----------:|:-------------------:|:----------:|
-|            1.8.0             |  v1.8.0  |    维护    | 2026/01/26 |  预计2026/07/26起无维护   | 2026/10/26 |
-|            1.7.0             |  v1.7.0  |    维护    | 2025/10/27 |  预计2026/04/27起无维护   | 2026/07/27 |
-|            1.6.0             |  v1.6.0  |   无维护    | 2025/07/29 | 预计2026/04/29起生命周期终止 | 2026/04/29 |
+|            1.9.0             |  v1.9.0  |    维护    | 2026/07/28 |  预计2027/01/28起无维护   | 2026/04/28 |
+|            1.8.0             |  v1.8.0  |   无维护    | 2026/01/26 | 预计2026/10/26起生命周期终止 | 2026/10/26 |
+|            1.7.0             |  v1.7.0  |  生命周期终止  | 2025/10/27 |          -          | 2026/07/27 |
+|            1.6.0             |  v1.6.0  |  生命周期终止  | 2025/07/29 |          -          | 2026/04/29 |
 |            1.5.0             |  v1.5.0  |  生命周期终止  | 2025/04/29 |          -          | 2026/01/29 |
 |            1.3.2             |  v1.3.2  |  生命周期终止  | 2024/12/20 |          -          | 2025/09/20 |
 |            1.2.0             |  v1.2.0  |  生命周期终止  | 2024/07/12 |          -          | 2025/04/12 |
