@@ -823,9 +823,6 @@ class Trainer:
                 reshard_worker_num=checkpoint.reshard_worker_num
             )
         else:
-            common_file = os.path.join(checkpoint_path, "common.json")
-            common_info = CommonInfo.load_common(common_file)
-
             checkpoint = self.config.checkpoint
 
             if not checkpoint.no_load_optim:
@@ -839,6 +836,8 @@ class Trainer:
                         "(*-opt-*.safetensors), or set no_load_optim=True to skip optimizer loading."
                     )
 
+                common_file = os.path.join(checkpoint_path, "common.json")
+                common_info = CommonInfo.load_common(common_file)
                 global_step = common_info.global_step
                 self._resumed = True
                 if self.dynamic_batch_enabled:
