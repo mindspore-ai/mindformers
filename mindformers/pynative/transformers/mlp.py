@@ -86,9 +86,8 @@ class MLP(nn.Cell):
         # Handle activation function
         self.activation_type = self.config.hidden_act
         # SwiGLU clamp: get_activation returns ClampedSwiGlu when clamp_value is
-        # set (MoE only per config validation). use_clamped_swiglu flag routes
-        # construct through the non-interleaved chunk path because ClampedSwiGlu
-        # uses first-half/second-half semantics, not ops.swiglu's layout.
+        # set (MoE only per config validation). Keep the flag for activation
+        # selection introspection; both fused SwiGLU variants share one layout path.
         clamp_value = self.config.activation_func_clamp_value
         self.use_clamped_swiglu = self.activation_type == 'fusedswiglu' and clamp_value is not None
         self.activation_func = get_activation(self.activation_type, clamp_value=clamp_value)
@@ -123,13 +122,9 @@ class MLP(nn.Cell):
         if self.gated_linear_unit:
             seq, bs, ffn_hidden_size = intermediate_parallel.shape
             intermediate_parallel = self.reshape(intermediate_parallel, (seq, bs, ffn_hidden_size // 2, 2))
-            if self.use_clamped_swiglu:
-                # After reshape, last dim separates [g,l] pairs; ClampedSwiGlu's
-                # chunk(x,2,-1) directly splits gate/linear. MoE only (dense MLP
-                # never reaches here per config validation).
-                intermediate_parallel = self.activation_func(intermediate_parallel, -1)
-                intermediate_parallel = self.reshape(intermediate_parallel, (seq, bs, ffn_hidden_size // 2))
-            elif self.activation_type == 'fusedswiglu':
+            if self.activation_type == 'fusedswiglu':
+                # Keep the gate/linear split axis away from the innermost dimension.
+                # SwiGlu/SwiGluGrad have a severe tiling cliff when that dimension is 2.
                 intermediate_parallel = self.transpose(intermediate_parallel, 2, 3)
                 intermediate_parallel = self.activation_func(intermediate_parallel, -2)
                 intermediate_parallel = self.reshape(intermediate_parallel, (seq, bs, ffn_hidden_size // 2))
