@@ -1,8 +1,8 @@
 # DeepSeek-V3
 
-## 模型描述
-
 DeepSeek-V3 系列模型是深度求索（DeepSeek）公司推出的一款高性能开源大语言模型，具有强大的自然语言处理能力。该模型在多个领域展现出了卓越的表现，包括代码生成、数学推理、逻辑推理和自然语言理解等。模型总参数 6710 亿，激活参数 370 亿， 其中 DeepSeek-R1 模型和 DeepSeek-V3.1 模型是基于 DeepSeek-V3 Base 模型进一步优化的推理特化模型，通过多阶段强化学习训练，在复杂推理、数学和编程任务上达到国际顶尖水平，同时大幅降低幻觉率。
+
+本文档同时覆盖 **动态图** 与 **静态图** 两种模式。两种模式依赖的运行环境、版本配套、支持任务与配置文件均不同，请按需阅读对应章节。
 
 ```text
 @misc{deepseekai2024deepseekv3technicalreport,
@@ -15,6 +15,337 @@ DeepSeek-V3 系列模型是深度求索（DeepSeek）公司推出的一款高性
       url={https://arxiv.org/abs/2412.19437},
 }
 ```
+
+# 动态图（PyNative）
+
+## 支持规格
+
+|     模型名称      |    规格    | 支持任务 | 模型架构  |                       支持设备                        |        模型级别         |
+|:-------------:|:--------:|:----:|:-----:|:-------------------------------------------------:|:-------------------:|
+|  DeepSeek-V3  |   671B   | 预训练 | Mcore | Atlas 800T A2/Atlas 800I A2/Atlas 900 A3 SuperPoD |     [Preliminary](#模型级别介绍)     |
+|  DeepSeek-R1  |   671B   | 预训练 | Mcore | Atlas 800T A2/Atlas 800I A2/Atlas 900 A3 SuperPoD |     [Preliminary](#模型级别介绍)     |
+| DeepSeek-V3.1 |   671B   | 预训练 | Mcore | Atlas 800T A2/Atlas 800I A2/Atlas 900 A3 SuperPoD |     [Preliminary](#模型级别介绍)     |
+
+说明：
+
+- 模型架构：`Mcore` 表示新模型架构。
+- 当前 PyNative 模式仅支持预训练任务，推理和微调暂不支持。
+- 模型级别：训练和推理各分为5个级别，分别代表该模型遵循不同的标准上线。每个级别的介绍详见[模型级别介绍](https://atomgit.com/mindspore/mindformers/blob/master/README_CN.md#模型级别介绍)。
+
+## 版本配套
+
+DeepSeek-V3 PyNative 当前支持的版本配套如下。
+
+|           | MindSpore Transformers | MindSpore | Hyper-Parallel | CANN  |  HDK   |
+|:---------:|:----------------------:|:---------:|:--------------:|:-----:|:------:|
+| 当前支持的版本 |      2.0.0/master      |  2.10.0   |     r1.0.0     | 9.1.0 | 26.1.0 |
+
+## 模型文件说明
+
+PyNative 模式的 DeepSeek-V3 代码结构如下：
+
+```text
+📦mindformers
+├── 📂mindformers
+│   └── 📂models
+│       └── 📂deepseek3
+│           ├── 📄__init__.py                         # DeepSeek-V3模块初始化文件
+│           ├── 📄configuration_deepseek_v3.py        # DeepSeek-V3模型配置类定义
+│           ├── 📄modeling_deepseek_v3.py             # DeepSeek-V3模型主体实现
+│           ├── 📄modeling_deepseek_v3_pynative.py    # DeepSeek-V3动态图训练模型实现
+│           └── 📄utils.py                            # DeepSeek-V3工具函数和基础类
+├── 📂configs
+│   └── 📂deepseek3
+│       └── 📄pretrain_deepseek3_1b_8p_pynative.yaml  # DeepSeek-V3动态图预训练配置
+└── 📄run_mindformer.py                               # 主要执行脚本
+```
+
+## 使用样例
+
+MindSpore Transformers 支持使用 DeepSeek-V3 进行动态图预训练。各任务的整体使用流程如下：
+
+| 任务  | 前期准备                    | 使用流程                       |
+|:---:|:------------------------|:---------------------------|
+| 预训练 | 环境安装 -> 预训练数据集下载        | 数据预处理 -> 修改任务配置 -> 启动预训练任务 |
+
+### 前期准备
+
+#### 环境安装
+
+按照上述版本配套，参考[环境安装指南](https://www.mindspore.cn/mindformers/docs/zh-CN/master/installation.html)安装运行环境。
+
+此外，PyNative 模式依赖 hyper-parallel 库提供 DTensor、FSDP/HSDP 和 Context Parallel 等分布式能力，参考[hyper-parallel](https://gitcode.com/mindspore/hyper-parallel.git)。
+
+#### 数据集下载
+
+MindSpore Transformers 以下面的数据集为例提供了 DeepSeek-V3 的预训练和微调流程的使用案例，实际训练时可参考[数据集](https://www.mindspore.cn/mindformers/docs/zh-CN/master/feature/dataset.html)章节制作数据集。请在执行任务前提前下载所需数据集。链接如下：
+
+| 任务  |    数据集名称     | 下载链接                                                                                            | 说明             |
+|:---:|:------------:|:------------------------------------------------------------------------------------------------|:---------------|
+| 预训练 | WikiText-103 | [Download](https://dagshub.com/DagsHub/WIkiText-103/src/main/dataset/tokens/wiki.train.tokens) | 用于预训练的大规模文本数据集 |
+| 微调  |    Alpaca    | [Download](https://github.com/tatsu-lab/stanford_alpaca/blob/main/alpaca_data.json)            | 用于微调的大规模文本数据集  |
+
+### 预训练样例
+
+预训练是指在大规模无标注数据上训练模型，使其能够全面捕捉语言的广泛特性。在 MindSpore 官网提供了详细的[指导](https://www.mindspore.cn/mindformers/docs/zh-CN/master/guide/pre_training.html)。
+
+#### 1. 数据预处理
+
+MindSpore Transformers 预训练阶段当前已支持[Megatron格式的数据集](https://www.mindspore.cn/mindformers/docs/zh-CN/master/feature/dataset.html#megatron%E6%95%B0%E6%8D%AE%E9%9B%86)。用户可以参考[数据集](https://www.mindspore.cn/mindformers/docs/zh-CN/master/feature/dataset.html)章节，使用 MindSpore 提供的工具将原始数据集转换为 Megatron 格式。
+
+制作Megatron格式数据集，需要经过两个步骤。首先将原始文本数据集转换为jsonl格式数据，然后使用MindSpore Transformers提供的脚本将jsonl格式数据转换为Megatron格式的.bin和.idx文件。
+
+- `wiki.train.tokens` 转为 `jsonl`格式数据
+
+用户需要**自行将`wiki.train.tokens`数据集处理成jsonl格式的文件**。作为参考，文档末尾的[FAQ](#faq)部分提供了一个临时转换方案，用户需要根据实际需求自行开发和验证转换逻辑。
+
+下面是 jsonl 格式文件的示例：
+
+```json
+{"src": "www.nvidia.com", "text": "The quick brown fox", "type": "Eng", "id": "0", "title": "First Part"}
+{"src": "The Internet", "text": "jumps over the lazy dog", "type": "Eng", "id": "42", "title": "Second Part"}
+...
+```
+
+- `jsonl`格式数据 转为 `bin`格式数据
+
+MindSpore Transformers提供了数据预处理脚本`toolkit/data_preprocess/megatron/preprocess_indexed_dataset.py`用于将jsonl格式的原始文本预料转换成.bin或.idx文件。
+
+> 这里需要提前下载[DeepSeek-V3](https://huggingface.co/deepseek-ai/DeepSeek-V3)模型的tokenizer文件。
+
+例如：
+
+```shell
+python toolkit/data_preprocess/megatron/preprocess_indexed_dataset.py \
+  --input /path/to/data.jsonl \
+  --output-prefix /path/to/wiki103-megatron \
+  --tokenizer-type HuggingFaceTokenizer \
+  --tokenizer-dir /path/to/DeepSeek-V3 # 其他规格的模型可以调整为对应的tokenizer路径
+```
+
+> 运行完成后会生成`/path/to/wiki103-megatron_text_document.bin`和`/path/to/wiki103-megatron_text_document.idx`文件。
+> 填写数据集路径时需要使用`/path/to/wiki103-megatron_text_document`，不需要带后缀名。
+
+#### 2. 修改任务配置
+
+MindSpore Transformers 提供了一份预训练任务的配置文件缩层到1.2b的DeepSeek-V3配置文件[configs/deepseek3/pretrain_deepseek3_1b_8p_pynative.yaml](https://atomgit.com/mindspore/mindformers/blob/master/configs/deepseek3/pretrain_deepseek3_1b_8p_pynative.yaml)，这份配置基于8卡Atlas 800T A2（64G），使用WikiText-103数据集进行预训练，用户可以根据实际情况修改配置文件。以下是一个示例配置文件片段，用户需要根据自己的数据集路径和其他参数进行相应修改，对完整模型进行预训练。
+
+- 数据集配置
+
+    ```yaml
+    # Dataset configuration
+    train_dataset: &train_dataset
+      dataloader:
+        ...
+        sizes:
+          - 128000  # 数据集的大小，可以根据实际数据集大小进行调整
+          ...
+        config:
+          ...
+          data_path:  # 采样比例和Megatron格式数据集路径
+            - '1'
+            - "/path/to/wiki103-megatron_text_document" # 替换为实际的Megatron格式数据集路径，此处不带后缀名
+    ```
+
+    数据集路径需要替换为实际的 Megatron 格式数据集路径。
+
+- 并行配置
+
+    提供配置文件configs/deepseek3/pretrain_deepseek3_1b_8p_pynative.yaml采用`data parallel`为8的fsdp并行。为了更加详细介绍并行配置，以下是一个混合并行配置示例，该示例在16卡训练时，`data parallel`为2，`expert_parallel`为2，`tensor_parallel`为4，其余并行均为1。如果用户需要使用混合并行训练可参照下述配置修改并行配置。
+    ```yaml
+    parallelism:
+      # Data Parallelism & FSDP
+      data_parallel_shard: -1
+      data_parallel_shard_strategy: "optim_grads_params"
+      disable_gradient_division: True
+      expert_parallel: 2 # expert parallelism degree (EP size)
+      tensor_parallel: 4 # tensor parallelism degree (TP size)
+      context_parallel: 1 # context parallelism degree (CP size)
+      context_parallel_method: colossal # implementation method for context parallelism
+      pipeline_parallel: 1 # pipeline parallelism degree (number of pipeline stages)
+      pipeline_parallel_schedule: "1f1b" # pipeline execution schedule (e.g., 1F1B)
+      pipeline_parallel_interleave_num: 1 # number of interleaved model chunks per pipeline stage
+      # number of layers assigned to each pipeline stage
+      # supports uneven or interleaved layer placement
+      pipeline_parallel_layers_per_stage: null
+      sequence_parallel: true # enable sequence parallelism
+      moe_token_dispatcher_type: "alltoall"
+    ```
+  下面是并行方式的详细介绍：
+  1. **Tensor Parallelism (TP)**：使用`parallelism.tensor_parallel`控制。对 Embedding、Output Layer、每层 Transformer 的 Attention 和 MLP 进行列切/行切。通过`ColwiseParallel`和`RowwiseParallel`实现。支持联合序列并行（`sequence_parallel`）将激活沿序列维切分。
+  2. **Expert Parallelism (EP)**：使用`parallelism.expert_parallel`控制。将 MoE 专家分布到多个设备上，支持`alltoall`和 `alltoall_deredundancy`两种 token 分发方式。
+  3. **Context Parallelism (CP)**：使用`parallelism.context_parallel`控制。支持 colossal、ulysses、hybrid 三种实现方式，分别从序列维度、头维度、混合方式进行切分。
+  4. **FSDP**：由`parallelism.data_parallel_shard`控制。当`parallelism.data_parallel_shard`为-1时，总 DP 并行度为`world_size // (tp × pp × cp)`。
+
+
+#### 3. 启动预训练任务
+
+通过指定模型路径和配置文件[configs/deepseek3/pretrain_deepseek3_1b_8p_pynative.yaml](https://atomgit.com/mindspore/mindformers/blob/master/configs/deepseek3/pretrain_deepseek3_1b_8p_pynative.yaml)以msrun的方式启动[run_mindformer.py](https://atomgit.com/mindspore/mindformers/blob/master/run_mindformer.py)脚本，进行分布式训练。可以参考如下方式拉起8卡Atlas 800T A2（64G）进行data parallel为8的预训练。
+
+在 PyNative 模式下通过 `--mode 1` 参数启动 `run_mindformer.py`，以 `msrun` 的方式启动分布式训练：
+
+```shell
+cd $MINDFORMERS_HOME
+bash scripts/msrun_launcher.sh "run_mindformer.py \
+--config configs/deepseek3/pretrain_deepseek3_1b_8p_pynative.yaml \
+--mode 1" \
+8 8110 output/msrun_log False 7200
+```
+
+上述命令执行完毕后，训练任务将在后台执行，过程日志保存在 `./output/msrun_log` 下，使用以下命令可查看训练状态：
+
+```shell
+tail -f ./output/msrun_log/worker_0.log
+```
+
+训练过程中的权重 checkpoint 将会保存在 `./output/checkpoint` 下。
+
+如有关于 DeepSeek-V3 预训练的相关问题，可以在 MindSpore Transformers 的 AtomGit 仓库中[提交 ISSUE](https://atomgit.com/mindspore/mindformers/issues/new) 以获取支持。
+
+## 附录
+
+### 并行配置建议
+
+以下配置为 PyNative 预训练场景下，不同模型规格的推荐配置：
+
+> 注意：`data_parallel_shard`设置为`-1`时，系统会根据`world_size`和其余并行参数自动推导。
+> `max_device_memory`在 Atlas 800T A2 和 Atlas 900 A3 SuperPoD 等机器上一般设置 ≤60GB，在 Atlas 800I A2 上一般设置 ≤30GB。
+
+- 预训练：
+
+<table>
+  <tr>
+    <th>模型</th>
+    <th>规格</th>
+    <th>设备</th>
+    <th>卡数</th>
+    <th>序列长度</th>
+    <th>并行配置</th>
+    <th>内存配置</th>
+    <th>模型级别</th>
+  </tr>
+  <tr>
+    <td>DeepSeek-V3</td>
+    <td>671B</td>
+    <td>32 x Atlas 800T A2(64G)</td>
+    <td>256</td>
+    <td>4096</td>
+    <td>
+      <pre><code class="language-yaml">parallelism:
+  dp_replicate: 1
+  dp_shard: 4
+  tensor_parallel: 8
+  pipeline_parallel: 8
+  expert_parallel: 32
+  sequence_parallel: true
+  param_dtype: "bfloat16"</code></pre>
+    </td>
+    <td>
+      <pre><code class="language-yaml">context:
+  max_device_memory: "56GB"</code></pre>
+    </td>
+    <td> Preliminary </td>
+  </tr>
+  <tr>
+    <td>DeepSeek-V3</td>
+    <td>12B</td>
+    <td>2 x Atlas 800T A2(64G)</td>
+    <td>16</td>
+    <td>4096</td>
+    <td>
+      <pre><code class="language-yaml">parallelism:
+  dp_replicate: 1
+  dp_shard: -1
+  tensor_parallel: 1
+  pipeline_parallel: 16
+  expert_parallel: 1
+  sequence_parallel: false
+  param_dtype: "bfloat16"</code></pre>
+    </td>
+    <td>
+      <pre><code class="language-yaml">context:
+  max_device_memory: "58GB"</code></pre>
+    </td>
+    <td> Released </td>
+  </tr>
+</table>
+
+
+### FAQ
+
+Q1：我有1台Atlas 800T A2（64G）服务器，配置已修改完成，如何进行DeepSeek-V3的单卡训练？拉起任务的指令是什么？
+
+A1：根据指导修改配置后，可以参考如下方式拉起单卡Atlas 800T A2（64G）训练。
+
+通过指定模型路径和配置文件以msrun的方式启动[run_mindformer.py](https://atomgit.com/mindspore/mindformers/blob/master/run_mindformer.py)脚本，启动单卡训练。
+
+下列脚本可以参考如下方式拉起**单卡Atlas 800T A2（64G）训练**。
+
+```shell
+python run_mindformer.py \
+--config path/pretrain_deepseek3_1p_pynative.yaml \
+--mode 1
+```
+
+上述命令执行完毕后，训练任务将在后台执行，过程日志保存在`./output/msrun_log`下，使用以下命令可实时查看训练状态
+
+```bash
+tail -f ./output/msrun_log/worker_0.log
+```
+
+训练过程中的权重checkpoint将会保存在`./output/checkpoint`下。
+
+如有关于DeepSeek-V3预训练的相关问题，可以在MindSpore Transformers的AtomGit仓库中[提交ISSUE](https://atomgit.com/mindspore/mindformers/issues/new)以获取支持。
+
+Q2：我有32台Atlas 800T A2（64G）服务器，配置已修改完成，如何进行DeepSeek-V3的满配预训练？拉起任务的指令是什么？
+
+A2：在每台服务器上执行如下命令。设置`master_ip`为主节点IP地址，即`Rank 0`服务器的IP；`node_rank`为每个节点的Rank序号，从`0`到`255`；`port`为当前进程的端口号。
+
+```shell
+master_ip=192.168.1.1
+node_rank=0
+port=8118
+
+cd $MINDFORMERS_HOME
+bash scripts/msrun_launcher.sh "run_mindformer.py \
+--config path/pretrain_deepseek3_671b_pynative.yaml \
+--mode 1" \
+256 8 $master_ip $port $node_rank output/msrun_log False 7200
+```
+
+> 此处样例代码假设主节点为`192.168.1.1`、当前Rank序号为`0`。实际执行时请将`master_ip`设置为实际的主节点IP地址；将`node_rank`设置为当前节点的Rank序号。
+
+上述命令执行完毕后，训练任务将在后台执行，过程日志保存在`./output/msrun_log`下，使用以下命令可查看训练状态（如果开启了流水并行，真实loss只显示在最后一个stage的日志中，其余卡显示`loss`为`0`）
+
+```shell
+tail -f ./output/msrun_log/worker_255.log
+```
+
+训练过程中的权重checkpoint将会保存在`./output/checkpoint`下。
+
+如有关于DeepSeek-V3预训练的相关问题，可以在MindSpore Transformers的AtomGit仓库中[提交ISSUE](https://atomgit.com/mindspore/mindformers/issues/new)以获取支持。
+
+Q3: 数据集准备部分中，应该如何将`wiki.train.tokens` 转为 `jsonl`格式数据？
+
+A3: [社区issue](https://gitee.com/mindspore/mindformers/issues/ICOKGY)中提供了一个临时转换脚本，仅作为参考使用。用户需要根据自己的数据特点和需求，自行开发和验证适合的转换逻辑。
+
+Q4：如果修改了配置中的参数，使用`run_mindformer.py`拉起任务时，还需要重新传参吗？
+
+A4：根据指导修改配置后，参数值已被修改，无需重复传参，`run_mindformer.py`会自动读取解析配置中的参数；如果没有修改配置中的参数，则需要在命令中添加参数。
+
+Q5：用户使用同一个服务器拉起多个训练任务时，端口号冲突怎么办？
+
+A5：用户使用同一个服务器拉起多个训练任务时，要注意不能使用相同的端口号，建议将端口号从50000~65536中选取，避免端口号冲突的情况发生。
+
+Q6：我想看看我训练下来的权重效果怎么样，可以直接使用训练权重做推理吗？
+
+A6：当然可以！你可以通过以下两种方式进行推理：
+
+**直接使用训练权重进行推理**，可以参考[《训练后模型进行评测》](https://www.mindspore.cn/mindformers/docs/zh-CN/master/guide/evaluation.html#%E8%AE%AD%E7%BB%83%E5%90%8E%E6%A8%A1%E5%9E%8B%E8%BF%9B%E8%A1%8C%E8%AF%84%E6%B5%8B)文档，使用去优化器合并的训练权重进行推理。
+
+更多FAQ请查看[官网FAQ](https://www.mindspore.cn/mindformers/docs/zh-CN/master/faq/model_related.html)
+
+# 静态图
 
 ## 支持规格
 
@@ -31,15 +362,40 @@ DeepSeek-V3 系列模型是深度求索（DeepSeek）公司推出的一款高性
 
 ## 版本配套
 
-DeepSeek-V3 当前支持的版本配套如下。
+DeepSeek-V3 静态图当前支持的版本配套如下。
 
 |           | MindSpore Transformers | MindSpore | CANN  |  HDK   |
 |:---------:|:----------------------:|:---------:|:-----:|:------:|
 | 当前支持的版本 |         1.8.0          |   2.7.2   | 8.5.0 | 25.5.0 |
 
+## 模型文件说明
+
+DeepSeek-V3的模型文件包括以下内容：
+
+```text
+📦mindformers
+├── 📂mindformers
+│   └── 📂models
+│       └── 📂deepseek3
+│           ├── 📄__init__.py                         # DeepSeek-V3模块初始化文件
+│           ├── 📄configuration_deepseek_v3.py        # DeepSeek-V3模型配置类定义
+│           ├── 📄modeling_deepseek_v3.py             # DeepSeek-V3模型主体实现
+│           ├── 📄modeling_deepseek_v3_infer.py       # DeepSeek-V3静态图推理模型实现
+│           ├── 📄modeling_deepseek_v3_train.py       # DeepSeek-V3静态图训练模型实现
+│           └── 📄utils.py                            # DeepSeek-V3工具函数和基础类
+├── 📂configs
+│   └── 📂deepseek3
+│       ├── 📄pretrain_deepseek3_671b.yaml            # DeepSeek-V3静态图预训练配置
+│       ├── 📄finetune_deepseek3_671b.yaml            # DeepSeek-V3静态图全参微调配置
+│       ├── 📄pretrain_deepseek3_12b_16p_pp16.yaml    # DeepSeek-V3静态图12B预训练配置
+│       ├── 📄finetune_deepseek3_12b_16p_pp16.yaml    # DeepSeek-V3静态图12B全参微调配置
+│       └── 📄predict_deepseek3_671b.yaml             # DeepSeek-V3静态图推理配置
+└── 📄run_mindformer.py                               # 主要执行脚本
+```
+
 ## 使用样例
 
-MindSpore Transformers 支持使用 DeepSeek-V3 进行预训练，微调和推理，并支持在 DeepSeek-V3 的基础上使用 DeepSeek-V3.2 的DSA特性进行训练（暂不支持推理）。各任务的整体使用流程如下：
+MindSpore Transformers 支持使用 DeepSeek-V3 进行静态图预训练，微调和推理，并支持在 DeepSeek-V3 的基础上使用 DeepSeek-V3.2 的DSA特性进行训练（暂不支持推理）。各任务的整体使用流程如下：
 
 | 任务  | 前期准备                    | 使用流程                       |
 |:---:|:------------------------|:---------------------------|
@@ -537,31 +893,6 @@ model:
 配置文件修改完成后，参考[启动微调任务](#2-启动微调任务)拉起训练任务即可。
 
 ## 附录
-
-### 模型文件说明
-
-DeepSeek-V3的模型文件包括以下内容：
-
-```text
-📦mindformers
-├── 📂mindformers
-│   └── 📂models
-│       └── 📂deepseek3
-│           ├── 📄__init__.py                         # DeepSeek-V3模块初始化文件
-│           ├── 📄configuration_deepseek_v3.py        # DeepSeek-V3模型配置类定义
-│           ├── 📄modeling_deepseek_v3.py             # DeepSeek-V3模型主体实现
-│           ├── 📄modeling_deepseek_v3_infer.py       # DeepSeek-V3推理模型实现
-│           ├── 📄modeling_deepseek_v3_train.py       # DeepSeek-V3训练模型实现
-│           └── 📄utils.py                            # DeepSeek-V3工具函数和基础类
-├── 📂configs
-│   └── 📂deepseek3
-│       ├── 📄pretrain_deepseek3_671b.yaml            # DeepSeek-V3预训练配置
-│       ├── 📄finetune_deepseek3_671b.yaml            # DeepSeek-V3全参微调配置
-│       ├── 📄pretrain_deepseek3_12b_16p_pp16.yaml    # DeepSeek-V3 12B预训练配置
-│       ├── 📄finetune_deepseek3_12b_16p_pp16.yaml    # DeepSeek-V3 12B全参微调配置
-│       └── 📄predict_deepseek3_671b.yaml             # DeepSeek-V3推理配置
-└── 📄run_mindformer.py                               # 主要执行脚本
-```
 
 ### 并行配置建议
 
