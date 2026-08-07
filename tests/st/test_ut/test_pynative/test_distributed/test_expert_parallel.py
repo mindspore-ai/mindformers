@@ -22,7 +22,6 @@ from mindspore import Tensor, context, nn, ops
 from hyper_parallel.core.dtensor.placement_types import Shard
 
 from mindformers.pynative.distributed import utils
-import mindformers.pynative.distributed.expert_parallel as ep_mod
 from mindformers.pynative.distributed.activation_checkpoint import recompute_context_fn
 from mindformers.pynative.distributed.ep_overlap import OverlapExpertParallel
 from mindformers.pynative.distributed.expert_parallel import ExpertParallel
@@ -34,10 +33,24 @@ from mindformers.pynative.transformers.moe.experts import GroupedMLP
 HIDDEN_SIZE = 32
 EXPERT_NUM = 4
 
+
+class _FakeDeviceMesh:
+    """Minimal EP mesh exposing the already-created communication group."""
+
+    def __init__(self):
+        self.group = "parallel-dims-ep-group"
+        self.get_group_calls = 0
+
+    def get_group(self):
+        self.get_group_calls += 1
+        return self.group
+
+
 @pytest.fixture(name="device_mesh")
 def fixture_device_mesh():
     """Provide a lightweight fake device mesh."""
-    return object()
+    return _FakeDeviceMesh()
+
 
 class TestExpertParallel:
     """Tests for ExpertParallel."""
@@ -46,7 +59,7 @@ class TestExpertParallel:
         """Set up test fixtures for expert parallel MoE tests."""
         context.set_context(mode=context.PYNATIVE_MODE)
 
-        self.device_mesh = object()
+        self.device_mesh = _FakeDeviceMesh()
         self.config = TransformerConfig(
             hidden_size=HIDDEN_SIZE,
             num_attention_heads=4,
@@ -72,6 +85,8 @@ class TestExpertParallel:
         module = self.expert_parallel._apply(GroupedMLP(self.config), self.device_mesh)
 
         assert isinstance(module, GroupedMLP)
+        assert self.expert_parallel.ep_group == self.device_mesh.group
+        assert self.device_mesh.get_group_calls == 1
 
     @pytest.mark.level1
     @pytest.mark.platform_x86_cpu
@@ -152,8 +167,6 @@ class TestExpertParallel:
         event = FakeEvent()
         issue_calls = []
 
-        monkeypatch.setattr(ep_mod, "get_rank", lambda: 0)
-        monkeypatch.setattr(ep_mod, "get_ep_group_name", lambda rank, degree: f"ep-{rank}-{degree}")
         monkeypatch.setattr(
             self.expert_parallel, "_count_tokens_per_expert",
             lambda topk_indices, num_experts: local_counts)

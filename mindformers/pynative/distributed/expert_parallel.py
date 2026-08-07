@@ -61,6 +61,7 @@ class ExpertParallel(ParallelStyle):
         super().__init__()
         self.ctx = None
         self.input_layout = None
+        self.ep_group = None
 
         self.cast = ops.cast
         self.reshape = mint.reshape
@@ -422,8 +423,6 @@ class ExpertParallel(ParallelStyle):
         original_shape = routed_input.shape
         num_tokens_per_expert = self._count_tokens_per_expert(topk_indices, num_experts)
 
-        self.ep_group = get_ep_group_name(get_rank(), ep_degree)
-
         flat_in = self.reshape(routed_input, (-1,))
         (
             flat_out, group_counts, input_splits, output_splits,
@@ -459,7 +458,6 @@ class ExpertParallel(ParallelStyle):
         the host wait is deferred to :meth:`_dispatch_a2a`.
         """
         num_tokens_per_expert = self._count_tokens_per_expert(topk_indices, num_experts)
-        self.ep_group = get_ep_group_name(get_rank(), ep_degree)
         num_tokens_per_expert_group = self._counts_a2a(num_tokens_per_expert, ep_degree, cell=cell)
         if is_in_recompute():
             # The matching forward saved the resolved host split lists. Keep
@@ -724,6 +722,11 @@ class ExpertParallel(ParallelStyle):
         # only supports GroupedMLP
         if not isinstance(module, GroupedMLP):
             raise TypeError(f"Expert parallel only supports GroupedMLP, but got {type(module)}")
+
+        # ParallelDims has already materialized the EP process group as part of
+        # the sparse device mesh. Reuse it instead of creating another HCCL
+        # group with the same ranks under a different name on the first forward.
+        self.ep_group = device_mesh.get_group()
 
         module = distribute_module(
             module,
@@ -994,14 +997,6 @@ def get_group(rank_list):
     create_group(group_name, rank_list)
     GROUP_NAME[rank_list_str] = group_name
     return group_name
-
-
-def get_ep_group_name(rank_id, expert_model_parallel_size):
-    """Get expert model parallel group."""
-    rank_start = rank_id // expert_model_parallel_size * expert_model_parallel_size
-    rand_end = rank_id // expert_model_parallel_size * expert_model_parallel_size + expert_model_parallel_size
-    rank_list = list(range(rank_start, rand_end))
-    return get_group(rank_list)
 
 
 def get_oep_group_name(rank_id, expert_model_parallel_size, npu_nums_per_device):
