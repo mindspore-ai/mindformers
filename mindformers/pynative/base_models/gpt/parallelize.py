@@ -1863,6 +1863,9 @@ def apply_pp(
     every MoE layer, and registers it on the schedule for the
     ``OVERLAP_B_F`` callback.
     """
+    calculate_per_token_loss = bool(
+        getattr(model.config, "calculate_per_token_loss", False)
+    )
     layer_setting = PpLayerSetting(model.config.num_hidden_layers, parallelism)
 
     model_cls = type(model)
@@ -1928,6 +1931,7 @@ def apply_pp(
     loss_scale = float(main_loss_sense.asnumpy().item())
     for stage in stages:
         stage.loss_scale = loss_scale
+        stage.calculate_per_token_loss = calculate_per_token_loss
 
     micro_batch_num = parallelism.pipeline_parallel_microbatch_size
     schedule_type = _infer_schedule_type(parallelism)

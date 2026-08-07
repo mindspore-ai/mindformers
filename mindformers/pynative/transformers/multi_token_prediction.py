@@ -645,12 +645,20 @@ def process_mtp_loss(
         if getattr(config, "chunk_loss_num", 0) > 1:
             mtp_logits = mtp_logits.transpose(0, 1)
             mtp_loss = compute_language_model_loss(mtp_labels, mtp_logits, mtp_loss_mask)
+            if config.calculate_per_token_loss:
+                mtp_loss_numerator, mtp_loss_denominator = mtp_loss
+                mtp_loss_for_log = mtp_loss_numerator / mtp_loss_denominator
+                mtp_loss_for_backward = mtp_loss_numerator
+            else:
+                mtp_loss_for_log = mtp_loss
+                mtp_loss_for_backward = mtp_loss
             save_to_mtp_losses_tracker(
-                mtp_loss,
+                mtp_loss_for_log,
                 mtp_layer_number,
                 config.mtp_num_layers,
             )
-            hidden_states = mtp_loss_auto_scaler(hidden_states, mtp_loss_scale * mtp_loss)
+            hidden_states = mtp_loss_auto_scaler(
+                hidden_states, mtp_loss_scale * mtp_loss_for_backward)
         else:
             mtp_logits = mtp_logits.transpose(0, 1).reshape((-1, mtp_logits.shape[-1]))
             mtp_loss_mask = mint.reshape(mtp_loss_mask, (-1,))
