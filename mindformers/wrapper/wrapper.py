@@ -1034,14 +1034,18 @@ class MFPipelineWithLossScaleCell(nn.TrainOneStepWithLossScaleCell):
         """calculate grad for legacy model"""
         if self.calculate_per_token_loss:
             numerator, denominator = self.network(*inputs)
-            denominator = self.allreduce2(denominator)
-            loss = numerator / denominator
             scaling_sens_filled = C.ones_like(numerator) * F.cast(scaling_sens, F.dtype(numerator))
             scaling_sens_filled2 = self.zero_t * F.cast(scaling_sens, F.dtype(denominator))
 
             grads = self.grad(self.network, self.weights)(*inputs,
                                                           (self.cast(scaling_sens_filled, mstype.float32),
                                                            self.cast(scaling_sens_filled2, mstype.float32)))
+            # The denominator is only produced by the last pipeline stage, so it has to be
+            # broadcast to the other stages. This collective is not part of the pipeline
+            # scheduling, so it must be ordered after the whole forward-backward of the step,
+            # otherwise it interleaves with the Send/Recv chain and deadlocks the pipeline.
+            denominator = self.allreduce2(F.depend(denominator, grads))
+            loss = numerator / denominator
             grad_scale_factor = denominator
         else:
             loss = self.network(*inputs)
@@ -1057,12 +1061,6 @@ class MFPipelineWithLossScaleCell(nn.TrainOneStepWithLossScaleCell):
         if self.calculate_per_token_loss:
             losses = self.network(*inputs)
             numerator0, denominator0, numerator1, _, aux_loss, *_ = losses
-            denominator0 = self.allreduce2(denominator0)
-            lm_loss = numerator0 / denominator0
-            mtp_loss = numerator1 / denominator0
-            aux_loss = aux_loss / denominator0
-            loss = lm_loss + aux_loss
-            loss = loss + mtp_loss
 
             scaling_sens_filled = C.ones_like(numerator0) * F.cast(scaling_sens, F.dtype(numerator0))
             scaling_sens_filled_zero = self.zero_t * F.cast(scaling_sens, F.dtype(denominator0))
@@ -1074,11 +1072,8 @@ class MFPipelineWithLossScaleCell(nn.TrainOneStepWithLossScaleCell):
                                   self.cast(scaling_sens_filled / self.micro_size,
                                             mstype.float32),
                                   )
-            indexer_loss = None
-            if not self.is_zbv or self.is_dsa:
-                indexer_loss = losses[-1]
-                indexer_loss = indexer_loss / denominator0
-                loss = loss + indexer_loss
+            has_indexer_loss = not self.is_zbv or self.is_dsa
+            if has_indexer_loss:
                 scaling_sens_tuple = (self.cast(scaling_sens_filled, mstype.float32),
                                       self.cast(scaling_sens_filled_zero, mstype.float32),
                                       self.cast(scaling_sens_filled, mstype.float32),
@@ -1089,6 +1084,18 @@ class MFPipelineWithLossScaleCell(nn.TrainOneStepWithLossScaleCell):
                                                 mstype.float32),
                                       )
             grads = self.grad(self.network, self.weights)(*inputs, scaling_sens_tuple)
+            # See the comment in grads_for_legacy: this collective is not part of the pipeline
+            # scheduling, so it is ordered after the whole forward-backward of the step.
+            denominator0 = self.allreduce2(F.depend(denominator0, grads))
+            lm_loss = numerator0 / denominator0
+            mtp_loss = numerator1 / denominator0
+            aux_loss = aux_loss / denominator0
+            loss = lm_loss + aux_loss
+            loss = loss + mtp_loss
+            indexer_loss = None
+            if has_indexer_loss:
+                indexer_loss = losses[-1] / denominator0
+                loss = loss + indexer_loss
             grad_scale_factor = denominator0
         else:
             losses = self.network(*inputs)
