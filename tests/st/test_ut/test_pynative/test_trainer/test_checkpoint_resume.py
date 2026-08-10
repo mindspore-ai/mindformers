@@ -88,7 +88,7 @@ def test_static_batch_resume_uses_micro_batch_cursor(
     trainer = _build_trainer(global_batch_size)
     load_checkpoint = _mock_checkpoint_load(monkeypatch)
     model = object()
-    optimizer = object()
+    optimizer = Mock()
 
     trainer._load_checkpoint(str(checkpoint_path), model, optimizer)
 

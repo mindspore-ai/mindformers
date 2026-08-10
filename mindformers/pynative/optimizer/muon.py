@@ -24,7 +24,7 @@ import copy as cp
 import math
 from fnmatch import fnmatch
 
-from mindspore import mint, Parameter, _no_grad
+from mindspore import mint, Parameter
 from mindspore.common import dtype as mstype
 from mindspore.common.parameter import ParameterTuple
 from mindspore.ops import functional as F, operations as P
@@ -49,6 +49,7 @@ from mindformers.core import context as core_context
 from mindformers.tools.logger import logger
 from mindformers.pynative.optimizer.adamw import _run_adamw_opt, _run_fused_adamw_opt
 from mindformers.pynative.dtensor_compat import inplace_copy
+from mindformers.pynative.optimizer.main_params import MainParamsMixin
 
 
 _HP_PLATFORM = get_platform()
@@ -1890,7 +1891,7 @@ def _run_muon_batched(
     return results
 
 
-class Muon(Optimizer):
+class Muon(MainParamsMixin, Optimizer):
     """
     Muon optimizer implementation for pynative mode.
 
@@ -2059,6 +2060,7 @@ class Muon(Optimizer):
             self.max_exp_avg_sq = None
 
         self.model = model
+        self._main_params_snapshot = None
 
     @staticmethod
     def _verify_model(model):
@@ -2196,21 +2198,6 @@ class Muon(Optimizer):
                     self._parameters, self.fp32_params, self._is_low_precision_param):
                 if is_lp:
                     inplace_copy(model_param, op_cast(fp32_param, model_param.dtype))
-
-    def reload_main_params_from_model(self):
-        """Refresh fp32 master weights from the model parameters.
-
-        Used on weights-only resume (no_load_optim=True): the model params have just
-        been loaded from checkpoint while the fp32 masters still hold their pre-load
-        init values, so copy model -> master to align their starting points.
-        _no_grad avoids the "leaf tensor that requires grad in an inplace operator"
-        error: the fp32 master is a leaf Parameter and this copy is not an autograd op.
-        """
-        with _no_grad(), SkipDTensorDispatch():
-            for model_param, fp32_param, is_lp in zip(
-                    self._parameters, self.fp32_params, self._is_low_precision_param):
-                if is_lp:
-                    inplace_copy(fp32_param, op_cast(model_param, mstype.float32))
 
     def _initialize_state(self):
         """Create Muon momentum and AdamW moment state from fp32 master weights."""
