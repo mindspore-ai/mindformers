@@ -23,3 +23,4 @@ pybind11 # for megatron dataset
 transformers==4.57.1
 datasets>=4.0.0
 mindspore~=2.10.0
+hyper-parallel~=1.0.0
