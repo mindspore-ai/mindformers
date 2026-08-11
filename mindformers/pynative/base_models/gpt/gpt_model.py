@@ -127,6 +127,11 @@ class GPTModel(nn.Cell):
         self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
         self.use_attn_mask_compression = config.use_attn_mask_compression or config.use_eod_attn_mask_compression
         self.return_logits = False
+        # The optimizer already materializes the synchronized per-head logits
+        # while deciding whether QK clip fires.  Keep the resulting device
+        # scalar here until MaxLogitsMonitor consumes it, so the callback does
+        # not reconstruct every TP-sharded layer and read it back to the host.
+        self._qk_clip_count_cache = [None]
 
         if hasattr(self.config, 'position_embedding_type'):
             # By default, use the position_embedding_type configuration in TransformerConfig.
@@ -636,16 +641,30 @@ class GPTModel(nn.Cell):
 
     def synced_max_attention_logit_fires(self, logit_threshold):
         """Combined qk_clip threshold check + sync in one batched AllReduce-Max.
-        Writes the synced values back only on fire so non-fire steps stay
-        bit-identical with the pre-batching behavior."""
+        Cache the strict-``>`` per-head count on device for the monitoring
+        callback, and write the synced values back only on fire so non-fire
+        steps stay bit-identical with the pre-batching behavior."""
         params, mesh, placements, stacked = self._stacked_synced_max_logits()
         if params is None:
+            self._qk_clip_count_cache[0] = Tensor([0], dtype=dtype.int32)
             return False
+        self._qk_clip_count_cache[0] = mint.sum(
+            mint.greater(stacked, logit_threshold).astype(dtype.int32)
+        ).reshape((1,))
         global_max = mint.max(stacked).reshape((1,))
         fires = bool(mint.greater_equal(global_max, logit_threshold).asnumpy()[0])
         if fires:
             self._writeback_synced_max_logits(params, mesh, placements, stacked)
         return fires
+
+    def take_qk_clip_count(self):
+        """Return and clear the optimizer-produced device-side QK-clip count."""
+        cache = getattr(self, "_qk_clip_count_cache", None)
+        if cache is None:
+            return None
+        count = cache[0]
+        cache[0] = None
+        return count
 
     def has_qk_clip_candidates(self, logit_threshold):
         """Whether any local/global max attention logit reaches QK-clip threshold.
