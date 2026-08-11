@@ -1312,18 +1312,25 @@ class Trainer:
             # Use user-defined loss function
             loss = self.compute_loss_func(outputs, labels)
         else:
-            # Extract loss from model output
-            # We don't use .loss here since the model may return tuples instead of ModelOutput
-            if isinstance(outputs, dict):
-                loss = outputs["loss"]
-            elif isinstance(outputs, (Tensor, DTensor)):
-                loss = outputs
-            else:
-                # Assume first element is loss
-                loss = outputs[0]
+            loss = self._extract_model_loss(outputs)
 
         # return value must be Tensor or DTensor
         return loss
+
+    def _extract_model_loss(self, outputs):
+        """Extract the loss from supported model output forms."""
+        if isinstance(outputs, dict):
+            return outputs["loss"]
+        if isinstance(outputs, (Tensor, DTensor)):
+            return outputs
+        if getattr(self.config.model, "calculate_per_token_loss", False):
+            if len(outputs) < 2:
+                raise ValueError(
+                    "calculate_per_token_loss=True requires model output "
+                    "(loss_sum, token_count)."
+                )
+            return outputs[0] / outputs[1]
+        return outputs[0]
 
     def compute_pp_loss(self, inputs: Dict[str, Any]):
         """
@@ -1353,15 +1360,14 @@ class Trainer:
             if isinstance(outputs, dict):
                 loss = outputs["loss"]
             elif isinstance(outputs, list):
-                # Assume first element is loss
                 if len(outputs) == 0:
                     loss = None
                 else:
                     for output in outputs:
-                        if isinstance(output[0], DTensor):
-                            loss += output[0].to_local()
-                        else:
-                            loss += output[0]
+                        micro_loss = self._extract_model_loss(output)
+                        if isinstance(micro_loss, DTensor):
+                            micro_loss = micro_loss.to_local()
+                        loss += micro_loss
                     loss /= len(outputs)
 
         # return value must be Tensor or DTensor

@@ -368,8 +368,10 @@ class ChunkCrossEntropyLoss(CrossEntropyLoss):
                 # vocab-parallel reduction over the TP group.
                 return _ChunkVocabParallelCrossEntropy.apply(
                     logits, label, input_mask, self.chunk_loss_num,
-                    self._tp_group, self._tp_rank, self._tp_size, self.compensate_loss_sense_tp)
-            return _ChunkCrossEntropyLoss.apply(logits, label, input_mask, self.chunk_loss_num)
+                    self._tp_group, self._tp_rank, self._tp_size, self.compensate_loss_sense_tp,
+                    self.calculate_per_token_loss)
+            return _ChunkCrossEntropyLoss.apply(
+                logits, label, input_mask, self.chunk_loss_num, self.calculate_per_token_loss)
         return super().construct(logits, label, input_mask)
 
 
@@ -403,13 +405,14 @@ class _ChunkCrossEntropyLoss(_Function):
         return mint.sub(log_sum, shifted)
 
     @staticmethod
-    def forward(ctx, logits, labels, input_mask, chunk_loss_num):
+    def forward(ctx, logits, labels, input_mask, chunk_loss_num, calculate_per_token_loss=False):
         """Forward pass for fused chunked cross entropy."""
         ctx.logits = logits
         ctx.labels = labels
         ctx.input_mask = input_mask
         ctx.logits_dtype = logits.dtype
         ctx.chunk_sizes = _ChunkCrossEntropyLoss._chunk_sizes(labels.shape[1], chunk_loss_num)
+        ctx.calculate_per_token_loss = calculate_per_token_loss
 
         denominator = mint.sum(mint.reshape(input_mask, (-1,)))
         denominator = mint.add(denominator, ops.cast(ops.tuple_to_array((1e-8,)), mstype.float32))
@@ -428,17 +431,20 @@ class _ChunkCrossEntropyLoss(_Function):
             indices = mint.reshape(seq_labels, (-1, 1))
             loss_reduce = mint.reshape(mint.gather(neg_log_softmax, 1, indices), (-1,))
             numerator = mint.sum(mint.mul(loss_reduce, seq_mask))
-            seq_loss = mint.div(numerator, denominator)
+            seq_loss = numerator if calculate_per_token_loss else mint.div(numerator, denominator)
             loss = seq_loss if loss is None else loss + seq_loss
             start_idx = end_idx
+        if calculate_per_token_loss:
+            return loss, denominator
         return loss
 
     @staticmethod
-    def backward(ctx, grads):
+    def backward(ctx, *grads):
         """Backward pass for fused chunked cross entropy."""
         logits = ctx.logits
         labels = ctx.labels
         input_mask = ctx.input_mask
+        loss_grad = grads[0]
         grad_logits_chunks = []
         start_idx = 0
         for chunk_size in ctx.chunk_sizes:
@@ -456,13 +462,15 @@ class _ChunkCrossEntropyLoss(_Function):
             indices = mint.reshape(seq_labels, (-1, 1))
             vals = mint.zeros_like(indices, dtype=probs.dtype) - 1
             grad = mint.scatter_add(probs, 1, indices, vals)
-            grad_scale = mint.div(mint.mul(seq_mask, grads), ctx.denominator)
+            grad_scale = mint.mul(seq_mask, loss_grad)
+            if not ctx.calculate_per_token_loss:
+                grad_scale = mint.div(grad_scale, ctx.denominator)
             grad = mint.mul(grad, mint.unsqueeze(grad_scale, -1))
             grad = ops.cast(mint.reshape(grad, seq_shape), ctx.logits_dtype)
             grad_logits_chunks.append(grad)
             start_idx = end_idx
         grad_logits = mint.cat(grad_logits_chunks, dim=1)
-        return grad_logits, mint.zeros_like(labels), mint.zeros_like(input_mask), None
+        return grad_logits, mint.zeros_like(labels), mint.zeros_like(input_mask), None, None
 
 
 class _ChunkVocabParallelCrossEntropy(_Function):
@@ -479,7 +487,7 @@ class _ChunkVocabParallelCrossEntropy(_Function):
 
     @staticmethod
     def forward(ctx, logits, labels, input_mask, chunk_loss_num, group, tp_rank, tp_size,
-                compensate_tp=True):
+                compensate_tp=True, calculate_per_token_loss=False):
         """Forward pass for fused chunked vocab-parallel cross entropy on local logits."""
         local_logits = logits  # [b, s, V_local]
         ctx.local_logits = local_logits
@@ -491,6 +499,7 @@ class _ChunkVocabParallelCrossEntropy(_Function):
         ctx.vocab_per_rank = local_logits.shape[-1]
         ctx.vocab_start = tp_rank * local_logits.shape[-1]
         ctx.chunk_sizes = _ChunkCrossEntropyLoss._chunk_sizes(labels.shape[1], chunk_loss_num)
+        ctx.calculate_per_token_loss = calculate_per_token_loss
 
         denominator = mint.sum(mint.reshape(input_mask, (-1,)))
         denominator = mint.add(denominator, ops.cast(ops.tuple_to_array((1e-8,)), mstype.float32))
@@ -509,17 +518,20 @@ class _ChunkVocabParallelCrossEntropy(_Function):
             loss_reduce = _vocab_parallel_ce_terms(
                 seq_logits, seq_labels, group, ctx.vocab_start, ctx.vocab_per_rank)[0]
             numerator = mint.sum(mint.mul(loss_reduce, seq_mask))
-            seq_loss = mint.div(numerator, denominator)
+            seq_loss = numerator if calculate_per_token_loss else mint.div(numerator, denominator)
             loss = seq_loss if loss is None else loss + seq_loss
             start_idx = end_idx
+        if calculate_per_token_loss:
+            return loss, denominator
         return loss
 
     @staticmethod
-    def backward(ctx, grads):
+    def backward(ctx, *grads):
         """Backward pass: recompute each chunk into one preallocated gradient buffer."""
         local_logits = ctx.local_logits
         labels = ctx.labels
         input_mask = ctx.input_mask
+        loss_grad = grads[0]
         grad_logits = mint.empty_like(local_logits)
         start_idx = 0
         for chunk_size in ctx.chunk_sizes:
@@ -532,11 +544,13 @@ class _ChunkVocabParallelCrossEntropy(_Function):
 
             _, exp_vals, global_sum_exp, local_target, in_range_f = _vocab_parallel_ce_terms(
                 seq_logits, seq_labels, ctx.group, ctx.vocab_start, ctx.vocab_per_rank)
-            upstream = mint.div(mint.mul(seq_mask, grads), ctx.denominator)
+            upstream = mint.mul(seq_mask, loss_grad)
+            if not ctx.calculate_per_token_loss:
+                upstream = mint.div(upstream, ctx.denominator)
             grad = _vocab_parallel_ce_grad(exp_vals, global_sum_exp, local_target, in_range_f,
                                            upstream, ctx.tp_grad_factor)
             grad = ops.cast(mint.reshape(grad, seq_shape), ctx.logits_dtype)
             inplace_copy(grad_logits[:, start_idx:end_idx, :], grad)
             start_idx = end_idx
         return (grad_logits, mint.zeros_like(labels), mint.zeros_like(input_mask),
-                None, None, None, None, None)
+                None, None, None, None, None, None)

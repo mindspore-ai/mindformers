@@ -2568,9 +2568,6 @@ class TransformerConfig:
                              f"should be equal to num_layers. But get num_encoder_layers: {self.num_encoder_layers}, "
                              f"num_decoder_layers: {self.num_decoder_layers}, num_layers: {self.num_layers}.")
 
-        if self.chunk_loss_num > 1 and self.calculate_per_token_loss:
-            raise ValueError("For chunk_loss_num > 1, calculate_per_token_loss is not supported.")
-
     def _validate_param_init_std_rules(self):
         """Validate and compile decoupling initialization rules."""
         rules = self.param_init_std_rules

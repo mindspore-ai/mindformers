@@ -57,6 +57,7 @@ class ScaledLossPipelineStage(PipelineStage):
     """
 
     loss_scale = 1.0
+    calculate_per_token_loss = False
 
     def __init__(self, *args, tp_mesh=None, **kwargs):
         super().__init__(*args, **kwargs)
@@ -96,12 +97,17 @@ class ScaledLossPipelineStage(PipelineStage):
         already includes the TP division, the seed for a replicated loss output
         is multiplied back by ``repeat_num`` here (via ``restore_repeat_num``)
         before ``loss_scale`` is applied; local (non-replicated) loss outputs
-        are left unchanged. ``loss_scale == 1.0`` short-circuits and returns the
-        base seed untouched.
+        are left unchanged.
+
+        When ``calculate_per_token_loss`` is enabled, the last stage returns
+        ``(loss_sum, token_count)``. Scale the loss-sum sensitivity by the
+        data-only token count so PP differentiates the same normalized loss as
+        the non-PP trainer path.
         """
         p_sens = super().get_last_stage_sens(last_stage_outputs)
         scale = self.loss_scale
-        if scale == 1.0:
+        per_token_loss = self.calculate_per_token_loss
+        if scale == 1.0 and not per_token_loss:
             return p_sens
         if isinstance(last_stage_outputs, (list, tuple)):
             outputs = last_stage_outputs
@@ -114,7 +120,29 @@ class ScaledLossPipelineStage(PipelineStage):
             return sens
 
         if isinstance(p_sens, list):
-            return [restore_repeat_num(s, output) * scale for s, output in zip(p_sens, outputs)]
+            scaled_sens = [
+                restore_repeat_num(sens, output) * scale
+                for sens, output in zip(p_sens, outputs)
+            ]
+            if not per_token_loss:
+                return scaled_sens
+            if len(outputs) < 2:
+                raise ValueError(
+                    "calculate_per_token_loss=True requires last-stage output "
+                    "(loss_sum, token_count)."
+                )
+
+            denominator = outputs[1].to_local() if hasattr(outputs[1], "to_local") else outputs[1]
+            denominator_for_numerator = denominator.reshape(scaled_sens[0].shape)
+            scaled_sens[0] /= denominator_for_numerator
+            for index in range(1, len(scaled_sens)):
+                scaled_sens[index] *= 0
+            return scaled_sens
+        if per_token_loss:
+            raise ValueError(
+                "calculate_per_token_loss=True requires last-stage output "
+                "(loss_sum, token_count)."
+            )
         return restore_repeat_num(p_sens, outputs[0]) * scale
 
 
