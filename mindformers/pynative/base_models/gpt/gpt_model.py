@@ -550,7 +550,7 @@ class GPTModel(nn.Cell):
         for _, prefix, self_attn in self._iter_self_attentions():
             yield f"{prefix}.core_attention", self_attn.core_attention
 
-    def set_qk_clip_reduce_group(self, group):
+    def set_qk_clip_reduce_group(self, group, group_size):
         """Register the comm group for the qk_clip max-logit all-reduce.
 
         ``max_logits_val`` is a per-(layer, head) running max that only needs to be
@@ -558,14 +558,30 @@ class GPTModel(nn.Cell):
         data + context-parallel domain (``dp x cp``, i.e. the ``loss_mesh`` group).
         tp / pp hold different heads / layers (handled by ``full_tensor()`` and by
         each stage owning only its layers' params), so they must NOT be folded into
-        this reduce. Set by ``parallelize_gptmodel``; ``None`` falls back to a world
-        all-reduce so unparallelized / legacy call paths keep working.
+        this reduce. Set by ``parallelize_gptmodel``; an explicitly configured
+        size-one group skips the collective entirely.
         """
         self._qk_clip_reduce_group = group
+        self._qk_clip_reduce_group_size = int(group_size)
+        self._qk_clip_reduce_group_configured = True
 
     def _all_reduce_max_logits(self, tensor):
-        """AllReduce-Max ``tensor`` over the dp x cp (``loss_mesh``) group when one
-        has been registered, else over the world group (legacy fallback)."""
+        """AllReduce-Max ``tensor`` over the configured dp x cp loss group."""
+        if getattr(self, "_qk_clip_reduce_group_configured", False):
+            group_size = self._qk_clip_reduce_group_size
+            if group_size <= 1:
+                return tensor
+            group = self._qk_clip_reduce_group
+            if group is None:
+                raise RuntimeError(
+                    "QK-clip reduce group is missing for a loss mesh with "
+                    f"size {group_size}."
+                )
+            result = all_reduce(tensor, op=ops.ReduceOp.MAX, group=group)
+            return result if result is not None else tensor
+
+        # Preserve the world-group fallback for legacy models that were not
+        # configured through ``set_qk_clip_reduce_group``.
         group = getattr(self, "_qk_clip_reduce_group", None)
         if group is not None:
             result = all_reduce(tensor, op=ops.ReduceOp.MAX, group=group)
