@@ -448,9 +448,6 @@ def _build_expert_fsdp_policy(experts, shard_size):
 def _collect_layer_forced_replicate_params(layer):
     """Collect transformer-layer state that must remain replicated under FSDP."""
     forced_replicate_params = []
-    if hasattr(layer.self_attention.core_attention, "max_logits_val"):
-        forced_replicate_params.append(layer.self_attention.core_attention.max_logits_val)
-
     if hasattr(layer.mlp, "tokens_per_expert"):
         forced_replicate_params.append(layer.mlp.tokens_per_expert)
 
@@ -462,6 +459,28 @@ def _collect_layer_forced_replicate_params(layer):
             forced_replicate_params.append(layer.mlp.router.tid2eid)
 
     return forced_replicate_params
+
+
+def _collect_qk_clip_fsdp_ignored_params(gpt_model):
+    """Collect mutable max-logit state that must stay outside FSDP transitions.
+
+    ``max_logits_val`` is a non-trainable forward statistic, not an optimizer
+    parameter. QK-clip explicitly synchronizes it over DP/CP before use, so FSDP
+    must leave the original TP-DTensor object attached to the attention module.
+    """
+    ignored_params = set()
+    layers = list(getattr(getattr(gpt_model, "decoder", None), "layers", ()))
+    mtp = getattr(gpt_model, "mtp", None)
+    if mtp is not None:
+        layers.extend(
+            layer.transformer_layer
+            for layer in getattr(mtp, "layers", ())
+        )
+    for layer in layers:
+        core_attention = layer.self_attention.core_attention
+        if hasattr(core_attention, "max_logits_val"):
+            ignored_params.add(core_attention.max_logits_val)
+    return ignored_params
 
 
 def _build_layer_fsdp_policy(layer, shard_size):
@@ -1319,6 +1338,7 @@ def apply_fsdp(
     layers = list(gpt_model.decoder.layers)
 
     mtp = getattr(gpt_model, "mtp", None)
+    qk_clip_ignored_params = _collect_qk_clip_fsdp_ignored_params(gpt_model)
     tail_modules = [
         m for m in [
             getattr(gpt_model.decoder, "final_layernorm", None),
@@ -1365,7 +1385,8 @@ def apply_fsdp(
                 **fsdp_config,
                 shard_placement_fn=layer_shard_plan,
                 reshard_after_forward=reshard_after_forward,
-                replicate_params=replicate_params
+                ignored_params=qk_clip_ignored_params,
+                replicate_params=replicate_params,
             )
 
     # --- 3. Wrap final_layernorm and output_layer independently ---
@@ -1413,6 +1434,7 @@ def apply_fsdp(
                     **fsdp_config,
                     shard_placement_fn=layer_shard_plan,
                     reshard_after_forward=reshard_after_forward,
+                    ignored_params=qk_clip_ignored_params,
                     replicate_params=mtp_replicate_params,
                 )
     # --- 4. Wrap root-owned state, including the decoder mHC head ---
@@ -1424,6 +1446,7 @@ def apply_fsdp(
             model,
             **fsdp_config,
             shard_placement_fn=root_shard_plan,
+            ignored_params=qk_clip_ignored_params,
             replicate_params=root_replicate_params,
         )
 
@@ -1684,6 +1707,38 @@ def _setup_moe_aux_loss_group(model, parallel_dims):
     )
 
 
+def _setup_qk_clip_reduce_group(model, parallel_dims):
+    """Scope QK-clip max-logit synchronization to the DP x CP loss mesh."""
+    if parallel_dims is None:
+        return
+
+    gpt_model = _unwrap_gptmodel(model)
+    if not hasattr(gpt_model, "set_qk_clip_reduce_group"):
+        return
+
+    loss_mesh = parallel_dims.get_optional_mesh("loss")
+    if loss_mesh is None:
+        gpt_model.set_qk_clip_reduce_group(None, 1)
+        return
+
+    group_size = loss_mesh.size()
+    group = None
+    if group_size > 1:
+        try:
+            group = loss_mesh.get_group()
+        except (RuntimeError, ValueError, KeyError) as exc:
+            raise RuntimeError(
+                "Failed to resolve the QK-clip loss-mesh reduce group."
+            ) from exc
+        if group is None:
+            raise RuntimeError(
+                "QK-clip loss mesh has multiple ranks but no reduce group."
+            )
+
+    gpt_model.set_qk_clip_reduce_group(group, group_size)
+    logger.info("[QK-Clip] configured loss-mesh reduce group (size=%d).", group_size)
+
+
 def _apply_spmd_parallelism(
         model: nn.Cell,
         parallel_dims: Any,
@@ -1794,17 +1849,9 @@ def _apply_spmd_parallelism(
             uses_dsa_cp_kernel=_uses_dsa_cp_kernel(gptmodel),
         )
 
-    # Scope the qk_clip max-logit all-reduce to the dp x cp (loss_mesh) domain
-    # instead of the whole world: tp/pp hold different heads/layers, so reducing
-    # over loss_mesh is both correct and far cheaper than a world all-reduce.
-    gpt_model = _unwrap_gptmodel(model)
-    if parallel_dims.dp_cp_enabled and hasattr(gpt_model, "set_qk_clip_reduce_group"):
-        try:
-            gpt_model.set_qk_clip_reduce_group(parallel_dims.world_mesh.get_group("loss_mesh"))
-        except (RuntimeError, ValueError, KeyError) as exc:
-            logger.warning(
-                "[QK-Clip] could not resolve loss_mesh reduce group (%s); "
-                "falling back to world all-reduce.", exc)
+    # Configure this even when DP and CP are both size one. Pure PP must skip
+    # the collective instead of falling back to a world-group all-reduce.
+    _setup_qk_clip_reduce_group(model, parallel_dims)
 
     # Tag every MoE router with the dp x cp group so the seq_aux_loss /
     # global_aux_loss can all-reduce tokens_per_expert and aggregated probs
