@@ -58,6 +58,7 @@ from mindformers.pynative.distributed.style import (
     AllGather,
     ShardTensor,
     PrepareModuleInput,
+    PrepareModuleOutput,
     PrepareModuleInputOutput,
     RowwiseParallel,
     SequenceParallel,
@@ -643,6 +644,31 @@ def _configure_local_fa(core_attention, world):
     )
 
 
+def _configure_dsa_local_fa(core_attention, world):
+    """Rebuild DSA dense FlashAttention for the local TP head count."""
+    if not isinstance(core_attention, DSAttention) or world == 1:
+        return
+    if core_attention.head_num % world != 0:
+        raise ValueError(
+            f"num_attention_heads ({core_attention.head_num}) must be divisible by the "
+            f"TP degree ({world}) for DSA head parallelism."
+        )
+    core_attention.head_num = core_attention.head_num // world
+    if core_attention.sparse_loss:
+        return
+    dense_attention = core_attention.dense_flash_attention
+    dense_attention.head_num = core_attention.head_num
+    dense_attention.flash_attention = FlashAttentionScore(
+        head_num=dense_attention.head_num,
+        scale_value=dense_attention.softmax_scale,
+        pre_tokens=2147483647,
+        next_tokens=0,
+        inner_precise=0,
+        input_layout=dense_attention.input_layout,
+        sparse_mode=dense_attention.sparse_mode,
+    )
+
+
 def _mla_attention_layer_plan(self_attn, tp_mesh, enable_mc2=False):
     """Run MLA compression on the sequence shard and gather only projected Q/K/V."""
     _configure_local_fa(self_attn.core_attention, tp_mesh.size())
@@ -761,17 +787,73 @@ def _tag_dsv4_tp_replicated_grad_norm_params(model):
             setattr(param, "_grad_norm_replica_count", replica_count)
 
 
-def _tag_dsa_tp_replicated_grad_norm_params(model):
-    """Tag replicated DSA-attention parameters for global grad-norm de-duplication."""
-    for _, cell in model.cells_and_names():
-        replica_count = getattr(cell, "_dsa_tp_full_attention_replica_count", 1)
-        if replica_count <= 1:
-            continue
-        for param_name, param in cell.parameters_and_names():
-            # This optional qk-clip state is explicitly sharded over TP below.
-            if param_name == "core_attention.max_logits_val":
+def _dsa_attention_layer_plan(self_attn, tp_mesh, enable_mc2=False):
+    """Build head-parallel DSA while keeping the Lightning Indexer replicated."""
+    world = tp_mesh.size()
+    if self_attn.num_attention_heads % world != 0:
+        raise ValueError(
+            f"num_attention_heads ({self_attn.num_attention_heads}) must be divisible by "
+            f"the TP degree ({world}) for DSA head parallelism."
+        )
+
+    _configure_dsa_local_fa(self_attn.core_attention, world)
+    plan = _mla_attention_layer_plan(self_attn, tp_mesh, enable_mc2)
+
+    # linear_qkv deliberately stays sequence-parallel.  Install one pre-hook on
+    # the real Indexer boundary so the duplicated Indexer alone reconstructs its
+    # full-sequence x/q inputs. Q/KV up-projections independently gather their
+    # sequence input and emit only this rank's head shard.
+    plan["self_attention.core_attention.indexer"] = PrepareModuleInput(
+        input_transforms=(
+            AllGather(0, reduce_grad=False),
+            AllGather(0, reduce_grad=False),
+            None, None, None,
+        )
+    )
+
+    # Hyper-Parallel r1.0.0's fused loss does not expose the per-rank teacher
+    # probability after its local-head sum. Gather only its head-bearing inputs
+    # so the kernel observes the TP=1 teacher; attention compute/output remain
+    # local-head and linear_proj still performs the TP reduce-scatter.
+    query_head_dim = 1 if self_attn.use_tnd else 2
+    if self_attn.sparse_loss:
+        softmax_head_dim = 2 if self_attn.use_tnd else 3
+        # Sparse attention consumes the normalized latent KV directly. Compose
+        # its sequence gather with k_layernorm's existing SequenceParallel
+        # parameter semantics instead of inserting an IdentityOp in forward.
+        plan["self_attention.k_layernorm"] = SequenceParallel(sequence_dim=0)
+    else:
+        softmax_head_dim = 0 if self_attn.use_tnd else 1
+    gather_query_head = AllGather(query_head_dim, reduce_grad=False)
+    gather_softmax_head = AllGather(softmax_head_dim, reduce_grad=False)
+    gather_key_head = None if self_attn.sparse_loss else AllGather(
+        query_head_dim, reduce_grad=False
+    )
+    # The fused r1.0.0 loss reconstructs the teacher from Q/K and softmax stats.
+    # Gather only its head-bearing arguments in a pre-hook on the real fused-loss
+    # boundary.  Query/key RoPE are split before this call and therefore need the
+    # same head transform as their corresponding nope tensors.
+    plan["self_attention.core_attention.indexer_loss.compute_indexer_loss"] = PrepareModuleInput(
+        input_transforms=(
+            gather_query_head, gather_key_head,
+            None, None, None, None,
+            gather_softmax_head, gather_softmax_head,
+            AllGather(query_head_dim, reduce_grad=False),
+            gather_key_head,
+        )
+    )
+    # Keep the duplicated Indexer parameters on the formal TP mesh. FSDP will
+    # compose its shard placement with this Replicate placement, so runtime,
+    # optimizer, and checkpoint metadata all share one layout source of truth.
+    distribute_param_plan = []
+    seen_params = set()
+    for _, module in self_attn.core_attention.indexer.cells_and_names():
+        for param_name, param in module.parameters_and_names(expand=False):
+            if id(param) in seen_params:
                 continue
-            setattr(param, "_grad_norm_replica_count", replica_count)
+            seen_params.add(id(param))
+            distribute_param_plan.append([module, param_name, (Replicate(),)])
+    return plan, distribute_param_plan
 
 
 def _dense_mlp_layer_plan(enable_mc2=False):
@@ -834,25 +916,9 @@ def _apply_layers_tp(
         layer_plan.update(dsv4_plan)
         distribute_param_plan.extend(dsv4_params)
     elif is_dsa:
-        # The upstream native-local TP rewrite changes MLA projections to
-        # full-sequence/local-head tensors.  The current DSA path still consumes
-        # full-sequence/full-head tensors (and sparse weight absorb reads the full
-        # linear_kvb weight directly), so applying the generic MLA TP plan would
-        # silently reinterpret full-sequence/local-head data as
-        # local-sequence/global-head data.  Keep DSA attention replicated for
-        # correctness: gather the TP sequence shard at the attention boundary and
-        # select this rank's sequence shard again on output.  The gather uses a
-        # local-slice backward because every TP rank executes the same full DSA
-        # attention graph.
-        layer_plan["self_attention"] = PrepareModuleInputOutput(
-            input_transforms=(AllGather(0, reduce_grad=False),),
-            output_transforms=(ShardTensor(0), None),
-        )
-        setattr(self_attn, "_dsa_tp_full_attention_replica_count", world)
-        logger.warning(
-            "DSA attention uses a correctness-first replicated local-TP path; "
-            "the surrounding MLP/MoE blocks remain tensor parallel."
-        )
+        dsa_plan, dsa_params = _dsa_attention_layer_plan(self_attn, tp_mesh, enable_mc2)
+        layer_plan.update(dsa_plan)
+        distribute_param_plan.extend(dsa_params)
     elif is_mla:
         layer_plan.update(_mla_attention_layer_plan(self_attn, tp_mesh, enable_mc2))
     else:
@@ -901,6 +967,12 @@ def _apply_layers_tp(
 
     _attach_lora_layouts(transformer_layer, layer_plan)
     parallelize_module(module=transformer_layer, device_mesh=tp_mesh, parallelize_plan=layer_plan)
+    if is_dsa and self_attn.sparse_loss:
+        # Keep k_layernorm's SequenceParallel parameter layout and attach the
+        # sparse-KV sequence gather directly to the real norm output boundary.
+        PrepareModuleOutput(output_transforms=AllGather(0))._apply(
+            self_attn.k_layernorm, tp_mesh
+        )
 
 def apply_non_moe_tp(
         model: nn.Cell,
@@ -1758,7 +1830,6 @@ def _apply_spmd_parallelism(
         parallelism,
     )
     _tag_dsv4_tp_replicated_grad_norm_params(model)
-    _tag_dsa_tp_replicated_grad_norm_params(model)
 
     for param_name, param in model.parameters_and_names():
         if isinstance(param, DTensor):

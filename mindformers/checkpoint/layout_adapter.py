@@ -135,7 +135,6 @@ class LayoutAdapter:
 
         if not global_layout_dict:
             return {}
-
         result = {}
         for rank_id, current_layout_dict in global_layout_dict.items():
             rank_id = int(rank_id)

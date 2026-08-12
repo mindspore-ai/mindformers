@@ -71,14 +71,22 @@ class DSADenseFlashAttention(nn.Cell):
 
     def __init__(self, input_layout: str, head_num: int, softmax_scale: float, sparse_mode: int):
         super().__init__()
+        self.input_layout = input_layout
+        self.head_num = head_num
+        self.softmax_scale = softmax_scale
+        self.sparse_mode = sparse_mode
+        self._build_flash_attention()
+
+    def _build_flash_attention(self):
+        """Build dense FlashAttention for the currently configured local head count."""
         self.flash_attention = FlashAttentionScore(
-            head_num=head_num,
-            scale_value=softmax_scale,
+            head_num=self.head_num,
+            scale_value=self.softmax_scale,
             pre_tokens=2147483647,
             next_tokens=0,
             inner_precise=0,
-            input_layout=input_layout,
-            sparse_mode=sparse_mode,
+            input_layout=self.input_layout,
+            sparse_mode=self.sparse_mode,
         )
 
     def construct(
@@ -160,7 +168,7 @@ class DSAttention(nn.Cell):
     Sparse attention mechanism using DSA Indexer for pynative mode.
 
     This module implements sparse attention with top-k token selection
-    for reduced computational complexity. Single card only, no parallel sharding.
+    for reduced computational complexity. Parallel styles shard its heads and sequence externally.
 
     Reference:
         https://github.com/deepseek-ai/DeepSeek-V3.2-Exp/blob/main/inference/model.py#L491-L597

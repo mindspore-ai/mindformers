@@ -104,7 +104,6 @@ class DSASelfAttention(MLASelfAttention):
             layer_number=layer_number,
         )
         self.sparse_loss = config.dsa_indexer_use_sparse_loss
-        self.dsa_indexer_key_handoff = IdentityOp()
         self.dsa_value_handoff = IdentityOp()
         self.dsa_loss_key_indexer_handoff = IdentityOp()
 
@@ -127,19 +126,13 @@ class DSASelfAttention(MLASelfAttention):
         q_compress = q_a
         x_detached = _DSADetachFunction.apply(x)
         q_compress_detached = _DSADetachFunction.apply(q_compress)
-        q_index, k_index, idx_weights = self.core_attention.indexer.get_qk_index(
-            x_detached, q_compress_detached, rotary_pos_emb
+        (
+            q_index, k_index, idx_weights,
+            topk_indices, _, softmax_max_index, softmax_sum_index,
+        ) = self.core_attention.indexer(
+            x_detached, q_compress_detached, rotary_pos_emb,
+            actual_seq_len, actual_seq_len,
         )
-        k_index = self.dsa_indexer_key_handoff(k_index)
-        if self.sparse_loss:
-            topk_indices, _, softmax_max_index, softmax_sum_index = self.core_attention.indexer(
-                q_index, k_index, idx_weights, actual_seq_len, actual_seq_len
-            )
-        else:
-            softmax_max_index, softmax_sum_index = self.core_attention.indexer(
-                q_index, k_index, idx_weights, actual_seq_len, actual_seq_len
-            )
-            topk_indices = None
 
         v_absorb = None
         if self.sparse_loss:
@@ -150,6 +143,7 @@ class DSASelfAttention(MLASelfAttention):
             query, key, value = self._dsa_dense_qkv(
                 q_a, compressed_kv, k_pe, seq_len, bs, rotary_pos_emb
             )
+        attention_seq_len = self.shape(query)[0]
         if self.use_tnd:
             query = self.sbh2tnd(query)
             key = self.sbh2tnd(key)
@@ -168,15 +162,19 @@ class DSASelfAttention(MLASelfAttention):
             actual_seq_qlen=actual_seq_len, actual_seq_kvlen=actual_seq_len
         )
         if self.sparse_loss and v_absorb is not None:
+            local_heads = v_absorb.shape[0]
             v_absorb_t = mint.permute(v_absorb, (0, 2, 1))
             attn_out = _AbsorbMatmul.apply(attn_out, v_absorb_t)
-            attn_out = mint.reshape(attn_out, (bs, seq_len, self.num_attention_heads, self.v_head_dim))
+            attn_out = mint.reshape(
+                attn_out,
+                (bs, attention_seq_len, local_heads, self.v_head_dim),
+            )
             attn_out = mint.permute(attn_out, (1, 0, 2, 3))
         elif not self.sparse_loss:
-            attn_out = mint.reshape(attn_out, (bs, seq_len, -1))
+            attn_out = mint.reshape(attn_out, (bs, attention_seq_len, -1))
             attn_out = mint.permute(attn_out, (1, 0, 2))
 
-        attn_out = mint.reshape(attn_out, (seq_len, bs, -1))
+        attn_out = mint.reshape(attn_out, (attention_seq_len, bs, -1))
         output = self.linear_proj(attn_out)
         output = self.cast(output, ori_dtype)
         indexer_loss = self.core_attention.indexer_loss(
@@ -197,13 +195,24 @@ class DSASelfAttention(MLASelfAttention):
     def _dsa_dense_qkv(self, q_a, compressed_kv, k_pe, seq_len, bs, rotary_pos_emb):
         """Generate QKV for the DSA dense warm-up stage."""
         q = self.linear_qb(q_a)
-        q = self.reshape(q, (seq_len, bs, self.num_attention_heads, -1))
+        query_head_dim = self.qk_head_dim + self.qk_pos_emb_head_dim
+        local_heads = self.shape(q)[-1] // query_head_dim
+        q = self.reshape(q, (self.shape(q)[0], bs, local_heads, query_head_dim))
         q_nope, q_pe = self.split(q, [self.qk_head_dim, self.qk_pos_emb_head_dim], dim=-1)
 
         k_pe = self.reshape(k_pe, (seq_len, bs, 1, self.qk_pos_emb_head_dim))
         compressed_kv_norm = self.k_layernorm(compressed_kv)
         kv = self.linear_kvb(compressed_kv_norm)
-        kv = self.reshape(kv, (seq_len, bs, self.num_attention_heads, self.qk_head_dim + self.v_head_dim))
+        kv_head_dim = self.qk_head_dim + self.v_head_dim
+        if self.shape(kv)[-1] != local_heads * kv_head_dim:
+            raise ValueError(
+                f"linear_kvb local output must contain {local_heads} heads, "
+                f"but got width {self.shape(kv)[-1]} with head width {kv_head_dim}."
+            )
+        kv = self.reshape(
+            kv,
+            (self.shape(kv)[0], bs, local_heads, kv_head_dim),
+        )
         k_nope, value = self.split(kv, [self.qk_head_dim, self.v_head_dim], dim=-1)
 
         if rotary_pos_emb is not None:
@@ -219,19 +228,22 @@ class DSASelfAttention(MLASelfAttention):
             )
 
         query = self.cat([q_nope, q_pe], 3)
-        k_pe = self.tile_kv(k_pe, (1, 1, self.num_attention_heads, 1))
+        k_pe = self.tile_kv(k_pe, (1, 1, local_heads, 1))
         key = self.cat([k_nope, k_pe], 3)
         return query, key, value
 
     def _dsa_sparse_qkv(self, q_a, compressed_kv, k_pe, seq_len, bs, rotary_pos_emb):
         """Generate QKV for the DSA sparse stage with MQA weight absorb."""
         q = self.linear_qb(q_a)
-        q = self.reshape(q, (seq_len, bs, self.num_attention_heads, -1))
+        query_head_dim = self.qk_head_dim + self.qk_pos_emb_head_dim
+        local_heads = self.shape(q)[-1] // query_head_dim
+        q = self.reshape(q, (self.shape(q)[0], bs, local_heads, query_head_dim))
         q_nope, q_pe = self.split(q, [self.qk_head_dim, self.qk_pos_emb_head_dim], dim=-1)
         k_pe = self.reshape(k_pe, (seq_len, bs, 1, self.qk_pos_emb_head_dim))
         compressed_kv_norm = self.k_layernorm(compressed_kv)
-        k_nope = self.reshape(compressed_kv_norm, (seq_len, bs, 1, self.kv_lora_rank))
-        value = self.reshape(compressed_kv_norm, (seq_len, bs, 1, self.kv_lora_rank))
+        sparse_kv_seq_len = self.shape(compressed_kv_norm)[0]
+        k_nope = self.reshape(compressed_kv_norm, (sparse_kv_seq_len, bs, 1, self.kv_lora_rank))
+        value = self.reshape(compressed_kv_norm, (sparse_kv_seq_len, bs, 1, self.kv_lora_rank))
 
         if rotary_pos_emb is not None:
             q_pe = self.apply_rotary_emb_q(
@@ -246,16 +258,26 @@ class DSASelfAttention(MLASelfAttention):
             )
 
         w_kvb = self.linear_kvb.weight
-        if w_kvb.has_init:
+        if getattr(w_kvb, "has_init", False):
             w_kvb.init_data()
+        w_kvb = self._to_local_tensor(w_kvb)
         w_kvb = self.cast(w_kvb, self.compute_dtype)
-        w_kvb = mint.reshape(w_kvb, (self.num_attention_heads,
+        expected_rows = local_heads * (self.qk_head_dim + self.v_head_dim)
+        if int(w_kvb.shape[0]) != expected_rows:
+            raise ValueError(
+                f"linear_kvb local rows must equal local_heads * (qk_head_dim + v_head_dim), "
+                f"but got {w_kvb.shape[0]} and expected {expected_rows}."
+            )
+        w_kvb = mint.reshape(w_kvb, (local_heads,
                                      self.qk_head_dim + self.v_head_dim, self.kv_lora_rank))
         q_absorb, v_absorb = mint.split(w_kvb, [self.qk_head_dim, self.v_head_dim], dim=1)
 
         q_nope = self.cast(q_nope, self.compute_dtype)
         q_nope = _AbsorbMatmul.apply(q_nope, q_absorb)
-        q_nope = mint.reshape(q_nope, (seq_len, bs, self.num_attention_heads, self.kv_lora_rank))
+        q_nope = mint.reshape(
+            q_nope,
+            (self.shape(q_nope)[0], bs, local_heads, self.kv_lora_rank),
+        )
 
         query = self.cat([q_nope, q_pe], 3)
         key = self.cat([k_nope, k_pe], 3)
