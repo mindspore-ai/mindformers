@@ -33,6 +33,7 @@ from mindspore.ops.function import comm_func
 from mindspore.nn.optim.optimizer import Optimizer
 from mindspore.common.tensor import Tensor
 from mindspore.communication import get_rank, get_group_size
+from mindspore.device_context.ascend import op_precision
 from mindspore.mint.distributed import (
     P2POp, batch_isend_irecv, broadcast, irecv, isend,
 )
@@ -65,6 +66,23 @@ op_cast = P.Cast()
 # batched groups retain at least two slots to stay on the same numerical path.
 _PHASE4_BATCH_TEMP_BYTES_PER_ELEMENT = 16
 _PHASE4_BATCH_TEMP_MEMORY_LIMIT = 4 * 1024 * 1024 * 1024
+
+
+def _enable_muon_cube_math_type():
+    """Enable the FP32 Addmm/Baddbmm epilogue required by BF16 Muon NS."""
+    setter = getattr(op_precision, "cube_math_type", None)
+    if setter is None:
+        raise RuntimeError(
+            "cube_math_type(4) for Muon requires MindSpore support for "
+            "device_context.ascend.op_precision.cube_math_type."
+        )
+    try:
+        setter(4)  # pylint: disable=not-callable
+    except RuntimeError as exc:
+        raise RuntimeError(
+            "Muon requires MindSpore cube_math_type=4 for BF16 Addmm/Baddbmm; "
+            "remove any conflicting Cube math configuration."
+        ) from exc
 
 
 def _create_state_parameter(old_param, prefix, init='zeros', name=None):
@@ -216,31 +234,54 @@ def _estimate_ns_peak_bytes(param_name, shape, muon_split_fn):
     return sum(_estimate_ns_peak_bytes_for_shape(piece_shape) for piece_shape in piece_shapes)
 
 
-def _bound_ns_groups(groups, slot_bytes, max_temp_bytes):
+def _bound_ns_groups(
+        groups, slot_bytes, max_temp_bytes, singleton_safe_groups=()):
     """Split same-shape local NS groups to cap batched-NS transients.
 
     ``groups`` maps ``group_sig -> [slot, ...]``; ``slot_bytes`` maps
     ``group_sig`` to the estimated per-slot NS working-set bytes.  Returns a
     dict keyed by ``(group_sig, chunk_index)`` so each chunk becomes its own
-    bmm-batched Newton-Schulz call.  Mirrors :func:`_bound_phase4_groups`:
+    bmm-batched Newton-Schulz call.  The budget is honoured down to the
+    unavoidable one-slot lower bound.  Mirrors :func:`_bound_phase4_groups`:
     groups with more than one slot keep at least two per chunk so no weight
-    falls back to the ``mm`` singleton numerical path.
+    falls back to the ``mm`` singleton numerical path, unless the group is in
+    ``singleton_safe_groups`` (for example rank-3 schema pieces, whose
+    singleton path still uses ``bmm``).
     """
+    singleton_safe_groups = set(singleton_safe_groups)
     bounded = {}
     for sig, slots in groups.items():
+        singleton_safe = sig in singleton_safe_groups
         bytes_per_slot = max(1, int(slot_bytes.get(sig, 1)))
         slots_per_batch = max(1, int(max_temp_bytes) // bytes_per_slot)
-        if len(slots) > 1:
+        if len(slots) > 1 and not singleton_safe:
             slots_per_batch = max(2, slots_per_batch)
         chunks = [slots[start:start + slots_per_batch]
                   for start in range(0, len(slots), slots_per_batch)]
-        if len(chunks) > 1 and len(chunks[-1]) == 1:
+        if not singleton_safe and len(chunks) > 1 and len(chunks[-1]) == 1:
             if len(chunks[-2]) > 2:
                 chunks[-1].insert(0, chunks[-2].pop())
             else:
                 chunks[-2].extend(chunks.pop())
         for chunk_index, chunk in enumerate(chunks):
             bounded[(sig, chunk_index)] = chunk
+    return bounded
+
+
+def _bound_elementwise_groups(groups, slot_bytes, max_temp_bytes):
+    """Split same-shape elementwise groups without a minimum chunk size.
+
+    Unlike Newton-Schulz, elementwise phases do not switch between ``mm`` and
+    ``bmm`` when a chunk contains one slot.  Singleton chunks are therefore
+    safe and let chunks honour the configured temporary-memory budget whenever
+    one slot itself fits; one slot is the unavoidable lower bound otherwise.
+    """
+    bounded = {}
+    for sig, slots in groups.items():
+        bytes_per_slot = max(1, int(slot_bytes.get(sig, 1)))
+        slots_per_batch = max(1, int(max_temp_bytes) // bytes_per_slot)
+        for chunk_index, start in enumerate(range(0, len(slots), slots_per_batch)):
+            bounded[(sig, chunk_index)] = slots[start:start + slots_per_batch]
     return bounded
 
 
@@ -374,6 +415,94 @@ def _format_work_load_summary(rank_loads, rank_counts):
         f"r{rank}:count={rank_counts[rank]},work={rank_loads[rank]:.3e}"
         for rank in range(len(rank_loads))
     )
+
+
+def _assign_grouped_muon_owners(items_by_group, world_size):
+    """Assign grouped 2D Muon weights to balanced, evenly-spaced owners.
+
+    Each shape group keeps contiguous parameter chunks per owner so its
+    Newton-Schulz calls remain batchable.  The evenly-spaced owner pattern is
+    rotated between groups according to the load accumulated so far; otherwise
+    every group restarts at ``rank_list[0]`` and concentrates unrelated groups
+    on the same small subset of ranks.
+    """
+    assignment = {}
+    rank_loads = [0] * world_size
+    rank_counts = [0] * world_size
+
+    def _group_total_work(weights):
+        return sum(weight[1] for weight in weights)
+
+    sorted_group_items = sorted(
+        items_by_group.items(),
+        key=lambda item: (-_group_total_work(item[1]), item[0]),
+    )
+    for sig, weights in sorted_group_items:
+        rank_list_in_group = tuple(int(rank) for rank in sig[1])
+        n_ranks_in_group = len(rank_list_in_group)
+        if not n_ranks_in_group:
+            raise ValueError("Muon owner assignment received an empty rank list.")
+        weights_sorted = sorted(weights, key=lambda weight: weight[0])
+        n_weights = len(weights_sorted)
+        if not n_weights:
+            continue
+
+        # A group uses at most one owner per weight.  Candidate rotations keep
+        # those owners evenly spaced through the layout rank list, while the
+        # score selects the rotation with the lowest projected load/count skew.
+        n_owner_chunks = min(n_weights, n_ranks_in_group)
+        base_max_load = max(rank_loads[rank] for rank in rank_list_in_group)
+        base_max_count = max(rank_counts[rank] for rank in rank_list_in_group)
+        best_score = None
+        best_owners = None
+        for offset in range(n_ranks_in_group):
+            owners = []
+            load_deltas = {}
+            count_deltas = {}
+            for index, (_, work, _) in enumerate(weights_sorted):
+                chunk = (index * n_owner_chunks) // n_weights
+                owner_pos = (
+                    offset + (chunk * n_ranks_in_group) // n_owner_chunks
+                ) % n_ranks_in_group
+                owner = rank_list_in_group[owner_pos]
+                owners.append(owner)
+                load_deltas[owner] = load_deltas.get(owner, 0) + work
+                count_deltas[owner] = count_deltas.get(owner, 0) + 1
+
+            projected_max_load = max(
+                base_max_load,
+                max(rank_loads[rank] + delta
+                    for rank, delta in load_deltas.items()),
+            )
+            projected_load_square_delta = sum(
+                (rank_loads[rank] + delta) ** 2 - rank_loads[rank] ** 2
+                for rank, delta in load_deltas.items()
+            )
+            projected_max_count = max(
+                base_max_count,
+                max(rank_counts[rank] + delta
+                    for rank, delta in count_deltas.items()),
+            )
+            projected_count_square_delta = sum(
+                (rank_counts[rank] + delta) ** 2 - rank_counts[rank] ** 2
+                for rank, delta in count_deltas.items()
+            )
+            score = (
+                projected_max_load,
+                projected_load_square_delta,
+                projected_max_count,
+                projected_count_square_delta,
+                offset,
+            )
+            if best_score is None or score < best_score:
+                best_score = score
+                best_owners = owners
+
+        for (param_index, work, _), chosen in zip(weights_sorted, best_owners):
+            assignment[param_index] = chosen
+            rank_loads[chosen] += work
+            rank_counts[chosen] += 1
+    return assignment, rank_loads, rank_counts
 
 
 class _AsyncAllConcatTensor:
@@ -786,7 +915,10 @@ def _build_local_shard_scatter_ops(info, x_ret_full, rank_id):
         info['p2p_tensors'] = p2p_tensors
     else:
         ns_inputs_local = info['ns_inputs_local']
-        local_output = mint.empty(ns_inputs_local.shape, dtype=ns_inputs_local.dtype)
+        # The momentum-updated NS input stays in FP32 until normalization, but
+        # newton_schulz enters and returns from its iteration in BF16. Match
+        # the owner's BF16 send buffer; P2P does not convert dtypes.
+        local_output = mint.empty(ns_inputs_local.shape, dtype=mstype.bfloat16)
         info['x_ret'] = local_output
         ops.append(P2POp('irecv', local_output, assigned_rank))
     info['x_ret_is_local'] = True
@@ -953,6 +1085,13 @@ def _start_full_tensor_p2p_gather_multi(
     )
 
 
+def _normalize_newton_schulz_input(x, eps):
+    """Normalize an NS input in FP32 and return the BF16 iteration state."""
+    norm = x.norm(dim=(-2, -1), keepdim=True, dtype=mstype.float32)
+    normalized = x / mint.clamp(norm, min=eps)
+    return op_cast(normalized, mstype.bfloat16)
+
+
 def newton_schulz(x, dim_a, dim_b, eps, ns_steps, ns_coefficients, matmul_op):
     """Apply Newton-Schulz iteration.
 
@@ -961,22 +1100,20 @@ def newton_schulz(x, dim_a, dim_b, eps, ns_steps, ns_coefficients, matmul_op):
     schedule (every step the same triple) reproduces the classic single-triple
     behaviour; a phased schedule (e.g. DeepSeek V4's first-8 / last-2) lets the
     coefficients change across iterations.  See :meth:`Muon._normalize_ns_schedule`.
+    Normalization uses FP32 reduction/division before the state crosses one
+    BF16 boundary. The fused polynomial updates then remain in BF16; with
+    ``cube_math_type(4)``, Addmm/Baddbmm performs the addition in FP32.
     """
     if dim_a > dim_b:
         x = x.mT
-    # Ensure spectral norm is at most 1
-    x = x / (mint.norm(x, p="fro", dim=(-2, -1), keepdim=True) + eps)
-    # Perform the NS iterations
+    addmm_op = mint.addmm if x.dim() == 2 else mint.baddbmm
+    x = _normalize_newton_schulz_input(x, eps)
+
     for step in range(ns_steps):
         a, b, c = ns_coefficients[step]
-        # a_mat = x @ x.T
         a_mat = matmul_op(x, x.mT)
-
-        # b_mat = b * a_mat + c * (a_mat @ a_mat)
-        b_mat = b * a_mat + c * matmul_op(a_mat, a_mat)
-
-        # x = a * x + (b_mat @ x)
-        x = a * x + matmul_op(b_mat, x)
+        b_mat = addmm_op(a_mat, a_mat, a_mat, beta=b, alpha=c)
+        x = addmm_op(x, b_mat, x, beta=a, alpha=1.0)
     if dim_a > dim_b:
         x = x.mT
     return x
@@ -1111,7 +1248,9 @@ def _apply_muon_update(
     else:
         gradient_fp32 = next_m
 
-    ns_inputs = op_cast(gradient_fp32, mstype.bfloat16)
+    # Preserve the momentum result through redistribution. The NS core owns
+    # the single FP32-to-BF16 boundary after normalization.
+    ns_inputs = gradient_fp32
     if needs_dtensor_redist:
         ns_inputs = DTensor.from_local(ns_inputs, device_mesh, placements).full_tensor()
     elif expert_redist_spec is not None:
@@ -1175,7 +1314,8 @@ def _prepare_muon_input_compute(gradient, muon_m, momentum, use_nesterov):
 
     Uses ``mint.add(input, other, alpha=momentum)`` to fuse the
     ``input + momentum * other`` pattern (was ``other * momentum + input``,
-    a separate Mul + Add) — saves one kernel launch per term per weight.
+    a separate Mul + Add) — saves one kernel launch per term per weight. The
+    FP32 result is retained until Newton-Schulz normalization.
     """
     gradient_local = _to_local(gradient)
     muon_m_local = _to_local(muon_m)
@@ -1191,18 +1331,16 @@ def _prepare_muon_input_compute(gradient, muon_m, momentum, use_nesterov):
     else:
         ns_input = next_m
 
-    ns_inputs_local = op_cast(ns_input, mstype.bfloat16)
-    return ns_inputs_local, next_m
+    return ns_input, next_m
 
 
 def _prepare_muon_input_batched(gradients, muon_m_list, momentum, use_nesterov):
     """Phase 0 batched momentum update for ``K`` same-shape weights.
 
     Stacks the ``K`` gradients and ``K`` momenta on a new leading dim, runs
-    a single ``cast → add → (nesterov add →) cast`` chain across the batched
+    a single ``cast → add → (nesterov add)`` chain across the batched
     tensors, and slices the per-slot results out as views.  Collapses
-    ``K × 4`` element-wise launches into ~6 (stack + 2 casts + 1-2 adds + 1
-    cast).
+    ``K × 3`` element-wise launches into ~5 (stack + 2 casts + 1-2 adds).
 
     Returns ``(ns_inputs_list, next_m_list)`` — both length ``K``; each
     element is a view of the stacked output that stays alive via the views
@@ -1225,11 +1363,10 @@ def _prepare_muon_input_batched(gradients, muon_m_list, momentum, use_nesterov):
         ns_input_stacked = mint.add(g_fp32, next_m_stacked, alpha=momentum)
     else:
         ns_input_stacked = next_m_stacked
-    ns_inputs_local_stacked = op_cast(ns_input_stacked, mstype.bfloat16)
     # Slice into per-slot views.  Views share the underlying stacked tensor
     # which is kept alive by their refcount.
     return (
-        [ns_inputs_local_stacked[k] for k in range(n_slots)],
+        [ns_input_stacked[k] for k in range(n_slots)],
         [next_m_stacked[k] for k in range(n_slots)],
     )
 
@@ -1427,7 +1564,7 @@ def _run_muon_batched(
     # Build the per-slot ``info`` dicts first (no NS inputs yet), then run
     # the momentum update.  When ``runtime_groups`` is provided we batch
     # same-shape weights through :func:`_prepare_muon_input_batched`:
-    # ``K × (cast + add + cast)`` launches collapse into ~5 launches per
+    # ``K × (cast + add)`` launches collapse into ~5 launches per
     # shape group, which is a big win on models with many small same-shape
     # weights (24-layer DSv3 has ~200 muon params across ~6 shape groups).
     prepared = []
@@ -1514,11 +1651,11 @@ def _run_muon_batched(
         ``next_m`` exists only to be written back -- the Newton-Schulz input was
         already derived from it above -- so doing the write here instead of in
         Phase 4 is the same ``inplace_copy`` of the same value, just earlier.
-        It matters because ``next_m`` is FP32 (twice the size of the BF16
-        Newton-Schulz tensors) and the per-slot values are views into one
-        stacked Phase 0 buffer: while any view is alive the whole stack stays
-        allocated, so deferring the write kept an FP32 copy of every Muon weight
-        resident across the entire Newton-Schulz and scatter stage.
+        It matters because ``next_m`` is an additional FP32 buffer and the
+        per-slot values are views into one stacked Phase 0 buffer: while any
+        view is alive the whole stack stays allocated, so deferring the write
+        kept another FP32 copy of every Muon weight resident across the entire
+        Newton-Schulz and scatter stage.
         """
         next_m = info['next_m']
         if next_m is None:
@@ -1821,7 +1958,8 @@ def _run_muon_batched(
         else:
             ns_inputs_full = info.get('ns_inputs_full')
             if ns_inputs_full is not None:
-                info['x_ret'] = mint.empty_like(ns_inputs_full)
+                info['x_ret'] = mint.empty(
+                    ns_inputs_full.shape, dtype=mstype.bfloat16)
             else:
                 raise RuntimeError(
                     f"Muon allgather_deredundency: scatter requires broadcast "
@@ -1894,6 +2032,12 @@ def _run_muon_batched(
 class Muon(MainParamsMixin, Optimizer):
     """
     Muon optimizer implementation for pynative mode.
+
+    When at least one parameter is routed through Muon, initialization enables
+    MindSpore ``cube_math_type(4)``. This keeps the Newton-Schulz state in BF16
+    while performing the fused Addmm/Baddbmm addition in FP32. A MindSpore
+    build without that API is rejected instead of silently using an unstable
+    low-precision epilogue.
 
     Args:
         params: model parameters to optimize.
@@ -2002,6 +2146,8 @@ class Muon(MainParamsMixin, Optimizer):
         # Preserve the historical 2D/3D shape-based routing here. The update
         # path validates 3D weights and accepts only grouped expert weight1/2.
         self._muon_filter = self._build_muon_filter(adamw_include)
+        if any(self._muon_filter(param) for param in self._parameters):
+            _enable_muon_cube_math_type()
 
         self.muon_split_fn, self.muon_merge_fn = model.make_model_muon_fns()
         self.logit_threshold = Tensor([qk_clip_threshold], dtype=mstype.float32) if qk_clip_enabled else None
@@ -2383,33 +2529,13 @@ class Muon(MainParamsMixin, Optimizer):
                         self.param_name_tuple[i], param.shape, self.muon_split_fn, self.ns_steps)
                     items_by_group.setdefault(sig, []).append((i, work, rl_key))
 
-        # Distribute each group's weights as a contiguous chunk per rank inside
-        # the group's rank_list.  Sorting weights by param_index inside the group
-        # and then mapping ``chunk = (j * n_ranks_in_group) // n`` keeps each
-        # rank's owned slice contiguous in the flat iteration order built below,
-        # which is what lets Phase 2/3 buffer them into a single batched NS.
-        new_assignment = {}
-        rank_loads = [0] * world_size
-        rank_counts = [0] * world_size
-        # Process groups in deterministic order (largest total work first so
-        # heaviest groups influence placement before tail groups).
-        def _group_total_work(weights):
-            return sum(w[1] for w in weights)
-        sorted_group_items = sorted(
-            items_by_group.items(),
-            key=lambda kv: (-_group_total_work(kv[1]), kv[0]),
-        )
-        for sig, weights in sorted_group_items:
-            rank_list_in_group = sig[1]
-            n_ranks_in_group = max(1, len(rank_list_in_group))
-            weights_sorted = sorted(weights, key=lambda w: w[0])
-            n = len(weights_sorted)
-            for j, (pidx, work, _) in enumerate(weights_sorted):
-                chunk = (j * n_ranks_in_group) // n
-                chosen = int(rank_list_in_group[chunk])
-                new_assignment[pidx] = chosen
-                rank_loads[chosen] += work
-                rank_counts[chosen] += 1
+        # Keep each owner's slice contiguous inside a shape group, but rotate
+        # the evenly-spaced owner pattern according to the loads accumulated by
+        # earlier groups.  Restarting every group at rank_list[0] concentrates
+        # unrelated groups on the same owners and multiplies their full-tensor
+        # gather buffers and sequential NS work.
+        new_assignment, rank_loads, rank_counts = _assign_grouped_muon_owners(
+            items_by_group, world_size)
 
         for pidx, sig in weight_group_sig.items():
             meta[pidx]['group_sig'] = sig
@@ -2488,6 +2614,7 @@ class Muon(MainParamsMixin, Optimizer):
         flat_order_2d_slots = []
         local_groups_slots = {}
         local_group_slot_bytes = {}  # group_sig -> per-slot NS transient bytes
+        local_ns_singleton_safe_groups = set()
 
         for slot, param_idx in enumerate(param_idx_for_slot):
             param = self._parameters[param_idx]
@@ -2529,6 +2656,14 @@ class Muon(MainParamsMixin, Optimizer):
                         local_group_slot_bytes[group_sig] = _estimate_ns_peak_bytes(
                             self.param_name_tuple[param_idx], ns_shape,
                             self.muon_split_fn)
+                        piece_shapes = group_sig[0]
+                        pieces_keep_bmm = bool(piece_shapes) and all(
+                            isinstance(piece_shape, (tuple, list))
+                            and len(piece_shape) == 3
+                            for piece_shape in piece_shapes
+                        )
+                        if pieces_keep_bmm:
+                            local_ns_singleton_safe_groups.add(group_sig)
 
         # Same sort key as the previously per-step sort in _run_muon_batched.
         def _sort_key(slot):
@@ -2551,14 +2686,15 @@ class Muon(MainParamsMixin, Optimizer):
         # batched (launch-bound, batching is essential).
         local_groups_slots = _bound_ns_groups(
             local_groups_slots, local_group_slot_bytes,
-            max_temp_bytes=self.ns_batch_memory_bytes)
+            max_temp_bytes=self.ns_batch_memory_bytes,
+            singleton_safe_groups=local_ns_singleton_safe_groups)
 
         # Phase 0 is the first large stacking after forward/backward, so its
         # contiguous momentum/gradient stacks are the ones that cannot fit the
         # fragmented free holes and force the memory pool to over-reserve.
         # Bounding them by byte budget lets the stacks reuse existing idle
         # memory, lowering the reserved high-water without changing the math.
-        phase0_groups = _bound_ns_groups(
+        phase0_groups = _bound_elementwise_groups(
             phase0_groups, phase0_group_slot_bytes,
             max_temp_bytes=self.phase0_batch_memory_bytes)
 
