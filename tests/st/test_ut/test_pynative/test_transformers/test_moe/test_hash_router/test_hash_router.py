@@ -27,6 +27,7 @@ usage:
 
 from pathlib import Path
 import subprocess
+from unittest.mock import patch
 
 import numpy as np
 import pytest
@@ -250,9 +251,15 @@ class TestHashRouterPrecision:
             np.arange(num_tokens, dtype=np.int32).reshape(2, -1)
         )
 
-        top_scores, selected_experts_indices = router._hash_routing(
-            Tensor(scores_np), input_ids
-        )
+        # Tensor truth-value conversion calls _item() and causes a D2H copy on Ascend.
+        with patch.object(
+                Tensor,
+                "__bool__",
+                side_effect=AssertionError("hash routing must not convert a Tensor to bool"),
+        ):
+            top_scores, selected_experts_indices = router._hash_routing(
+                Tensor(scores_np), input_ids
+            )
 
         expected_indices = (
             np.arange(num_tokens * top_k).reshape(num_tokens, top_k) % num_experts

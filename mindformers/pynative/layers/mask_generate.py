@@ -14,7 +14,7 @@
 # ============================================================================
 """Attention Mask Generate"""
 import mindspore as ms
-from mindspore import nn, Tensor, ops, mint
+from mindspore import nn, ops, mint
 import mindspore.common.dtype as mstype
 
 
@@ -105,7 +105,8 @@ class CausalMaskGenerate(nn.Cell):
         if tokens is not None:
             bs = tokens.shape[0]
             seq_len = tokens.shape[1]
-            input_mask = self.cast(self.not_equal(tokens, self.pad_token_id), self.compute_type)
+            pad_token = mint.full((1,), self.pad_token_id, dtype=tokens.dtype)
+            input_mask = self.cast(self.not_equal(tokens, pad_token), self.compute_type)
         else:
             bs = masks.shape[0]
             seq_len = masks.shape[1]
@@ -125,7 +126,7 @@ class CausalMaskGenerate(nn.Cell):
 
         # the returned shape is [bs, 1, seq_len, seq_len] (seq_len may differ from seq_length when is_dynamic=True)
         attention_mask = self.mul(attention_mask, lower_triangle)
-        one = Tensor([1.0], dtype=self.compute_type)
+        one = mint.ones((1,), dtype=self.compute_type)
         attention_mask = self.sub(one, attention_mask)
         attention_mask = self.expand_dim(attention_mask, 1)
         attention_mask = self.cast(attention_mask, mstype.uint8)
