@@ -893,6 +893,11 @@ class Trainer:
 
                 self.state.global_step = global_step
 
+            # Save fp32 master checksums before checkpoint load so we can later
+            # detect which params were actually loaded vs freshly initialized.
+            if optimizer is not None and not checkpoint.no_load_optim:
+                optimizer.save_main_params_snapshot()
+
             load_checkpoint(
                 checkpoint=checkpoint_path,
                 network=model,
@@ -901,11 +906,12 @@ class Trainer:
                 balanced_load=checkpoint.load_balanced,
             )
 
-            # When optimizer state is not loaded (weights-only resume), the fp32 master
-            # weights still hold their pre-load init values. Refresh them from the freshly
-            # loaded model params so master and model start aligned.
-        if checkpoint.no_load_optim and optimizer is not None:
-            logger.info("no_load_optim=True: refreshing fp32 master weights from loaded model params.")
+        # Refresh fp32 master weights after checkpoint load.
+        # reload_main_params_from_model handles both cases internally:
+        # - with a snapshot (optim state loaded): selective reload — only params
+        #   whose optimizer state was NOT found in the checkpoint
+        # - without a snapshot (no_load_optim): full reload from model params
+        if optimizer is not None:
             optimizer.reload_main_params_from_model()
 
     def _inner_train_loop(self):
