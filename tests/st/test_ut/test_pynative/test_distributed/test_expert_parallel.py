@@ -166,7 +166,7 @@ class TestExpertParallel:
             lambda topk_indices, num_experts: local_counts)
         monkeypatch.setattr(
             self.expert_parallel, "_counts_a2a",
-            lambda counts, ep_degree: grouped_counts)
+            lambda counts, ep_degree, cell=None: grouped_counts)
 
         def fake_issue(counts):
             issue_calls.append(counts)
@@ -288,7 +288,7 @@ class TestExpertParallel:
             lambda grouped_counts, ep_degree: calls.append("group_list") or "group_list")
         monkeypatch.setattr(
             expert_parallel, "_main_a2a",
-            lambda flat_in, input_splits, output_splits, block_size:
+            lambda flat_in, input_splits, output_splits, block_size, cell=None:
             calls.append("main_a2a") or "flat_out")
         monkeypatch.setattr(
             expert_parallel, "_build_resort_routing_map",
@@ -321,7 +321,7 @@ class TestExpertParallel:
         else:
             monkeypatch.setattr(
                 expert_parallel, "_counts_a2a",
-                lambda counts, ep_degree: calls.append("counts_a2a") or "grouped_counts")
+                lambda counts, ep_degree, cell=None: calls.append("counts_a2a") or "grouped_counts")
             monkeypatch.setattr(
                 expert_parallel, "_host_token_splits",
                 lambda counts, grouped_counts, ep_degree:
@@ -331,6 +331,37 @@ class TestExpertParallel:
 
         assert calls.index("main_a2a") < calls.index("routing_map") < calls.index("B")
         assert result[-1] == "routing_map"
+
+    @pytest.mark.level1
+    @pytest.mark.platform_x86_cpu
+    @pytest.mark.env_onecard
+    def test_overlap_registry_async_slots_registered(self):
+        """Overlap _apply clears base sync slots and registers async versions."""
+        overlap = OverlapExpertParallel(coordinator=object())
+        module = overlap._apply(GroupedMLP(self.config), self.device_mesh)
+        slots = module._comm_ops
+        assert "input.alltoallsingle" in slots
+        assert "output.alltoallsingle" in slots
+        assert "expert_counts.alltoallsingle" in slots
+        # Verify the registered functions are NOT the sync base ones (they
+        # should be the overlap async closures bound via style_self).
+        for slot_name in ("input.alltoallsingle", "output.alltoallsingle",
+                           "expert_counts.alltoallsingle"):
+            assert callable(slots[slot_name]["fn"])
+            assert slots[slot_name]["domain"] == "ep"
+
+    @pytest.mark.level1
+    @pytest.mark.platform_x86_cpu
+    @pytest.mark.env_onecard
+    def test_overlap_a2a_fallback_no_registry(self, monkeypatch):
+        """Without _comm_ops, overlap falls back to raw async a2a."""
+        overlap = OverlapExpertParallel(coordinator=object())
+        calls = []
+        monkeypatch.setattr(overlap, "_async_a2a",
+                            lambda *a, **kw: calls.append("raw_async") or "raw")
+        result = overlap._main_a2a("flat", [1], [1], 4, cell=None)
+        assert calls == ["raw_async"], f"Expected raw fallback, got {calls}"
+        assert result == "raw"
 
     @pytest.mark.level1
     @pytest.mark.platform_x86_cpu

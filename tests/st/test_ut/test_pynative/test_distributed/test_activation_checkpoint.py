@@ -16,7 +16,11 @@
 import pytest
 import mindspore as ms
 from mindspore import nn, ops
-from hyper_parallel.platform.mindspore.activation_checkpoint import CheckpointWrapper, SwapWrapper
+from hyper_parallel.platform.mindspore.activation_checkpoint import (
+    CheckpointWrapper,
+    CheckpointExcludeWrapper,
+    SwapWrapper,
+)
 from hyper_parallel.core.activation_checkpoint import CheckpointPolicy
 
 from mindformers.pynative.config.config import (
@@ -137,6 +141,33 @@ class MockMtpDecoder(MockModel):
         super().__init__(num_layers=num_layers)
         self.config = type("Config", (), {"num_layers": num_layers,
                                            "mtp_num_layers": mtp_num_layers})()
+
+
+class MockAttentionWithComm(MockAttention):
+    def __init__(self):
+        super().__init__()
+        self._comm_ops = {
+            "input.allgather": {"fn": lambda t: t, "domain": "tp"},
+            "output.reducescatter": {"fn": lambda t: t, "domain": "tp"},
+        }
+
+
+class MockTransformerLayerWithComm(MockTransformerLayer):
+    """Transformer layer whose attention carries comm-op attributes."""
+
+    def __init__(self):
+        super().__init__()
+        self.attention = MockAttentionWithComm()
+
+
+class MockModelWithComm(MockModel):
+    """Transformer-block mock with comm-op attributes on attention modules."""
+
+    def __init__(self, num_layers=2):
+        super().__init__(num_layers=num_layers)
+        self.layers = nn.CellList(
+            [MockTransformerLayerWithComm() for _ in range(num_layers)]
+        )
 
 
 def _make_recompute_config(mode="None", full_recompute_layer=None,
@@ -549,3 +580,233 @@ class TestMtpRecompute:
         rc, rc_comm = _make_recompute_config(mode="full", full_recompute_layer=["2"])
         with pytest.raises(ValueError):
             apply_ac(decoder, rc, rc_comm, _make_swap_config(enable=False), 1, mtp_block=None)
+
+
+# ---- Exclude op: validation ----
+
+@pytest.mark.level0
+@pytest.mark.platform_x86_cpu
+@pytest.mark.env_onecard
+class TestExcludeOpValidation:
+    """Validation of the exclude_op configuration format."""
+
+    def test_dict_format_accepted(self):
+        rc = RecomputeConfig(mode="full", full_recompute_layer=["0"],
+                             exclude_op={"attention": ["0"]})
+        ac_mod._validate_exclude_op(rc, num_layers=2)  # does not raise
+
+    def test_none_is_noop(self):
+        rc = RecomputeConfig(mode="full", full_recompute_layer=["0"],
+                             exclude_op=None)
+        ac_mod._validate_exclude_op(rc, num_layers=2)  # does not raise
+
+    def test_mode_none_with_exclude_is_noop(self):
+        """Ensure mode=None applies no recompute or exclude wrappers."""
+        model = MockModel(num_layers=2)
+        rc, rc_comm = _make_recompute_config(
+            mode="None", exclude_op={"attention": ["0"]})
+        apply_recompute(model, rc, rc_comm)
+        # No wrapper should be applied — neither CheckpointWrapper nor
+        # CheckpointExcludeWrapper.
+        for layer in model.layers:
+            assert not isinstance(layer, CheckpointWrapper)
+            assert not isinstance(layer.attention, CheckpointExcludeWrapper)
+
+# ---- Exclude op: full mode ----
+
+@pytest.mark.level0
+@pytest.mark.platform_x86_cpu
+@pytest.mark.env_onecard
+class TestExcludeOpFullMode:
+    """exclude_op behaviour inside full-recomputed layers."""
+
+
+    def test_exclude_cell(self):
+        """Full recompute wraps the layer; the excluded attention cell sits inside."""
+        model = MockModel(num_layers=2)
+        rc, rc_comm = _make_recompute_config(
+            mode="full", full_recompute_layer=["0"],
+            exclude_op={"attention": ["0"]})
+        apply_recompute(model, rc, rc_comm)
+        # layer 0 is full-recomputed ...
+        assert isinstance(model.layers[0], CheckpointWrapper)
+        # ... and its attention cell is excluded inside
+        assert isinstance(model.layers[0].attention, CheckpointExcludeWrapper)
+        # layer 1 is untouched
+        assert not isinstance(model.layers[1], CheckpointWrapper)
+
+    def test_exclude_nested_cell(self):
+        model = MockModel(num_layers=2)
+        rc, rc_comm = _make_recompute_config(
+            mode="full", full_recompute_layer=["0"],
+            exclude_op={"attention.proj": ["0"]})
+        apply_recompute(model, rc, rc_comm)
+        assert isinstance(model.layers[0], CheckpointWrapper)
+        assert isinstance(model.layers[0].attention.proj, CheckpointExcludeWrapper)
+        # parent is NOT excluded (only the matched child)
+        assert not isinstance(model.layers[0].attention, CheckpointExcludeWrapper)
+
+    def test_exclude_operator(self):
+        model = MockModelWithComm(num_layers=2)
+        rc, rc_comm = _make_recompute_config(
+            mode="full", full_recompute_layer=["0"],
+            exclude_op={"attention.input.allgather": ["0"]})
+        apply_recompute(model, rc, rc_comm)
+        assert isinstance(model.layers[0], CheckpointWrapper)
+        assert isinstance(
+            model.layers[0].attention._comm_ops["input.allgather"]["fn"],
+            CheckpointExcludeWrapper)
+
+    def test_exclude_multiple_independent_targets(self):
+        """Two unrelated modules can be excluded in the same layer."""
+        model = MockModelWithComm(num_layers=2)
+        rc, rc_comm = _make_recompute_config(
+            mode="full", full_recompute_layer=["0"],
+            exclude_op={
+                "attention": ["0"],
+                "mlp": ["0"],
+            })
+        apply_recompute(model, rc, rc_comm)
+        assert isinstance(model.layers[0].attention, CheckpointExcludeWrapper)
+        assert isinstance(model.layers[0].mlp, CheckpointExcludeWrapper)
+
+    def test_exclude_parent_covers_child(self):
+        """Excluding a parent suppresses the child comm-op target."""
+        model = MockModelWithComm(num_layers=2)
+        rc, rc_comm = _make_recompute_config(
+            mode="full", full_recompute_layer=["0"],
+            exclude_op={
+                "attention": ["0"],
+                "attention.input.allgather": ["0"],
+            })
+        apply_recompute(model, rc, rc_comm)
+        assert isinstance(model.layers[0].attention, CheckpointExcludeWrapper)
+        # attention.input.allgather is NOT individually wrapped — parent 'attention'
+        # already covers it (same dedup behaviour as select_module)
+        assert not isinstance(
+            model.layers[0].attention._comm_ops["input.allgather"]["fn"],
+            CheckpointExcludeWrapper)
+
+    def test_exclude_layer_selectivity(self):
+
+        model = MockModel(num_layers=2)
+        rc, rc_comm = _make_recompute_config(
+            mode="full", full_recompute_layer=["0-1"],
+            exclude_op={"attention": ["0"]})
+        apply_recompute(model, rc, rc_comm)
+        assert isinstance(model.layers[0].attention, CheckpointExcludeWrapper)
+        assert not isinstance(model.layers[1].attention, CheckpointExcludeWrapper)
+
+# ---- Exclude op: select mode ----
+
+
+@pytest.mark.level0
+@pytest.mark.platform_x86_cpu
+@pytest.mark.env_onecard
+class TestExcludeOpSelectMode:
+    """exclude_op behaviour inside select-recomputed layers."""
+
+
+    def test_exclude_cell_in_select(self):
+        model = MockModel(num_layers=2)
+        rc, rc_comm = _make_recompute_config(
+            mode="select", select_module={"attention": ["0"]},
+            exclude_op={"attention.proj": ["0"]})
+        apply_recompute(model, rc, rc_comm)
+        # attention is select-recomputed ...
+        assert isinstance(model.layers[0].attention, CheckpointWrapper)
+        # ... and proj inside it is excluded
+        assert isinstance(model.layers[0].attention.proj, CheckpointExcludeWrapper)
+
+    def test_exclude_comm_op_in_select(self):
+        model = MockModelWithComm(num_layers=2)
+        rc, rc_comm = _make_recompute_config(
+            mode="select", select_module={"attention": ["0"]},
+            exclude_op={"attention.input.allgather": ["0"]})
+        apply_recompute(model, rc, rc_comm)
+        assert isinstance(model.layers[0].attention, CheckpointWrapper)
+        assert isinstance(
+            model.layers[0].attention._comm_ops["input.allgather"]["fn"],
+            CheckpointExcludeWrapper)
+
+    def test_exclude_only_affects_select_layers(self):
+        """exclude_op only unwraps layers listed in its layer ranges."""
+        model = MockModel(num_layers=2)
+        rc, rc_comm = _make_recompute_config(
+            mode="select", select_module={"attention": ["0"]},
+            exclude_op={"attention": ["1"]})
+        apply_recompute(model, rc, rc_comm)
+        # layer 0: attention is select-recomputed, NOT excluded
+        assert isinstance(model.layers[0].attention, CheckpointWrapper)
+        assert not isinstance(model.layers[0].attention, CheckpointExcludeWrapper)
+        # layer 1: attention is excluded (and not select-recomputed)
+        assert isinstance(model.layers[1].attention, CheckpointExcludeWrapper)
+
+
+# ---- Exclude op: mixed ----
+
+
+@pytest.mark.level0
+@pytest.mark.platform_x86_cpu
+@pytest.mark.env_onecard
+class TestExcludeOpMixed:
+    """exclude_op combined with full/select/comm recompute."""
+
+
+    def test_select_plus_exclude_same_layer(self):
+
+        model = MockModel(num_layers=2)
+        rc, rc_comm = _make_recompute_config(
+            mode="select", select_module={"attention": ["0"]},
+            exclude_op={"mlp": ["0"]})
+        apply_recompute(model, rc, rc_comm)
+        assert isinstance(model.layers[0].attention, CheckpointWrapper)
+        assert isinstance(model.layers[0].mlp, CheckpointExcludeWrapper)
+
+    def test_exclude_cell_and_comm_op(self):
+        """Cell and comm-op targets can be mixed across layers."""
+        model = MockModelWithComm(num_layers=2)
+        rc, rc_comm = _make_recompute_config(
+            mode="full", full_recompute_layer=["0-1"],
+            exclude_op={
+                "attention": ["0"],
+                "attention.input.allgather": ["1"],
+            })
+        apply_recompute(model, rc, rc_comm)
+        # layer 0: whole attention cell excluded
+        assert isinstance(model.layers[0].attention, CheckpointExcludeWrapper)
+        # layer 1: only allgather operator excluded
+        assert not isinstance(model.layers[1].attention, CheckpointExcludeWrapper)
+        assert isinstance(
+            model.layers[1].attention._comm_ops["input.allgather"]["fn"],
+            CheckpointExcludeWrapper)
+
+    def test_exclude_with_comm_recompute(self):
+        """Comm-op exclude coexists with comm recompute on other slots."""
+        model = MockModelWithComm(num_layers=2)
+        rc, rc_comm = _make_recompute_config(
+            mode="select",
+            select_module={"attention": ["0"]},
+            exclude_op={"attention.output.reducescatter": ["0"]},
+            comm_enable=True,
+            comm_select_module={"attention.input.allgather": ["0"]})
+        apply_recompute(model, rc, rc_comm)
+        # reducescatter is excluded (not recomputed)
+        assert isinstance(
+            model.layers[0].attention._comm_ops["output.reducescatter"]["fn"],
+            CheckpointExcludeWrapper)
+        # attention is select-recomputed (parent covers allgather,
+        # so comm recompute dedup skips the child)
+        assert isinstance(model.layers[0].attention, CheckpointWrapper)
+
+    def test_wildcard_pattern(self):
+        """Regex patterns match comm-op slots across every layer."""
+        model = MockModelWithComm(num_layers=2)
+        rc, rc_comm = _make_recompute_config(
+            mode="full", full_recompute_layer=["0-1"],
+            exclude_op={".*allgather": ["0-1"]})
+        apply_recompute(model, rc, rc_comm)
+        for layer_id in (0, 1):
+            assert isinstance(
+                model.layers[layer_id].attention._comm_ops["input.allgather"]["fn"],
+                CheckpointExcludeWrapper)
