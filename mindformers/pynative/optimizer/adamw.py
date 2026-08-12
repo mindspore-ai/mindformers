@@ -14,7 +14,7 @@
 # ============================================================================
 """AdamW"""
 
-from mindspore import _checkparam as validator, mint, Parameter, Tensor, ParameterTuple, _no_grad
+from mindspore import _checkparam as validator, mint, Parameter, Tensor, ParameterTuple
 from mindspore.common import dtype as mstype
 from mindspore.ops import operations as P
 from mindspore.ops import auto_generate as gen
@@ -23,6 +23,7 @@ from mindspore.nn.optim.optimizer import Optimizer
 from hyper_parallel import SkipDTensorDispatch
 from mindformers.tools.logger import logger
 from mindformers.pynative.dtensor_compat import inplace_copy
+from mindformers.pynative.optimizer.main_params import MainParamsMixin
 
 op_cast = P.Cast()
 
@@ -90,7 +91,7 @@ def _check_param_value(betas, eps, weight_decay, prim_name):
 _LOW_PRECISION_DTYPES = (mstype.float16, mstype.bfloat16)
 
 
-class AdamW(Optimizer):
+class AdamW(MainParamsMixin, Optimizer):
     """
     This is the implementation of AdamW.
 
@@ -202,6 +203,7 @@ class AdamW(Optimizer):
 
         self.amsgrad = kwargs.get("amsgrad", False)
         self.maximize = kwargs.get("maximize", False)
+        self._main_params_snapshot = None
         if not self.enable_fused_opt:
             self.max_exp_avg_sq = None
         elif self.amsgrad:
@@ -258,24 +260,6 @@ class AdamW(Optimizer):
                 self._parameters, self.fp32_params, self._is_low_precision_param):
             if is_lp:
                 inplace_copy(model_param, op_cast(fp32_param, model_param.dtype))
-
-    def reload_main_params_from_model(self):
-        """Refresh fp32 master weights from the model parameters.
-
-        Used on weights-only resume (no_load_optim=True): the model params have just
-        been loaded from checkpoint while the fp32 masters still hold their pre-load
-        init values, so copy model -> master to align their starting points.
-
-        Runs outside the optimizer's construct(), so it must enter SkipDTensorDispatch
-        itself (InplaceCopy has no parallel layout infer func under DTensor dispatch).
-        _no_grad avoids the "leaf tensor that requires grad in an inplace operator"
-        error: the fp32 master is a leaf Parameter and this copy is not an autograd op.
-        """
-        with _no_grad(), SkipDTensorDispatch():
-            for model_param, fp32_param, is_lp in zip(
-                    self._parameters, self.fp32_params, self._is_low_precision_param):
-                if is_lp:
-                    inplace_copy(fp32_param, op_cast(model_param, mstype.float32))
 
     def _increase_global_step(self):
         """Increase global step in PyNative mode without static-graph AssignAdd."""
