@@ -621,6 +621,11 @@ class TrainDatasetConfig(BaseConfig):
     use_distribute_dataset: bool = False
     """Whether to broadcast dataset batches within each data domain"""
 
+    balance_enabled: bool = False
+    """Whether to enable sample load balancing across DP ranks (reorder indices
+    by attention load within each global-batch window). Requires
+    ``create_compressed_eod_mask=True``."""
+
 
 @dataclass
 class ModelConfig(BaseConfig):
