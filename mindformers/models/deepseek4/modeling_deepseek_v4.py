@@ -13,10 +13,18 @@
 # limitations under the License.
 # ============================================================================
 """Deepseek-V4 Model."""
+from mindformers.tools.logger import logger
 from mindformers.tools.register import MindFormerRegister, MindFormerModuleType
 
 from .configuration_deepseek_v4 import DeepseekV4Config
-from .modeling_deepseek_v4_pynative import PyNativeDeepseekV4ForCausalLM
+
+_PYNATIVE_IMPORT_ERROR = None
+try:
+    from .modeling_deepseek_v4_pynative import PyNativeDeepseekV4ForCausalLM
+except ImportError as e:
+    PyNativeDeepseekV4ForCausalLM = None
+    _PYNATIVE_IMPORT_ERROR = e
+    logger.warning(f"Import PyNativeDeepseekV4ForCausalLM failed: {e}.")
 
 @MindFormerRegister.register(MindFormerModuleType.MODELS, legacy=False)
 class DeepseekV4ForCausalLM:
@@ -33,4 +41,9 @@ class DeepseekV4ForCausalLM:
         # get run mode to init different model.
         # predict mode used to deploy.
         # when predict mode not supported, we can use online_predict mode to do inference task.
+        if PyNativeDeepseekV4ForCausalLM is None:
+            raise ImportError(
+                "PyNativeDeepseekV4ForCausalLM is unavailable, so DeepseekV4ForCausalLM cannot be built. "
+                "See the import warning logged at startup."
+            ) from _PYNATIVE_IMPORT_ERROR
         return PyNativeDeepseekV4ForCausalLM(config=config)
