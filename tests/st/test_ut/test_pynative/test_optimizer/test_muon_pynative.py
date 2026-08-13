@@ -132,6 +132,84 @@ class TestMuonConfig:
     @pytest.mark.level0
     @pytest.mark.platform_x86_cpu
     @pytest.mark.env_onecard
+    def test_muon_constructor_enables_cube_math_type_4(self, monkeypatch):
+        """A real Muon parameter automatically enables the FP32-add Cube mode."""
+        calls = []
+
+        class _FakeOpPrecision:
+            @staticmethod
+            def cube_math_type(value):
+                """Record the requested Cube mode."""
+                calls.append(value)
+
+        monkeypatch.setattr(muon_mod, "op_precision", _FakeOpPrecision(), raising=False)
+        monkeypatch.setattr(muon_mod.core_context, "is_legacy_model", lambda: False)
+
+        net = _TwoWeightNet(np.ones((2, 2), np.float32), np.zeros(2, np.float32))
+        optimizer = _build_optimizer(net)
+
+        assert optimizer.use_muon == (True, False)
+        assert calls == [4]
+
+    @pytest.mark.level0
+    @pytest.mark.platform_x86_cpu
+    @pytest.mark.env_onecard
+    def test_muon_requires_cube_math_type_api(self, monkeypatch):
+        """Fail clearly instead of silently using an unsafe MindSpore path."""
+        monkeypatch.setattr(muon_mod, "op_precision", object(), raising=False)
+
+        with pytest.raises(RuntimeError, match="cube_math_type.*MindSpore"):
+            muon_mod._enable_muon_cube_math_type()  # pylint: disable=protected-access
+
+    @pytest.mark.level0
+    @pytest.mark.platform_x86_cpu
+    @pytest.mark.env_onecard
+    @pytest.mark.parametrize(
+        "input_dtype", (mstype.float32, mstype.float16, mstype.bfloat16))
+    def test_ns_normalization_uses_fp32_and_returns_bf16(
+            self, monkeypatch, input_dtype):
+        """Every NS input is normalized in FP32 before entering BF16 iteration."""
+        events = []
+
+        class _FakeTensor:
+            """Record the dtype used by each normalization operation."""
+
+            def __init__(self, dtype):
+                self.dtype = dtype
+
+            def norm(self, dim=None, keepdim=False, dtype=None):
+                events.append(("norm", self.dtype, dim, keepdim, dtype))
+                return _FakeTensor(dtype or self.dtype)
+
+            def __truediv__(self, value):
+                events.append(("div", self.dtype, value.dtype))
+                return _FakeTensor(value.dtype)
+
+        def _fake_cast(tensor, dtype):
+            events.append(("cast", tensor.dtype, dtype))
+            return _FakeTensor(dtype)
+
+        def _fake_clamp(tensor, min=None, max=None):  # pylint: disable=redefined-builtin
+            events.append(("clamp", tensor.dtype, min, max))
+            return _FakeTensor(tensor.dtype)
+
+        monkeypatch.setattr(muon_mod, "op_cast", _fake_cast)
+        monkeypatch.setattr(muon_mod.mint, "clamp", _fake_clamp)
+
+        output = muon_mod._normalize_newton_schulz_input(  # pylint: disable=protected-access
+            _FakeTensor(input_dtype), 1e-7)
+
+        assert output.dtype == mstype.bfloat16
+        assert events == [
+            ("norm", input_dtype, (-2, -1), True, mstype.float32),
+            ("clamp", mstype.float32, 1e-7, None),
+            ("div", input_dtype, mstype.float32),
+            ("cast", mstype.float32, mstype.bfloat16),
+        ]
+
+    @pytest.mark.level0
+    @pytest.mark.platform_x86_cpu
+    @pytest.mark.env_onecard
     def test_expert_muon_redist_only_materializes_dim1(self, monkeypatch):
         """Only a grouped 3D expert weight receives the Shard(1) compatibility path."""
         class _FakeDTensor:
@@ -240,6 +318,100 @@ class TestMuonConfig:
     @pytest.mark.level0
     @pytest.mark.platform_x86_cpu
     @pytest.mark.env_onecard
+    def test_bound_ns_groups_allows_safe_singletons(self):
+        """
+        Feature: memory-bounded rank-3 Newton-Schulz batching.
+        Description: a singleton rank-3 schema piece still executes through
+            bmm, so splitting it does not switch to the 2D mm numerical path.
+        Expectation: singleton-safe groups strictly honour a one-slot budget.
+        """
+        piece_shapes = ((3, 7168, 2048), (3, 7168, 2048))
+        group_sig = (piece_shapes, tuple(range(128)))
+        groups = {group_sig: [0, 1, 2, 3, 4, 5, 6]}
+        bytes_per_slot = sum(
+            muon_mod._estimate_ns_peak_bytes_for_shape(shape)
+            for shape in piece_shapes
+        )
+        assert bytes_per_slot == 960 * 1024 ** 2
+        slot_bytes = {group_sig: bytes_per_slot}
+
+        bounded = muon_mod._bound_ns_groups(
+            groups,
+            slot_bytes,
+            max_temp_bytes=1024 ** 3,
+            singleton_safe_groups={group_sig},
+        )
+        assert list(bounded.values()) == [
+            [0], [1], [2], [3], [4], [5], [6],
+        ]
+
+        bounded = muon_mod._bound_ns_groups(
+            groups,
+            slot_bytes,
+            max_temp_bytes=2 * bytes_per_slot,
+            singleton_safe_groups={group_sig},
+        )
+        assert list(bounded.values()) == [[0, 1], [2, 3], [4, 5], [6]]
+
+    @pytest.mark.level0
+    @pytest.mark.platform_x86_cpu
+    @pytest.mark.env_onecard
+    def test_grouped_owner_assignment_spreads_across_shape_groups(self):
+        """
+        Feature: layout-aware Muon owner assignment.
+        Description: several small shape groups share a much larger rank list.
+        Expectation: later groups rotate to idle owners instead of restarting
+            from the first rank-list position and overloading the same ranks.
+        """
+        world_size = 1024
+        rank_list = tuple(range(896, 1024))
+        group_sizes = [7] * 8 + [8, 2]
+        items_by_group = {}
+        param_index = 0
+        for group_index, group_size in enumerate(group_sizes):
+            group_sig = (((group_index + 1, 16),), rank_list)
+            weights = []
+            work = (len(group_sizes) - group_index) * 100
+            for _ in range(group_size):
+                weights.append((param_index, work, rank_list))
+                param_index += 1
+            items_by_group[group_sig] = weights
+
+        assignment, rank_loads, rank_counts = \
+            muon_mod._assign_grouped_muon_owners(items_by_group, world_size)
+
+        assert len(assignment) == 66
+        assert len(set(assignment.values())) >= 60
+        assert max(rank_loads) == 1000
+        assert max(rank_counts) <= 2
+
+        reversed_groups = dict(reversed(list(items_by_group.items())))
+        repeated = muon_mod._assign_grouped_muon_owners(
+            reversed_groups, world_size)
+        assert repeated == (assignment, rank_loads, rank_counts)
+
+    @pytest.mark.level0
+    @pytest.mark.platform_x86_cpu
+    @pytest.mark.env_onecard
+    def test_bound_elementwise_groups_allows_singletons(self):
+        """
+        Feature: memory-bounded elementwise Muon batching.
+        Description: Phase 0 is elementwise and may split below two slots
+            without changing the numerical kernel path.
+        Expectation: every chunk respects the byte budget, including the tail.
+        """
+        group_key = ("phase0", (8, 8))
+        groups = {group_key: [0, 1, 2, 3, 4]}
+        slot_bytes = {group_key: 8}
+
+        bounded = muon_mod._bound_elementwise_groups(
+            groups, slot_bytes, max_temp_bytes=8)
+        assert list(bounded.values()) == [[0], [1], [2], [3], [4]]
+
+        bounded = muon_mod._bound_elementwise_groups(
+            groups, slot_bytes, max_temp_bytes=16)
+        assert list(bounded.values()) == [[0, 1], [2, 3], [4]]
+
     def test_resolve_batch_memory_bytes(self):
         """
         Feature: configurable Muon batch memory budgets.
@@ -423,14 +595,94 @@ class TestNewtonSchulz:
     def setup_method(self):
         ms.set_context(mode=ms.PYNATIVE_MODE)
 
+    @pytest.mark.level0
+    @pytest.mark.platform_arm_ascend910b_training
+    @pytest.mark.env_onecard
+    def test_bf16_normalization_matches_fp32_reference(self):
+        """A small BF16 input follows FP32 normalization, not BF16 reduction."""
+        rng = np.random.default_rng(1)
+        mat = (rng.standard_normal((4, 16)) * 1.3e-6).astype(np.float32)
+        x = Tensor(mat, mstype.bfloat16)
+
+        normalized = muon_mod._normalize_newton_schulz_input(  # pylint: disable=protected-access
+            x, 1e-7)
+        x_fp32 = x.astype(mstype.float32)
+        fp32_norm = x_fp32.norm(dim=(-2, -1), keepdim=True)
+        expected = (x_fp32 / mint.clamp(fp32_norm, min=1e-7)).astype(
+            mstype.bfloat16)
+        low_precision_norm = x.norm(dim=(-2, -1), keepdim=True)
+        low_precision = x / mint.clamp(low_precision_norm, min=1e-7)
+
+        actual_np = normalized.astype(mstype.float32).asnumpy()
+        expected_np = expected.astype(mstype.float32).asnumpy()
+        low_precision_np = low_precision.astype(mstype.float32).asnumpy()
+        assert normalized.dtype == mstype.bfloat16
+        assert np.array_equal(actual_np, expected_np)
+        assert not np.array_equal(actual_np, low_precision_np)
+
+    @pytest.mark.level0
+    @pytest.mark.platform_arm_ascend910b_training
+    @pytest.mark.env_onecard
+    def test_ns_uses_one_bf16_precision_path(self, monkeypatch):
+        """FP32 and BF16 API inputs share one normalized BF16 iteration path."""
+        schedule = (
+            (3.4445, -4.7750, 2.0315),
+            (2.0, -1.5, 0.5),
+        )
+        mat = np.random.default_rng(33).standard_normal((8, 12)).astype(np.float32)
+        bf16_input = Tensor(mat, mstype.bfloat16)
+        fp32_input = bf16_input.astype(mstype.float32)
+        cast_events = []
+        real_cast = muon_mod.op_cast
+
+        def _record_cast(tensor, dtype):
+            cast_events.append((tensor.dtype, dtype))
+            return real_cast(tensor, dtype)
+
+        monkeypatch.setattr(muon_mod, "op_cast", _record_cast)
+
+        from_fp32 = newton_schulz(
+            fp32_input, 8, 12, 1e-7, len(schedule), schedule, mint.mm)
+        from_bf16 = newton_schulz(
+            bf16_input, 8, 12, 1e-7, len(schedule), schedule, mint.mm)
+
+        assert from_fp32.dtype == mstype.bfloat16
+        assert from_bf16.dtype == mstype.bfloat16
+        assert cast_events == [
+            (mstype.float32, mstype.bfloat16),
+            (mstype.float32, mstype.bfloat16),
+        ]
+        np.testing.assert_array_equal(
+            from_fp32.astype(mstype.float32).asnumpy(),
+            from_bf16.astype(mstype.float32).asnumpy(),
+        )
+
+    @pytest.mark.level0
+    @pytest.mark.platform_arm_ascend910b_training
+    @pytest.mark.env_onecard
+    def test_prepare_input_preserves_fp32_until_ns_normalization(self):
+        """The momentum recurrence keeps its NS input in FP32."""
+        gradient = Tensor(
+            np.arange(12, dtype=np.float32).reshape(3, 4) / 100,
+            mstype.bfloat16,
+        )
+        momentum_state = Tensor(
+            np.arange(12, dtype=np.float32).reshape(3, 4) / 50,
+            mstype.float32,
+        )
+
+        ns_input, next_m = muon_mod._prepare_muon_input_compute(  # pylint: disable=protected-access
+            gradient, momentum_state, momentum=0.95, use_nesterov=True)
+
+        assert ns_input.dtype == mstype.float32
+        assert next_m.dtype == mstype.float32
+
     @staticmethod
     def _run_ns(mat):
         """Run Newton-Schulz on a float32 numpy matrix; return float32 numpy.
 
-        The precision tests run in fp32: they validate the orthogonalisation
-        *algorithm*, which must hold independent of accumulation precision. The
-        real bf16 production path (``op_cast(grad, bfloat16)`` before NS) stays
-        covered end-to-end by :class:`TestMuonSingleCardUpdate`.
+        The helper normalizes in FP32, then follows the same BF16 iteration path
+        used in production.
         """
         dim_a, dim_b = mat.shape
         x = Tensor(mat, mstype.float32)
@@ -509,8 +761,9 @@ class TestNewtonSchulz:
         Feature: memory-bounded NS group splitting (``_bound_ns_groups``).
         Description: the bmm batch dimension carries independent weights, so
             running Newton-Schulz on a stack of K weights must give byte-for-byte
-            the same per-weight result as running it on any sub-batch of them.
-            This is the precision guarantee that lets large expert groups split.
+            the same per-weight result as running it on any sub-batch, including
+            a singleton batch that still executes through ``bmm``.  This is the
+            precision guarantee that lets large expert groups split.
         Expectation: full-batch NS output equals the concatenation of chunked-NS
             outputs with rtol=0, atol=0 (bitwise).
         """
@@ -521,15 +774,52 @@ class TestNewtonSchulz:
         out_full = newton_schulz(
             x_full, m, n, 1e-7, 5, _NS_SCHED_5, mint.bmm).asnumpy()
 
-        # Split the batch dim into 2 + 2 + 2 (mirrors _bound_ns_groups chunks).
-        pieces = []
-        for start in range(0, k, 2):
-            x_chunk = Tensor(stack[start:start + 2], mstype.float32)
-            pieces.append(newton_schulz(
-                x_chunk, m, n, 1e-7, 5, _NS_SCHED_5, mint.bmm).asnumpy())
-        out_chunked = np.concatenate(pieces, axis=0)
+        for chunk_size in (2, 1):
+            pieces = []
+            for start in range(0, k, chunk_size):
+                x_chunk = Tensor(
+                    stack[start:start + chunk_size], mstype.float32)
+                pieces.append(newton_schulz(
+                    x_chunk, m, n, 1e-7, 5, _NS_SCHED_5,
+                    mint.bmm).asnumpy())
+            out_chunked = np.concatenate(pieces, axis=0)
 
-        assert np.array_equal(out_full, out_chunked)
+            assert np.array_equal(out_full, out_chunked), chunk_size
+
+    @pytest.mark.level1
+    @pytest.mark.platform_arm_ascend910b_training
+    @pytest.mark.env_onecard
+    def test_phase0_singleton_is_bitwise_invariant(self):
+        """
+        Feature: memory-bounded Phase 0 group splitting.
+        Description: Phase 0 is elementwise, so processing a same-shape stack
+            as singleton groups must preserve each weight's exact NS input and
+            next-momentum value.
+        Expectation: batched and singleton outputs are bitwise-identical.
+        """
+        rng = np.random.default_rng(8)
+        gradients = [
+            Tensor(value, mstype.float32)
+            for value in rng.standard_normal((3, 16, 24)).astype(np.float32)
+        ]
+        momenta = [
+            Tensor(value, mstype.float32)
+            for value in rng.standard_normal((3, 16, 24)).astype(np.float32)
+        ]
+
+        batched_ns, batched_m = muon_mod._prepare_muon_input_batched(
+            gradients, momenta, 0.95, True)
+        for index, (gradient, momentum) in enumerate(zip(gradients, momenta)):
+            singleton_ns, singleton_m = muon_mod._prepare_muon_input_batched(
+                [gradient], [momentum], 0.95, True)
+            assert np.array_equal(
+                batched_ns[index].float().asnumpy(),
+                singleton_ns[0].float().asnumpy(),
+            ), index
+            assert np.array_equal(
+                batched_m[index].asnumpy(),
+                singleton_m[0].asnumpy(),
+            ), index
 
 
 # --------------------------------------------------------------------------- #
@@ -787,6 +1077,28 @@ class TestMuonDeredundencyBatchedPath:
     def teardown_method(self):
         muon_mod.core_context.is_legacy_model = self._orig_is_legacy_model
         muon_mod.get_rank = self._orig_get_rank
+
+    @pytest.mark.level0
+    @pytest.mark.platform_x86_cpu
+    @pytest.mark.env_onecard
+    def test_scatter_recv_buffer_matches_bf16_ns_output(self):
+        """AGD receives BF16 NS output although its pre-NS input is FP32."""
+        ns_input = Tensor(np.zeros((2, 3), np.float32), mstype.float32)
+        info = {
+            'rank_list_tuple': (0, 1),
+            'assigned_rank': 0,
+            'ns_inputs_local': ns_input,
+        }
+
+        ok, ops = muon_mod._build_local_shard_scatter_ops(  # pylint: disable=protected-access
+            info, x_ret_full=None, rank_id=1)
+
+        assert ok
+        assert len(ops) == 1
+        assert info['x_ret'].shape == ns_input.shape
+        assert info['x_ret'].dtype == mstype.bfloat16
+        assert ops[0].tensor is info['x_ret']
+        assert ops[0].peer == 0
 
     @staticmethod
     def _run(momentum=0.95, seed_momentum=False):
