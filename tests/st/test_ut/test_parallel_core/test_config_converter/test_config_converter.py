@@ -227,3 +227,37 @@ def test_get_cp_comm_type_values():
     assert get_cp_comm_type("ulysses_cp") == "a2a"
     with pytest.raises(ValueError):
         get_cp_comm_type("unknown")
+
+
+@pytest.mark.level0
+@pytest.mark.platform_x86_cpu
+@pytest.mark.env_onecard
+def test_get_final_mapping_has_scalar_specs():
+    """
+    Feature: _get_final_mapping returns a 1:1 mapping (each source key maps to exactly one target spec).
+    Description: Inspect the structure of the mapping returned by _get_final_mapping.
+    Expectation: Every value is a scalar — either a str (target_key) or a (target_key, transform_func) tuple —
+                 never a list. This guards the invariant relied on by _apply_mapping_rule and _get_reversed_mapping.
+    """
+    log_handler = ConfigLogHandler()
+    mapping = ConfigConverter._get_final_mapping(log_handler, is_mla_model=False)
+
+    assert mapping, "mapping should not be empty"
+    for src_key, target_spec in mapping.items():
+        # Must NOT be a list — that would indicate the old multi-spec structure.
+        assert not isinstance(target_spec, list), (
+            f"source key '{src_key}' maps to a list {target_spec}; expected a scalar spec"
+        )
+        # Must be either a plain target_key string or a (target_key, transform_func) tuple.
+        if isinstance(target_spec, tuple):
+            assert len(target_spec) == 2, (
+                f"source key '{src_key}' has tuple spec {target_spec} of wrong length; expected (target_key, func)"
+            )
+            target_key, trans_func = target_spec
+            assert isinstance(target_key, str) and callable(trans_func), (
+                f"source key '{src_key}' has malformed tuple spec {target_spec}"
+            )
+        else:
+            assert isinstance(target_spec, str), (
+                f"source key '{src_key}' has unexpected spec type {type(target_spec).__name__}: {target_spec}"
+            )

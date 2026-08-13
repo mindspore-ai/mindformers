@@ -26,7 +26,7 @@ from mindformers.parallel_core.transformer_config_utils import get_cp_comm_type,
 
 @dataclass
 class ConversionContext:
-    mapping: Dict[str, Any]
+    mapping: Dict[str, Union[str, Tuple[str, Callable]]]
     reversed_mapping: Dict[str, List[str]]
     result: Dict[str, Any]
     log_handler: 'ConfigLogHandler'
@@ -178,15 +178,21 @@ class ConfigConverter(ABC):
             if rule_key not in existing_rule_keys:
                 final_rules.append((rule_key[0], rule_key[1], None))
         # step3: Build the final mapping dict (source_key -> target_spec)
-        final: Dict[str, List[Union[str, Tuple[str, Callable]]]] = {}
+        # Each source key maps to exactly one target spec: a plain target_key
+        # string, or a (target_key, transform_func) tuple. This 1:1 invariant is
+        # guaranteed by the deduplication in step1/step2 (seen_source_keys) and
+        # enforced here so regressions fail fast at build time. Use an explicit
+        # raise instead of assert, since assert is stripped under `python -O`.
+        final: Dict[str, Union[str, Tuple[str, Callable]]] = {}
         for src_keys, target_key, trans_func in final_rules:
+            spec = target_key if trans_func is None else (target_key, trans_func)
             for src in src_keys:
-                if src not in final:
-                    final[src] = []
-                if trans_func is None:
-                    final[src].append(target_key)
-                else:
-                    final[src].append((target_key, trans_func))
+                if src in final:
+                    raise RuntimeError(
+                        f"source key '{src}' is mapped more than once; "
+                        "this violates the 1:1 invariant of _get_final_mapping"
+                    )
+                final[src] = spec
         return final
 
     @classmethod
@@ -195,65 +201,60 @@ class ConfigConverter(ABC):
         Retrieved reversed final mapping used for tracer.
         """
         for src_key, target_spec in mapping.items():
-            keys = []
-            for item in target_spec:
-                if isinstance(item, str):
-                    keys.append(item)
-                elif isinstance(item, tuple) and len(item) == 2:
-                    keys.append(item[0])
-            for target_key in keys:
-                reversed_mapping.setdefault(target_key, []).append(src_key)
+            if isinstance(target_spec, str):
+                reversed_mapping.setdefault(target_spec, []).append(src_key)
+                continue
+            if isinstance(target_spec, tuple) and len(target_spec) == 2:
+                reversed_mapping.setdefault(target_spec[0], []).append(src_key)
 
     @classmethod
     def _apply_mapping_rule(cls, src_key: str, src_value: Any, ctx: ConversionContext):
         """
         Apply final mapping rules to config.
         """
-        rules = ctx.mapping[src_key]
-        rule_list = rules if isinstance(rules, list) else [rules]
-        for rule in rule_list:
-            trans_func_name = None
-            if isinstance(rule, str):
-                target_key = rule
-                target_value = src_value
-            elif isinstance(rule, tuple) and len(rule) == 2:
-                target_key, trans_func = rule
-                try:
-                    target_value = trans_func(src_value)
-                    trans_func_name = getattr(trans_func, "__name__", str(trans_func))
-                except (TypeError, ValueError, KeyError, AttributeError) as e:
-                    ctx.log_handler.add_error(
-                        "Function Convert Error",
-                        f"`{src_key}` → `{target_key}` with func {trans_func_name}: {e}"
-                    )
-                    continue
-            else:
-                ctx.log_handler.add_error("Invalid Mapping Rule",
-                                          f"src_key:{src_key} with target spec '{rule}' "
-                                          f"must be single target_key or (target_key, transform_func) "
-                                          f"Other mapping rule should be implemented in post_process"
-                                          )
-                continue
-            # Conflicts check
-            if target_key in ctx.result:
-                if ctx.result[target_key] == target_value:
-                    continue
-                existing_sources = ctx.reversed_mapping.get(target_key, [])
+        rule = ctx.mapping[src_key]
+        trans_func_name = None
+        if not isinstance(rule, (str, tuple)) or (isinstance(rule, tuple) and len(rule) != 2):
+            ctx.log_handler.add_error("Invalid Mapping Rule",
+                                      f"src_key:{src_key} with target spec '{rule}' "
+                                      f"must be single target_key or (target_key, transform_func) "
+                                      f"Other mapping rule should be implemented in post_process"
+                                      )
+            return
+        if isinstance(rule, str):
+            target_key = rule
+            target_value = src_value
+        else:
+            target_key, trans_func = rule
+            try:
+                target_value = trans_func(src_value)
+                trans_func_name = getattr(trans_func, "__name__", str(trans_func))
+            except (TypeError, ValueError, KeyError, AttributeError) as e:
                 ctx.log_handler.add_error(
-                    "Mapping Conflicts",
-                    f"target key'{target_key}' is mapped by multiple source keys: {existing_sources} "
-                    f"current convert is {src_key}:{src_value}, please check other source key"
+                    "Function Convert Error",
+                    f"`{src_key}` → `{target_key}` with func {trans_func_name}: {e}"
                 )
-                continue
-
-            ctx.result[target_key] = target_value
-            ctx.tracer.record(
-                source_key=src_key,
-                source_value=src_value,
-                target_key=target_key,
-                target_value=target_value,
-                trans_func_name=trans_func_name,
+                return
+        # Conflicts check
+        if target_key in ctx.result:
+            if ctx.result[target_key] == target_value:
+                return
+            existing_sources = ctx.reversed_mapping.get(target_key, [])
+            ctx.log_handler.add_error(
+                "Mapping Conflicts",
+                f"target key'{target_key}' is mapped by multiple source keys: {existing_sources} "
+                f"current convert is {src_key}:{src_value}, please check other source key"
             )
+            return
+
+        ctx.result[target_key] = target_value
+        ctx.tracer.record(
+            source_key=src_key,
+            source_value=src_value,
+            target_key=target_key,
+            target_value=target_value,
+            trans_func_name=trans_func_name,
+        )
 
     @classmethod
     def _pre_process(cls, model_config: Dict[str, Any], ctx: ConversionContext) -> None:
