@@ -132,7 +132,7 @@ class DSAIndexer(nn.Cell):
     DSA Lightning Indexer for pynative mode.
 
     Computes index scores to identify the top-k most relevant key-value pairs
-    for each query in sparse attention. Single card only, no parallel sharding.
+    for each query in sparse attention. The indexer remains replicated under tensor parallelism.
 
     Reference:
         https://github.com/deepseek-ai/DeepSeek-V3.2-Exp/blob/main/inference/model.py#L431-L480
@@ -284,32 +284,39 @@ class DSAIndexer(nn.Cell):
         k = self.key_handoff(k)
         return q, k, weights
 
-    def construct(self, q, k, weights, actual_seq_qlen=None, actual_seq_klen=None):
+    def construct(
+            self, x, qr, rotary_pos_emb,
+            actual_seq_qlen=None, actual_seq_klen=None
+    ):
         """
-        Forward pass: compute top-k indices using lightning_indexer.
+        Build indexer Q/K/weights and compute Top-K or dense LSE statistics.
+
+        Keeping projection and index selection in one ``Cell`` gives distributed
+        plans a real module boundary on which to install input hooks.  In TP the
+        replicated indexer can therefore gather its sequence-sharded ``x`` and
+        ``qr`` inputs without adding IdentityOp handoffs to DSA forward.
 
         Gradient flow from the main attention loss to indexer inputs is blocked
         via _DSAIndexerFunction. Indexer parameters are updated solely via
         DSAIndexerLoss.
 
         Args:
-            q: Indexer query, shape (B, S, n_idx_heads, head_dim).
-            k: Indexer key, shape (B, S, 1, head_dim).
-            weights: Indexer weights, shape (B, S, n_idx_heads).
+            x: Hidden states, shape (S, B, hidden_size).
+            qr: Compressed query, shape (S, B, q_lora_rank).
+            rotary_pos_emb: Rotary position embedding.
 
         Returns:
-            topk_indices: Top-k indices, shape (B, S, 1, topk).
-            index_scores: Top-k scores, shape (B, S, 1, topk).
-            softmax_max_index: Softmax max (dense stage only).
-            softmax_sum_index: Softmax sum (dense stage only).
+            Tuple containing the unfrozen indexer Q/K/weights followed by
+            Top-K outputs and dense-stage statistics.
         """
+        q, k, weights = self.get_qk_index(x, qr, rotary_pos_emb)
         # Block gradient flow from main loss to indexer inputs via custom autograd Function.
         # Use _DSAIndexerFunction (a _Function) instead of ops.stop_gradient because
         # stop_gradient creates a hard break in the autograd graph that prevents
         # _DSAIndexerLossFunction from routing gradients back to indexer parameters.
         # _DSAIndexerFunction blocks the main-loss gradient path while keeping the
         # computation graph intact for the indexer-loss gradient route.
-        q, k, weights = _DSAIndexerFunction.apply(q, k, weights)
+        q_for_index, k_for_index, weights_for_index = _DSAIndexerFunction.apply(q, k, weights)
 
         (
             topk_indices,
@@ -317,10 +324,12 @@ class DSAIndexer(nn.Cell):
             softmax_max_index,
             softmax_sum_index,
         ) = self.compute_sparse_indices(
-            q, k, weights,
+            q_for_index, k_for_index, weights_for_index,
             actual_seq_qlen=actual_seq_qlen,
             actual_seq_klen=actual_seq_klen,
         )
-        if not self.sparse_loss:
-            return softmax_max_index, softmax_sum_index
-        return topk_indices, index_scores, softmax_max_index, softmax_sum_index
+        return (
+            q, k, weights,
+            topk_indices, index_scores,
+            softmax_max_index, softmax_sum_index,
+        )
