@@ -46,12 +46,6 @@ class _FakeDeviceMesh:
         return self.group
 
 
-@pytest.fixture(name="device_mesh")
-def fixture_device_mesh():
-    """Provide a lightweight fake device mesh."""
-    return _FakeDeviceMesh()
-
-
 class TestExpertParallel:
     """Tests for ExpertParallel."""
 
