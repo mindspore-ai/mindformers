@@ -14,7 +14,7 @@
 # ============================================================================
 """AdamW"""
 
-from mindspore import _checkparam as validator, Parameter, Tensor, ParameterTuple
+from mindspore import _checkparam as validator, mint, Parameter, Tensor, ParameterTuple
 from mindspore.common import dtype as mstype
 from mindspore.ops import operations as P
 from mindspore.ops import auto_generate as gen
@@ -43,7 +43,10 @@ def _run_adamw_opt(
     next_param = param_fp32 * (1.0 - lr * weight_decay)
 
     inplace_copy(exp_avg, exp_avg.mul(beta1).add(grads_fp32.mul(1.0 - beta1)))
-    inplace_copy(exp_avg_sq, exp_avg_sq.mul(beta2).addcmul(grads_fp32, grads_fp32, one_minus_beta2))
+    inplace_copy(
+        exp_avg_sq,
+        mint.addcmul(exp_avg_sq.mul(beta2), grads_fp32, grads_fp32, value=one_minus_beta2),
+    )
 
     step_size = lr / bias_correction1
 
@@ -186,7 +189,8 @@ class AdamW(MainParamsMixin, Optimizer):
         self.beta1 = Tensor(betas[0], dtype=mstype.float32)
         self.beta2 = Tensor(betas[1], dtype=mstype.float32)
         self.eps = Tensor(eps, dtype=mstype.float32)
-        self.one_minus_beta2 = Tensor(1.0 - betas[1], dtype=mstype.float32)
+        # mint.addcmul maps to AddcmulExt, whose value input is a host Scalar.
+        self.one_minus_beta2 = 1.0 - betas[1]
 
         self.enable_fused_opt = bool(enable_fused_opt or use_fused)
         self.enable_cpu_offload = enable_cpu_offload

@@ -27,7 +27,7 @@ from fnmatch import fnmatch
 from mindspore import mint, Parameter
 from mindspore.common import dtype as mstype
 from mindspore.common.parameter import ParameterTuple
-from mindspore.ops import functional as F, operations as P
+from mindspore.ops import operations as P
 from mindspore.ops import auto_generate as gen
 from mindspore.ops.function import comm_func
 from mindspore.nn.optim.optimizer import Optimizer
@@ -391,7 +391,7 @@ class _AsyncAllConcatTensor:
             self.handle.wait()
         if self.concat_dim == 0:
             return self.output
-        output_tensors = P.Split(output_num=self.concat_size)(self.output)
+        output_tensors = mint.chunk(self.output, self.concat_size, dim=0)
         return mint.concat(output_tensors, self.concat_dim)
 
 
@@ -965,7 +965,7 @@ def newton_schulz(x, dim_a, dim_b, eps, ns_steps, ns_coefficients, matmul_op):
     if dim_a > dim_b:
         x = x.mT
     # Ensure spectral norm is at most 1
-    x = x / (x.norm(dim=(-2, -1), keepdim=True) + eps)
+    x = x / (mint.norm(x, p="fro", dim=(-2, -1), keepdim=True) + eps)
     # Perform the NS iterations
     for step in range(ns_steps):
         a, b, c = ns_coefficients[step]
@@ -1276,9 +1276,9 @@ def _apply_prepared_update_batched(infos):
         with SkipDTensorDispatch():
             param_fp32 = op_cast(param, mstype.float32) * (1 - info['lr'] * info['wd'])
             next_param = param_fp32 - x_ret.reshape(param_fp32.shape)
-            inplace_copy(param, op_cast(next_param, F.dtype(param)))
+            inplace_copy(param, op_cast(next_param, param.dtype))
             if info['next_m'] is not None:
-                inplace_copy(muon_m, op_cast(info['next_m'], F.dtype(muon_m)))
+                inplace_copy(muon_m, op_cast(info['next_m'], muon_m.dtype))
                 info['next_m'] = None
         return [param]
 
@@ -1306,7 +1306,7 @@ def _apply_prepared_update_batched(infos):
     else:
         scales = [1.0 - float(info['lr']) * float(info['wd']) for info in infos]
     scales_all_same = all(s == scales[0] for s in scales)
-    param_dtype = F.dtype(params[0])
+    param_dtype = params[0].dtype
     with SkipDTensorDispatch():
         # Complete the momentum-state writeback as a separate stage so its
         # Phase 0 views do not overlap the larger parameter-update buffers.
@@ -1525,8 +1525,8 @@ def _run_muon_batched(
             return
         muon_m = info['muon_m']
         with SkipDTensorDispatch():
-            if F.dtype(muon_m) != F.dtype(next_m):
-                next_m = op_cast(next_m, F.dtype(muon_m))
+            if muon_m.dtype != next_m.dtype:
+                next_m = op_cast(next_m, muon_m.dtype)
             inplace_copy(muon_m, next_m)
         info['next_m'] = None
 
@@ -2583,7 +2583,9 @@ class Muon(MainParamsMixin, Optimizer):
         gradients = self.flatten_gradients(gradients)
         weight_decay = self.get_weight_decay()
         lr = self.get_lr()
-        self.assignadd(self.global_step, self.global_step_increase_tensor)
+        # Keep the PyNative step update aligned with AdamW and avoid the
+        # static-graph AssignAdd primitive.
+        inplace_copy(self.global_step, self.global_step + self.global_step_increase_tensor)
 
         step = self.global_step
         bias_correction1 = 1.0 - self.beta1 ** step
@@ -2611,7 +2613,7 @@ class Muon(MainParamsMixin, Optimizer):
             param_name = self.param_name_tuple[i]
 
             if "max_logits_val" in param_name:
-                optim_result.append(P.Cast()(gradient, F.dtype(param)))
+                optim_result.append(op_cast(gradient, param.dtype))
                 continue
 
             if not self.optim_filter[i]:
@@ -2716,7 +2718,7 @@ class Muon(MainParamsMixin, Optimizer):
             param_name = self.param_name_tuple[i]
 
             if "max_logits_val" in param_name:
-                optim_result[i] = P.Cast()(gradient, F.dtype(param))
+                optim_result[i] = op_cast(gradient, param.dtype)
                 continue
 
             if not self.optim_filter[i]:
@@ -2773,7 +2775,7 @@ class Muon(MainParamsMixin, Optimizer):
         # counter still keeps resume-from-checkpoint correct.
         adamw_step_int64 = None
         if self.use_fused_adamw and adamw_tasks:
-            adamw_step_int64 = P.Cast()(self.global_step - 1, mstype.int64)
+            adamw_step_int64 = op_cast(self.global_step - 1, mstype.int64)
 
         adamw_done = False
 
