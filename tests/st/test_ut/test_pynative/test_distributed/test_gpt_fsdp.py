@@ -32,8 +32,10 @@ class _FakeModule:
 class _FakeTransformerLayer(_FakeModule):
     """Transformer-layer attributes consumed by the policy builder."""
 
-    def __init__(self):
+    def __init__(self, max_logits_val=None):
         self.self_attention = SimpleNamespace(core_attention=SimpleNamespace())
+        if max_logits_val is not None:
+            self.self_attention.core_attention.max_logits_val = max_logits_val
         self.mlp = SimpleNamespace()
 
 
@@ -105,8 +107,11 @@ class _FakeParallelDims:
 @pytest.mark.platform_x86_cpu
 def test_apply_fsdp_wraps_each_layer_once(monkeypatch):
     """Only decoder layers and outer MTP units are wrapped; their children are not."""
-    decoder_layer = _FakeTransformerLayer()
+    decoder_max_logits = _FakeParameter((8,))
+    mtp_max_logits = _FakeParameter((8,))
+    decoder_layer = _FakeTransformerLayer(decoder_max_logits)
     mtp_layer = _FakeMtpLayer()
+    mtp_layer.transformer_layer.self_attention.core_attention.max_logits_val = mtp_max_logits
     decoder = SimpleNamespace(layers=[decoder_layer], final_layernorm=None, hc_head=None)
     gpt_model = SimpleNamespace(
         embedding=None,
@@ -147,6 +152,12 @@ def test_apply_fsdp_wraps_each_layer_once(monkeypatch):
     assert [module for module, _ in wrapped] == [decoder_layer, mtp_layer, model]
     assert mtp_layer.transformer_layer not in [module for module, _ in wrapped]
     assert all(call[1]["comm_fusion"] is False for call in wrapped)
+    expected_ignored = {decoder_max_logits, mtp_max_logits}
+    assert wrapped[0][1]["ignored_params"] == expected_ignored
+    assert wrapped[1][1]["ignored_params"] == expected_ignored
+    assert wrapped[2][1]["ignored_params"] == expected_ignored
+    assert decoder_max_logits not in wrapped[0][1]["replicate_params"]
+    assert mtp_max_logits not in wrapped[1][1]["replicate_params"]
 
 
 @pytest.mark.level0
@@ -182,3 +193,40 @@ def test_mtp_embedding_sync_uses_canonical_pp_rank(monkeypatch):
     assert part.weight._embedding_grad_sync_group == "mtp_embedding_group"
     assert part.weight._embedding_grad_sync_size == 2
     assert part.weight._embedding_sync_src_rank == 0
+
+
+@pytest.mark.level0
+@pytest.mark.platform_x86_cpu
+def test_qk_clip_reduce_group_skips_collective_for_pure_pp(monkeypatch):
+    """Pure PP has a size-one loss mesh even though the world has many ranks."""
+    calls = []
+    gpt_model = SimpleNamespace(
+        set_qk_clip_reduce_group=lambda group, size: calls.append((group, size))
+    )
+    parallel_dims = SimpleNamespace(get_optional_mesh=lambda name: None)
+
+    monkeypatch.setattr(parallelize, "_unwrap_gptmodel", lambda _: gpt_model)
+
+    parallelize._setup_qk_clip_reduce_group(object(), parallel_dims)
+
+    assert calls == [(None, 1)]
+
+
+@pytest.mark.level0
+@pytest.mark.platform_x86_cpu
+def test_qk_clip_reduce_group_uses_loss_mesh(monkeypatch):
+    """DP/CP QK-clip synchronization uses the exact loss-mesh group."""
+    calls = []
+    gpt_model = SimpleNamespace(
+        set_qk_clip_reduce_group=lambda group, size: calls.append((group, size))
+    )
+    loss_mesh = SimpleNamespace(size=lambda: 2, get_group=lambda: "loss_group")
+    parallel_dims = SimpleNamespace(
+        get_optional_mesh=lambda name: loss_mesh if name == "loss" else None
+    )
+
+    monkeypatch.setattr(parallelize, "_unwrap_gptmodel", lambda _: gpt_model)
+
+    parallelize._setup_qk_clip_reduce_group(object(), parallel_dims)
+
+    assert calls == [("loss_group", 2)]
