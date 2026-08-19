@@ -832,6 +832,14 @@ def apply_recompute(
         raise ValueError(f"{type(model)} must have 'layers' attribute.")
 
     for layer_id in range(model.layer_start, model.layer_end + 1):
+        layer = model.layers[layer_id]
+        if _disables_activation_recompute(layer):
+            logger.info(
+                "Skip activation recompute at DSA warm-up layer %s: "
+                "the frozen trunk is detached by the layer backward boundary.",
+                layer_id,
+            )
+            continue
         # Step 1: exclude (must be before checkpoint_wrapper)
         if exclude_layer_to_modules:
             _set_exclude_recompute(model.layers[layer_id], layer_id, exclude_layer_to_modules)
@@ -848,6 +856,13 @@ def apply_recompute(
         # Step 4: comm recompute
         if need_comm:
             _set_select_recompute(model.layers[layer_id], layer_id, comm_layer_to_modules, add_prim_attr=True)
+
+
+def _disables_activation_recompute(module):
+    """Return whether a module contains a DSA1 layer that cuts its trunk graph."""
+    if getattr(module, "disable_activation_recompute", False):
+        return True
+    return any(_disables_activation_recompute(cell) for cell in module._cells.values())
 
 def _tensor_storage_ptr(tensor):
     """Return a tensor's storage pointer, or ``None`` for empty/non-tensors."""
