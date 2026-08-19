@@ -28,9 +28,14 @@ from mindformers.pynative.transformers.mlp import MLP, MLPSubmodules
 from mindformers.pynative.layers.layer_norm import get_norm_cls
 from mindformers.pynative.transformers.transformer_block import TransformerBlockSubmodules
 from mindformers.pynative.transformers.transformer_layer import (
+    BaseTransformerLayer,
     HyperConnectionTransformerLayer,
     TransformerLayer,
     TransformerLayerSubmodules,
+)
+from mindformers.pynative.transformers.experimental_attention_variant.dsa_transformer_layer import (
+    DSAHyperConnectionTransformerLayer,
+    DSATransformerLayer,
 )
 from mindformers.parallel_core.transformer_config import TransformerConfig
 from mindformers.parallel_core.utils.spec_utils import ModuleSpec
@@ -99,7 +104,14 @@ def get_gpt_layer_local_spec(
         num_experts=num_experts,
         moe_grouped_gemm=moe_grouped_gemm,
     )
-    layer_cls = HyperConnectionTransformerLayer if enable_hyper_connections else TransformerLayer
+    if attention_variant == "dsa":
+        layer_cls = (
+            DSAHyperConnectionTransformerLayer
+            if enable_hyper_connections
+            else DSATransformerLayer
+        )
+    else:
+        layer_cls = HyperConnectionTransformerLayer if enable_hyper_connections else TransformerLayer
 
     if attention_variant == "mla":
         if not multi_latent_attention:
@@ -233,7 +245,9 @@ def get_gpt_mtp_block_spec(
         # get the spec for the last layer of decoder block
         transformer_layer_spec = spec.layer_specs[-1]
         hc_head = spec.hc_head
-    elif isinstance(spec, ModuleSpec) and spec.module == TransformerLayer:
+    elif (isinstance(spec, ModuleSpec)
+          and isinstance(spec.module, type)
+          and issubclass(spec.module, BaseTransformerLayer)):
         transformer_layer_spec = spec
         hc_head = None
     else:
