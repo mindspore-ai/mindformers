@@ -28,7 +28,7 @@ from mindspore import Tensor, Parameter, load_param_into_net, DeviceCtx
 from mindspore.common import dtype as mstype
 from mindspore.nn import Cell
 from mindspore.nn.optim.optimizer import Optimizer
-from mindspore.communication import comm_func
+from mindspore.mint import distributed as dist
 from mindspore import save_checkpoint as ms_save_checkpoint
 
 try:
@@ -267,7 +267,7 @@ class AsyncSaveManager:
             return not is_alive
 
         ten = Tensor([is_alive], dtype=mstype.int8)
-        ten, _ = comm_func.all_reduce(ten)
+        dist.all_reduce(ten)
 
         return ten[0] == 0
 

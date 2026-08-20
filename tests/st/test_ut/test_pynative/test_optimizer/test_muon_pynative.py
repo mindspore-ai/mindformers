@@ -863,3 +863,42 @@ class TestMuonDeredundencyBatchedPath:
             assert np.array_equal(first.asnumpy(), second.asnumpy())
         for first, second in zip(opt1.muon_m, opt2.muon_m):
             assert np.array_equal(first.asnumpy(), second.asnumpy())
+
+
+class TestMuonAsyncGatherContract:
+    """Ensure Muon's async all-concat path uses mint.distributed's inplace API."""
+
+    @pytest.mark.level0
+    @pytest.mark.platform_arm_ascend910b_training
+    @pytest.mark.env_onecard
+    def test_start_full_tensor_async_preallocates_output(self, monkeypatch):
+        """The async all-gather path preallocates its output tensor."""
+        local_tensor = Tensor(np.ones((2, 3), dtype=np.float32), mstype.float32)
+        group = "muon-test-group"
+        calls = []
+
+        monkeypatch.setattr(
+            muon_mod,
+            "_get_full_tensor_ops",
+            lambda *_args: [("all_concat", (0, 2, (0, 1)))],
+        )
+        monkeypatch.setattr(muon_mod, "_get_all_concat_group", lambda _ranks: group)
+
+        class _Handle:
+            def wait(self):
+                calls.append(("wait",))
+
+        def fake_all_gather(output, input_tensor, group=None, async_op=False):
+            calls.append((output, input_tensor, group, async_op))
+            return _Handle()
+
+        monkeypatch.setattr(muon_mod, "all_gather_into_tensor", fake_all_gather)
+        pending = muon_mod._start_full_tensor_async(
+            local_tensor, object(), (), rank_id=0)
+
+        assert pending.output.shape == (4, 3)
+        assert pending.handle is not None
+        assert calls[0][1] is local_tensor
+        assert calls[0][2:] == (group, True)
+        pending.wait()
+        assert calls[-1] == ("wait",)

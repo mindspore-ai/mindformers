@@ -35,6 +35,7 @@ from mindformers.checkpoint.checkpoint import (
     CommonInfo,
     load_hf_checkpoint,
 )
+import mindformers.checkpoint.checkpoint as checkpoint_module
 from mindformers.checkpoint.converter.template import WeightTemplate
 from mindformers.checkpoint.sharded_tensor import build_sharded_tensor
 from mindformers.models.qwen3.configuration_qwen3 import Qwen3Config
@@ -165,6 +166,25 @@ def qwen3_hf_mock_checkpoint_dir(tmp_path):
 
 class TestSaveCheckpoint:
     """Test save checkpoint scenarios - Basic and advanced tests."""
+
+    @pytest.mark.level0
+    @pytest.mark.platform_x86_cpu
+    @pytest.mark.env_onecard
+    def test_async_status_uses_inplace_mint_all_reduce(self, monkeypatch):
+        """The async-save status reduction uses the mint inplace contract."""
+        manager = AsyncSaveManager(async_save=True)
+        calls = []
+
+        def fake_all_reduce(tensor, *args):
+            calls.append((tensor, args))
+            tensor[0] = 0
+
+        monkeypatch.setattr(checkpoint_module, "get_real_group_size", lambda: 2)
+        monkeypatch.setattr(checkpoint_module.dist, "all_reduce", fake_all_reduce)
+
+        assert manager.sync_all_async_save_status(is_alive=1)
+        assert len(calls) == 1
+        assert calls[0][0].dtype == mstype.int8
 
     @pytest.mark.level0
     @pytest.mark.platform_x86_cpu

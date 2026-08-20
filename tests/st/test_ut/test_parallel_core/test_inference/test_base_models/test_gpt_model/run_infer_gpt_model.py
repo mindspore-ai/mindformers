@@ -20,7 +20,8 @@ import numpy as np
 
 import mindspore as ms
 import mindspore.common.dtype as mstype
-from mindspore.communication import init, comm_func
+from mindspore.communication import init
+from mindspore.mint import distributed as dist
 
 from mindformers.parallel_core.transformer_config import TransformerConfig
 from mindformers.parallel_core.inference import parallel_state as ps
@@ -161,7 +162,7 @@ class GPTModelRunner:
         hidden_states = ms.mint.zeros(hidden_states_shape, dtype=self.compute_dtype)
 
         if not self.config.pre_process:
-            comm_func.recv(hidden_states,
+            dist.recv(hidden_states,
                            src=ps.get_pipeline_model_parallel_prev_rank(),
                            group=ps.get_pipeline_model_parallel_group().group)
 
@@ -180,7 +181,7 @@ class GPTModelRunner:
                 key_cache=key_cache,
                 value_cache=value_cache
             )
-            comm_func.send(hidden_states,
+            dist.send(hidden_states,
                            dst=ps.get_pipeline_model_parallel_next_rank(),
                            group=ps.get_pipeline_model_parallel_group().group)
 
@@ -200,7 +201,7 @@ class GPTModelRunner:
                 value_cache=value_cache
             )
         if ps.get_pipeline_model_parallel_world_size() > 1:
-            comm_func.all_reduce(logits, group=ps.get_pipeline_model_parallel_group().group)
+            dist.all_reduce(logits, group=ps.get_pipeline_model_parallel_group().group)
         return logits
 
     def run(self):

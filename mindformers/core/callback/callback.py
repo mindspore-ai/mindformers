@@ -54,7 +54,8 @@ from mindspore.train._utils import get_parameter_redundancy, remove_param_redund
 from mindspore.common.api import flops_collection
 from mindspore.communication.management import create_group, get_group_size, get_rank, GlobalComm
 from mindspore.parallel._auto_parallel_context import auto_parallel_context
-from mindspore.communication.comm_func import all_gather_into_tensor, barrier
+from mindspore.ops import communication as ops_comm
+from mindspore.mint.distributed import barrier
 from mindspore.profiler import ProfilerLevel, schedule
 from mindspore.utils import stress_detect
 from mindspore.mint.distributed import all_to_all_single
@@ -96,7 +97,6 @@ _cur_dir = os.getcwd()
 SAVE_DIR = _cur_dir
 
 VOLTAGE_ERROR_CODE = 574007
-
 
 
 class ExpertParallelManager:
@@ -3198,7 +3198,7 @@ class StressTestModelMonitor(Callback):
                 logger.warning(f"compare_interval_steps {self.compare_interval_steps} is larger than the total number"
                                f" of steps {subtask_global_step_num}, so only the last step result is compared.")
             else:
-                gathered_interval_results, _ = all_gather_into_tensor(interval_results)
+                gathered_interval_results, _ = ops_comm.all_gather_into_tensor(None, interval_results)
                 gathered_interval_results = gathered_interval_results.asnumpy()
                 logger.info("Stress tests interval results collected, now starting to compare interval results")
                 logger.debug(f"Collected interval results are {gathered_interval_results}")
@@ -3215,7 +3215,7 @@ class StressTestModelMonitor(Callback):
                 last_step_results = self.extract_last_step_result(log_file_path)
         barrier()
 
-        gathered_results, _ = all_gather_into_tensor(last_step_results)  # <class 'mindspore.common.tensor.Tensor'>
+        gathered_results, _ = ops_comm.all_gather_into_tensor(None, last_step_results)  # <class 'mindspore.common.tensor.Tensor'>
         gathered_results = gathered_results.asnumpy()  # <class 'numpy.ndarray'>
         logger.debug("Collected last step results are gathered_results.")
         logger.info("Last step results are collected from each rank, now starting to compare last step results")

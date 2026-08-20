@@ -28,7 +28,7 @@ from mindspore import set_seed as ms_set_seed
 from mindspore import Parameter
 from mindspore import ops, mint
 from mindspore import save_checkpoint
-from mindspore.communication.comm_func import barrier
+from mindspore.mint.distributed import barrier
 from mindspore.common.file_system import mindio_preload, set_mindio_server_info
 
 from mindformers.checkpoint.utils import is_hf_checkpoint
@@ -708,7 +708,10 @@ def get_load_checkpoint_result(config):
                 else:
                     checkpoint_dict = load_distributed_checkpoint(config.checkpoint.load_path)
         else:
-            err_msg = f"{config.checkpoint.load_path} is not a valid path to load checkpoint when auto_trans_ckpt is False."
+            err_msg = (
+                f"{config.checkpoint.load_path} is not a valid path to load checkpoint "
+                "when auto_trans_ckpt is False."
+            )
             logger.error(err_msg)
             raise ValueError(err_msg)
     return checkpoint_dict if checkpoint_dict else checkpoint_future
@@ -783,7 +786,7 @@ def validate_checkpoint_config(ckpt_config: MindFormerConfig):
     load_path = ckpt_config.get("load_path", None)
     if not no_load_optim and load_path:
         if is_hf_checkpoint(load_path):
-            raise ValueError(f"Resume training not supported for HuggingFace checkpoints.")
+            raise ValueError("Resume training not supported for HuggingFace checkpoints.")
 
 
 def compatible_with_both_old_new_config(deprecated_configs, old_config, new_config, opposite_value_config):

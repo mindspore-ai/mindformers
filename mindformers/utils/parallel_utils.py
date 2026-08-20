@@ -14,7 +14,7 @@
 # limitations under the License.
 # ============================================================================
 """ Process utils."""
-from mindspore.communication import comm_func
+from mindspore.mint import distributed as dist
 
 from mindformers.tools.logger import logger
 from mindformers.tools.utils import get_real_group_size
@@ -28,4 +28,4 @@ def barrier_world(action: str = None):
         else:
             logger.info("Now barriered...")
 
-        comm_func.barrier()
+        dist.barrier()

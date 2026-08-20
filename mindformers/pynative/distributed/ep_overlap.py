@@ -27,10 +27,10 @@ Key design points
 Single HCCL stream funnel
     Every EP all-to-all on a group (counts, main token, combine — the
     routing-map a2a is gone, and the post-dispatch resort is local) routes
-    through ``comm_func.all_to_all_single`` / the hyper_parallel
+    through ``ops.communication.all_to_all_single`` / the hyper_parallel
     platform's ``all_to_all_single`` path.  Using ``ops.AlltoAll`` /
     ``ops.AlltoAllV`` Primitives would dispatch on a *different* stream from
-    ``comm_func.all_to_all_single``, so mixing them under dual-thread overlap
+    ``ops.communication.all_to_all_single``, so mixing them under dual-thread overlap
     lets two threads enqueue HCCL ops on two streams against the same group;
     cross-rank the ordering is non-deterministic and the next collective on
     the group deadlocks once ``MS_DEV_LAUNCH_BLOCKING`` is unset.

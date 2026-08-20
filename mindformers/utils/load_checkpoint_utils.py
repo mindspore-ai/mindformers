@@ -25,7 +25,7 @@ from safetensors import safe_open
 import mindspore as ms
 from mindspore import Parameter
 from mindspore.common.api import _pynative_executor
-from mindspore.communication.comm_func import barrier
+from mindspore.mint.distributed import barrier
 
 from mindformers.tools.logger import logger
 from mindformers.tools.utils import is_main_rank, get_real_rank
