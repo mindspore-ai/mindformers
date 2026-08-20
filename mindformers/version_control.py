@@ -22,7 +22,7 @@ from mindspore import nn
 import mindspore.ops.operations as P
 import mindspore.ops.functional as F
 from mindspore._c_expression import MSContext
-from mindspore.communication.comm_func import barrier
+from mindspore.mint.distributed import barrier
 
 from mindformers.tools.utils import get_predict_run_mode
 from .tools.utils import is_version_ge
@@ -232,8 +232,8 @@ def check_valid_mindspore_gs():
     import mindspore_gs
     version_valid = is_version_ge(mindspore_gs.__version__, "0.6.0")
     if not version_valid:
-        logger.warning(f"Current MindSpore Golden-Stick version does not match"
-                       f"the MindFormers version, please upgrade to 0.6.0 or later version.")
+        logger.warning("Current MindSpore Golden-Stick version does not match"
+                       "the MindFormers version, please upgrade to 0.6.0 or later version.")
         return False
     return True
 

@@ -8,7 +8,7 @@ from abc import ABC, abstractmethod
 import mindspore as ms
 from mindspore import mint, nn
 from mindspore.common._grad_function import _Function
-from mindspore.ops.function import comm_func
+from mindspore.ops import communication as ops_comm
 
 from hyper_parallel import DTensor, DeviceMesh
 from hyper_parallel.core.context_parallel.async_context_parallel import AsyncContextParallel as HPAsyncContextParallel
@@ -64,20 +64,20 @@ def _normalize_dim(dim: int, ndim: int) -> int:
 def _all_gather_dim(tensor, dim, group):
     """All-gather a local tensor shard along an arbitrary dimension."""
     if dim == 0:
-        value, _ = comm_func.all_gather_into_tensor(None, _contiguous(tensor), group=group)
+        value, _ = ops_comm.all_gather_into_tensor(None, _contiguous(tensor), group=group)
         return value
     value = _contiguous(tensor.movedim(dim, 0))
-    value, _ = comm_func.all_gather_into_tensor(None, value, group=group)
+    value, _ = ops_comm.all_gather_into_tensor(None, value, group=group)
     return _contiguous(value.movedim(0, dim))
 
 
 def _reduce_scatter_dim(tensor, dim, group):
     """Reduce-scatter a tensor along an arbitrary dimension."""
     if dim == 0:
-        value, _ = comm_func.reduce_scatter_tensor(None, _contiguous(tensor), group=group)
+        value, _ = ops_comm.reduce_scatter_tensor(None, _contiguous(tensor), group=group)
         return value
     value = _contiguous(tensor.movedim(dim, 0))
-    value, _ = comm_func.reduce_scatter_tensor(None, value, group=group)
+    value, _ = ops_comm.reduce_scatter_tensor(None, value, group=group)
     return _contiguous(value.movedim(0, dim))
 
 
@@ -117,7 +117,7 @@ class _AllReduceFunction(_Function):
 
     @staticmethod
     def forward(ctx, tensor, group):  # pylint: disable=arguments-differ,unused-argument
-        output, _ = comm_func.all_reduce(tensor, group=group)
+        output, _ = ops_comm.all_reduce(tensor, group=group)
         return output
 
     @staticmethod
@@ -869,7 +869,7 @@ class RowwiseParallel(ParallelStyle):
         # Register comm ops for discovery.
         if self.reduce_mode == "reduce_scatter":
             def _rs_fn(tensor):
-                out, _ = comm_func.reduce_scatter_tensor(None, tensor, group=group)
+                out, _ = ops_comm.reduce_scatter_tensor(None, tensor, group=group)
                 return out
             register_comm_op(module, "output.reducescatter", _rs_fn, "tp")
         else:
@@ -930,7 +930,7 @@ class RowwiseParallel(ParallelStyle):
         # Register comm ops for discovery.
         if self.reduce_mode == "reduce_scatter":
             def _rs_fn(tensor):
-                out, _ = comm_func.reduce_scatter_tensor(None, tensor, group=group)
+                out, _ = ops_comm.reduce_scatter_tensor(None, tensor, group=group)
                 return out
             register_comm_op(module, "output.reducescatter", _rs_fn, "tp")
         else:

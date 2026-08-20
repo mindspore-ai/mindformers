@@ -15,16 +15,51 @@
 """Test RowParallelLinear with various configurations"""
 from pathlib import Path
 import subprocess
+from types import SimpleNamespace
 import pytest
 import numpy as np
+import mindspore as ms
 
 from mindformers.tools.logger import logger
+from mindformers.parallel_core.inference.tensor_parallel import layers as layers_module
+from mindformers.parallel_core.inference.tensor_parallel.layers import RowParallelLinear
 from tests.st.test_ut.test_parallel_core.test_inference.test_tensor_parallel.test_row_parallel_linear_infer.data_gen_utils import LEGACY_DATA
 from tests.utils.precision_utils import PrecisionChecker
 
 
 INPUT_SIZE = 32
 OUTPUT_SIZE = 32
+
+
+@pytest.mark.level0
+@pytest.mark.platform_x86_cpu
+@pytest.mark.env_onecard
+def test_pynative_row_parallel_uses_inplace_all_reduce(monkeypatch):
+    """The PyNative tensor-parallel path passes a preallocated output to mint all-reduce."""
+    calls = []
+
+    def fake_all_reduce(output, group=None):
+        calls.append((output, group))
+
+    monkeypatch.setattr(layers_module, "all_reduce", fake_all_reduce)
+    fake_layer = SimpleNamespace(
+        input_is_parallel=True,
+        tp_group=SimpleNamespace(rank=0, group="tp"),
+        bias=None,
+        quant_method=SimpleNamespace(
+            apply=lambda *_args: ms.Tensor([[2.0]], dtype=ms.float32)),
+        weight=ms.Tensor([[1.0]], dtype=ms.float32),
+        delay_allreduce=False,
+        skip_bias_add=False,
+        is_pynative=True,
+        tensor_parallel_group_size=2,
+    )
+
+    result = RowParallelLinear.construct(fake_layer, ms.Tensor([[3.0]], dtype=ms.float32))
+
+    assert len(calls) == 1
+    assert calls[0][0] is result
+    assert calls[0][1] == "tp"
 
 SINGLE_CARD_TEST_PARAM = "model_args, data_keys, expect_error"
 SINGLE_CARD_TEST_CASES = [

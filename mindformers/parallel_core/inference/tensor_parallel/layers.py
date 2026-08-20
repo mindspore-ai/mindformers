@@ -30,7 +30,7 @@ import mindspore.common.dtype as mstype
 import mindspore.ops.operations as P
 from mindspore import Parameter, Tensor, mint, nn, ops
 from mindspore.common.initializer import initializer
-from mindspore.communication.comm_func import all_reduce
+from mindspore.mint.distributed import all_reduce
 
 from mindformers.parallel_core.transformer_config import TransformerConfig
 from mindformers.parallel_core.inference.tensor_parallel.mappings import (gather_from_model_parallel_region,
@@ -52,6 +52,7 @@ from mindformers.models.utils import format_type
 class LinearMethodBase(QuantizeMethodBase):
     """Base class for different (maybe quantized) linear methods."""
 
+    # pylint: disable=arguments-differ
     @abstractmethod
     def create_weights(self, layer: ms.nn.Cell, input_size_per_partition: int,
                        output_partition_sizes: List[int], params_dtype, **extra_weight_attrs):
@@ -68,6 +69,7 @@ class LinearMethodBase(QuantizeMethodBase):
         """
         raise NotImplementedError
 
+    # pylint: disable=arguments-differ
     @abstractmethod
     def apply(self,
               layer: ms.nn.Cell,
@@ -251,6 +253,7 @@ class ColumnParallelLinear(LinearBase):
             quant_config=quant_config,
             prefix=prefix
         )
+        _ = is_expert
         if stride > 1:
             raise NotImplementedError(f"For ColumnParallelLinear, `stride > 1` is not supported for now, "
                                       f"but got `stride={stride}`")
@@ -752,6 +755,7 @@ class RowParallelLinear(LinearBase):
                                                 config.params_dtype,
                                                 quant_config=quant_config,
                                                 prefix=prefix)
+        _ = (init_method, is_expert)
         if stride > 1:
             raise NotImplementedError(f"For RowParallelLinear, `stride > 1` is not supported for now, "
                                       f"but got `stride={stride}`")
@@ -829,8 +833,11 @@ class RowParallelLinear(LinearBase):
         if self.delay_allreduce or self.skip_bias_add:
             output = output_parallel
         elif self.is_pynative:
-            output = output_parallel if self.tensor_parallel_group_size == 1 \
-                else all_reduce(output_parallel, group=self.tp_group.group)[0]
+            if self.tensor_parallel_group_size == 1:
+                output = output_parallel
+            else:
+                output = output_parallel.contiguous()
+                all_reduce(output, group=self.tp_group.group)
         else:
             output = reduce_from_model_parallel_region(output_parallel, self.tp_group)
         return output
@@ -938,6 +945,7 @@ class ReplicatedLinear(LinearBase):
                          config.params_dtype,
                          quant_config=quant_config,
                          prefix=prefix)
+        _ = is_expert
         if stride > 1:
             raise NotImplementedError(f"For ReplicatedLinear, `stride > 1` is not supported for now, "
                                       f"but got `stride={stride}`")
@@ -1100,6 +1108,7 @@ class VocabParallelEmbedding(nn.Cell):
             prefix: str = ""
     ):
         super().__init__()
+        _ = init_method
         if reduce_scatter_embeddings:
             raise NotImplementedError("For VocabParallelEmbedding, reduce_scatter_embeddings is not supported for now")
         self.num_embeddings = num_embeddings
@@ -1220,6 +1229,7 @@ class VocabParallelEmbedding(nn.Cell):
 class UnquantizedEmbeddingMethod(QuantizeMethodBase):
     """Unquantized method for embeddings."""
 
+    # pylint: disable=arguments-differ
     def create_weights(self, layer: nn.Cell, input_size_per_partition: int,
                        output_partition_sizes: List[int], params_dtype, **extra_weight_attrs):
         """Create weights for embedding layer."""
@@ -1236,6 +1246,7 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
         self.gather = ops.Gather()
         self.bias_add = ops.Add()
 
+    # pylint: disable=arguments-differ
     def apply(self, layer: nn.Cell, x: Tensor, weight: Tensor, bias: Optional[Tensor] = None) -> Tensor:
         origin_dtype = x.dtype
         output_shape = x.shape[:-1] + (self.output_size_per_partition,)
@@ -1253,5 +1264,6 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
         output_parallel = self.cast(output_parallel, origin_dtype)
         return output_parallel
 
+    # pylint: disable=arguments-differ
     def embedding(self, layer: nn.Cell, input_: Tensor) -> Tensor:
         return self.gather(layer.weight, input_, 0)

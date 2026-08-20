@@ -29,12 +29,11 @@ from mindspore.common import dtype as mstype
 from mindspore.common.parameter import ParameterTuple
 from mindspore.ops import operations as P
 from mindspore.ops import auto_generate as gen
-from mindspore.ops.function import comm_func
 from mindspore.nn.optim.optimizer import Optimizer
 from mindspore.common.tensor import Tensor
 from mindspore.communication import get_rank, get_group_size
 from mindspore.mint.distributed import (
-    P2POp, batch_isend_irecv, broadcast, irecv, isend,
+    P2POp, all_gather_into_tensor, batch_isend_irecv, broadcast, irecv, isend,
 )
 
 from hyper_parallel import DTensor
@@ -569,8 +568,9 @@ def _start_full_tensor_async(local_tensor, device_mesh, placements, rank_id):
     if int(concat_size) <= 1:
         return _AsyncAllConcatTensor(local_tensor, None, concat_size, concat_dim)
     group = _get_all_concat_group(rank_list)
-    output, handle = comm_func.all_gather_into_tensor(
-        None, local_tensor, group=group, async_op=True)
+    output_shape = (int(local_tensor.shape[0]) * int(concat_size), *tuple(local_tensor.shape[1:]))
+    output = mint.empty(output_shape, dtype=local_tensor.dtype)
+    handle = all_gather_into_tensor(output, local_tensor, group=group, async_op=True)
     return _AsyncAllConcatTensor(output, handle, concat_size, concat_dim)
 
 

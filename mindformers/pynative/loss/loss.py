@@ -17,7 +17,7 @@
 from mindspore import nn, mint, ops
 from mindspore.common import dtype as mstype
 from mindspore.common._grad_function import _Function
-from mindspore.ops.function import comm_func
+from mindspore.mint import distributed as dist
 from mindspore import log as logger
 
 from mindformers.pynative.dtensor_compat import inplace_copy
@@ -30,7 +30,8 @@ def _tp_all_reduce(tensor, op, group):
     Used inside ``_VocabParallelCrossEntropy`` whose manual backward already supplies
     the gradient, so the collective must not register its own bprop.
     """
-    output, _ = comm_func.all_reduce(tensor.contiguous(), op, group)
+    output = tensor.contiguous()
+    dist.all_reduce(output, op, group)
     return output
 
 

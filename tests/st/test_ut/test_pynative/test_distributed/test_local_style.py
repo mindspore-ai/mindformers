@@ -130,9 +130,9 @@ def fixture_mock_local_runtime(monkeypatch):
         return value * 2, None
 
     monkeypatch.setattr(style_module, "distribute_module", fake_distribute_module)
-    monkeypatch.setattr(style_module.comm_func, "all_gather_into_tensor", fake_all_gather)
-    monkeypatch.setattr(style_module.comm_func, "reduce_scatter_tensor", fake_reduce_scatter)
-    monkeypatch.setattr(style_module.comm_func, "all_reduce", fake_all_reduce)
+    monkeypatch.setattr(style_module.ops_comm, "all_gather_into_tensor", fake_all_gather)
+    monkeypatch.setattr(style_module.ops_comm, "reduce_scatter_tensor", fake_reduce_scatter)
+    monkeypatch.setattr(style_module.ops_comm, "all_reduce", fake_all_reduce)
     return plans
 
 
@@ -172,7 +172,7 @@ def test_shard_then_gather_reduces_backward(  # pylint: disable=unused-argument
         half = value.shape[0] // 2
         return value[:half] + value[half:], None
 
-    monkeypatch.setattr(style_module.comm_func, "reduce_scatter_tensor", fake_reduce_scatter)
+    monkeypatch.setattr(style_module.ops_comm, "reduce_scatter_tensor", fake_reduce_scatter)
     mesh = _FakeMesh()
     value = Tensor([1.0, 2.0, 1.0, 2.0])
     weights = Tensor([1.0, 1.0, 2.0, 2.0])
@@ -231,8 +231,8 @@ def test_dim_zero_collectives_skip_axis_moves(monkeypatch):
         collective_calls.append(("reduce_scatter", group))
         return value, None
 
-    monkeypatch.setattr(style_module.comm_func, "all_gather_into_tensor", fake_all_gather)
-    monkeypatch.setattr(style_module.comm_func, "reduce_scatter_tensor", fake_reduce_scatter)
+    monkeypatch.setattr(style_module.ops_comm, "all_gather_into_tensor", fake_all_gather)
+    monkeypatch.setattr(style_module.ops_comm, "reduce_scatter_tensor", fake_reduce_scatter)
 
     gather_value = _TraceTensor()
     assert style_module._all_gather_dim(gather_value, 0, "tp-group") is gather_value
