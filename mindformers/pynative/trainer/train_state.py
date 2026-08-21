@@ -40,6 +40,9 @@ class TrainerState:
             Global batch size across all devices.
         num_accumulation_steps (int):
             Number of steps to accumulate gradients before performing an optimizer step.
+        skipped_steps (int):
+            Number of optimizer updates skipped so far because the global gradient norm
+            was NaN/Inf (only non-zero when ``training.use_skip_step_on_nan`` is enabled).
         loss_scale (float):
             Current loss scale. PyNative training defaults to 1.0.
         total_flops (float):
@@ -63,6 +66,7 @@ class TrainerState:
     global_batch_size: int = 0
     num_accumulation_steps: int = 1
     consumed_samples: int = 0
+    skipped_steps: int = 0
     loss_scale: float = 1.0
     total_flops: float = 0.0
     best_metric: Optional[float] = None
@@ -92,6 +96,7 @@ class TrainerState:
             "global_batch_size": self.global_batch_size,
             "num_accumulation_steps": self.num_accumulation_steps,
             "consumed_samples": self.consumed_samples,
+            "skipped_steps": self.skipped_steps,
             "loss_scale": self.loss_scale,
             "total_flops": self.total_flops,
             "best_metric": self.best_metric,
