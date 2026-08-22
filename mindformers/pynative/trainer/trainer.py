@@ -35,6 +35,7 @@ from mindspore.mint.distributed import (
     broadcast_object_list,
 )
 from mindspore.graph.api import _no_grad
+from mindspore.ops.communication import barrier
 from hyper_parallel.platform.mindspore.pipeline_parallel._utils import _MicroBatch
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.platform.mindspore.autograd_compat import enable_mindspore_backward_compat
@@ -63,6 +64,7 @@ from mindformers.pynative.distributed.utils import get_loss_sense
 from mindformers.pynative.pet.lora_adapter import freeze_base_params
 
 from mindformers.checkpoint.checkpoint import CommonInfo, get_checkpoint_path
+from mindformers.version_control import skip_barrier_controller
 
 from .train_state import TrainerState
 from ..tools.monitor import MonitorGroup
@@ -77,6 +79,7 @@ from .utils import (
     compute_parameters,
     set_auxiliary_loss_backward_scale,
     _sync_mtp_embedding_weights_after_init,
+    _DistributedDatasetReceiver,
 )
 
 
@@ -202,6 +205,7 @@ class Trainer:
         # init data broadcast group
         self.enable_data_broadcast = getattr(self.config.train_dataset, "use_distribute_dataset", False)
         self._init_distributed_dataset_group()
+        self._distributed_dataset_receiver = None
 
         # Create model
         self.model = self._create_model(model, self.config.model)
@@ -259,7 +263,9 @@ class Trainer:
 
         # Create train dataset
         self.train_dataset = self._create_dataset(
-            train_dataset, getattr(self.config, "train_dataset", None)
+            train_dataset,
+            getattr(self.config, "train_dataset", None),
+            use_data_broadcast=self.enable_data_broadcast,
         )
         if self.train_dataset is not None:
             self.train_epoch_step = self._get_dataset_size(self.train_dataset)
@@ -287,7 +293,8 @@ class Trainer:
 
         # Create evaluate dataset
         self.eval_dataset = self._create_dataset(
-            eval_dataset, getattr(self.config, "eval_dataset", None)
+            eval_dataset,
+            getattr(self.config, "eval_dataset", None),
         )
 
         # Create optimizer and scheduler
@@ -525,13 +532,20 @@ class Trainer:
             )
         parallelism.pipeline_parallel_microbatch_size = self.num_accumulation_steps
 
-    def _create_dataset(self, dataset, dataset_config: Optional[Dict]) -> Optional[Any]:
+    def _create_dataset(
+            self,
+            dataset,
+            dataset_config: Optional[Dict],
+            use_data_broadcast: bool = False,
+    ) -> Optional[Any]:
         """
         Create or validate dataset instance.
 
         Args:
             dataset (Dataset): The dataset instance.
             dataset_config (Optional[Dict]): The dataset configuration.
+            use_data_broadcast (bool): Whether only the source rank should
+                construct the configured dataset.
 
         Returns:
             Optional[Any]: The created or validated dataset instance.
@@ -545,6 +559,33 @@ class Trainer:
         if dataset_config is None:
             return None
 
+        # With batch broadcast enabled, only the source rank in each TP×CP
+        # domain should construct the configured dataset.  Other ranks receive
+        # the resulting dataset size and use an empty facade; their iterator is
+        # never advanced because ``_get_batch_data_broadcast`` receives the
+        # batch from the source rank.
+        if use_data_broadcast and get_rank() != self.data_broadcast_src_rank:
+            logger.info(
+                "Rank %s skips train dataset construction; receiving batches from source rank %s.",
+                get_rank(), self.data_broadcast_src_rank,
+            )
+            # Receive-only ranks must still pair the source rank's build-chain
+            # world-scope barriers (no group arg, FIFO-paired) or it deadlocks:
+            # Blended has 3 (__new__ + builder + build_generic), HF has 1 (__new__),
+            # OrderedIndex has 1 (_build_index_map, executed by every rank that
+            # constructs the dataset).
+            loader_cfg = self._get_dataloader_config(dataset_config) or {}
+            loader_type = loader_cfg.get("type")
+            if loader_type in ("BlendedMegatronDatasetDataLoader", "HFDataLoader"):
+                skip_barrier_controller(
+                    times=3 if loader_type == "BlendedMegatronDatasetDataLoader" else 1
+                )
+            elif loader_type == "OrderedIndexDataLoader":
+                if loader_cfg.get("use_cache", True) and loader_cfg.get("cache_dir"):
+                    skip_barrier_controller(times=1)
+            self._sync_distributed_dataset_size(None)
+            return self._distributed_dataset_receiver
+
         # Build dataset from config
         logger.info("Building dataset from config...")
         dataset = _build_dataset(
@@ -553,7 +594,45 @@ class Trainer:
             local_batch_size=self.config.training.local_batch_size,
         )
 
+        if use_data_broadcast:
+            logger.info(
+                "Rank %s constructed the source train dataset; broadcasting its size.",
+                get_rank(),
+            )
+            self._sync_distributed_dataset_size(dataset)
+
         return dataset
+
+    @staticmethod
+    def _get_dataloader_config(dataset_config):
+        """Return the dataloader sub-config from a dataset config.
+
+        Supports both dict and object config forms. Returns ``None`` if the
+        dataloader config cannot be determined.
+        """
+        if isinstance(dataset_config, dict):
+            return dataset_config.get("dataloader")
+        return getattr(dataset_config, "dataloader", None)
+
+    def _sync_distributed_dataset_size(self, dataset_or_config):
+        """Broadcast the source dataset size to the receive-only ranks."""
+        if get_rank() == self.data_broadcast_src_rank:
+            dataset_size = self._get_dataset_size(dataset_or_config)
+            payload = [dataset_size]
+        else:
+            payload = [None]
+        barrier()
+        logger.info("Rank %s passed pre-broadcast barrier.", get_rank())
+        broadcast_object_list(
+            payload,
+            src=self.data_broadcast_src_rank,
+            group=self.data_broadcast_group,
+        )
+        if get_rank() != self.data_broadcast_src_rank:
+            self._distributed_dataset_receiver = _DistributedDatasetReceiver(payload[0])
+            logger.info(
+                "Rank %s received source dataset size %s.", get_rank(), payload[0]
+            )
 
     @staticmethod
     def _get_dataset_size(dataset) -> int:

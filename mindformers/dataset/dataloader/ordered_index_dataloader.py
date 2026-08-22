@@ -21,6 +21,7 @@ from pathlib import Path
 from dataclasses import dataclass
 
 import numpy as np
+from tqdm import tqdm
 
 import mindspore as ms
 from mindspore import Tensor, ops
@@ -29,7 +30,7 @@ from mindspore.dataset import GeneratorDataset
 from mindformers.tools.register import MindFormerRegister, MindFormerModuleType
 from mindformers.tools.logger import logger
 from mindformers.version_control import skip_barrier_controller
-from mindformers.tools.utils import get_real_group_size, MODE
+from mindformers.tools.utils import get_real_group_size, get_real_rank, MODE
 from mindformers.core.context.build_context import get_context
 from mindformers.dataset.blended_datasets.indexed_dataset import IndexedDataset
 
@@ -131,6 +132,11 @@ class OrderedIndexDataLoader:
             is_main_rank = True
         enable_dryrun = os.environ.get('MS_SIMULATION_LEVEL', '0') != '0'
         if world_size > 1 and not is_main_rank and not enable_dryrun:
+            if config.use_cache and config.cache_dir:
+                # Pair with the barrier rank 0 executes inside _build_index_map,
+                # so every rank runs the same number of barriers; otherwise the
+                # collective hangs on unmatched participation.
+                skip_barrier_controller()  # barrier
             skip_barrier_controller()  # barrier
 
             logger.info(" > Start receive dataset size from main rank.")
@@ -453,30 +459,49 @@ class OrderedIndexDataset:
         """
         Build a global index map: [global_idx] -> (dataset_idx, local_idx).
         Uses cache if available.
+
+        In multi-rank runs with disk cache enabled, only rank 0 builds and saves
+        the index map; every other rank waits at a barrier until rank 0 has
+        saved the cache and then loads it.
         """
         # Compute the current state hash
         self.state_hash = self._compute_state_hash()
 
-        # Try to load from cache
-        if self._load_cached_index_map():
+        multi_rank = get_real_group_size() > 1 and self.use_cache and self.cache_dir
+
+        # Non-rank0 ranks: wait at the barrier until rank 0 has saved the cache,
+        # then load it directly.
+        if multi_rank and get_real_rank() != 0:
+            skip_barrier_controller()
+            self._load_cached_index_map()
             logger.info("Using cached index map")
             return
 
-        logger.info("Building new index map")
+        # Rank 0 or single-process: load the cache if possible, otherwise
+        # build the index map and save it.
+        if self._load_cached_index_map():
+            logger.info("Using cached index map")
+        else:
+            self._fill_index_map()
+            self._save_index_map_cache()
 
-        # Create a new index map
+        # Rank 0 must always run the barrier in multi-rank runs so that the
+        # barrier count matches the non-rank0 ranks, whether the index map was
+        # loaded from cache or newly built.
+        if multi_rank:
+            skip_barrier_controller()
+
+    def _fill_index_map(self):
+        """Deterministically fill self.index_map from dataset offsets."""
         self.index_map = np.zeros((self.total_length, 2), dtype=np.int32)
 
-        global_idx = 0
-        for dataset_idx, dataset in enumerate(self.dataset_list):
-            dataset_length = len(dataset)
-            for local_idx in range(dataset_length):
-                self.index_map[global_idx, 0] = dataset_idx
-                self.index_map[global_idx, 1] = local_idx
-                global_idx += 1
-
-        # Save to cache
-        self._save_index_map_cache()
+        shard_ranges = list(zip(self.dataset_offsets[:-1], self.dataset_offsets[1:]))
+        with tqdm(total=self.total_length, desc="Building index map",
+                  unit="seq", mininterval=5.0) as pbar:
+            for dataset_idx, (start, end) in enumerate(shard_ranges):
+                self.index_map[start:end, 0] = dataset_idx
+                self.index_map[start:end, 1] = np.arange(end - start, dtype=np.int32)
+                pbar.update(end - start)
 
     def __getitem__(self, index: int) -> Union[Tuple[np.ndarray, ...], object]:
         """
