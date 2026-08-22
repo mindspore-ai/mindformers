@@ -821,3 +821,20 @@ def _calculate_global_grad_norm(
                     grad.mul_(scale)
 
     return global_norm, tuple(grads)
+
+
+class _DistributedDatasetReceiver:
+    """Lightweight dataset facade for ranks that receive broadcast batches."""
+
+    def __init__(self, dataset_size):
+        self._dataset_size = int(dataset_size)
+
+    def get_dataset_size(self):
+        return self._dataset_size
+
+    def create_dict_iterator(self, **kwargs):
+        del kwargs
+        return iter(())
+
+    def set_init_step(self, step):
+        del step
