@@ -264,10 +264,51 @@ def _get_global_offset_and_replica_id_from_layout(layout):
     return global_offset, cur_replica_id
 
 
+def _get_layout_shard_info(param_name, layout, global_shape, layout_cache=None):
+    """
+    Compute the layout-derived sharding info of one parameter.
+
+    A layout describes the *global* sharding of a parameter, so it is identical on every rank
+    that owns the parameter: only which entry of `global_offsets` applies depends on the rank.
+    Deriving it walks the whole rank list, so doing it once per (rank, parameter) makes the cost
+    quadratic in the world size. Caching it per parameter name removes that factor, and sharing
+    the returned `replica_id` (a tuple of `world_size` entries) between ranks also cuts the peak
+    memory of a global collection from O(world_size^2 x params) down to O(world_size x params).
+
+    Args:
+        param_name (str): Name of the parameter, used as the cache key.
+        layout: Distributed tensor layout object of the parameter.
+        global_shape: Full global shape of the unsharded tensor.
+        layout_cache (Optional[Dict]): Cache shared by all ranks of a single collection pass.
+            Pass `None` to disable caching.
+
+    Returns:
+        Tuple: `(axis_fragmentations, local_shape, global_offsets, replica_id)`, where
+        `global_offsets` holds the offset of every rank of the layout's rank list.
+    """
+    if layout_cache is not None:
+        shard_info = layout_cache.get(param_name)
+        if shard_info is not None:
+            return shard_info
+
+    distributed_info = _DistributedTensorInfo(layout)
+    strategy = distributed_info.sharding_strategy
+    axis_fragmentations = tuple(int(x) for x in strategy)
+    local_shape = tuple(int(s // c) for s, c in zip(global_shape, axis_fragmentations))
+    global_offsets, replica_id = _get_global_offset_and_replica_id_from_layout(layout)
+    shard_info = (axis_fragmentations, local_shape, tuple(global_offsets), tuple(replica_id))
+
+    if layout_cache is not None:
+        layout_cache[param_name] = shard_info
+
+    return shard_info
+
+
 def get_sharded_tensor_from_strategy_metadata(
         param_infos: Dict[str, List],
         cur_npu_rank: int,
-        filter_func: Callable[[str], bool] = None
+        filter_func: Callable[[str], bool] = None,
+        layout_cache: Optional[Dict] = None
 ) -> Optional[Dict[str, ShardedTensor]]:
     """
     Creates ShardedTensor instances for the current NPU rank based on distributed strategy metadata.
@@ -287,6 +328,9 @@ def get_sharded_tensor_from_strategy_metadata(
         filter_func: Optional callable that takes a parameter name (str) and returns a boolean. If provided, only
             parameters for which the function returns True are included in the output. Defaults to None (all parameters
             included).
+        layout_cache: Optional dictionary reused across the ranks of a single collection pass to avoid
+            recomputing the layout-derived sharding info, which is the same on every rank. Defaults to
+            None (no caching).
 
     Returns:
         Optional[Dict[str, ShardedTensor]]: A dictionary where keys are parameter names (filtered if `filter_func` is
@@ -314,13 +358,11 @@ def get_sharded_tensor_from_strategy_metadata(
                 layout=None
             )
         else:
-            distributed_info = _DistributedTensorInfo(layout)
-            strategy = distributed_info.sharding_strategy
-            axis_fragmentations = tuple(int(x) for x in strategy)
-            local_shape = tuple(int(s // c) for s, c in zip(global_shape, axis_fragmentations))
-            global_offset, replica_id = _get_global_offset_and_replica_id_from_layout(layout)
-            npu_nums_per_pp = len(global_offset)
-            global_offset = (global_offset[cur_npu_rank % npu_nums_per_pp],)
+            axis_fragmentations, local_shape, global_offsets, replica_id = _get_layout_shard_info(
+                param_name, layout, global_shape, layout_cache
+            )
+            npu_nums_per_pp = len(global_offsets)
+            global_offset = (global_offsets[cur_npu_rank % npu_nums_per_pp],)
 
             cur_sharded_tensor = build_sharded_tensor(
                 param_name=param_name,
@@ -419,6 +461,103 @@ def get_sharded_tensor_from_cell(
     return sharded_tensor_dict
 
 
+def _build_all_sharded_tensor_from_global_layout(
+        global_strategy_info: Dict[int, Dict[str, list]],
+        filter_func: Callable[[str], bool] = None
+) -> Dict[int, Dict[str, ShardedTensor]]:
+    """
+    Builds rank-specific ShardedTensor instances for every rank from global strategy metadata.
+
+    Args:
+        global_strategy_info (Dict[int, Dict[str, list]]): Global strategy metadata keyed by
+            rank ID, as returned by `LayoutAdapter.get_all_layouts`.
+        filter_func (Optional[Callable[[str], bool]]): An optional filtering function that takes
+            a parameter name (str) and returns a boolean.
+
+    Returns:
+        Dict[int, Dict[str, ShardedTensor]]: A nested dictionary mapping rank IDs to their
+            ShardedTensor dictionaries.
+    """
+    npu_nums = get_real_group_size()
+    sharded_tensor_metas: Dict[int, Dict[str, ShardedTensor]] = {}
+    # The layout of a parameter is the same on every rank, so the layout-derived sharding info is
+    # computed once per parameter instead of once per (rank, parameter).
+    layout_cache: Dict = {}
+    for cur_npu_rank in range(0, npu_nums):
+        cur_rank_strategy_layout = global_strategy_info[cur_npu_rank]
+
+        # Get Sharded tensors from strategy metadata of current rank.
+        cur_rank_sharded_tensors = get_sharded_tensor_from_strategy_metadata(
+            param_infos=cur_rank_strategy_layout,
+            cur_npu_rank=cur_npu_rank,
+            filter_func=filter_func,
+            layout_cache=layout_cache
+        )
+
+        sharded_tensor_metas[cur_npu_rank] = cur_rank_sharded_tensors
+
+    sharded_tensor_metas = {k: sharded_tensor_metas.get(k, None) for k in sorted(sharded_tensor_metas)}
+
+    return sharded_tensor_metas
+
+
+def _build_all_sharded_tensor_from_layout_index(
+        param_layouts: Dict[str, list],
+        rank_param_names: Dict[int, List[str]],
+        filter_func: Callable[[str], bool] = None
+) -> Dict[int, Dict[str, ShardedTensor]]:
+    """
+    Builds rank-specific ShardedTensor instances for every rank from a deduplicated layout index.
+
+    Equivalent to `_build_all_sharded_tensor_from_global_layout`, but takes the layout of each
+    parameter only once (instead of once per rank) plus the parameter names owned by each rank.
+    Since a parameter's layout is identical on every rank that owns it, this carries exactly the
+    same information while being a factor of `world_size` smaller.
+
+    Args:
+        param_layouts (Dict[str, list]): Layout information keyed by parameter name, each entry
+            being `[ms.Layout or None, dtype, full_shape]`.
+        rank_param_names (Dict[int, List[str]]): Names of the parameters owned by each rank, in
+            the order the owning rank reported them.
+        filter_func (Optional[Callable[[str], bool]]): An optional filtering function that takes
+            a parameter name (str) and returns a boolean.
+
+    Returns:
+        Dict[int, Dict[str, ShardedTensor]]: A nested dictionary mapping rank IDs to their
+            ShardedTensor dictionaries.
+
+    Raises:
+        RuntimeError: If a rank reported no parameters at all, which means the layout index is
+            incomplete and the resulting 'metadata.json' would silently miss that rank.
+    """
+    npu_nums = get_real_group_size()
+    sharded_tensor_metas: Dict[int, Dict[str, ShardedTensor]] = {}
+    # A parameter's layout-derived sharding info is rank independent, so it is derived once per
+    # parameter and shared by every rank that owns it.
+    layout_cache: Dict = {}
+    for cur_npu_rank in range(0, npu_nums):
+        param_names = rank_param_names.get(cur_npu_rank)
+        if param_names is None:
+            raise RuntimeError(
+                f"No layout information was collected for rank {cur_npu_rank}. This indicates the "
+                f"layout index is incomplete, please check whether all ranks took part in the gather."
+            )
+
+        # Rebuild this rank's view of the layout by indexing the shared, deduplicated layouts.
+        cur_rank_strategy_layout = {name: param_layouts[name] for name in param_names}
+
+        cur_rank_sharded_tensors = get_sharded_tensor_from_strategy_metadata(
+            param_infos=cur_rank_strategy_layout,
+            cur_npu_rank=cur_npu_rank,
+            filter_func=filter_func,
+            layout_cache=layout_cache
+        )
+
+        sharded_tensor_metas[cur_npu_rank] = cur_rank_sharded_tensors
+
+    return {k: sharded_tensor_metas.get(k, None) for k in sorted(sharded_tensor_metas)}
+
+
 def get_all_sharded_tensor(
         network: Union[Cell, List[Cell]],
         filter_func: Callable[[str], bool] = None
@@ -452,23 +591,53 @@ def get_all_sharded_tensor(
         raise RuntimeError('`get_strategy_metadata` returns `None`, which indicates there is no strategy info. '
                            'Please check whether this is a distributed job.')
 
-    npu_nums = get_real_group_size()
-    sharded_tensor_metas: Dict[int, Dict[str, ShardedTensor]] = {}
-    for cur_npu_rank in range(0, npu_nums):
-        cur_rank_strategy_layout = global_strategy_info[cur_npu_rank]
+    return _build_all_sharded_tensor_from_global_layout(global_strategy_info, filter_func)
 
-        # Get Sharded tensors from strategy metadata of current rank.
-        cur_rank_sharded_tensors = get_sharded_tensor_from_strategy_metadata(
-            param_infos=cur_rank_strategy_layout,
-            cur_npu_rank=cur_npu_rank,
-            filter_func=filter_func
-        )
 
-        sharded_tensor_metas[cur_npu_rank] = cur_rank_sharded_tensors
+def get_all_sharded_tensor_on_rank0(
+        network: Union[Cell, List[Cell]],
+        filter_func: Callable[[str], bool] = None
+) -> Optional[Dict[int, Dict[str, ShardedTensor]]]:
+    """
+    Collects sharded tensor metadata for all ranks, but builds and returns them on rank 0 only.
 
-    sharded_tensor_metas = {k: sharded_tensor_metas.get(k, None) for k in sorted(sharded_tensor_metas)}
+    Functionally equivalent to `get_all_sharded_tensor` on rank 0, while all other ranks
+    receive `None` and never materialize the global layout or the global ShardedTensor
+    metadata. This avoids the CPU memory explosion and huge CPU overhead caused by every
+    rank fetching and building the global layout on large-scale clusters (e.g. 10K cards).
 
-    return sharded_tensor_metas
+    The mode difference (PyNative vs Graph) is hidden inside `LayoutAdapter`: PyNative
+    gathers a deduplicated layout index onto rank 0, while Graph mode builds the same index
+    from the compiler-produced strategy metadata already available locally on rank 0.
+
+    Note:
+        All ranks must call this interface. In PyNative multi-rank scenarios it is a
+        collective: non-zero ranks only contribute their own layout to the gather towards
+        rank 0 and return None.
+
+    Args:
+        network (Cell): A MindSpore Network Cell containing distributed parameters and their sharding strategy.
+        filter_func (Optional[Callable[[str], bool]]): An optional filtering function that takes a parameter name (str)
+            and returns a boolean. Only parameters for which the function returns `True` are included in the
+            ShardedTensor collection. Defaults to `None` (all eligible parameters are included).
+
+    Returns:
+        Optional[Dict[int, Dict[str, ShardedTensor]]]: On rank 0 (or in single-rank jobs), a nested
+            dictionary mapping rank IDs to their ShardedTensor dictionaries, identical to the return
+            value of `get_all_sharded_tensor`; on all other ranks, None.
+
+    Raises:
+        RuntimeError: If no distributed strategy metadata is associated with the network (rank 0 only).
+    """
+    logger.info(".........Get All Ranks' Strategy Metadata on Rank 0.........")
+    layout_index = LayoutAdapter.get_all_layouts_on_rank0(network)
+    if get_real_group_size() > 1 and get_real_rank() != 0:
+        return None
+    if not layout_index or not layout_index[0]:
+        raise RuntimeError('`get_strategy_metadata` returns `None`, which indicates there is no strategy '
+                           'info. Please check whether this is a distributed job.')
+    param_layouts, rank_param_names = layout_index
+    return _build_all_sharded_tensor_from_layout_index(param_layouts, rank_param_names, filter_func)
 
 
 def get_cur_sharded_tensor(
