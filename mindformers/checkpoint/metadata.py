@@ -127,12 +127,14 @@ def save_metadata(sharded_tensor_metas, param_file_mappings, meta_data_path):
             else:
                 sharded_tensor_list.append(sharded_tensor)
 
+    seen_chunks = {}
     for sharded_tensor in sharded_tensor_list:
         param_name = sharded_tensor.key
         new_chunk = {
             "global_offset": sharded_tensor.global_offset,
             "local_shape": sharded_tensor.local_shape
         }
+        chunk_key = (tuple(new_chunk["global_offset"]), tuple(new_chunk["local_shape"]))
         if param_name not in state_dict_metadata:
             state_dict_metadata[param_name] = {
                 "properties": {
@@ -146,14 +148,10 @@ def save_metadata(sharded_tensor_metas, param_file_mappings, meta_data_path):
                 "layout": _serialize_sharded_tensor_layout(sharded_tensor.layout) if sharded_tensor.layout else None,
                 "chunk": [new_chunk]
             }
-        elif param_name in state_dict_metadata:
-            existing_chunks = state_dict_metadata[param_name]["chunk"]
-            if not any(
-                    chunk["global_offset"] == new_chunk["global_offset"] and
-                    chunk["local_shape"] == new_chunk["local_shape"]
-                    for chunk in existing_chunks
-            ):
-                state_dict_metadata[param_name]["chunk"].append(new_chunk)
+            seen_chunks[param_name] = {chunk_key}
+        elif chunk_key not in seen_chunks[param_name]:
+            seen_chunks[param_name].add(chunk_key)
+            state_dict_metadata[param_name]["chunk"].append(new_chunk)
 
     storage_data = {}
     for param_file_mapping in param_file_mappings:
@@ -172,7 +170,7 @@ def save_metadata(sharded_tensor_metas, param_file_mappings, meta_data_path):
 
     metadata = {"state_dict_metadata": state_dict_metadata, "storage_data": storage_data}
 
-    metadata_str = json.dumps(metadata, ensure_ascii=False, indent=4)
+    metadata_str = json.dumps(metadata, ensure_ascii=False, separators=(",", ":"))
     try:
         with tempfile.NamedTemporaryFile(mode='w', dir=os.path.dirname(meta_data_path), delete=False) as tmp_file:
             tmp_file.write(metadata_str)
