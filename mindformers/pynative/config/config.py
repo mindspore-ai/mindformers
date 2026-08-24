@@ -327,6 +327,20 @@ class TrainingConfig(BaseConfig):
     max_norm: float = 1.0
     """Enable gradient clipping if value > 0"""
 
+    use_skip_step_on_nan: bool = False
+    """Skip the optimizer update of a step whose global gradient norm is NaN/Inf.
+
+    Mirrors the static-graph overflow behaviour (see ``MFTrainOneStepCell``): when the
+    gradients of a step are not finite, the optimizer is not invoked, so neither the
+    parameters, the optimizer states, nor the internal ``global_step`` (and therefore the
+    learning rate) advance. Gradients are still zeroed and training continues with the next
+    step. ``False`` (default) keeps the previous behaviour of always updating."""
+
+    max_consecutive_skipped_steps: int = 0
+    """Guard against a run that silently makes no progress: raise once this many
+    consecutive steps have been skipped by ``use_skip_step_on_nan``. ``0`` (default)
+    disables the guard."""
+
     seed: int = 42
     """Random seed for training"""
 
@@ -347,6 +361,11 @@ class TrainingConfig(BaseConfig):
             raise ValueError("training.global_batch_size in config must be positive")
         if self.local_batch_size <= 0:
             raise ValueError("training.local_batch_size in config must be positive")
+        if self.max_consecutive_skipped_steps < 0:
+            raise ValueError(
+                "training.max_consecutive_skipped_steps in config must be >= 0, "
+                f"got {self.max_consecutive_skipped_steps}."
+            )
         if self.rampup_batch_size is not None:
             self._validate_rampup_batch_size()
 

@@ -16,6 +16,7 @@
 
 import os
 import enum
+import math
 from typing import Optional, Callable, List, Dict, Any, Union
 import json
 import numpy as np
@@ -184,6 +185,10 @@ class Trainer:
         self.has_last = True
 
         self.global_batch_size = self.config.training.global_batch_size
+        # NaN/Inf step skipping (static-graph parity, see TrainingConfig).
+        self.use_skip_step_on_nan = self.config.training.use_skip_step_on_nan
+        self.max_consecutive_skipped_steps = self.config.training.max_consecutive_skipped_steps
+        self._consecutive_skipped_steps = 0
         self.dynamic_scheduler = None
         self._dataset_iter = None
         # consumed_samples: total samples processed so far.
@@ -1395,9 +1400,55 @@ class Trainer:
         loss.backward(sense)
         return loss
 
+    def _should_skip_optimizer_step(self, global_norm):
+        """Decide whether this step's optimizer update must be skipped.
+
+        Mirrors the static-graph overflow path: a step whose gradients are not finite
+        leaves parameters, optimizer states and the optimizer's internal ``global_step``
+        (hence the learning rate) untouched. ``global_norm`` is the all-reduced global
+        norm, so every rank observes the same NaN/Inf and takes the same decision.
+
+        Args:
+            global_norm (Tensor): Global gradient norm of the current step.
+
+        Returns:
+            bool: True when the optimizer update must be skipped.
+        """
+        if not self.use_skip_step_on_nan:
+            return False
+
+        norm_value = global_norm.item() if hasattr(global_norm, "item") else float(global_norm)
+        if math.isfinite(norm_value):
+            self._consecutive_skipped_steps = 0
+            return False
+
+        self._consecutive_skipped_steps += 1
+        self.state.skipped_steps += 1
+        # ``state.global_step`` is only incremented after the step finishes, so report
+        # ``+ 1`` to match the 1-based step number printed by the loss callback.
+        logger.warning(
+            "[SkipStepOnNaN] Global gradient norm is %s at step %d, skipping the optimizer "
+            "update (consecutive skipped: %d, total skipped: %d).",
+            norm_value, self.state.global_step + 1,
+            self._consecutive_skipped_steps, self.state.skipped_steps,
+        )
+        if 0 < self.max_consecutive_skipped_steps <= self._consecutive_skipped_steps:
+            raise RuntimeError(
+                f"[SkipStepOnNaN] The global gradient norm has been NaN/Inf for "
+                f"{self._consecutive_skipped_steps} consecutive steps, which reaches "
+                f"training.max_consecutive_skipped_steps="
+                f"{self.max_consecutive_skipped_steps}. Training is making no progress; "
+                f"check the data, the learning rate and the model configuration."
+            )
+        return True
+
     def _optimizer_update(self):
         """
         Compute gradient norm, clip gradients, update optimizer and zero gradients.
+
+        When ``training.use_skip_step_on_nan`` is enabled and the global gradient norm is
+        NaN/Inf, the optimizer update is skipped; gradients are zeroed either way so the
+        next step starts clean.
 
         Returns:
             Tensor: Global gradient norm.
@@ -1408,8 +1459,9 @@ class Trainer:
             max_norm=self.config.training.max_norm,
         )
 
-        with _no_grad():
-            self.optimizer(grads)
+        if not self._should_skip_optimizer_step(global_norm):
+            with _no_grad():
+                self.optimizer(grads)
 
         # zero grad
         for m in self.model:
