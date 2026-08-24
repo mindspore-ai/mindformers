@@ -27,9 +27,11 @@ from typing import Optional, List
 
 import mindspore as ms
 from mindspore import context
+from mindspore.mint.distributed import gather_object
 
 from mindformers.tools import get_output_root_path
 from mindformers.tools.logger import logger
+from mindformers.tools.utils import get_real_rank, get_real_group_size
 
 
 PER_ITERATION_CKPT_DIR_PREFIX = "iteration_"
@@ -70,7 +72,7 @@ class CkptHealthStatus(Enum):
 
 
 def check_checkpoints_dir_max_num(max_keep_num: int,
-                                  current_ckpt_step_list: List[int] = None):
+                                  current_ckpt_step_list: List[str] = None):
     """
     Monitor the maximum number of weights that can be stored.
     If the number of checkpoint directory greater than 'max_keep_num',
@@ -121,6 +123,41 @@ def get_checkpoint_iter_dir(checkpoints_path: str, iteration: int) -> str:
     iter_dir = os.path.join(checkpoints_path, directory)
 
     return iter_dir
+
+
+def gather_param_names_on_rank0(param_names) -> Optional[set]:
+    """
+    Gather per-rank parameter name sets onto rank 0 and union them.
+
+    Used to obtain the global model parameter names on rank 0 without fetching any layout
+    information (under pipeline parallelism different ranks hold different parameters).
+    The payload is just the parameter names of each rank.
+
+    Note:
+        This is a collective interface in multi-rank scenarios: **all ranks must call it**.
+        Non-zero ranks only contribute their own name set to the gather and get None.
+
+    Args:
+        param_names: An iterable of parameter names (str) held by the current rank.
+
+    Returns:
+        Optional[set]: On rank 0, the union of all ranks' parameter names; on all other
+            ranks, None. In single-rank jobs, the input names are returned as a set.
+    """
+    local_names = set(param_names)
+    if get_real_group_size() == 1:
+        return local_names
+
+    if get_real_rank() != 0:
+        gather_object(local_names, None, dst=0)
+        return None
+
+    gathered_names = [None] * get_real_group_size()
+    gather_object(local_names, gathered_names, dst=0)
+    global_names = set()
+    for names in gathered_names:
+        global_names.update(names)
+    return global_names
 
 
 def get_checkpoint_tracker_filename(checkpoints_path: str) -> str:
