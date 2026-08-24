@@ -21,6 +21,7 @@ Unlike the static graph version, this version:
 """
 
 import copy as cp
+import logging
 import math
 from fnmatch import fnmatch
 
@@ -43,11 +44,11 @@ from hyper_parallel import SkipDTensorDispatch
 from hyper_parallel.core.dtensor.dtensor import distribute_tensor
 from hyper_parallel.core.dtensor.layout import _infer_slice_area_by_rank
 from hyper_parallel.core.dtensor.placement_types import Replicate
-from hyper_parallel.core.dtensor.redistribute_infer import RedistributionOperatorInfer
+from hyper_parallel.core.dtensor.redistribute_infer import DevMat, RedistributionOperatorInfer
 from hyper_parallel.platform import get_platform
 
 from mindformers.core import context as core_context
-from mindformers.tools.logger import logger
+from mindformers.tools.logger import get_logger, logger
 from mindformers.pynative.optimizer.adamw import _run_adamw_opt, _run_fused_adamw_opt
 from mindformers.pynative.dtensor_compat import inplace_copy
 from mindformers.pynative.optimizer.main_params import MainParamsMixin
@@ -66,6 +67,11 @@ op_cast = P.Cast()
 # batched groups retain at least two slots to stay on the same numerical path.
 _PHASE4_BATCH_TEMP_BYTES_PER_ELEMENT = 16
 _PHASE4_BATCH_TEMP_MEMORY_LIMIT = 4 * 1024 * 1024 * 1024
+
+
+def _is_debug_logging_enabled():
+    """Avoid building distributed debug payloads when DEBUG is filtered."""
+    return get_logger().isEnabledFor(logging.DEBUG)
 
 
 def _enable_muon_cube_math_type():
@@ -410,11 +416,16 @@ def _estimate_muon_work(param_name, shape, muon_split_fn, ns_steps):
 
 
 def _format_work_load_summary(rank_loads, rank_counts):
-    """Format rank load statistics for one-line optimizer init logging."""
-    return ", ".join(
+    """Format non-empty rank loads without expanding every idle world rank."""
+    active_loads = [
         f"r{rank}:count={rank_counts[rank]},work={rank_loads[rank]:.3e}"
         for rank in range(len(rank_loads))
-    )
+        if rank_counts[rank]
+    ]
+    inactive_ranks = len(rank_loads) - len(active_loads)
+    if inactive_ranks:
+        active_loads.append(f"inactive_ranks={inactive_ranks}")
+    return ", ".join(active_loads)
 
 
 def _assign_grouped_muon_owners(items_by_group, world_size):
@@ -427,8 +438,9 @@ def _assign_grouped_muon_owners(items_by_group, world_size):
     on the same small subset of ranks.
     """
     assignment = {}
-    rank_loads = [0] * world_size
-    rank_counts = [0] * world_size
+    aggregate_rank_loads = [0] * world_size
+    aggregate_rank_counts = [0] * world_size
+    domain_states = {}
 
     def _group_total_work(weights):
         return sum(weight[1] for weight in weights)
@@ -446,6 +458,14 @@ def _assign_grouped_muon_owners(items_by_group, world_size):
         n_weights = len(weights_sorted)
         if not n_weights:
             continue
+
+        # Balance only between groups that have the same owner domain.
+        if rank_list_in_group not in domain_states:
+            domain_states[rank_list_in_group] = (
+                dict.fromkeys(rank_list_in_group, 0),
+                dict.fromkeys(rank_list_in_group, 0),
+            )
+        rank_loads, rank_counts = domain_states[rank_list_in_group]
 
         # A group uses at most one owner per weight.  Candidate rotations keep
         # those owners evenly spaced through the layout rank list, while the
@@ -502,7 +522,9 @@ def _assign_grouped_muon_owners(items_by_group, world_size):
             assignment[param_index] = chosen
             rank_loads[chosen] += work
             rank_counts[chosen] += 1
-    return assignment, rank_loads, rank_counts
+            aggregate_rank_loads[chosen] += work
+            aggregate_rank_counts[chosen] += 1
+    return assignment, aggregate_rank_loads, aggregate_rank_counts
 
 
 class _AsyncAllConcatTensor:
@@ -632,6 +654,77 @@ def _get_full_tensor_ops(local_tensor, device_mesh, placements, rank_id):
         dtensor = DTensor.from_local(local_tensor, device_mesh, placements)
         _FULL_TENSOR_OP_CACHE[cache_key] = _infer_full_tensor_ops(dtensor, rank_id)
     return _FULL_TENSOR_OP_CACHE[cache_key]
+
+
+def _get_replica_local_layout_info(rank_id, rank_list, mesh_shape, tensor_map):
+    """Drop replicated mesh axes from cached P2P layout metadata.
+
+    ``layout.rank_list`` spans every HSDP replica, although a DTensor
+    ``full_tensor()`` reconstruction communicates only over mesh axes present
+    in ``tensor_map``.  Fix the unused axes at this rank's coordinates and
+    compact the remaining mesh/tensor-map metadata.  The returned rank list is
+    therefore one replica-local set of unique logical shards and can be used by
+    both the single- and multi-``all_concat`` P2P paths.
+    """
+    try:
+        rank_id = int(rank_id)
+        rank_list = tuple(int(rank) for rank in rank_list)
+        mesh_shape = tuple(int(dim) for dim in mesh_shape)
+        mesh_numel = math.prod(mesh_shape)
+        if not mesh_shape or mesh_numel != len(rank_list) or rank_id not in rank_list:
+            return None
+
+        mesh_ndim = len(mesh_shape)
+        active_axes = set()
+        for mapping in tensor_map:
+            mapping_dims = mapping if isinstance(mapping, (tuple, list)) else (mapping,)
+            for mapped_dim in mapping_dims:
+                mapped_dim = int(mapped_dim)
+                if mapped_dim == -1:
+                    continue
+                mesh_axis = mesh_ndim - 1 - mapped_dim
+                if mesh_axis < 0 or mesh_axis >= mesh_ndim:
+                    return None
+                active_axes.add(mesh_axis)
+    except (TypeError, ValueError):
+        return None
+
+    active_axes = tuple(sorted(active_axes))
+    if len(active_axes) == mesh_ndim:
+        return rank_list, mesh_shape, list(tensor_map)
+
+    if active_axes:
+        try:
+            local_rank_list = tuple(
+                DevMat(list(mesh_shape)).get_devices_along_dim(
+                    rank_id, list(rank_list), list(active_axes)))
+        except ValueError:
+            return None
+        compact_mesh_shape = tuple(mesh_shape[axis] for axis in active_axes)
+        compact_reverse_map = {
+            axis: len(active_axes) - 1 - compact_axis
+            for compact_axis, axis in enumerate(active_axes)
+        }
+    else:
+        # A fully replicated 2D DTensor is already complete on every rank.
+        local_rank_list = (rank_id,)
+        compact_mesh_shape = (1,)
+        compact_reverse_map = {}
+
+    def _remap_tensor_dim(mapping):
+        if isinstance(mapping, (tuple, list)):
+            return tuple(_remap_tensor_dim(mapped_dim) for mapped_dim in mapping)
+        mapped_dim = int(mapping)
+        if mapped_dim == -1:
+            return -1
+        mesh_axis = mesh_ndim - 1 - mapped_dim
+        return compact_reverse_map[mesh_axis]
+
+    compact_tensor_map = [_remap_tensor_dim(mapping) for mapping in tensor_map]
+    if len(local_rank_list) != math.prod(compact_mesh_shape) \
+            or rank_id not in local_rank_list:
+        return None
+    return local_rank_list, compact_mesh_shape, compact_tensor_map
 
 
 def _get_all_concat_group(rank_list):
@@ -896,11 +989,10 @@ def _build_local_shard_scatter_ops(info, x_ret_full, rank_id):
 
     ops = []
     if int(rank_id) == assigned_rank:
-        mesh_shape = info.get('mesh_shape_tuple')
-        tensor_map = info.get('tensor_map_list')
-        if mesh_shape is not None and tensor_map is not None:
+        if info.get('mesh_shape_tuple') is not None \
+                and info.get('tensor_map_list') is not None:
             shards = _list_full_tensor_local_shards_cached(
-                x_ret_full, rank_list, mesh_shape, tensor_map)
+                x_ret_full, rank_list, info['mesh_shape_tuple'], info['tensor_map_list'])
         else:
             shards = _list_full_tensor_local_shards(x_ret_full, info['layout'])
         p2p_tensors = []
@@ -2333,8 +2425,9 @@ class Muon(MainParamsMixin, Optimizer):
             else:
                 is_low_precision.append(False)
                 fp32_params.append(param)
-        logger.info("[Muon MixedPrecision] _init_main_params: %d/%d params with fp32 master copy",
-                    lp_count, len(self._parameters))
+        logger.debug(
+            "Muon: event=main_params_initialized rank=%s fp32_master_params=%d total_params=%d",
+            self._rank_id, lp_count, len(self._parameters))
         return tuple(is_low_precision), ParameterTuple(fp32_params)
 
     def _copy_main_params_to_model_params(self):
@@ -2397,13 +2490,15 @@ class Muon(MainParamsMixin, Optimizer):
                 rank_loads[assigned_rank] += work
                 rank_counts[assigned_rank] += 1
 
-            load_summary = _format_work_load_summary(rank_loads, rank_counts)
-            logger.info(
-                f"Muon allgather_deredundency: {len(muon_work_items)} 2D muon weights "
-                f"provisionally assigned across {world_size} ranks; "
-                f"{local_muon_count} 3D/local muon weights run independently on every rank "
-                f"(rank_id={self._rank_id}); estimated_loads=[{load_summary}]"
-            )
+            if _is_debug_logging_enabled():
+                load_summary = _format_work_load_summary(rank_loads, rank_counts)
+                logger.debug(
+                    "Muon allgather_deredundency: event=provisional_assignment "
+                    "rank=%s world_size=%d weights_2d=%d local_weights_3d=%d "
+                    "active_owners=%d max_weights_per_owner=%d owner_loads=[%s]",
+                    self._rank_id, world_size, len(muon_work_items), local_muon_count,
+                    sum(bool(count) for count in rank_counts), max(rank_counts, default=0),
+                    load_summary)
             # The init-time assignment ignores per-weight layout because we
             # have no access to gradient layouts here.  ``_recompute_muon_assigned_ranks``
             # refines this on the first ``construct`` call so each owner is
@@ -2444,6 +2539,10 @@ class Muon(MainParamsMixin, Optimizer):
         meta = {}  # param_index -> frozen per-param metadata (see _run_muon_batched)
         items_by_group = {}  # group_sig -> list of (param_index, work, rank_list_tuple)
         weight_group_sig = {}  # param_index -> group_sig
+        owner_domain_counts = {}  # (full layout ranks, owner ranks) -> 2D weight count
+        # The one-time layout probe deliberately keeps metadata, redistribution
+        # inference and replica-domain decisions together for each parameter.
+        # pylint: disable=too-many-nested-blocks
         for i, is_muon in enumerate(self.use_muon):
             if not is_muon:
                 continue
@@ -2463,6 +2562,8 @@ class Muon(MainParamsMixin, Optimizer):
                 'layout_covers_world': False,
                 'skip_redist_comm': False,
                 'group_sig': None,
+                'layout_rank_count': 0,
+                'layout_decision': 'local_2d' if ndim == 2 else 'local_3d',
                 # Pre-probed redistribution ops for the P2P gather fast path.
                 # ``None`` means introspection failed → hot path falls back to
                 # all-gather without re-attempting (and re-catching) the same
@@ -2489,20 +2590,69 @@ class Muon(MainParamsMixin, Optimizer):
                         'full_shape_tuple': full_shape,
                         'layout_covers_world': (len(rank_list) == world_size),
                         'skip_redist_comm': rank_id_int not in rank_list,
+                        'layout_rank_count': len(rank_list),
+                        'layout_decision': 'p2p_layout_pending',
                     })
-                except (AttributeError, TypeError, ValueError):
-                    pass  # keep defaults — falls back to per-step path
+                except (AttributeError, TypeError, ValueError) as exc:
+                    entry['layout_decision'] = 'fallback_layout_metadata_error'
+                    logger.warning(
+                        "Muon allgather_deredundency: event=layout_metadata_error "
+                        "rank=%s param_index=%d param=%r error=%s:%s action=keep_local_path",
+                        self._rank_id, i, self.param_name_tuple[i],
+                        type(exc).__name__, exc)
                 if entry['needs_redist']:
                     try:
                         entry['p2p_op_list'] = _get_full_tensor_ops(
                             grad.to_local(), grad.device_mesh,
                             grad.placements, rank_id_int)
+                        op_list = entry['p2p_op_list']
+                        if op_list is None:
+                            all_concat_only = False
+                        else:
+                            all_concat_only = all(
+                                isinstance(op, (tuple, list)) and op and op[0] == "all_concat"
+                                for op in op_list
+                            )
+                        # Partial/unknown placements must retain the legacy owner domain.
+                        replica_or_shard_only = all(
+                            placement.is_replicate() or placement.is_shard()
+                            for placement in grad.placements
+                        )
+                        replica_layout = _get_replica_local_layout_info(
+                            rank_id_int, rank_list, mesh_shape, tensor_map
+                        ) if all_concat_only and replica_or_shard_only else None
+                        if replica_layout is not None:
+                            layout_rank_count = len(rank_list)
+                            rank_list, mesh_shape, tensor_map = replica_layout
+                            entry.update({
+                                'rank_list_tuple': rank_list,
+                                'mesh_shape_tuple': mesh_shape,
+                                'tensor_map_list': tensor_map,
+                                'layout_covers_world': (len(rank_list) == world_size),
+                                'skip_redist_comm': False,
+                            })
+                            if len(rank_list) < layout_rank_count:
+                                entry['layout_decision'] = 'p2p_replica_local'
+                            else:
+                                entry['layout_decision'] = 'p2p_shard_domain'
+                        elif not all_concat_only:
+                            entry['layout_decision'] = 'fallback_non_concat'
+                        elif not replica_or_shard_only:
+                            entry['layout_decision'] = 'fallback_guarded_placement'
+                        else:
+                            entry['layout_decision'] = 'p2p_uncompacted_layout'
                     except (AttributeError, TypeError, ValueError) as exc:
+                        entry['layout_decision'] = 'fallback_ops_introspection_error'
                         logger.warning(
-                            "[Muon P2P gather] param '%s' layout introspection "
-                            "failed (%s: %s); this param will fall back to "
-                            "all-gather every step.",
-                            self.param_name_tuple[i], type(exc).__name__, exc)
+                            "Muon allgather_deredundency: event=redistribution_introspection_error "
+                            "rank=%s param_index=%d param=%r error=%s:%s "
+                            "action=allgather_fallback",
+                            self._rank_id, i, self.param_name_tuple[i],
+                            type(exc).__name__, exc)
+                if entry['needs_redist']:
+                    domain_key = (
+                        entry['layout_rank_count'], len(entry['rank_list_tuple']))
+                    owner_domain_counts[domain_key] = owner_domain_counts.get(domain_key, 0) + 1
             meta[i] = entry
             # Group signature for batched NS: same (piece-shape tuple, rank_list)
             # ⇒ weights can be stacked and run as a single bmm-batched NS.
@@ -2528,6 +2678,7 @@ class Muon(MainParamsMixin, Optimizer):
                     work = _estimate_muon_work(
                         self.param_name_tuple[i], param.shape, self.muon_split_fn, self.ns_steps)
                     items_by_group.setdefault(sig, []).append((i, work, rl_key))
+        # pylint: enable=too-many-nested-blocks
 
         # Keep each owner's slice contiguous inside a shape group, but rotate
         # the evenly-spaced owner pattern according to the loads accumulated by
@@ -2539,6 +2690,26 @@ class Muon(MainParamsMixin, Optimizer):
 
         for pidx, sig in weight_group_sig.items():
             meta[pidx]['group_sig'] = sig
+
+        if _is_debug_logging_enabled():
+            for pidx, entry in sorted(meta.items()):
+                if entry['ndim'] != 2:
+                    continue
+                owner_ranks = entry['rank_list_tuple']
+                logger.debug(
+                    "Muon allgather_deredundency: event=layout_decision rank=%s "
+                    "param_index=%d param=%r decision=%s assigned_owner=%s "
+                    "param_shape=%s full_shape=%s placements=%s mesh_shape=%s tensor_map=%s "
+                    "layout_rank_count=%d owner_rank_count=%d owner_rank_edges=%s/%s "
+                    "redist_ops=%s",
+                    self._rank_id, pidx, self.param_name_tuple[pidx], entry['layout_decision'],
+                    new_assignment.get(pidx), tuple(self._parameters[pidx].shape),
+                    entry['full_shape_tuple'], entry['placements'], entry['mesh_shape_tuple'],
+                    entry['tensor_map_list'], entry['layout_rank_count'],
+                    len(owner_ranks) if owner_ranks is not None else 0,
+                    owner_ranks[:4] if owner_ranks is not None else None,
+                    owner_ranks[-4:] if owner_ranks is not None else None,
+                    entry['p2p_op_list'])
 
         self._muon_assigned_rank = new_assignment
         self._muon_param_meta = meta
@@ -2562,15 +2733,34 @@ class Muon(MainParamsMixin, Optimizer):
         n_3d_groups = sum(
             1 for sig in set(weight_group_sig.values()) if sig not in items_by_group
         )
-        load_summary = _format_work_load_summary(rank_loads, rank_counts)
+        decision_counts = {}
+        for entry in meta.values():
+            if entry['ndim'] != 2:
+                continue
+            decision = entry['layout_decision']
+            decision_counts[decision] = decision_counts.get(decision, 0) + 1
+        decision_summary = ", ".join(
+            f"{decision}={count}" for decision, count in sorted(decision_counts.items())
+        ) or "none"
         logger.info(
-            f"Muon allgather_deredundency: refined assignment for "
-            f"{sum(len(w) for w in items_by_group.values())} 2D muon weights "
-            f"across {len(items_by_group)} 2D shape groups + "
-            f"{n_3d_groups} 3D shape groups "
-            f"(rank_id={self._rank_id}); estimated_loads=[{load_summary}]; "
-            f"max_batch_per_rank={max_batch_per_rank}"
-        )
+            "Muon allgather_deredundency: event=assignment_ready rank=%s world_size=%d "
+            "weights_2d=%d shape_groups_2d=%d local_groups_3d=%d active_owners=%d "
+            "max_weights_per_owner=%d max_batch_per_owner=%d decisions=[%s]",
+            self._rank_id, world_size, sum(len(weights) for weights in items_by_group.values()),
+            len(items_by_group), n_3d_groups, sum(bool(count) for count in rank_counts),
+            max(rank_counts, default=0), max(max_batch_per_rank, default=0),
+            decision_summary)
+        if _is_debug_logging_enabled():
+            owner_domain_detail = ", ".join(
+                f"layout={layout_size}->owner={owner_size}(weights={count})"
+                for (layout_size, owner_size), count in sorted(owner_domain_counts.items())
+            ) or "unchanged"
+            logger.debug(
+                "Muon allgather_deredundency: event=assignment_detail rank=%s "
+                "owner_loads=[%s] owner_batches=%s owner_domains=[%s]",
+                self._rank_id, _format_work_load_summary(rank_loads, rank_counts),
+                [(rank, batch) for rank, batch in enumerate(max_batch_per_rank) if batch],
+                owner_domain_detail)
 
     def _build_muon_runtime_groups(self, gradients, meta):
         """Precompute slot orderings and Phase 0/4/NS group dicts.
