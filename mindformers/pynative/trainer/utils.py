@@ -818,6 +818,8 @@ def _calculate_global_grad_norm(
     enable_parallel: bool = False,
     max_norm: float = 1.0,
     eps: float = 1e-6,
+    step_loss=None,
+    return_finite: bool = False,
 ):
     """Calculate the global gradient norm across all parameters and clip gradients in-place.
 
@@ -840,10 +842,17 @@ def _calculate_global_grad_norm(
         max_norm (float): Maximum allowed gradient norm. Default: 1.0.
         eps (float): Small epsilon added to the norm for numerical stability when computing the clipping coefficient.
            Default: 1e-6.
+        step_loss (Tensor, optional): Loss of the current optimizer step. When given, its
+            finite state is reduced together with the gradient norm, so a NaN/Inf loss is
+            caught even when the gradients themselves look finite, and every rank reaches
+            the same verdict without a second collective. Default: None.
+        return_finite (bool): Whether to also return whether this step is finite (both the
+            global gradient norm and, when given, ``step_loss``). Default: False.
 
     Returns:
         Tuple of (global_norm, grads) where global_norm is the computed global
-        gradient norm and grads is a tuple of gradient tensors.
+        gradient norm and grads is a tuple of gradient tensors. With
+        ``return_finite=True``, a third element carries the finite state of the step.
     """
     grads = []
     missing = []
@@ -872,9 +881,6 @@ def _calculate_global_grad_norm(
             f"(the optimizers index this tuple positionally). First few: {missing[:6]}."
         )
 
-    if not grads:
-        return Tensor(0.0, dtype=mstype.float32), ()
-
     grouped_grads = _group_grads_by_device_and_dtype(grads)
 
     group_norm_sqs = []
@@ -884,22 +890,51 @@ def _calculate_global_grad_norm(
         group_norm_sq = _compute_grad_norm_sq_fused(local_grads, grad_factors)
         group_norm_sqs.append(group_norm_sq)
 
-    if len(group_norm_sqs) == 1:
+    if not group_norm_sqs:
+        # Empty PP/adapter stages still join the world-wide finite verdict.
+        total_norm_sq = Tensor(0.0, dtype=mstype.float32)
+    elif len(group_norm_sqs) == 1:
         total_norm_sq = group_norm_sqs[0]
     else:
         total_norm_sq = mint.sum(mint.stack(group_norm_sqs))
 
+    loss_is_finite = Tensor(True, dtype=mstype.bool_)
+    if step_loss is not None:
+        local_loss = step_loss.to_local() if _is_dtensor_like(step_loss) else step_loss
+        if not isinstance(local_loss, Tensor):
+            local_loss = Tensor(local_loss)
+        loss_is_finite = mint.all(mint.isfinite(local_loss))
+
+    # Pack the norm and the loss-finite flag into the single existing world reduction:
+    # no extra collective, and every rank (PP stages and FSDP shards alike) sees the same
+    # verdict, so they either all run the optimizer or all skip it.
+    reduced_values = mint.stack((total_norm_sq, loss_is_finite.astype(mstype.float32)))
+
     if enable_parallel:
         from mindspore import ops
         from mindspore.mint.distributed import all_reduce
-        all_reduce(total_norm_sq, op=ops.ReduceOp.SUM)
+        all_reduce(reduced_values, op=ops.ReduceOp.SUM)
 
-    global_norm = mint.sqrt(total_norm_sq)
-
-    # Clip gradients in-place if the global norm exceeds max_norm
+    global_norm = mint.sqrt(reduced_values[0])
+    expected_finite_count = get_world_size() if enable_parallel else 1
+    step_is_finite_tensor = mint.logical_and(
+        mint.isfinite(global_norm),
+        reduced_values[1] == expected_finite_count,
+    )
     clip_coef = max_norm / (global_norm + eps)
-    if clip_coef < 1:
-        scale = clip_coef.item()
+
+    # Read both control values in one go. The clipping branch already forced a
+    # device-host sync every step, so folding the finite flag into the same read keeps
+    # the one-sync-per-step contract instead of adding a second one.
+    step_is_finite_value, clip_coef_value = mint.stack(
+        (step_is_finite_tensor.astype(mstype.float32), clip_coef)
+    ).asnumpy()
+    step_is_finite = bool(step_is_finite_value)
+
+    # Clip gradients in-place if the global norm exceeds max_norm. A non-finite step is
+    # about to be dropped, so scaling its gradients would only waste kernels.
+    if step_is_finite and clip_coef_value < 1:
+        scale = float(clip_coef_value)
         for (_, _), grad_list in grouped_grads.items():
             for grad, local_grad in grad_list:
                 if _is_dtensor_like(grad):
@@ -907,6 +942,8 @@ def _calculate_global_grad_norm(
                 else:
                     grad.mul_(scale)
 
+    if return_finite:
+        return global_norm, tuple(grads), step_is_finite
     return global_norm, tuple(grads)
 
 

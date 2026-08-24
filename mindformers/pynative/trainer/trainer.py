@@ -16,7 +16,6 @@
 
 import os
 import enum
-import math
 from typing import Optional, Callable, List, Dict, Any, Union
 import json
 import numpy as np
@@ -277,7 +276,6 @@ class Trainer:
         # NaN/Inf step skipping (static-graph parity, see TrainingConfig).
         self.use_skip_step_on_nan = self.config.training.use_skip_step_on_nan
         self.max_consecutive_skipped_steps = self.config.training.max_consecutive_skipped_steps
-        self._consecutive_skipped_steps = 0
         self.dynamic_scheduler = None
         self._dataset_iter = None
         # consumed_samples: total samples processed so far.
@@ -1367,6 +1365,20 @@ class Trainer:
                 self.state.global_step = global_step
                 restore_checkpoint_rng_state(checkpoint_path)
 
+                # Restore the NaN/Inf skip counters so the cumulative statistic stays
+                # meaningful and the max_consecutive_skipped_steps guard keeps counting
+                # across the resume. Checkpoints written before these fields existed
+                # carry None; fall back to 0.
+                self.state.skipped_steps = int(getattr(common_info, "skipped_steps", None) or 0)
+                self.state.consecutive_skipped_steps = int(
+                    getattr(common_info, "consecutive_skipped_steps", None) or 0
+                )
+                if self.state.skipped_steps or self.state.consecutive_skipped_steps:
+                    logger.info(
+                        "Resume NaN/Inf skip counters: total skipped=%d, consecutive skipped=%d.",
+                        self.state.skipped_steps, self.state.consecutive_skipped_steps,
+                    )
+
             for stage in models:
                 stage_loaded_names = load_checkpoint(
                     checkpoint=checkpoint_path,
@@ -1680,7 +1692,7 @@ class Trainer:
                 if per_token_step:
                     loss, denominator = self._finalize_per_token_grads(loss, denominator)
                 # Compute grad norm and update optimizer
-                grad_norm = self._optimizer_update()
+                grad_norm = self._optimizer_update(loss=loss)
 
                 # Loss reduction for parallel training
                 if per_token_step:
@@ -1721,10 +1733,10 @@ class Trainer:
             # gradient divisor is identical across the pipeline.
             numerator, denominator = loss if isinstance(loss, tuple) else (0.0, 0.0)
             numerator, denominator = self._finalize_per_token_grads(numerator, denominator)
-            global_norm = self._optimizer_update()
+            global_norm = self._optimizer_update(loss=numerator)
             return numerator / denominator, global_norm
 
-        global_norm = self._optimizer_update()
+        global_norm = self._optimizer_update(loss=loss)
 
         if self.has_last:
             if isinstance(loss, DTensor):
@@ -2065,16 +2077,19 @@ class Trainer:
         loss.backward(sense)
         return loss
 
-    def _should_skip_optimizer_step(self, global_norm):
+    def _should_skip_optimizer_step(self, global_norm, step_is_finite):
         """Decide whether this step's optimizer update must be skipped.
 
-        Mirrors the static-graph overflow path: a step whose gradients are not finite
-        leaves parameters, optimizer states and the optimizer's internal ``global_step``
-        (hence the learning rate) untouched. ``global_norm`` is the all-reduced global
-        norm, so every rank observes the same NaN/Inf and takes the same decision.
+        Mirrors the static-graph overflow path: a step that is not finite leaves
+        parameters, optimizer states and the optimizer's internal ``global_step`` (hence
+        the learning rate) untouched. ``step_is_finite`` comes out of the same world
+        reduction that produced ``global_norm`` and covers both the gradients and the
+        step loss, so every rank observes the same verdict and takes the same decision.
 
         Args:
             global_norm (Tensor): Global gradient norm of the current step.
+            step_is_finite (bool): Whether both the global gradient norm and the step
+                loss are finite.
 
         Returns:
             bool: True when the optimizer update must be skipped.
@@ -2082,25 +2097,26 @@ class Trainer:
         if not self.use_skip_step_on_nan:
             return False
 
-        norm_value = global_norm.item() if hasattr(global_norm, "item") else float(global_norm)
-        if math.isfinite(norm_value):
-            self._consecutive_skipped_steps = 0
+        if step_is_finite:
+            self.state.consecutive_skipped_steps = 0
             return False
 
-        self._consecutive_skipped_steps += 1
+        norm_value = global_norm.item() if hasattr(global_norm, "item") else float(global_norm)
+        self.state.consecutive_skipped_steps += 1
         self.state.skipped_steps += 1
         # ``state.global_step`` is only incremented after the step finishes, so report
         # ``+ 1`` to match the 1-based step number printed by the loss callback.
         logger.warning(
-            "[SkipStepOnNaN] Global gradient norm is %s at step %d, skipping the optimizer "
-            "update (consecutive skipped: %d, total skipped: %d).",
-            norm_value, self.state.global_step + 1,
-            self._consecutive_skipped_steps, self.state.skipped_steps,
+            "[SkipStepOnNaN] Step %d is not finite (global gradient norm is %s, the step "
+            "loss may be NaN/Inf as well), skipping the optimizer update "
+            "(consecutive skipped: %d, total skipped: %d).",
+            self.state.global_step + 1, norm_value,
+            self.state.consecutive_skipped_steps, self.state.skipped_steps,
         )
-        if 0 < self.max_consecutive_skipped_steps <= self._consecutive_skipped_steps:
+        if 0 < self.max_consecutive_skipped_steps <= self.state.consecutive_skipped_steps:
             raise RuntimeError(
-                f"[SkipStepOnNaN] The global gradient norm has been NaN/Inf for "
-                f"{self._consecutive_skipped_steps} consecutive steps, which reaches "
+                f"[SkipStepOnNaN] The step loss or global gradient norm has been NaN/Inf for "
+                f"{self.state.consecutive_skipped_steps} consecutive steps, which reaches "
                 f"training.max_consecutive_skipped_steps="
                 f"{self.max_consecutive_skipped_steps}. Training is making no progress; "
                 f"check the data, the learning rate and the model configuration."
@@ -2147,24 +2163,30 @@ class Trainer:
         scale_grads_(self.optimizer.parameters, 1.0 / divisor)
         return numerator, denominator
 
-    def _optimizer_update(self):
+    def _optimizer_update(self, loss=None):
         """
         Compute gradient norm, clip gradients, update optimizer and zero gradients.
 
-        When ``training.use_skip_step_on_nan`` is enabled and the global gradient norm is
-        NaN/Inf, the optimizer update is skipped; gradients are zeroed either way so the
-        next step starts clean.
+        When ``training.use_skip_step_on_nan`` is enabled and the step is not finite —
+        either the global gradient norm or ``loss`` is NaN/Inf — the optimizer update is
+        skipped; gradients are zeroed either way so the next step starts clean.
+
+        Args:
+            loss (Tensor, optional): Loss accumulated for the current optimizer step. Its
+                finite state rides along in the gradient-norm reduction.
 
         Returns:
             Tensor: Global gradient norm.
         """
-        global_norm, grads = _calculate_global_grad_norm(
+        global_norm, grads, step_is_finite = _calculate_global_grad_norm(
             self.optimizer.parameters,
             enable_parallel=self.enable_parallel,
             max_norm=self.config.training.max_norm,
+            step_loss=loss,
+            return_finite=True,
         )
 
-        if not self._should_skip_optimizer_step(global_norm):
+        if not self._should_skip_optimizer_step(global_norm, step_is_finite):
             with _no_grad():
                 self.optimizer(grads)
         # zero grad

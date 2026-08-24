@@ -201,6 +201,8 @@ class LossCallback(TrainerCallback):
                 "cur_step": state.global_step,
                 "max_steps": state.max_steps,
                 "step_time": step_time_cost,
+                "skipped_steps": state.skipped_steps,
+                "consecutive_skipped_steps": state.consecutive_skipped_steps,
             }
             self._save_monitor_data(log_info)
             self._print_log(log_info)
@@ -261,6 +263,8 @@ class LossCallback(TrainerCallback):
             "mtp_loss_values": mtp_loss_values,
             "indexer_loss": self._to_float(indexer_loss)
         }
+        log_info["skipped_steps"] = state.skipped_steps
+        log_info["consecutive_skipped_steps"] = state.consecutive_skipped_steps
 
         self._save_monitor_data(log_info)
 
@@ -307,6 +311,9 @@ class LossCallback(TrainerCallback):
                 f"per_step_time: {log_info.get('step_time'):6d}ms",
             ]
 
+        log_parts.append(f"skipped_steps: {log_info.get('skipped_steps', 0)}")
+        log_parts.append(f"consecutive_skipped_steps: {log_info.get('consecutive_skipped_steps', 0)}")
+
         load_balancing_loss = log_info.get("load_balancing_loss")
         if load_balancing_loss is not None:
             log_parts.append(f"load_balancing_loss: {load_balancing_loss:10.6f}")
@@ -351,6 +358,8 @@ class LossCallback(TrainerCallback):
             "learning-rate": log_info.get("learning_rate"),
             "batch-size": log_info.get("global_batch_size"),
             "indexer-loss": log_info.get("indexer_loss"),
+            "skipped-steps": log_info.get("skipped_steps"),
+            "consecutive-skipped-steps": log_info.get("consecutive_skipped_steps"),
         }
         metric_mapping.update(log_info.get("mtp_loss_values") or {})
         for name, value in metric_mapping.items():

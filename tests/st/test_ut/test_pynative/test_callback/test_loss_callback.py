@@ -45,6 +45,8 @@ class TestLossCallback:
         self.state.global_batch_size = 2
         self.state.loss_scale = 1024.0
         self.state.total_flops = 0
+        self.state.skipped_steps = 7
+        self.state.consecutive_skipped_steps = 2
         yield
         reset_monitor_data_tracker()
 
@@ -133,6 +135,8 @@ class TestLossCallback:
         call_args = mock_logger.info.call_args[0][0]
         assert "loss: N/A" in call_args
         assert "non-last PP stage" in call_args
+        assert "skipped_steps: 7" in call_args
+        assert "consecutive_skipped_steps: 2" in call_args
 
         # Case 3: Normal logging
         self.callback.step_time = time.time() - 0.1
@@ -155,7 +159,10 @@ class TestLossCallback:
         assert "grad_norm:   0.500000" in call_args
         assert "lr: 1.000000e-02" in call_args
         assert "throughput:" in call_args
+        assert "skipped_steps: 7" in call_args
+        assert "consecutive_skipped_steps: 2" in call_args
         assert get_monitor_data_tracker().data["loss-scale"] == 1024.0
+        assert get_monitor_data_tracker().data["skipped-steps"] == 7
 
     @patch("mindformers.pynative.callback.loss_callback.logger")
     @patch("mindformers.pynative.callback.loss_callback.get_world_size")
