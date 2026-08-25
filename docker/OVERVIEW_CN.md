@@ -23,15 +23,17 @@ MindSpore Transformers套件的目标是构建一个大模型预训练、微调�
 Tag 遵循以下格式：
 
 ```text
-<MindSpore Transformers 版本号>-<硬件信息（芯片）>-<操作系统>-<Python 版本>
+<MindSpore Transformers 版本号>-cann-<CANN 版本号>-mindspore<MindSpore 版本号>-<硬件信息（芯片）>-<操作系统>-<Python 版本>
 ```
 
 | 字段                         | 取值                           | 说明                                        |
 |----------------------------|------------------------------|-------------------------------------------|
-| MindSpore Transformers 版本号 | 1.9.0                        | 对应 MindSpore Transformers 官方发布 Tag 中的版本标识 |
+| MindSpore Transformers 版本号 | 2.0.0                        | 对应 MindSpore Transformers 官方发布 Tag 中的版本标识 |
+| CANN 版本号                   | 9.1.0                        | 镜像内置 CANN 版本号                            |
+| MindSpore 版本号              | 2.10.0                       | 镜像内置 MindSpore 版本号                       |
 | 硬件信息（芯片）                   | 910b / a3                    | 昇腾芯片型号标识                                  |
 | 操作系统                       | ubuntu22.04 / openeuler24.03 | 基础镜像所使用的操作系统发行版及版本号                       |
-| Python 版本                  | py3.11                       | 镜像内置 Python 大版本号                          |
+| Python 版本                  | py3.12                       | 镜像内置 Python 大版本号                          |
 
 > Tips: 系统架构通过 Docker Manifest 自动识别，无需在 Tag 中指定。
 
@@ -39,10 +41,10 @@ Tag 遵循以下格式：
 
 ### Tag
 
-- `1.9.0-910b-ubuntu22.04-py3.11`
-- `1.9.0-910b-openeuler24.03-py3.11`
-- `1.9.0-a3-ubuntu22.04-py3.11`
-- `1.9.0-a3-openeuler24.03-py3.11`
+- `2.0.0-cann-9.1.0-mindspore2.10.0-910b-ubuntu22.04-py3.12`
+- `2.0.0-cann-9.1.0-mindspore2.10.0-910b-openeuler24.03-py3.12`
+- `2.0.0-cann-9.1.0-mindspore2.10.0-a3-ubuntu22.04-py3.12`
+- `2.0.0-cann-9.1.0-mindspore2.10.0-a3-openeuler24.03-py3.12`
 
 ### 镜像仓库地址
 
@@ -55,7 +57,7 @@ swr.cn-south-1.myhuaweicloud.com/ascendhub/mindformers
 **完整镜像示例：**
 
 ```text
-swr.cn-south-1.myhuaweicloud.com/ascendhub/mindformers:1.9.0-910b-ubuntu22.04-py3.11
+swr.cn-south-1.myhuaweicloud.com/ascendhub/mindformers:2.0.0-cann-9.1.0-mindspore2.10.0-910b-ubuntu22.04-py3.12
 ```
 
 ### 构建参数
@@ -64,12 +66,12 @@ dockerfile详见：[dockerfile](https://gitcode.com/mindspore/mindformers/blob/m
 
 | 参数                  | 说明                         | 必填 | 参考来源                         | 取值                                                     |
 |---------------------|----------------------------|----|------------------------------|--------------------------------------------------------|
-| CANN_VERSION        | 昇腾 CANN 工具包版本              | 是  | CANN 镜像标签                    | 9.0.0                                                  |
+| CANN_VERSION        | 昇腾 CANN 工具包版本              | 是  | CANN 镜像标签                    | 9.1.0                                                  |
 | CHIP_ARCH           | 昇腾芯片架构标识                   | 是  | Tag 规范                       | 910b / a3                                              |
 | OS_SYSTEM           | 基础镜像操作系统及版本                | 是  | Tag 规范                       | ubuntu22.04 / openeuler24.03                           |
-| PY_VERSION          | 基础镜像内置 Python 版本           | 是  | Tag 规范                       | py3.11                                                 |
-| MINDSPORE_VERSION   | MindSpore 版本号              | 是  | MindSpore 仓库发行版              | 2.9.0                                                  |
-| MINDFORMERS_VERSION | MindSpore Transformers 版本号 | 是  | MindSpore Transformers 仓库发行版 | 1.9.0                                                  |
+| PY_VERSION          | 基础镜像内置 Python 版本           | 是  | Tag 规范                       | py3.12                                                 |
+| MINDSPORE_VERSION   | MindSpore 版本号              | 是  | MindSpore 仓库发行版              | 2.10.0                                                 |
+| MINDFORMERS_VERSION | MindSpore Transformers 版本号 | 是  | MindSpore Transformers 仓库发行版 | 2.0.0                                                  |
 | PIP_INDEX_URL       | pip 安装源地址（默认华为云源）          | 否  | PyPI 镜像源                     | https://mirrors.huaweicloud.com/repository/pypi/simple |
 
 ## 快速开始
@@ -78,14 +80,14 @@ dockerfile详见：[dockerfile](https://gitcode.com/mindspore/mindformers/blob/m
 
 ```bash
 docker build \
---build-arg CANN_VERSION=9.0.0 \
+--build-arg CANN_VERSION=9.1.0 \
 --build-arg CHIP_ARCH=910b \
 --build-arg OS_SYSTEM=ubuntu22.04 \
---build-arg PY_VERSION=py3.11 \
---build-arg MINDSPORE_VERSION=2.9.0 \
---build-arg MINDFORMERS_VERSION=1.9.0 \
+--build-arg PY_VERSION=py3.12 \
+--build-arg MINDSPORE_VERSION=2.10.0 \
+--build-arg MINDFORMERS_VERSION=2.0.0 \
 --build-arg PIP_INDEX_URL=https://mirrors.huaweicloud.com/repository/pypi/simple \
--t mindformers:1.9.0-910b-ubuntu22.04-py3.11 \
+-t mindformers:2.0.0-cann-9.1.0-mindspore2.10.0-910b-ubuntu22.04-py3.12 \
 -f Dockerfile .
 ```
 
@@ -128,6 +130,10 @@ docker run \
 | 昇腾 A3   | Atlas 800T A3                    | 自动识别 (ARM64/x86_64)   |
 
 > Tips: 使用 `docker manifest inspect` 命令可以查看镜像支持的系统架构。
+
+## 镜像使用责任说明
+
+发布的昇腾软件镜像均是社区版本，不对商业负责，仅作为生产实践的参考，责任说明在镜像启动信息和昇腾镜像平台展示。
 
 ## 许可证
 

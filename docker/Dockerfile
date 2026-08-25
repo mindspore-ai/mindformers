@@ -27,5 +27,7 @@ RUN pip3 install wheel \
 # install mindspore pkg
 ARG MINDSPORE_VERSION
 RUN pip3 install --no-cache-dir mindspore==${MINDSPORE_VERSION} -i https://repo.mindspore.cn/pypi/simple --trusted-host repo.mindspore.cn --extra-index-url ${PIP_INDEX_URL}
+ARG HYPER_PARALLEL_VERSION
+RUN pip3 install --no-cache-dir hyper-parallel==${HYPER_PARALLEL_VERSION} -i https://repo.mindspore.cn/pypi/simple --trusted-host repo.mindspore.cn --extra-index-url ${PIP_INDEX_URL}
 ARG MINDFORMERS_VERSION
 RUN pip3 install --no-cache-dir mindformers==${MINDFORMERS_VERSION}

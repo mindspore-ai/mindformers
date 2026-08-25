@@ -23,28 +23,30 @@ The MindSpore Transformers suite aims to build a comprehensive development toolk
 Tags follow this format:
 
 ```text
- <MindSpore Transformers Version>-<Hardware Info (Chip)>-<Operating System>-<Python Version>
+<MindSpore Transformers Version>-cann-<CANN Version>-mindspore<MindSpore Version>-<Hardware Info (Chip)>-<Operating System>-<Python Version>
 ```
 
 | Field                          | Values                       | Description                                                                           |
 |--------------------------------|------------------------------|---------------------------------------------------------------------------------------|
-| MindSpore Transformers Version | 1.9.0                        | Corresponds to the version identifier in MindSpore Transformers official release tags |
-| Hardware Info (Chip)           | 910b / a3                    | Ascend chip model identifier                                                          |
+| MindSpore Transformers Version | 2.0.0                        | Corresponds to the version identifier in MindSpore Transformers official release tags |
+| CANN Version                    | 9.1.0                        | CANN version built into the image                                                      |
+| MindSpore Version               | 2.10.0                       | MindSpore version built into the image                                                 |
+| Hardware Info (Chip)           | 910b / a3                    | NPU chip model identifier                                                             |
 | Operating System               | ubuntu22.04 / openeuler24.03 | Operating system distribution and version used in the base image                      |
-| Python Version                 | py3.11                       | Major Python version built into the image                                             |
+| Python Version                 | py3.12                       | Major Python version built into the image                                             |
 
 > Tips: System architecture is automatically detected via Docker Manifest, no need to specify in the tag.
 
 ### Available Tags
 
-- `1.9.0-910b-ubuntu22.04-py3.11`
-- `1.9.0-910b-openeuler24.03-py3.11`
-- `1.9.0-a3-ubuntu22.04-py3.11`
-- `1.9.0-a3-openeuler24.03-py3.11`
+- `2.0.0-cann-9.1.0-mindspore2.10.0-910b-ubuntu22.04-py3.12`
+- `2.0.0-cann-9.1.0-mindspore2.10.0-910b-openeuler24.03-py3.12`
+- `2.0.0-cann-9.1.0-mindspore2.10.0-a3-ubuntu22.04-py3.12`
+- `2.0.0-cann-9.1.0-mindspore2.10.0-a3-openeuler24.03-py3.12`
 
 ### Image Repository Address
 
-MindSpore Transformers Ascend images are hosted on Huawei Cloud SWR image repository:
+MindSpore Transformers images are hosted on the Huawei Cloud SWR image repository:
 
 ```text
 swr.cn-south-1.myhuaweicloud.com/ascendhub/mindformers
@@ -53,7 +55,7 @@ swr.cn-south-1.myhuaweicloud.com/ascendhub/mindformers
 **Full Image Example：**
 
 ```text
-swr.cn-south-1.myhuaweicloud.com/ascendhub/mindformers:1.9.0-910b-ubuntu22.04-py3.11
+swr.cn-south-1.myhuaweicloud.com/ascendhub/mindformers:2.0.0-cann-9.1.0-mindspore2.10.0-910b-ubuntu22.04-py3.12
 ```
 
 ### 构建参数
@@ -62,12 +64,12 @@ See dockerfile: [dockerfile](https://gitcode.com/mindspore/mindformers/blob/mast
 
 | Parameter                      | Description                                                | Required | Source                        | Values                                                 |
 |--------------------------------|------------------------------------------------------------|----------|-------------------------------|--------------------------------------------------------|
-| CANN_VERSION                   | Ascend CANN toolkit version                                | Yes      | CANN image tag                | 9.0.0                                                  |
-| CHIP_ARCH                      | Ascend chip architecture identifier                        | Yes      | Tag specification             | 910b / a3                                              |
+| CANN_VERSION                   | CANN toolkit version                                       | Yes      | CANN image tag                | 9.1.0                                                  |
+| CHIP_ARCH                      | NPU chip architecture identifier                           | Yes      | Tag specification             | 910b / a3                                              |
 | OS_SYSTEM                      | Base image operating system and version                    | Yes      | Tag specification             | ubuntu22.04 / openeuler24.03                           |
-| PY_VERSION                     | Python version built into the base image                   | Yes      | Tag specification             | py3.11                                                 |
-| MINDSPORE_VERSION              | MindSpore version number                                   | Yes      | MindSpore repository releases | 2.9.0                                                  |
-| MINDFORMERS_VERSION | MindSpore Transformers version number                                   | Yes      | MindSpore Transformers repository releases | 1.9.0                                                  |
+| PY_VERSION                     | Python version built into the base image                   | Yes      | Tag specification             | py3.12                                                 |
+| MINDSPORE_VERSION              | MindSpore version number                                   | Yes      | MindSpore repository releases | 2.10.0                                                 |
+| MINDFORMERS_VERSION | MindSpore Transformers version number                                   | Yes      | MindSpore Transformers repository releases | 2.0.0                                                  |
 | PIP_INDEX_URL                  | pip installation source URL (default: Huawei Cloud mirror) | No       | PyPI mirror source            | https://mirrors.huaweicloud.com/repository/pypi/simple |
 
 ## Quick Start
@@ -76,14 +78,14 @@ See dockerfile: [dockerfile](https://gitcode.com/mindspore/mindformers/blob/mast
 
 ```bash
 docker build \
---build-arg CANN_VERSION=9.0.0 \
+--build-arg CANN_VERSION=9.1.0 \
 --build-arg CHIP_ARCH=910b \
 --build-arg OS_SYSTEM=ubuntu22.04 \
---build-arg PY_VERSION=py3.11 \
---build-arg MINDSPORE_VERSION=2.9.0 \
---build-arg MINDFORMERS_VERSION=1.9.0 \
+--build-arg PY_VERSION=py3.12 \
+--build-arg MINDSPORE_VERSION=2.10.0 \
+--build-arg MINDFORMERS_VERSION=2.0.0 \
 --build-arg PIP_INDEX_URL=https://mirrors.huaweicloud.com/repository/pypi/simple \
--t mindformers:1.9.0-910b-ubuntu22.04-py3.11 \
+-t mindformers:2.0.0-cann-9.1.0-mindspore2.10.0-910b-ubuntu22.04-py3.12 \
 -f Dockerfile .
 ```
 
@@ -113,7 +115,7 @@ When running MindSpore Transformers in Docker containers, pay attention to the f
   Containers run as the root user by default, which may introduce security risks. It is recommended to create and use a non-privileged user in production environments.
 
 - **Running with `--privileged` mode**:  
-  To ensure Ascend NPU functionality works properly, the container may require the `--privileged` option. This mode grants the container elevated access to host devices and system resources, increasing potential security risks. It is recommended to use it only in trusted environments and reduce risks through device whitelisting, resource limits, and network isolation.
+  To ensure NPU functionality works properly, the container may require the `--privileged` option. This mode grants the container elevated access to host devices and system resources, increasing potential security risks. It is recommended to use it only in trusted environments and reduce risks through device whitelisting, resource limits, and network isolation.
 
 - **Missing CPU and memory resource limits**:  
   Without resource limits, containers may consume excessive system resources and impact host performance. It is recommended to use the `--cpus` and `--memory` options to limit resource usage.
@@ -122,10 +124,14 @@ When running MindSpore Transformers in Docker containers, pay attention to the f
 
 | Chip Series | Product Examples                | Architecture                  |
 |-------------|---------------------------------|-------------------------------|
-| Ascend 910B | Atlas 800T A2, Atlas 900 A2 PoD | Auto-detected (ARM64/x86_64)  |
-| Ascend A3   | Atlas 800T A3                   | Auto-detected (ARM64/x86_64)  |
+| 910B        | Atlas 800T A2, Atlas 900 A2 PoD | Auto-detected (ARM64/x86_64)  |
+| A3          | Atlas 800T A3                   | Auto-detected (ARM64/x86_64)  |
 
 > Tips: Use the `docker manifest inspect` command to view the system architectures supported by an image.
+
+## Image Usage Responsibility Statement
+
+The released software images are community editions and are not intended for commercial use. They are provided solely as references for production practices. The responsibility statement is displayed in the image startup information and on the image hosting platform.
 
 ## License
 
