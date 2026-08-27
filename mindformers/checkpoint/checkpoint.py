@@ -31,11 +31,6 @@ from mindspore.nn.optim.optimizer import Optimizer
 from mindspore.mint import distributed as dist
 from mindspore import save_checkpoint as ms_save_checkpoint
 
-try:
-    from hyper_parallel.core.distributed_checkpoint import get_global_layout
-except ImportError as e:
-    get_global_layout = None
-
 from mindformers.checkpoint.layout_adapter import LayoutAdapter
 from mindformers.tools.logger import logger
 from mindformers.checkpoint.reshard import ReshardLoader
@@ -45,7 +40,7 @@ from mindformers.tools.utils import (
     get_output_subpath,
     get_real_rank,
     set_safe_mode_for_file_or_dir,
-    get_real_group_size
+    get_real_group_size,
 )
 from mindformers.checkpoint.utils import (
     get_checkpoint_iter_dir,
@@ -59,7 +54,11 @@ from mindformers.checkpoint.utils import (
     FileType,
     get_core_network
 )
-from mindformers.checkpoint.fully_parallel import BalancedSaveStrategy, apply_balance_shard_strategy
+from mindformers.checkpoint.fully_parallel import (
+    BalancedSaveStrategy,
+    build_balanced_shard_plan,
+    save_balanced_metadata
+)
 from mindformers.checkpoint.metadata import (
     save_metadata,
     get_total_params_file_mapping_info,
@@ -67,9 +66,7 @@ from mindformers.checkpoint.metadata import (
 )
 from mindformers.checkpoint.sharded_tensor import (
     get_sharded_tensor_from_cell,
-    get_cur_sharded_tensor,
-    get_cur_sharded_tensor_after_balanced,
-    get_param_redundancy_after_balanced
+    get_cur_sharded_tensor
 )
 from mindformers.checkpoint.broadcast import single_parameter_broadcast
 
@@ -276,7 +273,8 @@ def save_checkpoint(iteration: int, network: Union[Cell, List[Cell]], optimizer:
                     async_save_manager: AsyncSaveManager = None, common_info: CommonInfo = None,
                     keep_max_num: int = 5, user_prefix: str = None, save_checkpoint_path: str = None,
                     sharded_tensor_metas: Dict = None, remove_redundancy: bool = False,
-                    current_ckpt_step_list: List[int] = None):
+                    current_ckpt_step_list: List[str] = None, balanced_plan_cache: Dict = None,
+                    global_model_keys=None):
     """
     Saves the current state of the training process,
         including the model, optimizer, and learning rate scheduler, to a checkpoint file.
@@ -292,11 +290,34 @@ def save_checkpoint(iteration: int, network: Union[Cell, List[Cell]], optimizer:
         save_checkpoint_path (str): The user can specify the path to save the weights.
             If None, the default path is 'output_dir/checkpoint'.
             And 'output_dir' is configured in yaml and defaults to './output' in the execution script path.
-        sharded_tensor_metas (Dict): The ShardedTensor metas of this network.
+        sharded_tensor_metas (Dict): The global ShardedTensor metadata of the network and
+            optimizer parameters combined, keyed by rank ID. Only rank 0 needs the real
+            metadata (used to write 'metadata.json'); all other ranks should pass None.
+            In PyNative multi-rank scenarios with `remove_redundancy=True`, this is mandatory
+            on rank 0: rank 0 derives the balanced shard distribution from it, and it should
+            be fetched and cached once via `get_all_sharded_tensor_on_rank0` before saving.
         remove_redundancy (bool): Whether to remove redundancy of saving checkpoint.
         current_ckpt_step_list (list): List of checkpoint step numbers saved during the current training round.
+        balanced_plan_cache (Dict): Optional caller-owned dictionary caching the balanced
+            shard plans across saves (keyed by file type). The parallel layout is static
+            during training, so once the plans are built at the first save, subsequent saves
+            reuse them directly without any collective communication. Only used with
+            `remove_redundancy=True`. Defaults to None (plans are rebuilt at every save).
+        global_model_keys: The global union of model parameter names, held on rank 0 only
+            (None on all other ranks). Mandatory on rank 0 in PyNative multi-rank scenarios,
+            where it distinguishes model shards from optimizer shards. It should be fetched
+            and cached once by the caller via `gather_param_names_on_rank0` before saving.
+            In Graph mode (or single-rank jobs) it is derived locally and this argument is
+            ignored.
     """
-    logger.info('....... Start to save checkpoint as new format .......')
+    logger.info('...... Start to save checkpoint ......')
+    start_save_ckpt_time = time()
+    is_pynative_mode = LayoutAdapter.is_pynative_mode()
+
+    if remove_redundancy and get_real_group_size() == 1:
+        remove_redundancy = False
+        logger.warning("The 'remove_redundancy' feature is not supported in single rank.")
+
     if current_ckpt_step_list is None:
         current_ckpt_step_list = []
 
@@ -352,93 +373,118 @@ def save_checkpoint(iteration: int, network: Union[Cell, List[Cell]], optimizer:
         if get_real_rank() == 0:
             async_save_manager.add_finalize_fn(iter_finalize_func)
 
-
     barrier_world("Rank_0 checking saved weights iteration num...")
 
-    # Save model weight.
-    logger.info("....... Start to save model weight .......")
-    if LayoutAdapter.is_pynative_mode() and get_real_group_size() > 1:
-        if get_global_layout is None:
-            raise ImportError("hyper_parallel is required for PyNative mode. Please install it.")
-        # Get global model keys.
-        network = network if isinstance(network, list) else [network]
-        model_keys = set()
-        for net in network:
-            global_layout_dict = get_global_layout(net)
-            for _, val in global_layout_dict.items():
-                model_keys.update(val.keys())
-    elif LayoutAdapter.is_pynative_mode():
-        network = network if isinstance(network, list) else [network]
-        model_keys = network[0].parameters_dict().keys()
+    # The local model parameter names are available on every rank without any collective
+    # communication and drive the per-side parameter filters below. Only rank 0 additionally
+    # needs the global union of model parameter names to split the cached global ShardedTensor
+    # metadata into the model side and the optimizer side (under pipeline parallelism
+    # different ranks hold different parameters); in PyNative multi-rank scenarios it is
+    # fetched once and cached by the caller, so no per-save gather happens here.
+    network = network if isinstance(network, list) else [network]
+    model_keys = set()
+    for net in network:
+        model_keys.update(net.parameters_dict().keys())
+    if is_pynative_mode and get_real_group_size() > 1:
+        if get_real_rank() == 0 and global_model_keys is None:
+            raise ValueError(
+                "In PyNative multi-rank scenarios, `global_model_keys` (the global union of "
+                "model parameter names) is required on rank 0. Please fetch and cache it once "
+                "via `gather_param_names_on_rank0` before calling `save_checkpoint`."
+            )
     else:
-        model_keys = network.parameters_dict().keys()
-    start_save_ckpt_time = time()
+        # Graph mode (or single-rank jobs): the full network is defined on every rank,
+        # so the local parameter names are already the global ones.
+        global_model_keys = model_keys
 
-    if remove_redundancy and sharded_tensor_metas is not None:
-        remove_model_redundancy = BalancedSaveStrategy(
-            network,
-            user_prefix=user_prefix,
-            checkpoint_path=checkpoints_root_path,
-            filter_func=lambda x: x in list(model_keys),
-            file_type=FileType.MODEL
-        )
-        remove_model_redundancy.save(iteration)
-    else:
-        model_ckpt_filename = get_checkpoint_name(
-            cur_iter_checkpoint_dir, user_prefix, get_real_rank(), get_real_group_size(), FileType.MODEL
-        )
-        ms_save_checkpoint(
-            LayoutAdapter.preprocess_params(network),
-            model_ckpt_filename,
-            async_save=use_async_save,
-            format="safetensors"
-        )
-        logger.info(f"Model checkpoint successfully saved at '{model_ckpt_filename}.safetensors'.")
+    model_sharded_tensor_metas = None
+    optimizer_sharded_tensor_metas = None
+    if remove_redundancy and get_real_rank() == 0:
+        if sharded_tensor_metas is None:
+            raise ValueError(
+                "Remove_redundancy saving requires `sharded_tensor_metas` "
+                "(the global ShardedTensor metadata of network and optimizer parameters, "
+                "held on rank 0). Please fetch and cache it once via "
+                "`get_all_sharded_tensor_on_rank0` before calling `save_checkpoint`."
+            )
 
-    # Save optimizer weight.
-    logger.info("....... Start to save optimizer weight .......")
-    if optimizer is not None:
-        if remove_redundancy and sharded_tensor_metas is not None:
-            # Optimizer weight remove redundancy.
-            remove_optimizer_redundancy = BalancedSaveStrategy(
-                optimizer,
+        model_sharded_tensor_metas = {
+            rank_id: {name: meta for name, meta in metas.items() if name in global_model_keys}
+            for rank_id, metas in sharded_tensor_metas.items()
+        }
+        if optimizer is not None:
+            optimizer_sharded_tensor_metas = {
+                rank_id: {name: meta for name, meta in metas.items() if name not in global_model_keys}
+                for rank_id, metas in sharded_tensor_metas.items()
+            }
+
+    def save_network(net, file_type, side_sharded_tensor_metas, filter_func, choice_func=None):
+        """Save one side (model or optimizer) of the checkpoint.
+
+        Returns the BalancedShardPlan when saving with redundancy removal, otherwise None.
+        """
+        if remove_redundancy:
+            balanced_save_strategy = BalancedSaveStrategy(
+                net,
                 user_prefix=user_prefix,
                 checkpoint_path=checkpoints_root_path,
-                filter_func=lambda x: x not in list(model_keys),
-                file_type=FileType.OPTIMIZER
+                filter_func=filter_func,
+                file_type=file_type,
+                global_sharded_tensor_metas=side_sharded_tensor_metas,
+                plan_cache=balanced_plan_cache
             )
-            remove_optimizer_redundancy.save(iteration)
-        else:
-            # Optimizer weight has redundancy.
-            optimizer_ckpt_filename = get_checkpoint_name(
-                cur_iter_checkpoint_dir, user_prefix, get_real_rank(), get_real_group_size(), FileType.OPTIMIZER
-            )
-            ms_save_checkpoint(
-                LayoutAdapter.preprocess_params(optimizer),
-                optimizer_ckpt_filename,
-                async_save=use_async_save,
-                format="safetensors",
-                choice_func=lambda x: x not in list(model_keys)
-            )
-            logger.info(f"Optimizer checkpoint successfully saved at '{optimizer_ckpt_filename}.safetensors'.")
+            return balanced_save_strategy.save(iteration, async_save=use_async_save)
+
+        save_name = get_checkpoint_name(
+            cur_iter_checkpoint_dir, user_prefix, get_real_rank(), get_real_group_size(), file_type
+        )
+        start_save_network_time = time()
+        ms_save_checkpoint(
+            LayoutAdapter.preprocess_params(net),
+            save_name,
+            async_save=use_async_save,
+            format="safetensors",
+            choice_func=choice_func
+        )
+        logger.info(f"{file_type.value} checkpoint successfully saved at '{save_name}.safetensors'. "
+                    f"Save time: {time() - start_save_network_time:.4f} seconds.")
+        return None
+
+    logger.info("....... Start saving model weight .......")
+    model_save_plan = save_network(network, FileType.MODEL, model_sharded_tensor_metas,
+                                   filter_func=lambda x: x in model_keys)
+
+    if optimizer is not None:
+        logger.info("....... Start saving optimizer weight .......")
+        optim_save_plan = save_network(optimizer, FileType.OPTIMIZER, optimizer_sharded_tensor_metas,
+                                       filter_func=lambda x: x not in model_keys,
+                                       choice_func=lambda x: x not in list(model_keys))
     else:
+        optim_save_plan = None
         logger.warning("Optimizer weight will not be save!")
 
-    # Save 'common.json'.
+    # Save 'common.json' (rank 0 only).
     if get_real_rank() == 0:
         logger.info("...... Start saving common info ......")
-        start_save_common_info_time = time()
-
         common_filename = get_common_filename(checkpoints_root_path, iteration)
         common_info.save_common(common_filename)
 
-        logger.info(f"The 'common.json' is saved at '{common_filename}'.")
-        logger.info(f"Save common info cost time: {time() - start_save_common_info_time:.3f}s.")
-
-    # Save 'metadata.json'.
-    if not remove_redundancy:
+    # Save 'metadata.json'. Written by rank 0 only, but all ranks must call these functions:
+    # `save_metadata_json` contains a world barrier in multi-rank jobs.
+    logger.info("....... Start saving metadata.json .......")
+    if remove_redundancy:
+        # Balanced saving: rank 0 writes one combined 'metadata.json' covering the model
+        # and optimizer shards, reusing the cached global ShardedTensor metadata and the
+        # full assignments of both plans (no collective communication).
+        balanced_plans = [(model_save_plan, FileType.MODEL)]
+        if optimizer is not None:
+            balanced_plans.append((optim_save_plan, FileType.OPTIMIZER))
+        save_balanced_metadata(
+            checkpoints_root_path, iteration, user_prefix, balanced_plans, sharded_tensor_metas
+        )
+    else:
         metadata_file_path = get_metadata_filename(checkpoints_root_path, iteration)
-        save_metadata_json(sharded_tensor_metas, model_keys, user_prefix, metadata_file_path)
+        save_metadata_json(sharded_tensor_metas, global_model_keys, user_prefix, metadata_file_path)
 
     # Save tracker file in sync save process.
     if not use_async_save:
@@ -455,18 +501,28 @@ def save_checkpoint(iteration: int, network: Union[Cell, List[Cell]], optimizer:
 
 
 def save_metadata_json(sharded_tensor_metas, model_keys, user_prefix, metadata_file_path):
-    """Saving metadata.json used `get_strategy_metadata` API."""
-    if sharded_tensor_metas is not None:
-        logger.info("...... Start saving metadata ......")
-        if get_real_rank() == 0:
+    """
+    Save 'metadata.json' for the checkpoint of the current iteration.
+
+    Only rank 0 needs `sharded_tensor_metas` and `model_keys`; all other ranks may pass None
+    for them. The barrier below is executed by all ranks unconditionally in multi-rank jobs,
+    keeping the collective communication consistent even though only rank 0 writes the file.
+    """
+    if get_real_group_size() == 1 and sharded_tensor_metas is None:
+        logger.info("No need to save metadata.json for single card.")
+        return
+
+    if get_real_rank() == 0:
+        if sharded_tensor_metas is None:
+            logger.warning("Skip saving 'metadata.json' because rank 0 has no sharded tensor metas.")
+        else:
             param_file_mappings = get_total_params_file_mapping_info(sharded_tensor_metas, user_prefix, model_keys)
             save_metadata(sharded_tensor_metas, param_file_mappings, metadata_file_path)
 
-        # Barrier here to ensure 'metadata.json' saved, then continue training.
+    # Barrier here to ensure 'metadata.json' saved, then continue training.
+    if get_real_group_size() > 1:
         barrier_world("Rank_0 is saving 'metadata.json' ...")
-        logger.info(f"The 'metadata.json' saved successfully at '{metadata_file_path}'.")
-    else:
-        logger.info("No need to save metadata.json for single card.")
+    logger.info(f"The 'metadata.json' saved successfully at '{metadata_file_path}'.")
 
 
 def load_checkpoint(
@@ -517,9 +573,9 @@ def load_checkpoint(
     param_redundancy = None
     logger.info("..........Get Metadata of Network..........")
     if balanced_load:
-        rank_id_to_sharded_tensors = apply_balance_shard_strategy(network, filter_func)
-        dst_sharded_tensor_metas = get_cur_sharded_tensor_after_balanced(rank_id_to_sharded_tensors)
-        param_redundancy = get_param_redundancy_after_balanced(rank_id_to_sharded_tensors)
+        balanced_plan = build_balanced_shard_plan(network, filter_func)
+        dst_sharded_tensor_metas = balanced_plan.cur_rank_sharded_tensors
+        param_redundancy = balanced_plan.param_redundancy
     else:
         dst_sharded_tensor_metas = get_cur_sharded_tensor(network, filter_func) \
             if get_real_group_size() > 1 else get_sharded_tensor_from_cell(network, optimizer)
@@ -622,9 +678,9 @@ def load_hf_checkpoint(
     param_redundancy = None
     logger.info("..........Get Metadata of Network..........")
     if balanced_load:
-        rank_id_to_sharded_tensors = apply_balance_shard_strategy(network, filter_func)
-        dst_sharded_tensor_metas = get_cur_sharded_tensor_after_balanced(rank_id_to_sharded_tensors)
-        param_redundancy = get_param_redundancy_after_balanced(rank_id_to_sharded_tensors)
+        balanced_plan = build_balanced_shard_plan(network, filter_func)
+        dst_sharded_tensor_metas = balanced_plan.cur_rank_sharded_tensors
+        param_redundancy = balanced_plan.param_redundancy
     else:
         dst_sharded_tensor_metas = get_cur_sharded_tensor(network, filter_func) \
             if get_real_group_size() > 1 else get_sharded_tensor_from_cell(network)
@@ -745,11 +801,11 @@ def load_parameters(
         state_dict_opt (Optional[Dict[str, Parameter]]): Optional dictionary containing optimizer parameters to load.
             Initialized as an empty dict if not provided.
         balanced_load (Optional[bool]): Whether to enable balanced loading with redundant parameter elimination.
-            When True, uses `apply_balance_shard_strategy` to identify redundant parameters and
+            When True, uses `build_balanced_shard_plan` to identify redundant parameters and
             `single_parameter_broadcast` to synchronize values across ranks. Defaults to False.
         param_redundancy (Optional[Dict[Tuple[int, ...], List[str]]]): Precomputed mapping of redundant rank groups
             (tuples of rank IDs) to lists of parameter keys. Only used if `balanced_load` is True; if not provided,
-            generated dynamically via `apply_balance_shard_strategy`. Defaults to None.
+            generated dynamically via `build_balanced_shard_plan`. Defaults to None.
 
     Raises:
         ValueError: If `network` is not a valid MindSpore Cell, `state_dict` is invalid (e.g., not a dict),
@@ -781,8 +837,7 @@ def load_parameters(
 
     # Separate network and optimizer parameters
     if balanced_load and param_redundancy is None:
-        rank_id_to_sharded_tensors = apply_balance_shard_strategy(network)
-        param_redundancy = get_param_redundancy_after_balanced(rank_id_to_sharded_tensors)
+        param_redundancy = build_balanced_shard_plan(network).param_redundancy
 
     network_param_names, _, state_dict, state_dict_opt = \
         split_state_dict(network, state_dict, optimizer, state_dict_opt)
