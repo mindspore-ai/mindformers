@@ -23,6 +23,7 @@ from mindspore import nn
 from mindformers.checkpoint.utils import FileType
 from mindformers.checkpoint.fully_parallel import (
     BalancedSaveStrategy,
+    BalancedShardPlan,
     distribute_shards,
     apply_balance_shard_strategy
 )
@@ -54,6 +55,21 @@ def mock_get_all_sharded_tensor():
     mock_shard_tensor3 = MockShardTensor("param3", (0,), (10,), "float32")
 
     with patch("mindformers.checkpoint.fully_parallel.get_all_sharded_tensor") as mock:
+        mock.return_value = {
+            0: {"param1": mock_shard_tensor1, "param2": mock_shard_tensor2},
+            1: {"param3": mock_shard_tensor3}
+        }
+        yield mock
+
+
+@pytest.fixture
+def mock_get_all_sharded_tensor_on_rank0():
+    """Mock get_all_sharded_tensor_on_rank0 function"""
+    mock_shard_tensor1 = MockShardTensor("param1", (0,), (10,), "float32")
+    mock_shard_tensor2 = MockShardTensor("param2", (10,), (10,), "float32")
+    mock_shard_tensor3 = MockShardTensor("param3", (0,), (10,), "float32")
+
+    with patch("mindformers.checkpoint.fully_parallel.get_all_sharded_tensor_on_rank0") as mock:
         mock.return_value = {
             0: {"param1": mock_shard_tensor1, "param2": mock_shard_tensor2},
             1: {"param3": mock_shard_tensor3}
@@ -104,14 +120,6 @@ def mock_get_checkpoint_iter_dir():
 def mock_save_metadata():
     """Mock save_metadata function"""
     with patch("mindformers.checkpoint.fully_parallel.save_metadata") as mock:
-        yield mock
-
-
-@pytest.fixture
-def mock_load_metadata():
-    """Mock load_metadata function"""
-    with patch("mindformers.checkpoint.fully_parallel.load_metadata") as mock:
-        mock.return_value = ({}, {})
         yield mock
 
 
@@ -267,7 +275,7 @@ def test_balanced_save_strategy_apply_saving_parallelization(
     """
     Feature: BalancedSaveStrategy.apply_saving_parallelization method
     Description: Test apply_saving_parallelization method without cache
-    Expectation: Return a tuple of two dictionaries: shared_distribution and id_to_tensor
+    Expectation: Return a BalancedShardPlan with the current rank's shard assignment
     """
     strategy = BalancedSaveStrategy(
         network=mock_network,
@@ -276,7 +284,9 @@ def test_balanced_save_strategy_apply_saving_parallelization(
 
     result = strategy.apply_saving_parallelization()
 
-    assert isinstance(result, dict)
+    assert isinstance(result, BalancedShardPlan)
+    assert isinstance(result.cur_rank_shards, dict)
+    assert result.total_files_num >= 0
 
 
 @pytest.mark.level0
@@ -361,13 +371,15 @@ def test_balanced_save_strategy_get_cur_rank_file_id(
 @pytest.mark.env_onecard
 def test_balanced_save_strategy_save(
         tmp_path, mock_network, mock_get_real_rank, mock_get_all_sharded_tensor,
+        mock_get_all_sharded_tensor_on_rank0,
         mock_sharded_tensor_shard_id, mock_get_shard_size, mock_save_checkpoint,
         mock_get_metadata_filename, mock_get_checkpoint_name, mock_get_checkpoint_iter_dir,
-        mock_save_metadata, mock_load_metadata, mock_reverse_sharded_tensor_shard_id
+        mock_save_metadata, mock_reverse_sharded_tensor_shard_id
 ):
     """
     Feature: BalancedSaveStrategy.save method
-    Description: Test save method to save model checkpoint without existing metadata
+    Description: Test save method saves the model checkpoint and returns the plan;
+        metadata writing is the caller's responsibility (save_balanced_metadata)
     Expectation: save_checkpoint is called, get_checkpoint_iter_dir is called, get_checkpoint_name is called
     """
     checkpoint_path = str(tmp_path / "checkpoint")
@@ -379,7 +391,7 @@ def test_balanced_save_strategy_save(
     )
 
     with patch("mindformers.checkpoint.fully_parallel.os.path.exists", return_value=False):
-        strategy.save(0)
+        plan = strategy.save(0)
 
     # Check that save_checkpoint was called
     mock_save_checkpoint.assert_called_once()
@@ -387,75 +399,48 @@ def test_balanced_save_strategy_save(
     mock_get_checkpoint_iter_dir.assert_called_once_with(checkpoint_path, 0)
     # Check that get_checkpoint_name was called
     mock_get_checkpoint_name.assert_called()
+    # The built plan is returned for the caller to write metadata
+    assert plan is not None
 
 
 @pytest.mark.level0
 @pytest.mark.platform_x86_cpu
 @pytest.mark.env_onecard
-def test_balanced_save_strategy_save_with_existing_metadata(
-        tmp_path, mock_network, mock_get_real_rank, mock_get_all_sharded_tensor,
-        mock_sharded_tensor_shard_id, mock_get_shard_size, mock_save_checkpoint,
-        mock_get_metadata_filename, mock_get_checkpoint_name, mock_get_checkpoint_iter_dir,
-        mock_save_metadata, mock_reverse_sharded_tensor_shard_id
-):
-    """
-    Feature: BalancedSaveStrategy.save method with existing metadata
-    Description: Test save method to save model checkpoint with existing metadata file
-    Expectation: save_checkpoint is called, load_metadata is called
-    """
-    checkpoint_path = str(tmp_path / "checkpoint")
-    os.makedirs(checkpoint_path, exist_ok=True)
-
-    # Create a mock metadata file
-    metadata_file = os.path.join(checkpoint_path, "metadata.json")
-    with open(metadata_file, "w", encoding="utf-8") as f:
-        f.write("{}")
-
-    strategy = BalancedSaveStrategy(
-        network=mock_network,
-        checkpoint_path=checkpoint_path
-    )
-
-    with patch("mindformers.checkpoint.fully_parallel.os.path.exists", return_value=True):
-        with patch("mindformers.checkpoint.fully_parallel.load_metadata") as mock_load:
-            mock_load.return_value = (
-                {
-                    "shard1": MagicMock()
-                },
-                {
-                    "param1": [
-                        {
-                            "file_name": "test.safetensors",
-                            "storage_rank": 0,
-                            "rank_group": [0]
-                        }
-                    ]
-                }
-            )
-            strategy.save(0)
-
-    # Check that save_checkpoint was called
-    mock_save_checkpoint.assert_called_once()
-    # Check that load_metadata was called
-    mock_load.assert_called_once()
-
-
-@pytest.mark.level0
-@pytest.mark.platform_x86_cpu
-@pytest.mark.env_onecard
-def test_balanced_save_strategy__get_rank_params_mappings(
+def test_balanced_shard_plan_properties(
         mock_network, mock_get_real_rank
 ):
     """
-    Feature: BalancedSaveStrategy._get_rank_params_mappings method
-    Description: Test _get_rank_params_mappings method to create mapping from rank IDs to parameter names
-    Expectation: Return a dictionary mapping rank IDs to lists of parameter names
+    Feature: BalancedShardPlan properties
+    Description: Test cur_rank_param_names and cur_rank_sharded_tensors properties
+    Expectation: Return parameter names and ShardedTensor mapping of the current rank's shards
     """
-    strategy = BalancedSaveStrategy(
-        network=mock_network,
-        checkpoint_path="./checkpoint"
+    _ = mock_network, mock_get_real_rank
+
+    mock_tensor1 = MagicMock()
+    mock_tensor1.key = "param1"
+    mock_tensor3 = MagicMock()
+    mock_tensor3.key = "param3"
+
+    plan = BalancedShardPlan(
+        cur_rank_shards={"shard1": (mock_tensor1, (0,)), "shard3": (mock_tensor3, (0,))}
     )
 
+    assert set(plan.cur_rank_param_names) == {"param1", "param3"}
+    assert set(plan.cur_rank_sharded_tensors.keys()) == {"param1", "param3"}
+    assert plan.cur_rank_sharded_tensors["param1"] is mock_tensor1
+
+
+@pytest.mark.level0
+@pytest.mark.platform_x86_cpu
+@pytest.mark.env_onecard
+def test_balanced_save_strategy_file_numbering(
+        mock_network, mock_get_real_rank
+):
+    """
+    Feature: BalancedSaveStrategy file numbering
+    Description: Test get_total_files and get_cur_rank_file_id derived from the balanced plan
+    Expectation: Return correct total file number and current rank's file ID
+    """
     mock_tensor1 = MagicMock()
     mock_tensor1.key = "param1"
     mock_tensor2 = MagicMock()
@@ -463,137 +448,74 @@ def test_balanced_save_strategy__get_rank_params_mappings(
     mock_tensor3 = MagicMock()
     mock_tensor3.key = "param3"
 
-    # Create mock data
+    # rank 0 owns two shards, rank 1 owns none (absent), rank 2 owns one shard.
     shared_distribution = {
         0: {"shard1": (mock_tensor1, (0,)), "shard3": (mock_tensor3, (0,))},
+        2: {"shard2": (mock_tensor2, (2,))}
+    }
+
+    with patch("mindformers.checkpoint.fully_parallel.apply_balance_shard_strategy") as mock_apply:
+        mock_apply.return_value = shared_distribution
+
+        strategy = BalancedSaveStrategy(
+            network=mock_network,
+            checkpoint_path="./checkpoint"
+        )
+        assert strategy.get_total_files() == 2
+        assert strategy.get_cur_rank_file_id() == 0
+
+        with patch("mindformers.checkpoint.fully_parallel.get_real_rank", return_value=2):
+            strategy_rank2 = BalancedSaveStrategy(
+                network=mock_network,
+                checkpoint_path="./checkpoint"
+            )
+            assert strategy_rank2.get_total_files() == 2
+            assert strategy_rank2.get_cur_rank_file_id() == 1
+
+        with patch("mindformers.checkpoint.fully_parallel.get_real_rank", return_value=1):
+            strategy_rank1 = BalancedSaveStrategy(
+                network=mock_network,
+                checkpoint_path="./checkpoint"
+            )
+            assert strategy_rank1.get_total_files() == 2
+            assert strategy_rank1.get_cur_rank_file_id() is None
+
+
+@pytest.mark.level0
+@pytest.mark.platform_x86_cpu
+@pytest.mark.env_onecard
+def test_balanced_save_strategy_plan_param_redundancy(
+        mock_network, mock_get_real_rank
+):
+    """
+    Feature: BalancedShardPlan param redundancy
+    Description: Test that the plan carries the redundant rank groups containing the current rank
+    Expectation: param_redundancy only contains groups including the current rank
+    """
+    mock_tensor1 = MagicMock()
+    mock_tensor1.key = "param1"
+    mock_tensor2 = MagicMock()
+    mock_tensor2.key = "param2"
+
+    # shard1 is redundantly held by ranks (0, 1) and assigned to rank 0;
+    # shard2 is only held by rank 1 and assigned to rank 1.
+    shared_distribution = {
+        0: {"shard1": (mock_tensor1, (0, 1))},
         1: {"shard2": (mock_tensor2, (1,))}
     }
 
-    result = strategy._get_rank_params_mappings(shared_distribution)
+    with patch("mindformers.checkpoint.fully_parallel.apply_balance_shard_strategy") as mock_apply:
+        mock_apply.return_value = shared_distribution
 
-    assert isinstance(result, dict)
-    assert 0 in result
-    assert 1 in result
-    assert "param1" in result[0]
-    assert "param3" in result[0]
-    assert "param2" in result[1]
+        strategy = BalancedSaveStrategy(
+            network=mock_network,
+            checkpoint_path="./checkpoint"
+        )
+        plan = strategy.apply_saving_parallelization()
 
-
-@pytest.mark.level0
-@pytest.mark.platform_x86_cpu
-@pytest.mark.env_onecard
-def test_balanced_save_strategy__get_rank_param_ids_mappings(
-        mock_network, mock_get_real_rank
-):
-    """
-    Feature: BalancedSaveStrategy._get_rank_param_ids_mappings method
-    Description: Test _get_rank_param_ids_mappings method to create mapping from rank IDs to parameter IDs
-    Expectation: Return a dictionary mapping rank IDs to lists of parameter IDs
-    """
-    strategy = BalancedSaveStrategy(
-        network=mock_network,
-        checkpoint_path="./checkpoint"
-    )
-
-    # Create mock data
-    shared_distribution = {
-        0: {"shard1": (None, (0,)), "shard3": (None, (0,))},
-        1: {"shard2": (None, (1,))}
-    }
-
-    result = strategy._get_rank_param_ids_mappings(shared_distribution)
-
-    assert isinstance(result, dict)
-    assert 0 in result
-    assert 1 in result
-    assert "shard1" in result[0]
-    assert "shard3" in result[0]
-    assert "shard2" in result[1]
-
-
-@pytest.mark.level0
-@pytest.mark.platform_x86_cpu
-@pytest.mark.env_onecard
-def test_balanced_save_strategy__get_total_files_num(
-        mock_network, mock_get_real_rank
-):
-    """
-    Feature: BalancedSaveStrategy._get_total_files_num method
-    Description: Test _get_total_files_num method to calculate total number of files based on rank params mappings
-    Expectation: Return the correct number of files based on the input mappings
-    """
-    strategy = BalancedSaveStrategy(
-        network=mock_network,
-        checkpoint_path="./checkpoint"
-    )
-
-    # Test with non-empty params
-    rank_params_mappings = {
-        0: ["param1", "param2"],
-        1: ["param3"],
-        2: []
-    }
-
-    result = strategy._get_total_files_num(rank_params_mappings)
-    assert result == 2
-
-    # Test with all empty params
-    rank_params_mappings = {
-        0: [],
-        1: []
-    }
-
-    result = strategy._get_total_files_num(rank_params_mappings)
-    assert result == 0
-
-
-@pytest.mark.level0
-@pytest.mark.platform_x86_cpu
-@pytest.mark.env_onecard
-def test_balanced_save_strategy__get_cur_rank_file_id(
-        mock_network, mock_get_real_rank
-):
-    """
-    Feature: BalancedSaveStrategy._get_cur_rank_file_id method
-    Description: Test _get_cur_rank_file_id method to get the current rank's file ID based on rank params mappings
-    Expectation: Return the correct file ID for the current rank based on the input mappings
-    """
-    strategy = BalancedSaveStrategy(
-        network=mock_network,
-        checkpoint_path="./checkpoint"
-    )
-
-    # Test when current rank has params
-    rank_params_mappings = {
-        0: [],
-        1: ["param1"],
-        2: ["param2"]
-    }
-
-    with patch.object(strategy, 'rank_id', 1):
-        result = strategy._get_cur_rank_file_id(rank_params_mappings)
-        assert result == 0
-
-    # Test when current rank has no params
-    rank_params_mappings = {
-        0: ["param1"],
-        1: [],
-        2: ["param2"]
-    }
-
-    with patch.object(strategy, 'rank_id', 1):
-        result = strategy._get_cur_rank_file_id(rank_params_mappings)
-        assert result == 1
-
-    # Test when current rank is not in mappings
-    rank_params_mappings = {
-        0: ["param1"],
-        2: ["param2"]
-    }
-
-    with patch.object(strategy, 'rank_id', 1):
-        result = strategy._get_cur_rank_file_id(rank_params_mappings)
-        assert result is None
+        assert plan.param_redundancy == {(0, 1): ["param1"]}
+        assert set(plan.cur_rank_shards.keys()) == {"shard1"}
+        assert plan.full_assignment == {0: {"shard1": (0, 1)}, 1: {"shard2": (1,)}}
 
 
 @pytest.mark.level0
