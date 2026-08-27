@@ -37,7 +37,9 @@ class CheckpointCallback(TrainerCallback):
 
     Args:
         save_path (str): Directory where checkpoints will be saved.
-        save_interleaved_steps (int): Number of steps between checkpoint saves. Default: 1000.
+        save_interleaved_steps (int): Number of steps between checkpoint saves, counted from the
+            step training starts at. On resume the interval restarts from the resumed step, so a
+            run resumed at step 300 with an interval of 70 saves at 370, 440, ... Default: 1000.
         no_save_optim (bool): Whether to skip saving optimizer state. Default: False.
         save_max (int): Maximum number of checkpoints to keep. Default: 3.
         prefix (str): Prefix for checkpoint file names. Default: "checkpoint".
@@ -61,6 +63,9 @@ class CheckpointCallback(TrainerCallback):
         """
         super().__init__()
         self._last_triggered_step = 0
+        # Step training starts at; the save interval is counted from here so that a resumed
+        # run keeps the configured spacing instead of snapping to the absolute step grid.
+        self._start_step = 0
         self.save_path = save_path
         self.save_max = save_max
         self.save_interleaved_steps = save_interleaved_steps
@@ -86,7 +91,7 @@ class CheckpointCallback(TrainerCallback):
         """
         Called at the beginning of training.
 
-        Creates the save directory if it doesn't exist.
+        Creates the save directory if it doesn't exist and records the step training starts at.
 
         Args:
             args: Training arguments.
@@ -96,6 +101,16 @@ class CheckpointCallback(TrainerCallback):
         if self.save_path and not os.path.exists(self.save_path):
             os.makedirs(self.save_path, exist_ok=True)
             logger.info(f"Created checkpoint directory: {self.save_path}")
+
+        # ``global_step`` is already restored from the checkpoint when resuming, so this is the
+        # resumed step (0 for a fresh run). Anchoring the interval here keeps the spacing the
+        # user configured in both cases.
+        self._start_step = int(getattr(state, "global_step", 0) or 0)
+        logger.info(
+            f"Checkpoints will be saved every {self.save_interleaved_steps} steps "
+            f"starting from step {self._start_step}, "
+            f"first save at step {self._start_step + self.save_interleaved_steps}."
+        )
 
     def on_step_end(self, args, state, **kwargs):
         """
@@ -110,8 +125,10 @@ class CheckpointCallback(TrainerCallback):
                 - model: The model to save.
                 - optimizer: The optimizer to save (saved unless no_save_optim is True).
         """
-        # Skip saving when the interval is not reached.
-        if state.global_step % self.save_interleaved_steps != 0:
+        # Skip saving when the interval is not reached. The interval is counted from the step
+        # training started at, so a run resumed at step 300 with an interval of 70 saves at
+        # 370 / 440 / ... instead of snapping to the absolute 350 / 420 / ... grid.
+        if (state.global_step - self._start_step) % self.save_interleaved_steps != 0:
             return
 
         self._save_checkpoint(args, state, **kwargs)
