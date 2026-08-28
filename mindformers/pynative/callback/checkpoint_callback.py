@@ -15,17 +15,13 @@
 """Checkpoint callback for saving model checkpoints during training."""
 import os
 
-try:
-    from hyper_parallel.core.distributed_checkpoint import get_global_layout
-except ImportError as e:
-    get_global_layout = None
-
 from mindformers.pynative.callback.callback import TrainerCallback
 from mindformers.tools.logger import logger
 from mindformers.tools.utils import get_real_group_size
 from mindformers.checkpoint import save_checkpoint
 from mindformers.checkpoint.checkpoint import CommonInfo, AsyncSaveManager
-from mindformers.checkpoint.sharded_tensor import get_all_sharded_tensor
+from mindformers.checkpoint.sharded_tensor import get_all_sharded_tensor_on_rank0
+from mindformers.checkpoint.utils import gather_param_names_on_rank0
 
 
 class CheckpointCallback(TrainerCallback):
@@ -75,8 +71,15 @@ class CheckpointCallback(TrainerCallback):
         self.remove_redundancy = remove_redundancy
         self.current_ckpt_step_list = []
         self.sharded_tensor_metas = None
-        self.opt_sharded_tensor_metas = None
+        self.global_model_keys = None
+        # Caller-owned cache of the balanced shard plans (keyed by file type), reused
+        # across saves since the parallel layout is static during training.
+        self.balanced_plan_cache = {}
         self.save_global_layout_cache = save_global_layout_cache
+        # Whether the global metadata has been fetched at least once. Non-zero ranks always
+        # get None metadata, so a dedicated flag is required to keep the first collective
+        # fetch consistent across all ranks.
+        self._sharded_tensor_metas_initialized = False
 
         if not self.save_path:
             raise ValueError("save_path must be provided for CheckpointCallback.")
@@ -175,31 +178,26 @@ class CheckpointCallback(TrainerCallback):
         # CommonInfo provides metadata required by save_checkpoint.
         common_info = self._create_common_info(state)
 
-        if self.sharded_tensor_metas is None and get_real_group_size() > 1:
-            if get_global_layout is None:
-                raise ImportError("hyper_parallel is required for PyNative mode. Please install it.")
-            # Get global model keys.
-            model_keys = set()
-            for net in model:
-                global_layout_dict = get_global_layout(net)
-                for _, val in global_layout_dict.items():
-                    model_keys.update(val.keys())
+        if not self._sharded_tensor_metas_initialized and get_real_group_size() > 1:
+            # Fetch the combined network+optimizer global ShardedTensor metadata and the
+            # global model parameter names exactly once and cache them; the parallel layout
+            # is static during training, so all subsequent saves reuse these caches. The
+            # metadata is collected onto rank 0 in a deduplicated form (non-zero ranks get
+            # None). All ranks must participate in these collective calls consistently.
+            # When the optimizer is not saved, the optimizer is left out of the gather,
+            # which is equivalent to filtering the optimizer parameters out of the
+            # combined metadata.
+            model_networks = list(model) if isinstance(model, (list, tuple)) else [model]
+            networks = list(model_networks)
+            if not self.no_save_optim and optimizer is not None:
+                networks.append(optimizer)
+            self.sharded_tensor_metas = get_all_sharded_tensor_on_rank0(network=networks)
 
-            self.sharded_tensor_metas = get_all_sharded_tensor(
-                network=model,
-                filter_func=(lambda x: x in list(model_keys)) if self.no_save_optim else None
-            ) if get_real_group_size() > 1 else None
-
-        if self.opt_sharded_tensor_metas is None and get_real_group_size() > 1 and not self.no_save_optim:
-            self.opt_sharded_tensor_metas = get_all_sharded_tensor(
-                network=optimizer,
-                filter_func=(lambda x: x in list(
-                    optimizer.parameters_dict().keys())) if self.no_save_optim else None
-            ) if get_real_group_size() > 1 else None
-
-        if self.sharded_tensor_metas is not None and self.opt_sharded_tensor_metas is not None:
-            for rank_id in self.sharded_tensor_metas:
-                self.sharded_tensor_metas[rank_id].update(self.opt_sharded_tensor_metas[rank_id])
+            local_model_keys = set()
+            for net in model_networks:
+                local_model_keys.update(net.parameters_dict().keys())
+            self.global_model_keys = gather_param_names_on_rank0(local_model_keys)
+            self._sharded_tensor_metas_initialized = True
 
         try:
             # Prepare the async manager before any save operation.
@@ -218,14 +216,18 @@ class CheckpointCallback(TrainerCallback):
                 save_checkpoint_path=self.save_path,
                 remove_redundancy=self.remove_redundancy,
                 sharded_tensor_metas=self.sharded_tensor_metas,
-                current_ckpt_step_list=self.current_ckpt_step_list
+                current_ckpt_step_list=self.current_ckpt_step_list,
+                balanced_plan_cache=self.balanced_plan_cache,
+                global_model_keys=self.global_model_keys
             )
 
             self._last_triggered_step = state.global_step
 
             if not self.save_global_layout_cache and get_real_group_size() > 1:
                 self.sharded_tensor_metas = None
-                self.opt_sharded_tensor_metas = None
+                self.global_model_keys = None
+                self.balanced_plan_cache = {}
+                self._sharded_tensor_metas_initialized = False
 
             logger.info(
                 f"Checkpoint saved at step {common_info.global_step} to {self.save_path} "

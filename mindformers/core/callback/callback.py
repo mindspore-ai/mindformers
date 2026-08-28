@@ -60,7 +60,7 @@ from mindspore.utils import stress_detect
 from mindspore.mint.distributed import all_to_all_single
 
 from mindformers.wrapper.wrapper import get_real_models
-from mindformers.checkpoint.sharded_tensor import get_all_sharded_tensor
+from mindformers.checkpoint.sharded_tensor import get_all_sharded_tensor_on_rank0
 from mindformers.core.context.build_context import get_context, is_legacy_model
 from mindformers.tools import get_output_root_path
 from mindformers.tools.logger import logger
@@ -1766,6 +1766,10 @@ class CheckpointMonitor(ModelCheckpoint):
         self.common_info = CommonInfo()
         self.save_checkpoint_steps = save_checkpoint_steps
         self.current_ckpt_step_list = []
+        # Cache of the global sharded tensor metadata held by rank 0 (None on other ranks).
+        # The distributed layout does not change during training, so it is fetched only once.
+        self._cached_sharded_tensor_metas = None
+        self._sharded_tensor_metas_initialized = False
 
     def print_savetime(self, record_step, batch_num):
         """print the time cost of saving checkpoint files."""
@@ -2164,12 +2168,20 @@ class CheckpointMonitor(ModelCheckpoint):
             self.common_info.ckpt_status = CkptHealthStatus.NORMAL.value \
                 if self.get_checkpoint_health_info(cb_params) == 0 else CkptHealthStatus.ABNORMAL.value
 
-        # Get all sharded tensor info of this network to save 'metadata.json'
-        sharded_tensor_metas = get_all_sharded_tensor(
-            network=cb_params.network,
-            filter_func=(lambda x: x in list(
-                cb_params.network.network.parameters_dict().keys())) if not self.save_optimizer else None
-        ) if get_real_group_size() > 1 else None
+        # Get all sharded tensor info of this network to save 'metadata.json'.
+        # Only rank 0 fetches and holds the global metadata (other ranks get None), and the
+        # result is cached across saves since the distributed layout does not change during
+        # training. This avoids every rank materializing the global layout, which causes CPU
+        # memory explosion on large-scale clusters. Note: all ranks must participate in the
+        # first call consistently (collective communication in PyNative mode).
+        if get_real_group_size() > 1 and not self._sharded_tensor_metas_initialized:
+            self._cached_sharded_tensor_metas = get_all_sharded_tensor_on_rank0(
+                network=cb_params.network,
+                filter_func=(lambda x: x in list(
+                    cb_params.network.network.parameters_dict().keys())) if not self.save_optimizer else None
+            )
+            self._sharded_tensor_metas_initialized = True
+        sharded_tensor_metas = self._cached_sharded_tensor_metas if get_real_group_size() > 1 else None
 
         save_checkpoint(
             iteration=iteration,
