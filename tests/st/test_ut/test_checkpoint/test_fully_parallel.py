@@ -406,6 +406,64 @@ def test_balanced_save_strategy_save(
 @pytest.mark.level0
 @pytest.mark.platform_x86_cpu
 @pytest.mark.env_onecard
+def test_save_balanced_metadata(tmp_path, mock_get_real_rank):
+    """
+    Feature: save_balanced_metadata writes one combined 'metadata.json' on rank 0
+    Description: The file covers the shard assignments of every file type's plan and the
+        full global ShardedTensor metadata
+    Expectation: storage_data covers exactly the assigned shards; all params are present
+    """
+    import json
+    import mindspore as ms
+    from mindformers.checkpoint.fully_parallel import (
+        save_balanced_metadata, _compute_balanced_assignment_on_rank0
+    )
+    from mindformers.checkpoint.sharded_tensor import build_sharded_tensor
+    from mindformers.checkpoint.utils import sharded_tensor_shard_id
+
+    metas_per_rank = {
+        0: {
+            "param1": build_sharded_tensor("param1", ms.float32, (10,), (20,), (2,), (0,)),
+            "param2": build_sharded_tensor("param2", ms.float32, (10,), (20,), (2,), (10,)),
+        },
+        1: {
+            "param2": build_sharded_tensor("param2", ms.float32, (10,), (20,), (2,), (10,)),
+            "param3": build_sharded_tensor("param3", ms.float32, (10,), (10,), (1,), (0,)),
+        }
+    }
+    payloads, full_assignment = _compute_balanced_assignment_on_rank0(metas_per_rank, 2)
+    model_plan = BalancedShardPlan(
+        cur_rank_shards={},
+        param_redundancy={},
+        total_files_num=payloads[0][3],
+        cur_rank_file_id=0,
+        full_assignment=full_assignment,
+    )
+
+    checkpoint_path = str(tmp_path / "checkpoint")
+    iteration = 0
+    iter_dir = os.path.join(checkpoint_path, f"iteration_{iteration:08d}")
+    os.makedirs(iter_dir, exist_ok=True)
+
+    save_balanced_metadata(
+        checkpoint_path, iteration, "ckpt", [(model_plan, FileType.MODEL)], metas_per_rank
+    )
+
+    with open(os.path.join(iter_dir, "metadata.json"), "r", encoding="utf-8") as f:
+        metadata = json.load(f)
+
+    assigned_shards = {shard_id for shards in full_assignment.values() for shard_id in shards}
+    assert set(metadata["storage_data"].keys()) == assigned_shards
+    assert set(metadata["state_dict_metadata"].keys()) == {"param1", "param2", "param3"}
+    # The redundant param2 (held by both ranks) is deduplicated to a single chunk.
+    assert len(metadata["state_dict_metadata"]["param2"]["chunk"]) == 1
+    shard_b = sharded_tensor_shard_id("param2", (10,))
+    assert metadata["storage_data"][shard_b][0]["rank_group"] == [0, 1]
+
+
+@pytest.mark.level0
+@pytest.mark.platform_x86_cpu
+@pytest.mark.env_onecard
 def test_balanced_shard_plan_properties(
         mock_network, mock_get_real_rank
 ):
@@ -553,3 +611,157 @@ def test_balanced_save_strategy_get_total_files_and_cur_rank_file_id(
 
         assert total_files2 == total_files
         assert cur_rank_file_id2 == cur_rank_file_id
+
+
+@pytest.mark.level0
+@pytest.mark.platform_x86_cpu
+@pytest.mark.env_onecard
+def test_build_balanced_shard_plan_with_gather(mock_network):
+    """
+    Feature: Gather-based balanced shard plan building for PyNative multi-rank scenarios
+    Description: Simulate two ranks gathering their locally-built ShardedTensor metadata
+        onto rank 0, and verify each rank rebuilds only its own assignment while rank 0
+        keeps the full shard-level assignment.
+    Expectation: Assignments, param redundancy and file numbering match the legacy semantics.
+    """
+    from mindformers.checkpoint.fully_parallel import _build_balanced_shard_plan_with_gather
+    from mindformers.checkpoint.utils import sharded_tensor_shard_id
+
+    # rank 0 owns shard_a(param1) and shard_b(param2); rank 1 owns shard_b(param2) and shard_c(param3).
+    metas_per_rank = {
+        0: {
+            "param1": MockShardTensor("param1", (0,), (10,), "float32"),
+            "param2": MockShardTensor("param2", (10,), (10,), "float32"),
+        },
+        1: {
+            "param2": MockShardTensor("param2", (10,), (10,), "float32"),
+            "param3": MockShardTensor("param3", (0,), (10,), "float32"),
+        }
+    }
+
+    captured_payloads = []
+
+    def run_as_rank(rank):
+        with patch("mindformers.checkpoint.fully_parallel.get_real_rank", return_value=rank), \
+             patch("mindformers.checkpoint.fully_parallel.get_real_group_size", return_value=2), \
+             patch("mindformers.checkpoint.fully_parallel.get_cur_sharded_tensor",
+                   side_effect=lambda network, filter_func=None: metas_per_rank[rank]), \
+             patch("mindformers.checkpoint.fully_parallel.get_all_sharded_tensor_on_rank0",
+                   side_effect=lambda network, filter_func=None: metas_per_rank if rank == 0 else None), \
+             patch("mindformers.checkpoint.fully_parallel.scatter_object_list") as mock_scatter:
+
+            def fake_scatter(output_list, input_list, src=0):
+                assert src == 0
+                if input_list is not None:
+                    # Rank 0: capture the payloads it would scatter to every rank.
+                    captured_payloads.clear()
+                    captured_payloads.extend(input_list)
+                # Deliver the payload that rank 0 scattered to this rank.
+                output_list[0] = captured_payloads[rank]
+
+            mock_scatter.side_effect = fake_scatter
+
+            return _build_balanced_shard_plan_with_gather(mock_network)
+
+    shard_a = sharded_tensor_shard_id("param1", (0,))
+    shard_b = sharded_tensor_shard_id("param2", (10,))
+    shard_c = sharded_tensor_shard_id("param3", (0,))
+
+    # Rank 0 must run first so that its scattered payloads are captured for other ranks.
+    plan_rank0 = run_as_rank(0)
+    plan_rank1 = run_as_rank(1)
+
+    # Shard sizes are equal: shard_a must stay on rank 0, shard_c must stay on rank 1,
+    # and the redundant shard_b is assigned to rank 0 by load balancing.
+    assert set(plan_rank0.cur_rank_shards.keys()) == {shard_a, shard_b}
+    assert set(plan_rank1.cur_rank_shards.keys()) == {shard_c}
+
+    # Each rank rebuilds ShardedTensor objects from its own local metadata.
+    assert plan_rank0.cur_rank_shards[shard_b][0] is metas_per_rank[0]["param2"]
+    assert plan_rank1.cur_rank_shards[shard_c][0] is metas_per_rank[1]["param3"]
+    assert plan_rank0.cur_rank_shards[shard_b][1] == (0, 1)
+
+    # Param redundancy groups containing the current rank.
+    assert plan_rank0.param_redundancy == {(0, 1): ["param2"]}
+    assert plan_rank1.param_redundancy == {(0, 1): ["param2"]}
+
+    # File numbering.
+    assert plan_rank0.total_files_num == 2
+    assert plan_rank1.total_files_num == 2
+    assert plan_rank0.cur_rank_file_id == 0
+    assert plan_rank1.cur_rank_file_id == 1
+
+    # Only rank 0 holds the complete shard-level assignment.
+    assert plan_rank0.full_assignment == {0: {shard_a: (0,), shard_b: (0, 1)}, 1: {shard_c: (1,)}}
+    assert plan_rank1.full_assignment is None
+
+
+@pytest.mark.level0
+@pytest.mark.platform_x86_cpu
+@pytest.mark.env_onecard
+def test_build_balanced_shard_plan_from_global_metas(mock_network):
+    """
+    Feature: Balanced shard plan building from caller-provided global ShardedTensor metadata
+    Description: Rank 0 computes the assignment from the provided metadata without any
+        gather, scatters the per-rank assignments, and each rank rebuilds its own shards.
+        A missing metadata on rank 0 raises a ValueError.
+    Expectation: Same assignment semantics as the gather-based path; no gather is performed.
+    """
+    from mindformers.checkpoint.fully_parallel import _build_balanced_shard_plan_from_global_metas
+    from mindformers.checkpoint.utils import sharded_tensor_shard_id
+
+    metas_per_rank = {
+        0: {
+            "param1": MockShardTensor("param1", (0,), (10,), "float32"),
+            "param2": MockShardTensor("param2", (10,), (10,), "float32"),
+        },
+        1: {
+            "param2": MockShardTensor("param2", (10,), (10,), "float32"),
+            "param3": MockShardTensor("param3", (0,), (10,), "float32"),
+        }
+    }
+
+    captured_payloads = []
+
+    def run_as_rank(rank, global_metas):
+        with patch("mindformers.checkpoint.fully_parallel.get_real_rank", return_value=rank), \
+             patch("mindformers.checkpoint.fully_parallel.get_real_group_size", return_value=2), \
+             patch("mindformers.checkpoint.fully_parallel.get_cur_sharded_tensor",
+                   side_effect=lambda network, filter_func=None: metas_per_rank[rank]), \
+             patch("mindformers.checkpoint.fully_parallel.get_all_sharded_tensor_on_rank0") as mock_gather, \
+             patch("mindformers.checkpoint.fully_parallel.scatter_object_list") as mock_scatter:
+
+            def fake_scatter(output_list, input_list, src=0):
+                assert src == 0
+                if input_list is not None:
+                    captured_payloads.clear()
+                    captured_payloads.extend(input_list)
+                output_list[0] = captured_payloads[rank]
+
+            mock_scatter.side_effect = fake_scatter
+            plan = _build_balanced_shard_plan_from_global_metas(mock_network, None, global_metas)
+            # The provided-metadata path must never gather.
+            mock_gather.assert_not_called()
+            return plan
+
+    shard_a = sharded_tensor_shard_id("param1", (0,))
+    shard_b = sharded_tensor_shard_id("param2", (10,))
+    shard_c = sharded_tensor_shard_id("param3", (0,))
+
+    plan_rank0 = run_as_rank(0, metas_per_rank)
+    plan_rank1 = run_as_rank(1, None)
+
+    assert set(plan_rank0.cur_rank_shards.keys()) == {shard_a, shard_b}
+    assert set(plan_rank1.cur_rank_shards.keys()) == {shard_c}
+    assert plan_rank0.cur_rank_shards[shard_b][1] == (0, 1)
+    assert plan_rank0.param_redundancy == {(0, 1): ["param2"]}
+    assert plan_rank0.full_assignment == {0: {shard_a: (0,), shard_b: (0, 1)}, 1: {shard_c: (1,)}}
+    assert plan_rank1.full_assignment is None
+
+    # Rank 0 without the global metadata must fail loudly.
+    with patch("mindformers.checkpoint.fully_parallel.get_real_rank", return_value=0), \
+         patch("mindformers.checkpoint.fully_parallel.get_real_group_size", return_value=2), \
+         patch("mindformers.checkpoint.fully_parallel.get_cur_sharded_tensor",
+               side_effect=lambda network, filter_func=None: metas_per_rank[0]):
+        with pytest.raises(ValueError):
+            _build_balanced_shard_plan_from_global_metas(mock_network, None, None)
