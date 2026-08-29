@@ -19,6 +19,7 @@ from mindspore.common import dtype as mstype
 
 from hyper_parallel import DeviceMesh
 
+from mindformers.tools.logger import logger
 from mindformers.pynative.distributed.style import (
     ParallelStyle,
     build_hp_async_cp_style,
@@ -102,10 +103,12 @@ class ContextParallelAttentionStyle(ParallelStyle):
 
 class DSAContextParallelAttentionStyle(ParallelStyle):
     """Attention-side CP style for PyNative DSA core-attention modules."""
-    def __init__(self, method: str, input_layout=None,
+    def __init__(self, method: str, cp_size: int, ulysses_degree_in_cp=None, input_layout=None,
                  async_enabled: bool = False, use_sparse_loss: bool = True):
         super().__init__()
         self.method = method.lower()
+        self.cp_size = cp_size
+        self.ulysses_degree_in_cp = ulysses_degree_in_cp
         self.input_layout = input_layout
         self.async_enabled = async_enabled
         self.use_sparse_loss = use_sparse_loss
@@ -113,6 +116,8 @@ class DSAContextParallelAttentionStyle(ParallelStyle):
     def _apply(self, module: nn.Cell, device_mesh: DeviceMesh) -> nn.Cell:
         hp_style = build_hp_dsa_cp_style(
             method=self.method,
+            cp_size=self.cp_size,
+            ulysses_degree_in_cp=self.ulysses_degree_in_cp,
             input_layout=self.input_layout,
             async_enabled=self.async_enabled,
             use_sparse_loss=self.use_sparse_loss,
@@ -134,6 +139,8 @@ def build_context_parallel_attention_style(method: str,
     if attention_variant == "dsa":
         return DSAContextParallelAttentionStyle(
             method=method,
+            cp_size=cp_size,
+            ulysses_degree_in_cp=ulysses_degree_in_cp,
             input_layout=input_layout,
             async_enabled=async_enabled,
             use_sparse_loss=dsa_use_sparse_loss,
@@ -168,13 +175,15 @@ class ContextParallelModelIOStyle(ParallelStyle):
 
     def __init__(self, cp_mesh, cp_method: str = "colossal",
                  ulysses_degree_in_cp: int = None, mask_type: str = "causal",
-                 build_attention_mask: bool = True):
+                 build_attention_mask: bool = True,
+                 require_actual_seq_len: bool = False):
         super().__init__()
         self.cp_mesh = cp_mesh
         self.cp_method = cp_method
         self.ulysses_degree_in_cp = ulysses_degree_in_cp
         self.mask_type = mask_type
         self.build_attention_mask = build_attention_mask
+        self.require_actual_seq_len = require_actual_seq_len
 
     def _prepare_inputs(self, module, args, kwargs):
         """Prepare root-model inputs for CP."""
@@ -185,6 +194,12 @@ class ContextParallelModelIOStyle(ParallelStyle):
                 inputs[name] = args[index]
             else:
                 inputs[name] = kwargs.get(name)
+
+        if self.require_actual_seq_len and inputs.get("actual_seq_len") is None:
+            raise ValueError(
+                "TND DSA context parallel requires actual_seq_len from the dataset. "
+                "Enable create_compressed_eod_mask and include actual_seq_len in column_names."
+            )
 
         sharded_inputs = prepare_context_parallel_input(
             inputs,
@@ -227,10 +242,10 @@ def apply_context_parallel_model_io(
     if not getattr(parallel_dims, "cp_enabled", False):
         return model
     # Context parallel relies on the model's compressed attention mask. Without it CP
-    # would have to materialize a dense O(seq_len^2) causal mask, which is exactly the
-    # memory blow-up we want to avoid on long sequences. Intercept early and tell the
-    # user which switch to turn on. DSA is exempt: its CP kernels consume the per-rank
-    # causal mask built in prepare_context_parallel_input instead of a compressed mask.
+    # has to materialize a rank-offset dense causal mask. DSA BSND can use the same
+    # 2048x2048 compressed left-up mask as ordinary FlashAttention: HP keeps pure
+    # Ulysses left-up causal, and converts Colossal/Hybrid sequence shards to band mode
+    # with rank-adjusted pre_tokens/next_tokens at the DTensor operator boundary.
     attn_mask_compressed = bool(
         getattr(model_config, "use_attn_mask_compression", False)
         or getattr(model_config, "use_eod_attn_mask_compression", False)
@@ -241,12 +256,24 @@ def apply_context_parallel_model_io(
             "Please enable use_attn_mask_compression for non-eod data, or "
             "create_compressed_eod_mask for eod data."
         )
+    cp_method = getattr(parallelism, "context_parallel_method", "colossal").lower()
+    if uses_dsa_cp_kernel and not attn_mask_compressed:
+        logger.warning(
+            "DSA %s CP without attention-mask compression builds a rank-offset dense "
+            "causal mask. Enable use_attn_mask_compression for BSND, or "
+            "create_compressed_eod_mask with actual_seq_len for TND long sequences.",
+            cp_method,
+        )
     return ContextParallelModelIOStyle(
         cp_mesh=parallel_dims.get_mesh("cp"),
-        cp_method=getattr(parallelism, "context_parallel_method", "colossal"),
+        cp_method=cp_method,
         ulysses_degree_in_cp=getattr(parallelism, "ulysses_degree_in_cp", None),
         mask_type=getattr(parallelism, "context_parallel_mask_type", "causal"),
-        build_attention_mask=uses_dsa_cp_kernel,
+        build_attention_mask=uses_dsa_cp_kernel and not attn_mask_compressed,
+        require_actual_seq_len=(
+            uses_dsa_cp_kernel
+            and bool(getattr(model_config, "use_eod_attn_mask_compression", False))
+        ),
     )._apply(model)
 
 
