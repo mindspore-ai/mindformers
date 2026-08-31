@@ -16,7 +16,7 @@
 
 import json
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, call
 
 import pytest
 
@@ -104,3 +104,55 @@ def test_static_batch_resume_uses_micro_batch_cursor(
         global_step=expected_global_step,
         balanced_load=False,
     )
+
+
+@pytest.mark.level0
+@pytest.mark.platform_x86_cpu
+@pytest.mark.env_onecard
+@pytest.mark.parametrize("no_load_optim", [False, True])
+def test_pipeline_checkpoint_load_manages_shared_optimizer_once(monkeypatch, tmp_path, no_load_optim):
+    """Snapshot and reload shared fp32 masters once for all pipeline stages."""
+    checkpoint_path = tmp_path / "checkpoint"
+    checkpoint_path.mkdir()
+    (checkpoint_path / "common.json").write_text(
+        json.dumps({"global_step": 2, "global_batch_size": 8, "consumed_samples": 16}),
+        encoding="utf-8",
+    )
+    trainer = _build_trainer()
+    trainer.config.checkpoint.no_load_optim = no_load_optim
+    load_checkpoint = _mock_checkpoint_load(monkeypatch)
+    models = [object(), object()]
+    optimizer = Mock()
+    events = []
+    optimizer.save_main_params_snapshot.side_effect = lambda: events.append("snapshot")
+    load_checkpoint.side_effect = lambda **kwargs: events.append(kwargs["network"])
+    optimizer.reload_main_params_from_model.side_effect = lambda: events.append("reload")
+
+    trainer._load_checkpoint(str(checkpoint_path), models, optimizer)
+
+    expected_events = [models[0], models[1], "reload"]
+    if no_load_optim:
+        optimizer.save_main_params_snapshot.assert_not_called()
+    else:
+        expected_events.insert(0, "snapshot")
+        optimizer.save_main_params_snapshot.assert_called_once_with()
+    assert events == expected_events
+    optimizer.reload_main_params_from_model.assert_called_once_with()
+    loaded_optimizer = None if no_load_optim else optimizer
+    loaded_global_step = None if no_load_optim else 2
+    assert load_checkpoint.call_args_list == [
+        call(
+            checkpoint=str(checkpoint_path),
+            network=models[0],
+            optimizer=loaded_optimizer,
+            global_step=loaded_global_step,
+            balanced_load=False,
+        ),
+        call(
+            checkpoint=str(checkpoint_path),
+            network=models[1],
+            optimizer=loaded_optimizer,
+            global_step=loaded_global_step,
+            balanced_load=False,
+        ),
+    ]

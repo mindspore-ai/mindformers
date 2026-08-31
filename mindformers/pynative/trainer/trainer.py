@@ -834,8 +834,10 @@ class Trainer:
         # Load checkpoint
         checkpoint_path = checkpoint_path or self.config.checkpoint.load_path
         if checkpoint_path:
-            for m in self.model:
-                self._load_checkpoint(checkpoint_path, m, self.optimizer)
+            # A pipeline-parallel trainer shares one optimizer across all model
+            # stages. Pass the complete stage list so _load_checkpoint can manage
+            # the fp32 master-weight lifecycle around the whole load.
+            self._load_checkpoint(checkpoint_path, self.model, self.optimizer)
 
         # Register gradient hooks for fp32 accumulation
         self._register_grad_hooks()
@@ -868,7 +870,8 @@ class Trainer:
 
         Args:
             checkpoint_path (str): The path to the checkpoint file.
-            model (PreTrainedModel): The model instance.
+            model (PreTrainedModel or list[PreTrainedModel]): The model instance,
+                or all pipeline stages sharing the optimizer.
             optimizer (Any, optional): The optimizer instance. Defaults to None.
             global_step (Optional[int], optional): The global step. Defaults to None.
 
@@ -877,6 +880,10 @@ class Trainer:
         """
         if model is None:
             raise ValueError("model is None, cannot load checkpoint.")
+
+        models = model if isinstance(model, (list, tuple)) else [model]
+        if not models or any(stage is None for stage in models):
+            raise ValueError("model contains None, cannot load checkpoint.")
 
         if not is_checkpoint_path_valid(checkpoint_path):
             return
@@ -890,12 +897,13 @@ class Trainer:
                 raise ValueError(
                     "Resume training (no_load_optim=False) is not supported for HuggingFace checkpoints."
                 )
-            load_hf_checkpoint(
-                pretrained_model_dir=checkpoint_path,
-                network=model,
-                balanced_load=checkpoint.load_balanced,
-                reshard_worker_num=checkpoint.reshard_worker_num
-            )
+            for stage in models:
+                load_hf_checkpoint(
+                    pretrained_model_dir=checkpoint_path,
+                    network=stage,
+                    balanced_load=checkpoint.load_balanced,
+                    reshard_worker_num=checkpoint.reshard_worker_num
+                )
         else:
             checkpoint = self.config.checkpoint
 
@@ -971,13 +979,14 @@ class Trainer:
             if optimizer is not None and not checkpoint.no_load_optim:
                 optimizer.save_main_params_snapshot()
 
-            load_checkpoint(
-                checkpoint=checkpoint_path,
-                network=model,
-                optimizer=optimizer if not checkpoint.no_load_optim else None,
-                global_step=global_step,
-                balanced_load=checkpoint.load_balanced,
-            )
+            for stage in models:
+                load_checkpoint(
+                    checkpoint=checkpoint_path,
+                    network=stage,
+                    optimizer=optimizer if not checkpoint.no_load_optim else None,
+                    global_step=global_step,
+                    balanced_load=checkpoint.load_balanced,
+                )
 
         # Refresh fp32 master weights after checkpoint load.
         # reload_main_params_from_model handles both cases internally:
