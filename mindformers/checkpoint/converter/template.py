@@ -190,8 +190,44 @@ class WeightTemplate:
         return mf_names
 
     def get_hf_names_for_mf(self, mf_name: str) -> List[str]:
-        """Get all HF parameter names required to generate a MF parameter"""
-        raise ValueError("Conversion from MindSpore Transformer weights to Hugging Face is currently not supported.")
+        """Get all HF parameter names produced from a MF parameter.
+
+        Returns an empty list when no converter claims ``mf_name``. For MoE
+        experts a single MF tensor expands to one name per expert per HF slot.
+        """
+        converter = self.get_convert_op(mf_name, self.mf_name_to_converter)
+        if converter is None:
+            return []
+
+        # Recover the layer index (if any) from the matching MF pattern.
+        layer_index = None
+        for mf_pattern in converter.mf_names:
+            compiled_re = self._compiled_mf_patterns.get(mf_pattern)
+            if compiled_re is not None:
+                match = compiled_re.match(mf_name)
+                if match and match.groups():
+                    layer_index = match.group(1)
+                    break
+
+        num_local_experts = None
+        if isinstance(converter, ExpertsConvertOp):
+            # pylint: disable=protected-access
+            num_local_experts = converter._num_local_experts()
+
+        hf_names: List[str] = []
+        for hf_pattern in converter.hf_names:
+            placeholders = hf_pattern.count("{}")
+            if placeholders == 0:
+                hf_names.append(hf_pattern)
+            elif num_local_experts is not None:
+                prefix = () if layer_index is None else (layer_index,)
+                hf_names.extend(hf_pattern.format(*prefix, expert_id)
+                                for expert_id in range(num_local_experts))
+            elif layer_index is not None:
+                hf_names.append(hf_pattern.replace("{}", layer_index))
+            else:
+                hf_names.append(hf_pattern)
+        return hf_names
 
     def get_mf_state_dict(
             self,
