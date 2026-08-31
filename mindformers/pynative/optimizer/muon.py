@@ -41,7 +41,6 @@ from mindspore.mint.distributed import (
 from hyper_parallel import DTensor
 from hyper_parallel import SkipDTensorDispatch
 from hyper_parallel.core.dtensor.dtensor import distribute_tensor
-from hyper_parallel.core.dtensor.layout import _infer_slice_area_by_rank
 from hyper_parallel.core.dtensor.placement_types import Replicate
 from hyper_parallel.core.dtensor.redistribute_infer import DevMat, RedistributionOperatorInfer
 from hyper_parallel.platform import get_platform
@@ -49,7 +48,7 @@ from hyper_parallel.platform import get_platform
 from mindformers.core import context as core_context
 from mindformers.tools.logger import get_logger, logger
 from mindformers.pynative.optimizer.adamw import _run_adamw_opt, _run_fused_adamw_opt
-from mindformers.pynative.dtensor_compat import inplace_copy
+from mindformers.pynative.dtensor_compat import inplace_copy, slice_specs_for_layout
 from mindformers.pynative.optimizer.main_params import MainParamsMixin
 
 
@@ -737,15 +736,8 @@ def _get_all_concat_group(rank_list):
 def _slice_full_tensor_for_layout_rank(full_tensor, layout, rank):
     """Slice ``full_tensor`` exactly as ``distribute_tensor(...).to_local()`` would for ``rank``."""
     rank_list = tuple(int(item) for item in layout.rank_list)
-    inner_rank_id = rank_list.index(int(rank))
-    slice_area = _infer_slice_area_by_rank(
-        layout.mesh_shape,
-        layout.tensor_map,
-        inner_rank_id,
-        full_tensor.shape,
-    )
-    slice_spec = tuple(slice(begin, end) for begin, end in slice_area)
-    return full_tensor[slice_spec].clone()
+    specs = slice_specs_for_layout(layout, full_tensor.shape, len(rank_list))
+    return full_tensor[specs[rank_list.index(int(rank))]].clone()
 
 
 def _list_full_tensor_local_shards(full_tensor, layout):
@@ -755,24 +747,6 @@ def _list_full_tensor_local_shards(full_tensor, layout):
         _slice_full_tensor_for_layout_rank(full_tensor, layout, rank)
         for rank in rank_list
     ]
-
-
-def _list_full_tensor_local_shards_cached(
-    full_tensor, rank_list_tuple, mesh_shape_tuple, tensor_map_list,
-):
-    """Cached-tuple variant: returns shards in ``rank_list_tuple`` order.
-
-    Skips the per-call ``layout.rank_list`` / ``mesh_shape`` / ``tensor_map``
-    property accesses that :func:`_list_full_tensor_local_shards` would do.
-    """
-    full_shape = full_tensor.shape
-    shards = []
-    for inner_rank_id in range(len(rank_list_tuple)):
-        slice_area = _infer_slice_area_by_rank(
-            mesh_shape_tuple, tensor_map_list, inner_rank_id, full_shape)
-        slice_spec = tuple(slice(int(begin), int(end)) for begin, end in slice_area)
-        shards.append(full_tensor[slice_spec].clone())
-    return shards
 
 
 def _start_full_tensor_async(local_tensor, device_mesh, placements, rank_id):
@@ -802,7 +776,7 @@ def _build_full_tensor_p2p_gather_ops(
     full_shape_tuple=None,
     rank_id=None,
 ):
-    """Like :func:`_start_full_tensor_p2p_gather_async` but builds P2POps lazily.
+    """Build the P2POps for one weight's owner-gather; issued later in one batch.
 
     ``op_list`` is the pre-probed redistribution op list from
     :func:`_get_full_tensor_ops`, threaded in by the caller (see
@@ -898,14 +872,12 @@ def _build_full_tensor_p2p_gather_multi_ops(
 ):
     """Build P2POps for the N-D (multi all_concat) path; returns ``(pending, p2pops)``.
 
-    Mirrors :func:`_start_full_tensor_p2p_gather_multi` exactly but defers
-    issuing comms — the caller batches them via :func:`batch_isend_irecv`.
+    Comms are deferred — the caller batches them via :func:`batch_isend_irecv`.
     """
     if rank_list_tuple is not None and mesh_shape_tuple is not None \
             and tensor_map_list is not None and full_shape_tuple is not None:
         rank_list = rank_list_tuple
         mesh_shape = mesh_shape_tuple
-        tensor_map = tensor_map_list
         full_shape = full_shape_tuple
     else:
         if layout is None:
@@ -913,7 +885,6 @@ def _build_full_tensor_p2p_gather_multi_ops(
         try:
             rank_list = tuple(int(r) for r in layout.rank_list)
             mesh_shape = tuple(int(d) for d in layout.mesh_shape)
-            tensor_map = list(layout.tensor_map)
             full_shape = tuple(int(d) for d in layout.get_global_shape(local_tensor.shape))
         except (AttributeError, TypeError, ValueError):
             return None
@@ -941,10 +912,8 @@ def _build_full_tensor_p2p_gather_multi_ops(
     prealloc_full = mint.empty(full_shape, dtype=local_tensor.dtype)
     deferred = []
     keep_alive = []
-    for inner_rank_id, src_rank in enumerate(rank_list):
-        slice_area = _infer_slice_area_by_rank(
-            mesh_shape, tensor_map, inner_rank_id, full_shape)
-        slice_spec = tuple(slice(int(begin), int(end)) for begin, end in slice_area)
+    for slice_spec, src_rank in zip(
+            slice_specs_for_layout(layout, full_shape, len(rank_list)), rank_list):
         if int(src_rank) == rank_id:
             prealloc_full[slice_spec] = local_tensor
             continue
@@ -989,12 +958,7 @@ def _build_local_shard_scatter_ops(info, x_ret_full, rank_id):
 
     ops = []
     if int(rank_id) == assigned_rank:
-        if info.get('mesh_shape_tuple') is not None \
-                and info.get('tensor_map_list') is not None:
-            shards = _list_full_tensor_local_shards_cached(
-                x_ret_full, rank_list, info['mesh_shape_tuple'], info['tensor_map_list'])
-        else:
-            shards = _list_full_tensor_local_shards(x_ret_full, info['layout'])
+        shards = _list_full_tensor_local_shards(x_ret_full, info['layout'])
         p2p_tensors = []
         local_output = None
         for dst_rank, shard in zip(rank_list, shards):
@@ -1015,166 +979,6 @@ def _build_local_shard_scatter_ops(info, x_ret_full, rank_id):
         ops.append(P2POp('irecv', local_output, assigned_rank))
     info['x_ret_is_local'] = True
     return True, ops
-
-
-def _start_full_tensor_p2p_gather_async(
-    local_tensor, device_mesh, placements, rank_id, assigned_rank, layout=None,
-    rank_list_tuple=None, mesh_shape_tuple=None, tensor_map_list=None,
-    full_shape_tuple=None,
-):
-    """P2P gather: non-owner ranks isend their shard, owner irecv assembles. Returns
-    None when the layout needs reductions (Partial) or doesn't tile one shard per rank,
-    so the caller falls back to all-gather."""
-    try:
-        op_list = _get_full_tensor_ops(local_tensor, device_mesh, placements, rank_id)
-    except (AttributeError, TypeError, ValueError):
-        return None
-    if not op_list:
-        return _PendingP2PGather(full_tensor=local_tensor)
-    if any(op[0] != "all_concat" for op in op_list):
-        return None
-    if len(op_list) > 1:
-        return _start_full_tensor_p2p_gather_multi(
-            local_tensor, rank_id, int(assigned_rank), layout,
-            rank_list_tuple=rank_list_tuple,
-            mesh_shape_tuple=mesh_shape_tuple,
-            tensor_map_list=tensor_map_list,
-            full_shape_tuple=full_shape_tuple,
-        )
-
-    concat_dim, concat_size, rank_list = op_list[0][1]
-    concat_size = int(concat_size)
-    rank_list = tuple(int(r) for r in rank_list)
-
-    if concat_size <= 1:
-        return _PendingP2PGather(full_tensor=local_tensor)
-
-    # Layout subsets: ranks outside ``rank_list`` are routed around via
-    # ``skip_redist_comm`` in Phase 0, so we only require owner + current to be in.
-    assigned_rank = int(assigned_rank)
-    if assigned_rank not in rank_list or int(rank_id) not in rank_list:
-        return None
-
-    if int(rank_id) != assigned_rank:
-        # ns_inputs_local from _prepare_muon_input is already contiguous —
-        # skip the redundant ViewCopy.
-        if not local_tensor.is_contiguous():
-            local_tensor = local_tensor.contiguous()
-        handle = isend(local_tensor, dst=assigned_rank)
-        return _PendingP2PGather(handles=[handle], keep_alive=[local_tensor])
-
-    # Owner. When concat_dim == 0 pre-allocate one contiguous full buffer and
-    # irecv directly into its row slices, avoiding the post-recv ``mint.cat``.
-    can_prealloc = concat_dim == 0
-    if can_prealloc:
-        local_shape = local_tensor.shape
-        full_shape = list(local_shape)
-        full_shape[0] *= concat_size
-        prealloc_full = mint.empty(tuple(full_shape), dtype=local_tensor.dtype)
-        local_rank_list = list(rank_list)
-        my_pos = local_rank_list.index(int(rank_id))
-        shard_rows = int(local_shape[0])
-        start_row = int(my_pos) * shard_rows
-        # HCCL irecv requires contiguous destination slices.
-        test_slice = prealloc_full[0:shard_rows]
-        if not test_slice.is_contiguous():
-            can_prealloc = False
-        else:
-            inplace_copy(prealloc_full[start_row:start_row + shard_rows], local_tensor)
-            handles = []
-            for pos, src_rank in enumerate(local_rank_list):
-                if pos == my_pos:
-                    continue
-                start = pos * shard_rows
-                buf_slice = prealloc_full[start:start + shard_rows]
-                handles.append(irecv(buf_slice, src=src_rank))
-            return _PendingP2PGather(
-                handles=handles,
-                prealloc_full=prealloc_full,
-            )
-    shards = []
-    handles = []
-    for src_rank in rank_list:
-        if int(src_rank) == int(rank_id):
-            shards.append(local_tensor)
-            continue
-        buf = mint.empty_like(local_tensor)
-        shards.append(buf)
-        handles.append(irecv(buf, src=int(src_rank)))
-    return _PendingP2PGather(
-        handles=handles,
-        shards=shards,
-        concat_dim=int(concat_dim),
-    )
-
-
-def _start_full_tensor_p2p_gather_multi(
-    local_tensor, rank_id, assigned_rank, layout,
-    rank_list_tuple=None, mesh_shape_tuple=None, tensor_map_list=None,
-    full_shape_tuple=None,
-):
-    """P2P gather for N-D sharded layouts (e.g. DP × TP). Owner slice-places each
-    incoming shard into a pre-allocated full tensor via :func:`_infer_slice_area_by_rank`
-    — the inverse of ``distribute_tensor(...).to_local()`` — matching the all-gather
-    path bit-for-bit. The ``*_tuple`` / ``*_list`` kwargs carry frozen layout metadata
-    cached at init so the hot path skips ``layout.*`` property access."""
-    if rank_list_tuple is not None and mesh_shape_tuple is not None \
-            and tensor_map_list is not None and full_shape_tuple is not None:
-        rank_list = rank_list_tuple
-        mesh_shape = mesh_shape_tuple
-        tensor_map = tensor_map_list
-        full_shape = full_shape_tuple
-    else:
-        if layout is None:
-            return None
-        try:
-            rank_list = tuple(int(r) for r in layout.rank_list)
-            mesh_shape = tuple(int(d) for d in layout.mesh_shape)
-            tensor_map = list(layout.tensor_map)
-            full_shape = tuple(int(d) for d in layout.get_global_shape(local_tensor.shape))
-        except (AttributeError, TypeError, ValueError):
-            return None
-
-    mesh_numel = 1
-    for dim in mesh_shape:
-        mesh_numel *= int(dim)
-    # Require one unique shard per rank for the gather assembly.
-    if mesh_numel != len(rank_list):
-        return None
-
-    rank_id = int(rank_id)
-    assigned_rank = int(assigned_rank)
-    if assigned_rank not in rank_list or rank_id not in rank_list:
-        return None
-
-    if rank_id != assigned_rank:
-        if not local_tensor.is_contiguous():
-            local_tensor = local_tensor.contiguous()
-        handle = isend(local_tensor, dst=assigned_rank)
-        return _PendingP2PGather(handles=[handle], keep_alive=[local_tensor])
-
-    # Owner: N-D slices are non-contiguous, so placement is deferred to wait().
-    prealloc_full = mint.empty(full_shape, dtype=local_tensor.dtype)
-    handles = []
-    keep_alive = []
-    deferred = []
-    for inner_rank_id, src_rank in enumerate(rank_list):
-        slice_area = _infer_slice_area_by_rank(
-            mesh_shape, tensor_map, inner_rank_id, full_shape)
-        slice_spec = tuple(slice(int(begin), int(end)) for begin, end in slice_area)
-        if int(src_rank) == rank_id:
-            prealloc_full[slice_spec] = local_tensor
-            continue
-        buf = mint.empty_like(local_tensor)
-        handles.append(irecv(buf, src=int(src_rank)))
-        keep_alive.append(buf)
-        deferred.append((slice_spec, buf))
-    return _PendingP2PGather(
-        prealloc_full=prealloc_full,
-        handles=handles,
-        deferred=deferred,
-        keep_alive=keep_alive,
-    )
 
 
 def _normalize_newton_schulz_input(x, eps):
@@ -1570,29 +1374,6 @@ def _apply_prepared_update_batched(infos):
         for k in range(n_slots):
             inplace_copy(params[k], next_param_cast[k])
     return params
-
-
-def _prepare_muon_input(gradient, muon_m, momentum, use_nesterov):
-    """Phase 0 slow path: compute momentum-updated gradient *and* extract
-    DTensor metadata via ``gradient.layout`` / ``device_mesh`` / ``placements``.
-
-    Kept for the legacy code path (``muon_metas=None``) where metadata has
-    not been pre-frozen.  Returns
-    ``(ns_inputs_local, next_m_fp32, needs_redist, dev_mesh, placements, layout)``.
-    """
-    ndim = len(gradient.shape)
-    if ndim not in (2, 3):
-        raise ValueError(
-            f"newton_schulz only supports 2D or 3D gradient, got shape={gradient.shape}")
-
-    needs_redist = isinstance(gradient, DTensor) and ndim == 2
-    dev_mesh = gradient.device_mesh if needs_redist else None
-    plmts = gradient.placements if needs_redist else None
-    layout = gradient.layout if needs_redist else None
-
-    ns_inputs_local, next_m = _prepare_muon_input_compute(
-        gradient, muon_m, momentum, use_nesterov)
-    return ns_inputs_local, next_m, needs_redist, dev_mesh, plmts, layout
 
 
 def _run_muon_batched(
