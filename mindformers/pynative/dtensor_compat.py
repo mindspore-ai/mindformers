@@ -25,10 +25,30 @@ a plain ``src`` and writing it into the local shard.
 shard. It accepts either a ``DTensor`` or a plain ``Tensor`` for both ``dst``
 and ``src``, so the result is identical to the old local-to-local copy and
 introduces no numerical change.
+
+``slice_specs_for_layout`` is the module's single entry point to
+``hyper_parallel``'s slice-area inference. It calls the public
+``infer_slice_area_by_layout``, which reads the ``uneven_shard`` markers off the
+layout itself, so no shard geometry is duplicated here and no private
+hyper_parallel symbol is referenced.
 """
 from hyper_parallel import DTensor
+from hyper_parallel.core.dtensor.layout import infer_slice_area_by_layout
 
-__all__ = ["inplace_copy"]
+__all__ = ["inplace_copy", "slice_specs_for_layout"]
+
+
+def slice_specs_for_layout(layout, full_shape, rank_count):
+    """Return each rank's ``tuple(slice(...))`` into a tensor of ``full_shape``.
+
+    Index ``i`` is the slice owned by ``layout.rank_list[i]`` -- the same region
+    ``distribute_tensor(...).to_local()`` would hand that rank.
+    """
+    return tuple(
+        tuple(slice(int(begin), int(end))
+              for begin, end in infer_slice_area_by_layout(layout, inner_rank_id, full_shape))
+        for inner_rank_id in range(rank_count)
+    )
 
 
 def inplace_copy(dst, src):

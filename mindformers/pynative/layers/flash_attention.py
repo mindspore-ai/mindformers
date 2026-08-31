@@ -22,7 +22,6 @@ import mindspore.common.dtype as mstype
 import mindspore as ms
 from hyper_parallel import SkipDTensorDispatch
 from hyper_parallel import DTensor
-from hyper_parallel.core.dtensor.layout import _infer_slice_area_by_rank
 from mindspore import ops, mint, Parameter
 from mindspore.common.tensor import Tensor
 from mindspore.communication import get_rank
@@ -30,7 +29,7 @@ from mindspore.nn.cell import Cell
 from mindspore.ops.operations.nn_ops import FlashAttentionScore
 
 from mindformers.parallel_core.transformer_config import TransformerConfig, MLATransformerConfig
-from mindformers.pynative.dtensor_compat import inplace_copy
+from mindformers.pynative.dtensor_compat import inplace_copy, slice_specs_for_layout
 
 
 def _local_head_slice(softmax_val, head_dim=1):
@@ -54,13 +53,9 @@ def _local_head_slice(softmax_val, head_dim=1):
         return None
     local_shape = tuple(int(d) for d in softmax_val.to_local().shape)
     full_shape = tuple(int(d) for d in layout.get_global_shape(local_shape))
-    slice_area = _infer_slice_area_by_rank(
-        tuple(int(d) for d in layout.mesh_shape),
-        list(layout.tensor_map),
-        rank_list.index(rank),
-        full_shape,
-    )
-    begin, end = slice_area[head_dim]
+    head_slice = slice_specs_for_layout(
+        layout, full_shape, len(rank_list))[rank_list.index(rank)][head_dim]
+    begin, end = head_slice.start, head_slice.stop
     return int(begin), int(end)
 
 
