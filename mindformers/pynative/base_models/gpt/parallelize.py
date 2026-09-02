@@ -1905,18 +1905,13 @@ def _make_overlap_b_f_callback(overlap):
             if overlap.coordinator.is_enabled():
                 overlap.coordinator.rendezvous(HookRole.COMPUTE)
 
-        # Activation-recompute compatibility: fire the BWD chunk's forward
-        # re-run serially on THIS (main) thread, BEFORE overlap.run enables the
-        # coordinator and spawns the BWD daemon. Two reasons it must be here:
-        #   1. The coordinator is still disabled, so the re-run's A/B/C/D sync
-        #      hooks are no-ops (the is_enabled() gate) — no stray rendezvous to
-        #      desync the protocol.
-        #   2. backward_one_chunk then reuses the cached recomputed activations
-        #      instead of re-running the forward on the daemon thread, which
-        #      would be concurrent FWD-record + BWD-replay (unsupported by MS
-        #      PyNative) and would re-fire the hooks, deadlocking the coordinator.
-        # No-op when the chunk has no checkpoint_wrapper'd blocks (recompute
-        # off). Mirrors the reference PoC's recompute path.
+        # Prefire saved-tensor-hook/non-reentrant handles serially before the
+        # two-thread window. HyperParallel reentrant checkpoints use their own
+        # per-invocation state and are intentionally not collected by this
+        # stage API, so this call is a no-op for them: their replay stays lazy
+        # and runs inside backward_one_chunk on the BWD worker. Keeping the two
+        # paths separate avoids coupling reentrant BF support to the legacy
+        # collector/session protocol.
         bwd_stage.recompute_one_chunk(bwd_mi)
 
         # Diagnostic: EP_OVERLAP_SEQ=1 runs bwd then fwd sequentially on the main
@@ -2064,6 +2059,13 @@ def parallelize_gptmodel(
         gradient_accumulation_steps: int = 1,
 ) -> List[nn.Cell]:
     """Apply pipeline parallelism to the GPTModel."""
+
+    if recompute.use_reentrant and getattr(
+            parallelism, "pipeline_parallel_enable_dxdw_split", False):
+        raise ValueError(
+            "pipeline_parallel_enable_dxdw_split=True is not supported with "
+            "recompute.use_reentrant=True."
+        )
 
     if parallel_dims.pp_enabled:
         pp_mesh = parallel_dims.get_mesh("pp")

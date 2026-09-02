@@ -26,6 +26,9 @@ from mindformers.pynative.config.config import (
     ParallelismConfig,
     OptimizerConfig,
     CallbackConfig,
+    RecomputeCommConfig,
+    RecomputeConfig,
+    SwapConfig,
 )
 from mindformers.pynative.config.utils import check_type
 
@@ -344,3 +347,50 @@ class TestConfig:
 
         config = ParallelismConfig(tensor_parallel=2, sequence_parallel=True)
         assert config.sequence_parallel is True
+
+    def test_reentrant_recompute_requires_enabled_mode(self):
+        """Do not silently ignore a reentrant request."""
+        with pytest.raises(ValueError, match="requires mode='full' or mode='select'"):
+            RecomputeConfig(mode="None", use_reentrant=True)
+
+    def test_reentrant_recompute_accepts_select_mode(self):
+        """Module-selective reentrant recomputation is a supported mode."""
+        config = RecomputeConfig(
+            mode="select",
+            select_module={"attention": ["0"]},
+            use_reentrant=True,
+        )
+        assert config.mode == "select"
+        assert config.use_reentrant is True
+
+    @pytest.mark.parametrize(
+        ("extra_config", "expected"),
+        [
+            (
+                {"recompute_comm": RecomputeCommConfig(enable=True)},
+                "recompute_comm.enable=True",
+            ),
+            (
+                {"swap": SwapConfig(enable=True)},
+                "swap.enable=True",
+            ),
+            (
+                {
+                    "parallelism": ParallelismConfig(
+                        pipeline_parallel_enable_dxdw_split=True
+                    )
+                },
+                "pipeline_parallel_enable_dxdw_split=True",
+            ),
+        ],
+    )
+    def test_reentrant_recompute_rejects_unsupported_combinations(
+            self, extra_config, expected):
+        """Fail while loading config, before model construction or scheduling."""
+        with pytest.raises(ValueError, match=expected):
+            TrainConfig(
+                recompute=RecomputeConfig(
+                    mode="full", full_recompute_layer=["0"], use_reentrant=True
+                ),
+                **extra_config,
+            )

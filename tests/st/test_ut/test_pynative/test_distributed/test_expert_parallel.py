@@ -22,6 +22,7 @@ from mindspore import Tensor, context, nn, ops
 from hyper_parallel.core.dtensor.placement_types import Shard
 
 from mindformers.pynative.distributed import utils
+import mindformers.pynative.distributed.ep_overlap as ep_overlap_mod
 from mindformers.pynative.distributed.activation_checkpoint import recompute_context_fn
 from mindformers.pynative.distributed.ep_overlap import OverlapExpertParallel
 from mindformers.pynative.distributed.expert_parallel import ExpertParallel
@@ -361,3 +362,26 @@ class TestExpertParallel:
         assert set(plan.keys()) == {"weight1", "weight2"}
         assert plan["weight1"][0] == Shard(0)
         assert plan["weight2"][0] == Shard(0)
+
+    @pytest.mark.level0
+    @pytest.mark.platform_x86_cpu
+    @pytest.mark.env_onecard
+    def test_reentrant_replay_closes_last_combine_with_regular_d(self, monkeypatch):
+        """Replay has no CHUNK_END, so its D_LAST must notify like regular D."""
+        hooks = []
+        monkeypatch.setattr(
+            ep_overlap_mod._platform,
+            "differentiable_sync_hook",
+            lambda value, hook_name, coordinator:
+            hooks.append((hook_name, coordinator)) or value,
+        )
+        coordinator = object()
+        expert_parallel = OverlapExpertParallel(
+            coordinator=coordinator, is_last_layer=True)
+
+        assert expert_parallel._sync_hook("forward", "D_LAST") == "forward"
+        _, replay_ctx = recompute_context_fn()
+        with replay_ctx:
+            assert expert_parallel._sync_hook("replay", "D_LAST") == "replay"
+
+        assert hooks == [("D_LAST", coordinator), ("D", coordinator)]

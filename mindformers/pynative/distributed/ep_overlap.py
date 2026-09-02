@@ -51,16 +51,11 @@ Local pad_size
     in :attr:`ctx` alongside the other state needed by ``_token_combine``.
 
 Recompute compatibility
-    Activation recompute composes with overlap through the OVERLAP_B_F
-    callback (:func:`_make_overlap_b_f_callback`), which calls
-    ``bwd_stage.recompute_one_chunk(bwd_mi)`` on the main thread BEFORE
-    ``overlap.run`` enables the coordinator and spawns the BWD daemon.  The
-    re-run's A/B/C/D hooks are then no-ops (the coordinator is still
-    disabled, so every ``_MSSyncHookFunction.apply`` passes through via the
-    ``is_enabled()`` gate), and its activations are cached, so the
-    dual-thread ``backward_one_chunk`` reuses them instead of re-running the
-    forward on the daemon thread (which would be concurrent FWD-record +
-    BWD-replay, re-fire the hooks, and deadlock the coordinator).
+    Non-reentrant recompute is prefired by the OVERLAP_B_F callback before
+    entering the two-thread window. HyperParallel reentrant checkpoints replay
+    lazily inside the BWD worker. Their final ``D_LAST`` replay hook is treated
+    as a regular ``D`` because replay has no callback-level ``CHUNK_END`` to
+    notify the last combine event.
 """
 
 import mindspore as ms
@@ -71,6 +66,7 @@ from hyper_parallel.platform import get_platform
 from hyper_parallel.core.pipeline_parallel.hook_coordinator import HookCoordinator
 
 from mindformers.pynative.distributed.expert_parallel import ExpertParallel
+from mindformers.pynative.distributed.activation_checkpoint import is_in_recompute
 from mindformers.pynative.distributed.style import register_comm_op, _call_comm_op
 
 _platform = get_platform()
@@ -150,6 +146,14 @@ class OverlapExpertParallel(ExpertParallel):
 
     def _sync_hook(self, x, hook_name: str):
         """Fire a differentiable A/B/C/D sync hook on ``x`` (identity in the base)."""
+        # D_LAST.forward is a pure skip for the paired main-thread forward:
+        # CHUNK_END later notifies the C_last COMM event and supplies its next
+        # rendezvous. A reentrant layer replay has no callback-level CHUNK_END,
+        # so applying that skip there leaves the paired thread waiting forever.
+        # Treat replay's D_LAST as a regular D; its notify+rendezvous closes the
+        # replay-forward C event before the retained replay graph runs backward.
+        if hook_name == "D_LAST" and is_in_recompute():
+            hook_name = "D"
         return _platform.differentiable_sync_hook(x, hook_name, self._coordinator)
 
     @staticmethod

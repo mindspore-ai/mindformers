@@ -16,8 +16,10 @@
 
 from contextlib import nullcontext
 from types import SimpleNamespace
+import threading
 
 import pytest
+import mindspore as ms
 
 from mindformers.pynative.base_models.gpt import parallelize
 
@@ -122,3 +124,144 @@ def test_tag_dsv4_tp_replicated_grad_norm_params_excludes_sharded_and_indexer_we
     assert not hasattr(parameters["linear_q_up_proj.weight"], "_grad_norm_replica_count")
     assert not hasattr(parameters["core_attention.indexer.weight"], "_grad_norm_replica_count")
     assert not hasattr(unrelated, "_grad_norm_replica_count")
+
+
+@pytest.mark.level0
+@pytest.mark.platform_x86_cpu
+@pytest.mark.env_onecard
+def test_parallelize_rejects_reentrant_dxdw_split():
+    """Reject the unsupported reentrant + pipeline dxdw-split combination."""
+    with pytest.raises(ValueError, match="enable_dxdw_split=True"):
+        parallelize.parallelize_gptmodel(
+            model=object(),
+            parallel_dims=SimpleNamespace(pp_enabled=False),
+            parallelism=SimpleNamespace(
+                pipeline_parallel_enable_dxdw_split=True),
+            recompute=SimpleNamespace(use_reentrant=True),
+            recompute_comm=object(),
+            swap=object(),
+        )
+
+
+@pytest.mark.level0
+@pytest.mark.platform_x86_cpu
+@pytest.mark.env_onecard
+def test_overlap_b_f_runs_reentrant_replay_lazily_on_backward_worker():
+    """Reentrant replay overlaps the paired forward instead of being prefired."""
+    fwd_started = threading.Event()
+    replay_started = threading.Event()
+    records = []
+
+    class ReplayLoss:
+        """Model the lazy replay entered from pipeline backward."""
+
+        @staticmethod
+        def backward():
+            records.append(("replay", threading.current_thread().name))
+            replay_started.set()
+            if not fwd_started.wait(timeout=5):
+                raise RuntimeError("paired forward did not overlap reentrant replay")
+
+    loss = ReplayLoss()
+
+    class Coordinator:
+        """Minimal disabled overlap coordinator used by the schedule stub."""
+
+        @staticmethod
+        def is_enabled():
+            return False
+
+        @staticmethod
+        def rendezvous(_):
+            return None
+
+        @staticmethod
+        def notify_dispatched(_):
+            return None
+
+    class Overlap:
+        """Run paired forward and backward functions on separate threads."""
+
+        coordinator = Coordinator()
+
+        @staticmethod
+        def run(fwd_fn, bwd_fn):
+            """Overlap the supplied forward with the backward worker."""
+            errors = []
+
+            def _run_backward():
+                try:
+                    bwd_fn()
+                except Exception as exc:  # pylint: disable=broad-exception-caught
+                    errors.append(exc)
+
+            worker = threading.Thread(
+                target=_run_backward, name="hp-overlap-bwd-worker")
+            worker.start()
+            fwd_fn()
+            worker.join(timeout=10)
+            if worker.is_alive():
+                raise RuntimeError("backward worker did not finish")
+            if errors:
+                raise errors[0]
+
+    class BackwardStage:
+        """Run the loss backward call for the pipeline schedule stub."""
+
+        stage_index = 0
+
+        @staticmethod
+        def recompute_one_chunk(_):
+            records.append(("prefire", threading.current_thread().name))
+
+        @staticmethod
+        def backward_one_chunk(_):
+            loss.backward()
+
+    class ForwardStage:
+        """Signal when the paired pipeline forward starts."""
+
+        stage_index = 1
+
+        @staticmethod
+        def forward_one_chunk(_, args, kwargs):
+            del kwargs
+            records.append(("paired_forward", threading.current_thread().name))
+            fwd_started.set()
+            if not replay_started.wait(timeout=5):
+                raise RuntimeError("reentrant replay did not start")
+            return args[0] * 2
+
+    class Schedule:
+        """Provide the pipeline schedule protocol consumed by the callback."""
+
+        _stage_dict = {0: BackwardStage(), 1: ForwardStage()}
+
+        @staticmethod
+        def wait_bwd_recv(*_):
+            return None
+
+        @staticmethod
+        def wait_fwd_recv(*_):
+            return None
+
+        @staticmethod
+        def update_losses(*_):
+            return None
+
+    step = SimpleNamespace(sub_steps=(
+        SimpleNamespace(stage_index=0, micro_index=0),
+        SimpleNamespace(stage_index=1, micro_index=1),
+    ))
+    ctx = SimpleNamespace(
+        schedule=Schedule(),
+        arg_mbs=(None, (ms.Tensor([1.0], ms.float32),)),
+        kwarg_mbs=(None, {}),
+        losses=[],
+    )
+
+    parallelize._make_overlap_b_f_callback(Overlap())(step, ctx)
+
+    assert ("prefire", "MainThread") in records
+    assert ("paired_forward", "MainThread") in records
+    assert ("replay", "hp-overlap-bwd-worker") in records

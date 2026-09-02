@@ -19,6 +19,7 @@ import contextvars
 import inspect
 import re
 from collections import defaultdict, deque
+from dataclasses import dataclass
 from typing import Sequence, Tuple
 
 import regex
@@ -27,8 +28,6 @@ import mindspore as ms
 from mindspore import nn
 from hyper_parallel.core.activation_checkpoint import(
     CheckpointPolicy,
-    checkpoint_exclude_wrapper,
-    checkpoint_wrapper,
     swap_wrapper,
     SwapManager,
 )
@@ -37,6 +36,9 @@ from mindformers.pynative.config.config import (
     RecomputeConfig,
     RecomputeCommConfig,
     SwapConfig,
+)
+from mindformers.pynative.distributed.checkpoint_backend import (
+    create_checkpoint_backend,
 )
 from mindformers.tools.logger import logger
 
@@ -56,8 +58,8 @@ _config_list = {}
 # Generic activation-recompute marker. During recompute the wrapped forward re-runs in
 # the backward pass; any per-forward side effect that must happen once (MoE aux-loss
 # logging today; reused as-is by other aux losses / modules later) has to be skipped on
-# that re-run. ``recompute_context_fn`` is a context_fn for ms.recompute /
-# checkpoint_wrapper whose recompute_ctx is entered only on the backward re-run;
+# that re-run. ``recompute_context_fn`` is shared by both checkpoint backends;
+# its recompute context is entered only on the backward re-run.
 # ``is_in_recompute`` lets callers detect and skip it. A context_fn is used rather than
 # the selective-checkpoint policy_fn because policy_fn is a per-op save/recompute
 # decision hook present only for `select` mode, whereas this context_fn brackets the
@@ -99,7 +101,7 @@ def recompute_marker(state=None):
 
 
 def recompute_context_fn():
-    """``context_fn`` factory for ms.recompute(use_reentrant=False) / checkpoint_wrapper.
+    """Create matching forward/replay contexts for either checkpoint backend.
 
     Returns ``(forward_ctx, recompute_ctx)`` sharing invocation-local metadata. The
     original forward records small non-tensor values needed by replay, while the
@@ -282,7 +284,7 @@ def _validate_recompute_layer_specs(recompute_cfg: RecomputeConfig, num_layers: 
         _validate_layer_specs(
             recompute_cfg.full_recompute_layer, f"{pfx}.full_recompute_layer", num_layers
         )
-    elif recompute_cfg.mode == "select":
+    if recompute_cfg.mode == "select":
         for key, ranges in recompute_cfg.select_module.items():
             _validate_layer_specs(
                 ranges, f"{pfx}.select_module[{key!r}]", num_layers
@@ -646,66 +648,13 @@ def _clean_and_parse_comm_config(full_target_ids, select_layer_to_modules, comm_
     return layer_to_modules
 
 
-def _wrap_cell_recompute(cell):
-    """``checkpoint_wrapper`` a cell under the recompute marker."""
-    return checkpoint_wrapper(cell, context_fn=recompute_context_fn)
+def _create_checkpoint_backend(use_reentrant):
+    """Create a checkpoint backend bound to MindFormers replay context."""
+    return create_checkpoint_backend(use_reentrant, recompute_context_fn)
 
 
-def _set_pattern_recompute(layer, p_list, add_prim_attr=False, info=''):
-    """Recursively traverse layer cells along p_list path and apply checkpoint_wrapper."""
-    log_list = []
-    log = ''
-    # Pop the next path segment to match
-    if p_list:
-        p = p_list.pop(0)
-    else:
-        return info
-    if p_list:
-        for name, cell in layer._cells.items():
-            if p == name:
-                log = _set_pattern_recompute(cell, p_list, add_prim_attr, info + f'.{name}')
-                if log:
-                    log_list.append(log[1:])
-    else:
-        for name, cell in layer._cells.items():
-            if p == name:
-                if add_prim_attr:
-                    logger.info(f"For communication recompute, {info.replace('.', '', 1)}.{name} "
-                                "is expected to be operation but got cell, "
-                                "this configuration will not be effective.")
-                    continue
-                setattr(layer, name, _wrap_cell_recompute(cell))
-                log = f"{info}.{name}"
-        for attr in dir(layer):
-            if p == attr:
-                operator = getattr(layer, attr)
-                setattr(layer, attr, checkpoint_wrapper(operator, output_recompute=True))
-                log = f"{info}.{attr}"
-
-    # Restore p_list so the caller's list is unchanged after recursion
-    p_list.insert(0, p)
-    if log_list:
-        return " " + ", ".join(log_list)
-    return log
-
-
-def _set_select_recompute(layer, layer_id, layer_to_modules, add_prim_attr=False):
-    """Set select recompute or comm recompute for a layer."""
-    if layer_id in layer_to_modules:
-        log_ops = []
-        for pattern in layer_to_modules[layer_id]:
-            log = _set_pattern_recompute(layer, pattern.split(r'.'), add_prim_attr)
-            if log:
-                log_ops.append(log[1:])
-        log_ops_str = ', '.join(log_ops)
-        if log_ops_str:
-            comm = 'comm ' if add_prim_attr else ''
-            logger.info(f"Set select {comm}recompute at layer {layer_id}: {log_ops_str}")
-
-
-def _install_callable_exclude_wrapper(layer, name, operator):
+def _install_callable_wrapper(layer, name, wrapped):
     """Replace an instance callable, bound method, or settable property."""
-    wrapped = checkpoint_exclude_wrapper(operator)
     if name in vars(layer):
         setattr(layer, name, wrapped)
         return
@@ -716,15 +665,86 @@ def _install_callable_exclude_wrapper(layer, name, operator):
         return
     if inspect.isfunction(descriptor) or isinstance(
             descriptor, (staticmethod, classmethod)):
-        # ``nn.Cell.__setattr__`` rejects a child Cell whose name is already a
-        # class method. Shadow the non-data descriptor on this instance.
         object.__setattr__(layer, name, wrapped)
         return
     setattr(layer, name, wrapped)
 
 
-def _set_pattern_exclude(layer, p_list, info=''):
-    """Apply ``checkpoint_exclude_wrapper`` to a module path within a layer.
+def _set_pattern_recompute(
+        layer, p_list, backend, add_prim_attr=False, info=''):
+    """Find the configured path and install its recompute wrapper."""
+    log_list = []
+    log = ''
+    # Pop the next path segment to match
+    if p_list:
+        p = p_list.pop(0)
+    else:
+        return info
+    if p_list:
+        for name, cell in layer._cells.items():
+            if p == name:
+                log = _set_pattern_recompute(
+                    cell,
+                    p_list,
+                    backend,
+                    add_prim_attr,
+                    info + f'.{name}',
+                )
+                if log:
+                    log_list.append(log[1:])
+    else:
+        for name, cell in layer._cells.items():
+            if p == name:
+                if add_prim_attr:
+                    logger.info(f"For communication recompute, {info.replace('.', '', 1)}.{name} "
+                                "is expected to be operation but got cell, "
+                                "this configuration will not be effective.")
+                    continue
+                setattr(
+                    layer,
+                    name,
+                    backend.wrap_cell(cell),
+                )
+                log = f"{info}.{name}"
+        if not log and p not in layer._cells and hasattr(layer, p):
+            operator = getattr(layer, p)
+            if callable(operator):
+                _install_callable_wrapper(
+                    layer, p, backend.wrap_callable(operator))
+                log = f"{info}.{p}"
+
+    # Restore p_list so the caller's list is unchanged after recursion
+    p_list.insert(0, p)
+    if log_list:
+        return " " + ", ".join(log_list)
+    return log
+
+
+def _set_select_recompute(
+        layer, layer_id, layer_to_modules, backend, add_prim_attr=False):
+    """Set select recompute or comm recompute for a layer."""
+    if layer_id in layer_to_modules:
+        log_ops = []
+        for pattern in layer_to_modules[layer_id]:
+            log = _set_pattern_recompute(
+                layer,
+                pattern.split(r'.'),
+                backend,
+                add_prim_attr,
+            )
+            if log:
+                log_ops.append(log[1:])
+        log_ops_str = ', '.join(log_ops)
+        if log_ops_str:
+            comm = 'comm ' if add_prim_attr else ''
+            logger.info(
+                f"Set select {comm}{backend.log_prefix}recompute at layer "
+                f"{layer_id}: {log_ops_str}"
+            )
+
+
+def _set_pattern_exclude(layer, p_list, backend, info=''):
+    """Apply the matching exclude wrapper to a module path within a layer.
 
     Matches two target types at the final path segment:
     1. Cell in ``_cells``
@@ -742,29 +762,35 @@ def _set_pattern_exclude(layer, p_list, info=''):
         slot = p + '.' + '.'.join(p_list)
         if hasattr(layer, '_comm_ops') and slot in layer._comm_ops:
             entry = layer._comm_ops[slot]
-            entry['fn'] = checkpoint_exclude_wrapper(entry['fn'])
+            entry['fn'] = backend.wrap_exclude(entry['fn'])
             log = f"{info}.{slot}"
             p_list.clear()
         else:
             for name, cell in layer._cells.items():
                 if p == name:
-                    log = _set_pattern_exclude(cell, p_list, info + f'.{name}')
+                    log = _set_pattern_exclude(
+                        cell, p_list, backend, info + f'.{name}')
                     if log:
                         log_list.append(log[1:])
     else:
         # Leaf segment: match cells, comm ops, then functional operators.
         for name, cell in layer._cells.items():
             if p == name:
-                setattr(layer, name, checkpoint_exclude_wrapper(cell))
+                setattr(
+                    layer,
+                    name,
+                    backend.wrap_exclude(cell),
+                )
                 log = f"{info}.{name}"
         if hasattr(layer, '_comm_ops') and p in layer._comm_ops:
             entry = layer._comm_ops[p]
-            entry['fn'] = checkpoint_exclude_wrapper(entry['fn'])
+            entry['fn'] = backend.wrap_exclude(entry['fn'])
             log = f"{info}.{p}"
         if not log and p not in layer._cells and hasattr(layer, p):
             operator = getattr(layer, p)
             if callable(operator):
-                _install_callable_exclude_wrapper(layer, p, operator)
+                _install_callable_wrapper(
+                    layer, p, backend.wrap_exclude(operator))
                 log = f"{info}.{p}"
 
     # Restore p_list so the caller's list is unchanged after recursion
@@ -774,13 +800,15 @@ def _set_pattern_exclude(layer, p_list, info=''):
     return log
 
 
-def _set_exclude_recompute(layer, layer_id, exclude_layer_to_modules):
-    """Apply exclude recompute (checkpoint_exclude_wrapper) to the specified layer."""
+def _set_exclude_recompute(
+        layer, layer_id, exclude_layer_to_modules, backend):
+    """Apply exclude recompute using the surrounding layer's checkpoint type."""
     if layer_id not in exclude_layer_to_modules:
         return
     log_ops = []
     for pattern in exclude_layer_to_modules[layer_id]:
-        log = _set_pattern_exclude(layer, pattern.split(r'.'))
+        log = _set_pattern_exclude(
+            layer, pattern.split(r'.'), backend)
         if log:
             log_ops.append(log[1:])
     log_ops_str = ', '.join(log_ops)
@@ -788,12 +816,66 @@ def _set_exclude_recompute(layer, layer_id, exclude_layer_to_modules):
         logger.info(f"Set exclude recompute at layer {layer_id}: {log_ops_str}")
 
 
+@dataclass(frozen=True)
+class _RecomputePlan:
+    """Backend-neutral checkpoint targets resolved from user configuration."""
+
+    full_target_ids: set
+    select_layer_to_modules: dict
+    exclude_layer_to_modules: dict
+    comm_layer_to_modules: dict
+
+
+def _build_recompute_plan(model, recompute_config, recompute_comm_config):
+    """Resolve layer ranges and patterns without selecting an implementation."""
+    rc = recompute_config
+    rc_comm = recompute_comm_config
+    need_recompute = rc.mode != "None"
+
+    config_list = _config_list or _get_modules_and_ops_list(model)
+    full_target_ids = set()
+    select_layer_to_modules = {}
+    exclude_layer_to_modules = {}
+    comm_layer_to_modules = {}
+
+    if need_recompute:
+        full_target_ids = _parse_layer_ids(rc.full_recompute_layer)
+        if rc.mode == "select":
+            select_modules = _expand_select_module(
+                config_list, rc.select_module)
+            select_layer_to_modules = _clean_and_parse_config(
+                full_target_ids, select_modules, label="Recompute")
+
+    if need_recompute and isinstance(rc.exclude_op, dict) and rc.exclude_op:
+        exclude_modules = _expand_select_module(
+            config_list, rc.exclude_op, label="exclude_op")
+        exclude_layer_to_modules = _clean_and_parse_config(
+            set(), exclude_modules, label="ExcludeOp")
+
+    if rc_comm.enable:
+        comm_modules = _expand_select_module(
+            config_list,
+            rc_comm.select_module,
+            label="comm_select_module",
+        )
+        comm_layer_to_modules = _clean_and_parse_comm_config(
+            full_target_ids, select_layer_to_modules, comm_modules)
+
+    return _RecomputePlan(
+        full_target_ids=full_target_ids,
+        select_layer_to_modules=select_layer_to_modules,
+        exclude_layer_to_modules=exclude_layer_to_modules,
+        comm_layer_to_modules=comm_layer_to_modules,
+    )
+
+
 def apply_recompute(
     model,
     recompute_config: RecomputeConfig,
     recompute_comm_config: RecomputeCommConfig,
+    backend=None,
 ) -> None:
-    """Apply ``checkpoint_wrapper`` using recompute and recompute_comm configs.
+    """Build and apply a backend-neutral activation-recompute plan.
 
     ``model`` may be a bare decoder ``TransformerBlock`` or a ``_MtpLayerView``
     that also exposes the MTP layers as the last global layer ids.
@@ -802,34 +884,13 @@ def apply_recompute(
     rc_comm = recompute_comm_config
     need_recompute = rc.mode != "None"
     need_comm = rc_comm.enable
-
-    full_target_ids = set()
-    layer_to_modules = {}
-    comm_layer_to_modules = {}
-    exclude_layer_to_modules = {}
-
-    if _config_list:
-        config_list = _config_list
-    else:
-        config_list = _get_modules_and_ops_list(model)
-
-    if need_recompute:
-        full_target_ids = _parse_layer_ids(rc.full_recompute_layer)
-        if rc.mode == "select":
-            select_module_list = _expand_select_module(config_list, rc.select_module)
-            layer_to_modules = _clean_and_parse_config(full_target_ids, select_module_list, label="Recompute")
-
-    # Expand exclude_op patterns against the whitelist (same pipeline as select_module).
-    if need_recompute and isinstance(rc.exclude_op, dict) and rc.exclude_op:
-        exclude_layer_to_modules = _clean_and_parse_config(
-            set(), _expand_select_module(config_list, rc.exclude_op, label="exclude_op"), label="ExcludeOp")
-
-    if need_comm:
-        comm_select_module_list = _expand_select_module(config_list, rc_comm.select_module, label="comm_select_module")
-        comm_layer_to_modules = _clean_and_parse_comm_config(full_target_ids, layer_to_modules, comm_select_module_list)
+    if backend is None:
+        backend = _create_checkpoint_backend(rc.use_reentrant)
+        backend.validate_recompute(rc, rc_comm)
 
     if not hasattr(model, "layers"):
         raise ValueError(f"{type(model)} must have 'layers' attribute.")
+    plan = _build_recompute_plan(model, rc, rc_comm)
 
     for layer_id in range(model.layer_start, model.layer_end + 1):
         layer = model.layers[layer_id]
@@ -841,21 +902,54 @@ def apply_recompute(
             )
             continue
         # Step 1: exclude (must be before checkpoint_wrapper)
-        if exclude_layer_to_modules:
-            _set_exclude_recompute(model.layers[layer_id], layer_id, exclude_layer_to_modules)
+        if plan.exclude_layer_to_modules:
+            active_excludes, inactive_excludes = backend.partition_excludes(
+                layer_id,
+                plan.exclude_layer_to_modules.get(layer_id, ()),
+                plan.full_target_ids,
+                plan.select_layer_to_modules,
+            )
+            for pattern in inactive_excludes:
+                logger.info(
+                    "Skip exclude_op '%s' at layer %s because it is outside "
+                    "every %s checkpoint boundary.",
+                    pattern,
+                    layer_id,
+                    backend.name,
+                )
+            if active_excludes:
+                _set_exclude_recompute(
+                    model.layers[layer_id],
+                    layer_id,
+                    {layer_id: active_excludes},
+                    backend,
+                )
 
         # Step 2: full recompute
-        if need_recompute and layer_id in full_target_ids:
-            model.layers[layer_id] = _wrap_cell_recompute(model.layers[layer_id])
-            logger.info(f"Set full recompute at layer {layer_id}")
+        if need_recompute and layer_id in plan.full_target_ids:
+            model.layers[layer_id] = backend.wrap_cell(model.layers[layer_id])
+            logger.info(
+                f"Set full recompute at layer {layer_id} ({backend.name})")
 
         # Step 3: select recompute
         if need_recompute and rc.mode == "select":
-            _set_select_recompute(model.layers[layer_id], layer_id, layer_to_modules)
+            _set_select_recompute(
+                model.layers[layer_id],
+                layer_id,
+                plan.select_layer_to_modules,
+                backend,
+            )
 
         # Step 4: comm recompute
         if need_comm:
-            _set_select_recompute(model.layers[layer_id], layer_id, comm_layer_to_modules, add_prim_attr=True)
+            _set_select_recompute(
+                model.layers[layer_id],
+                layer_id,
+                plan.comm_layer_to_modules,
+                backend,
+                add_prim_attr=True,
+            )
+
 
 
 def _disables_activation_recompute(module):
@@ -1151,6 +1245,12 @@ def apply_ac(
     if not (enable_recompute or enable_swap):
         return
 
+    backend = None
+    if enable_recompute:
+        backend = _create_checkpoint_backend(recompute.use_reentrant)
+        backend.validate_recompute(recompute, recompute_comm)
+        backend.validate_swap(swap)
+
     num_layers = None
     if hasattr(model, "config"):
         num_layers = model.config.num_layers
@@ -1173,7 +1273,8 @@ def apply_ac(
 
     if enable_recompute:
         _validate_recompute_config(recompute, recompute_comm, total_num_layers)
-        apply_recompute(ac_model, recompute, recompute_comm)
+        apply_recompute(
+            ac_model, recompute, recompute_comm, backend=backend)
 
     if enable_swap:
         _validate_swap_config(swap, total_num_layers)

@@ -169,6 +169,14 @@ class Trainer:
         logger.info(f"Current world size: {self.world_size}.")
         self.enable_parallel = self.world_size > 1
 
+        if not self.enable_parallel and self.config.recompute.use_reentrant:
+            raise ValueError(
+                "recompute.use_reentrant=True is not supported by the single-card "
+                "PyNative Trainer path because activation checkpoint wrappers are "
+                "only installed during distributed parallelization. Launch at least "
+                "two workers or set recompute.use_reentrant=False."
+            )
+
         self.communication_init = False
         if self.enable_parallel:
             init_process_group()
