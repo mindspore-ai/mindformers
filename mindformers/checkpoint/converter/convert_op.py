@@ -190,7 +190,14 @@ class ConcatConvertOp(ConvertOp):
 
     HF → MF: interleaves values along ``dim`` by default for fused gated-MLP
     layouts; set ``interleaved=False`` for a plain ``np.concatenate`` layout.
-    MF → HF: not supported.
+    MF → HF: the exact inverse, a strided gather or a plain split.
+
+    For a fused gated-MLP ``linear_fc1`` the layout is not a property of the
+    mapping but of the model: ``use_interleaved_weight_layout_mlp`` picks
+    ``MLPInterleaved`` over ``MLP`` (and ``SharedExpertMLPInterleaved`` over
+    ``SharedExpertMLP``), which read the fused weight differently.
+    :meth:`set_model_config` therefore takes ``interleaved`` from the config for
+    those ops, so a declaration cannot go stale against the model it describes.
     """
     dim: int = 0
     split_sizes: List[int] = None  # Optional: specify size of each HF weight
@@ -205,6 +212,29 @@ class ConcatConvertOp(ConvertOp):
                 f"or 'N mf_name to 1 hf_name'，"
                 f"but got hf_names: `{self.hf_names}`, mf_names: `{self.mf_names}`."
             )
+
+    def is_gated_mlp_fc1(self) -> bool:
+        """True for the fused gate|up weight of an MLP / shared-expert MLP.
+
+        Keyed on ``linear_fc1`` so that concatenations which are not a gated MLP
+        (MTP's ``eh_proj``, say) keep whatever their declaration asked for.
+        """
+        return any('linear_fc1' in name for name in self.mf_names)
+
+    def set_model_config(self, config: TransformerConfig):
+        """Take the fused-fc1 layout from the model config.
+
+        ``use_interleaved_weight_layout_mlp`` selects ``MLPInterleaved`` over
+        ``MLP`` in the layer spec, i.e. whether the fused gate|up weight is read
+        row-interleaved or as two contiguous halves. Reading it here keeps the
+        converter in step with the model the config builds; MoE routed experts
+        are unaffected (they are ``ExpertsConvertOp`` and always contiguous).
+        """
+        self.mf_config = config
+        if self.is_gated_mlp_fc1():
+            interleaved = getattr(config, 'use_interleaved_weight_layout_mlp', None)
+            if interleaved is not None:
+                self.interleaved = bool(interleaved)
 
     def _hf_to_mf(self, weights: List[np.ndarray]) -> List[np.ndarray]:
         if not self.interleaved:
