@@ -32,6 +32,11 @@ from mindspore.mint.distributed import (
 
 from mindformers.tools.logger import logger
 from mindformers.tools.register.register import MindFormerModuleType, MindFormerRegister
+from mindformers.dataset.dataloader.balance_scheduler import (
+    BALANCE_SUPPORTED_LOADERS,
+    DatasetBalancer,
+    assert_balance_supported,
+)
 from mindformers.dataset.dataloader.blended_megatron_dataloader import (
     BlendedMegatronDatasetDataLoader,
 )
@@ -454,6 +459,9 @@ def _build_dataset(
         "num_parallel_workers": config.num_parallel_workers
     })
     dataloader_type = dataloader_config.pop("type")
+    # Fail fast if balancing is enabled for an unsupported loader type.
+    balance_enabled = config.balance_enabled
+    assert_balance_supported(dataloader_type, balance_enabled)
 
     create_compressed_eod_mask = False
     if dataloader_type == "BlendedMegatronDatasetDataLoader":
@@ -483,6 +491,24 @@ def _build_dataset(
         # Each batch is one micro-batch at local_batch_size granularity,
         # so all sequences in a batch share a single accumulating offset.
         per_batch_map_func = _actual_seq_len_batch_map
+
+    # Balance requires the compressed EOD mask (variable-length attention); the
+    # actual_seq_len column it produces is the load metric used for reordering.
+    if balance_enabled and not create_compressed_eod_mask:
+        raise ValueError(
+            "balance_enabled=True requires create_compressed_eod_mask=True. "
+            "Enable create_compressed_eod_mask or set balance_enabled to False."
+        )
+
+    # Apply load balancing only when the loader is supported and both preconditions hold.
+    if dataloader_type in BALANCE_SUPPORTED_LOADERS and balance_enabled and create_compressed_eod_mask:
+        global_batch_size = parallelism.data_parallel * local_batch_size \
+            * parallelism.pipeline_parallel_microbatch_size
+        dataset = DatasetBalancer(
+            dataset,
+            parallelism=parallelism,
+            global_batch_size=global_batch_size,
+        ).apply()
 
     dataset = dataset.batch(
         batch_size=local_batch_size,
