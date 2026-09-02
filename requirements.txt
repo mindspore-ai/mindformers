@@ -6,7 +6,7 @@ tqdm>=4.65.0
 pyyaml>=6.0
 jieba>=0.42.1
 rouge_chinese>=1.0.3
-nltk==3.9.1
+nltk==3.10.3
 mindpet==1.0.4
 opencv-python-headless
 pyarrow>=23.0.1
