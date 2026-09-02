@@ -38,6 +38,7 @@ from mindspore.graph.api import _no_grad
 from mindspore.ops.communication import barrier
 from hyper_parallel.platform.mindspore.pipeline_parallel._utils import _MicroBatch
 from hyper_parallel.core.dtensor.dtensor import DTensor
+from hyper_parallel.core.fully_shard.api import HSDPModule
 from hyper_parallel.platform.mindspore.autograd_compat import enable_mindspore_backward_compat
 
 from mindformers.tools.logger import logger
@@ -1211,6 +1212,13 @@ class Trainer:
         loss = 0.0
         grad_norm = 0.0
         for micro_step in range(self.num_accumulation_steps):
+            # Keep reduce-scatter enabled on every micro-batch so full, unsharded
+            # gradients do not survive across accumulation steps. The HSDP
+            # replicate all-reduce is linear, so defer only that second-level
+            # reduction until the final micro-batch after the locally sharded
+            # gradients have accumulated.
+            is_last_micro_step = micro_step == self.num_accumulation_steps - 1
+            self._set_requires_all_reduce(is_last_micro_step)
             micro_inputs = self._next_batch()
 
             try:
@@ -1238,6 +1246,12 @@ class Trainer:
                 if self.monitor.should_record("device_norm"):
                     self.monitor.record("device_norm")
         return loss, grad_norm
+
+    def _set_requires_all_reduce(self, requires_all_reduce: bool) -> None:
+        """Control HSDP replicate all-reduce for every local model partition."""
+        for model in self.model:
+            if isinstance(model, HSDPModule):
+                model.set_requires_all_reduce(requires_all_reduce)
 
     def training_pp_step(self):
         """Perform a training step for pipeline parallelism.
