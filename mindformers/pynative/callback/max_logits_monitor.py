@@ -153,11 +153,11 @@ class MaxLogitsMonitor(TrainerCallback):
         return "[" + ", ".join(self._fmt(x) for x in vs) + "]"
 
     def _dump(self, params, state, qk_clip_threshold=None, enable_logging=True):
-        """Match TrainingStateMonitor._dump_max_attention_logit print format."""
+        """Match TrainingStateMonitor._dump_max_attention_logit format, logging this rank's head partition."""
         vals = []
         qk_clip_count = 0
         for param_name, param in params.items():
-            param = param.full_tensor() if hasattr(param, "full_tensor") else param
+            # max_logits_val is a per-partition buffer now, so no full_tensor() gather.
             v = param.asnumpy().reshape(-1)
             if enable_logging:
                 self._to_log(f"max_attention_logit/{param_name}", self._fmt_list(v), state)

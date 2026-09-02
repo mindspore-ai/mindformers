@@ -15,8 +15,6 @@
 """Tests for pynative GPT model-level behavior."""
 
 from types import SimpleNamespace
-from unittest.mock import Mock
-
 import numpy as np
 import pytest
 from mindspore import Tensor, dtype
@@ -28,24 +26,33 @@ from mindformers.pynative.base_models.gpt.gpt_model import GPTModel
 @pytest.mark.level0
 @pytest.mark.platform_x86_cpu
 @pytest.mark.env_onecard
-def test_synced_max_logits_caches_strict_device_count():
-    """Reuse the already-synchronized logits for a strict-``>`` device count."""
+def test_apply_qk_clip_caches_strict_device_count():
+    """The clip pass reuses its own synced logits for a strict-``>`` device count."""
     stacked = Tensor([[99.0, 100.0], [101.0, 150.0]], dtype=dtype.float32)
-    writeback = Mock()
+    applied = []
+
+    def make_layer(row):
+        core = SimpleNamespace(max_logits_val=stacked[row])
+        layer = SimpleNamespace(core_attention=core)
+        layer.apply_qk_clip = lambda scales, fp32, _l=layer: applied.append((_l, scales))
+        return layer
+
+    layers = [make_layer(0), make_layer(1)]
     model = SimpleNamespace(
-        _stacked_synced_max_logits=Mock(
-            return_value=([object(), object()], None, None, stacked)),
-        _writeback_synced_max_logits=writeback,
+        config=SimpleNamespace(multi_latent_attention=True),
+        _iter_self_attentions=lambda: [(i, "", l) for i, l in enumerate(layers)],
+        _all_reduce_max_logits=lambda t: stacked,
         _qk_clip_count_cache=[None],
     )
 
-    assert GPTModel.synced_max_attention_logit_fires(
-        model, Tensor([100.0], dtype=dtype.float32)) is True
+    GPTModel.apply_qk_clip_scaling(model, Tensor([100.0], dtype=dtype.float32), {})
 
+    # 100.0 is not strictly greater than the threshold; 101.0 and 150.0 are.
     count = GPTModel.take_qk_clip_count(model)
     assert np.array_equal(count.asnumpy(), np.array([2], np.int32))
     assert GPTModel.take_qk_clip_count(model) is None
-    writeback.assert_called_once()
+    # every tracked layer got its own row of scales, in order
+    assert [l for l, _ in applied] == layers
 
 
 @pytest.mark.level0
