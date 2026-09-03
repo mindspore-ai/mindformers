@@ -115,8 +115,7 @@ class OrderedIndexDataLoader:
 
         world_size = get_real_group_size()
         if world_size > 1 and get_context('mode') == MODE['PYNATIVE_MODE']:
-            balance_config = kwargs.get('balance_config')
-            dataset = OrderedIndexDataset(config, balance_config=balance_config)
+            dataset = OrderedIndexDataset(config)
             return GeneratorDataset(
                 dataset,
                 column_names=kwargs.get('column_names'),
@@ -156,8 +155,7 @@ class OrderedIndexDataLoader:
                 shuffle=False,
             )
 
-        balance_config = kwargs.get('balance_config')
-        dataset = OrderedIndexDataset(config, balance_config=balance_config)
+        dataset = OrderedIndexDataset(config)
 
         if world_size > 1:
             skip_barrier_controller()  # barrier
@@ -273,7 +271,7 @@ class OrderedIndexDataset:
 
     _cache: dict = {}
 
-    def __init__(self, config: OrderedIndexDataLoaderConfig, **kwargs):
+    def __init__(self, config: OrderedIndexDataLoaderConfig):
         """
         Initialize the dataset.
 
@@ -299,17 +297,6 @@ class OrderedIndexDataset:
 
         self._load_datasets()
         self._build_index_map()
-
-        self.balance_config = kwargs.get('balance_config')
-        self.balanced_indices = None
-        self.balanced_indices_start_idx = None
-        self.data_parallel_stage = None
-        if self.balance_config:
-            from mindspore.communication import get_rank
-            logger.info(f"use balance_config: {self.balance_config}")
-            dp = self.balance_config.data_parallel
-            tp = self.balance_config.model_parallel
-            self.data_parallel_stage = (get_rank() // tp) % dp
 
     def __len__(self) -> int:
         """
@@ -517,11 +504,6 @@ class OrderedIndexDataset:
             tuple: (tokens, labels, loss_mask, position_ids) or
                    (tokens, labels, loss_mask, position_ids, attention_mask)
         """
-        # src_index = index
-        if self.balance_config:
-            index = self._balance_index(index)
-            index = min(index, self.total_length - 1)
-        # print(f">>> input index: {src_index}, <<< output index: {index}")
         return self._query_data(index)
 
     def _query_data(self, index):
@@ -621,58 +603,6 @@ class OrderedIndexDataset:
         if index_map.shape != (self.total_length, 2):
             raise ValueError("Provided index map has incorrect shape.")
         self.index_map = index_map
-
-    def _balance_index(self, index):
-        """Map a global index to a load-balanced peer index."""
-        global_batch_size = int(self.balance_config.global_batch_size)
-        start_idx, local_idx = divmod(index, global_batch_size)
-        start_idx *= global_batch_size
-
-        # re-compute local_idx in pipeline parallel
-        # print(f"src_index: {local_idx}")
-        m, d = divmod(local_idx, self.balance_config.data_parallel)
-        local_idx = m + d * self.balance_config.micro_batch_num
-        # print(f"dst_index: {local_idx}")
-
-        if self.balanced_indices is not None and self.balanced_indices_start_idx == start_idx:
-            return self.balanced_indices[local_idx] + start_idx
-
-        actual_seq_lens = []
-        for i in range(start_idx, start_idx + global_batch_size):
-            i = min(i, self.total_length - 1)
-            actual_seq_len = self._get_actual_seq_len(i)
-            actual_seq_lens.append(actual_seq_len)
-
-        self.balanced_indices = _balance_attention_load(
-            actual_seq_lens,
-            self.balance_config.data_parallel,
-            self.balance_config.micro_batch_num
-        )
-        self.balanced_indices_start_idx = start_idx
-        return self.balanced_indices[local_idx] + start_idx
-
-    def _get_actual_seq_len(self, index):
-        """Get compressed EOD positions for balance scheduling."""
-        if index < 0:
-            index = self.total_length + index
-        if index < 0 or index >= self.total_length:
-            raise IndexError(f"Index {index} out of range [0, {self.total_length - 1}]")
-
-        dataset_idx = int(self.index_map[index, 0])
-        local_idx = int(self.index_map[index, 1])
-        text = self.dataset_list[dataset_idx][local_idx]
-
-        max_seq_length = self.config.sequence_length + 1
-        if len(text) > max_seq_length:
-            text = text[:max_seq_length]
-        elif len(text) < max_seq_length:
-            text = np.pad(text, (0, max_seq_length - len(text)), 'constant',
-                          constant_values=self.config.pad_token)
-        return _get_eod_attention_mask(
-            text[:-1],
-            self.config.eod_token,
-            self.config.compressed_eod_mask_length
-        )
 
 
 def _get_eod_attention_mask(
@@ -811,60 +741,3 @@ def _get_ltor_masks_and_position_ids(
         attention_mask = seq_len_vector
 
     return attention_mask, loss_mask, position_ids
-
-
-def _balance_attention_load(actual_seq_lens, data_parallel, micro_batch_num):
-    """Balance samples by approximate attention load across DP micro-batches."""
-    # Compute attention load for each sequence:
-    # load = sum((len_i - len_{i-1})^2)
-    attn_load = []
-    for seq in actual_seq_lens:
-        # Add 0 at the beginning of seq to calculate the square of the first value
-        seq_with_zero = [0] + seq.tolist()
-        cur_load = sum((seq_with_zero[i] - seq_with_zero[i - 1]) ** 2 for i in range(1, len(seq_with_zero)))
-        attn_load.append(cur_load)
-    attn_load = np.array(attn_load)
-
-    # Balance loads using greedy partition
-    balanced_group, group_sums = _greedy_balanced_group(
-        attn_load,
-        data_parallel * micro_batch_num
-    )
-
-    # Reorder groups by ascending group load
-    indices = np.argsort(np.array(group_sums))
-    balanced_group = [idx for group_idx in indices for idx in balanced_group[group_idx]]
-    # print("balanced group index:", balanced_group)
-    return np.array(balanced_group, dtype=np.int64)
-
-
-def _greedy_balanced_group(attn_load, k=None):
-    """Greedily partition attention loads into balanced groups."""
-    if k is None or k <= 0:
-        raise ValueError(f"k must be a positive integer, but got {k}.")
-    max_group_size = (len(attn_load) + k - 1) // k
-
-    pairs = [(int(attn_load[i]), i) for i in range(len(attn_load))]
-    pairs.sort(key=lambda x: -x[0])
-
-    groups = [[] for _ in range(k)]
-    group_sums = np.zeros(k, dtype=np.int64)
-    group_sizes = np.zeros(k, dtype=int)
-
-    for value, idx in pairs:
-        best_group = None
-        best_sum = None
-
-        for g in range(k):
-            if group_sizes[g] < max_group_size:
-                if best_group is None or group_sums[g] < best_sum:
-                    best_group = g
-                    best_sum = group_sums[g]
-
-        groups[best_group].append(idx)
-        group_sums[best_group] += value
-        group_sizes[best_group] += 1
-
-    return groups, group_sums
-    # for i in range(k):
-    #     print(f"Group {i + 1}: size={group_sizes[i]}, sum={group_sums[i]}, indices={groups[i]}")
