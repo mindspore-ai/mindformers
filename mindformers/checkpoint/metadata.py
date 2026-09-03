@@ -323,9 +323,12 @@ def generate_default_metadata_from_checkpoint(checkpoint_dir: str) -> tuple[dict
             # Read the safetensors JSON header directly to avoid MindSpore dtype
             # compatibility issues (e.g. F8_E8M0, BF16 not recognised by ms_load_checkpoint).
             header, _ = read_safetensors_header(safetensor_file)
+            # `__metadata__` is a free-form annotation block, not a tensor entry.
+            # transformers' save_pretrained always writes one ({"format": "pt"}),
+            # so every checkpoint published from a PyTorch model carries it.
             param_iter = (
                 (name, tuple(info["shape"]), safetensor_dtype_to_np_meta(info["dtype"]))
-                for name, info in header.items()
+                for name, info in header.items() if name != "__metadata__"
             )
         else:
             loaded_params = ms_load_checkpoint(safetensor_file, format='safetensors')

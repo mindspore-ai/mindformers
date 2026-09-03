@@ -190,7 +190,14 @@ class ConcatConvertOp(ConvertOp):
 
     HF → MF: interleaves values along ``dim`` by default for fused gated-MLP
     layouts; set ``interleaved=False`` for a plain ``np.concatenate`` layout.
-    MF → HF: not supported.
+    MF → HF: the exact inverse, a strided gather or a plain split.
+
+    For a fused gated-MLP ``linear_fc1`` the layout is not a property of the
+    mapping but of the model: ``use_interleaved_weight_layout_mlp`` picks
+    ``MLPInterleaved`` over ``MLP`` (and ``SharedExpertMLPInterleaved`` over
+    ``SharedExpertMLP``), which read the fused weight differently.
+    :meth:`set_model_config` therefore takes ``interleaved`` from the config for
+    those ops, so a declaration cannot go stale against the model it describes.
     """
     dim: int = 0
     split_sizes: List[int] = None  # Optional: specify size of each HF weight
@@ -205,6 +212,29 @@ class ConcatConvertOp(ConvertOp):
                 f"or 'N mf_name to 1 hf_name'，"
                 f"but got hf_names: `{self.hf_names}`, mf_names: `{self.mf_names}`."
             )
+
+    def is_gated_mlp_fc1(self) -> bool:
+        """True for the fused gate|up weight of an MLP / shared-expert MLP.
+
+        Keyed on ``linear_fc1`` so that concatenations which are not a gated MLP
+        (MTP's ``eh_proj``, say) keep whatever their declaration asked for.
+        """
+        return any('linear_fc1' in name for name in self.mf_names)
+
+    def set_model_config(self, config: TransformerConfig):
+        """Take the fused-fc1 layout from the model config.
+
+        ``use_interleaved_weight_layout_mlp`` selects ``MLPInterleaved`` over
+        ``MLP`` in the layer spec, i.e. whether the fused gate|up weight is read
+        row-interleaved or as two contiguous halves. Reading it here keeps the
+        converter in step with the model the config builds; MoE routed experts
+        are unaffected (they are ``ExpertsConvertOp`` and always contiguous).
+        """
+        self.mf_config = config
+        if self.is_gated_mlp_fc1():
+            interleaved = getattr(config, 'use_interleaved_weight_layout_mlp', None)
+            if interleaved is not None:
+                self.interleaved = bool(interleaved)
 
     def _hf_to_mf(self, weights: List[np.ndarray]) -> List[np.ndarray]:
         if not self.interleaved:
@@ -230,8 +260,37 @@ class ConcatConvertOp(ConvertOp):
         return [interleaved_concat]
 
     def _mf_to_hf(self, weights: List[np.ndarray]) -> List[np.ndarray]:
-        """Split concatenated MF weights back to HF weights"""
-        raise ValueError("Currently, ConcatConvertOp does not support MF → HF conversion")
+        """Split the concatenated MF weight back into the HF weights.
+
+        Exact inverse of :meth:`_hf_to_mf`: when ``interleaved`` is set the parts
+        alternate along ``dim`` (part0[0], part1[0], part0[1], ...), so they are
+        recovered with a strided gather rather than a contiguous split.
+        """
+        weight = weights[0]
+        num_parts = len(self.hf_names)
+        if num_parts < 2:
+            raise ValueError(
+                f"ConcatConvertOp MF → HF requires at least 2 hf_names, got `{self.hf_names}`.")
+
+        if self.interleaved:
+            length = weight.shape[self.dim]
+            if length % num_parts != 0:
+                raise ValueError(
+                    f"ConcatConvertOp: dim {self.dim} of the MF weight ({length}) is not "
+                    f"divisible by the number of hf_names ({num_parts}).")
+            return [np.ascontiguousarray(
+                np.take(weight, np.arange(k, length, num_parts), axis=self.dim))
+                    for k in range(num_parts)]
+
+        if self.split_sizes:
+            if len(self.split_sizes) != num_parts:
+                raise ValueError(
+                    f"ConcatConvertOp: split_sizes {self.split_sizes} does not match "
+                    f"the number of hf_names ({num_parts}).")
+            offsets = np.cumsum(self.split_sizes)[:-1]
+            return [np.ascontiguousarray(w) for w in np.split(weight, offsets, axis=self.dim)]
+
+        return [np.ascontiguousarray(w) for w in np.split(weight, num_parts, axis=self.dim)]
 
 
 @dataclass
@@ -295,9 +354,77 @@ class ExpertsConvertOp(ConvertOp):
 
         return result
 
+    def _num_local_experts(self) -> int:
+        """Number of experts actually stored in this checkpoint shard."""
+        if not self.num_moe_experts:
+            raise ValueError(
+                "ExpertsConvertOp requires set_model_config() (or num_moe_experts, "
+                "hidden_size, expert_parallel_size and optimizer_parallel_size) to be "
+                "set before MF → HF conversion.")
+        return (self.num_moe_experts
+                // (self.expert_parallel_size or 1)
+                // (self.optimizer_parallel_size or 1))
+
     def _mf_to_hf(self, weights: List[np.ndarray]) -> List[np.ndarray]:
-        """Convert experts MF weights back to HF weights"""
-        raise ValueError("Currently, ExpertsConvertOp does not support MF → HF conversion")
+        """Unstack the MF experts weight into one array per HF slot.
+
+        Returns one array per entry of ``hf_names``, each shaped
+        ``[num_local_experts, ...]``. Exact inverse of :meth:`_hf_to_mf`.
+        Naming is handled by :meth:`mf_to_hf`, because a single MF tensor maps
+        to ``len(hf_names) * num_local_experts`` HF tensors.
+        """
+        num_local = self._num_local_experts()
+        weight = weights[0]
+
+        if len(self.hf_names) == 2:
+            # weight1: [E * hidden, 2 * ffn] -> gate/up, each [E, ffn, hidden]
+            stacked = weight.reshape(num_local, self.hidden_size, -1)
+            gate_weight, up_weight = np.split(stacked, 2, axis=2)
+            return [np.ascontiguousarray(gate_weight.transpose(0, 2, 1)),
+                    np.ascontiguousarray(up_weight.transpose(0, 2, 1))]
+        if len(self.hf_names) == 1:
+            # weight2: [E * ffn, hidden] -> down, [E, hidden, ffn]
+            stacked = weight.reshape(num_local, -1, self.hidden_size)
+            return [np.ascontiguousarray(stacked.transpose(0, 2, 1))]
+        raise ValueError(
+            f"ExpertsConvertOp MF → HF supports 1 or 2 hf_names, got `{self.hf_names}`.")
+
+    def mf_to_hf(self, name_to_weight: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
+        """MF → HF conversion, expanding the stacked weight into per-expert names.
+
+        The base implementation assumes a 1:1 correspondence between names on
+        each side. Experts are the one case where a single MF tensor yields
+        ``len(hf_names) * num_local_experts`` HF tensors, so the naming is done
+        here instead of in :meth:`ConvertOp.mf_to_hf`.
+        """
+        mf_pattern = self.mf_names[0]
+        weight, match = None, None
+        if mf_pattern in name_to_weight:
+            weight = name_to_weight[mf_pattern]
+        else:
+            re_pattern = self._name_to_pattern(mf_pattern)
+            for name in name_to_weight:
+                found = re.findall(re_pattern, name)
+                if found:
+                    weight, match = name_to_weight[name], found
+                    break
+        if weight is None:
+            raise ValueError(f"Cannot find {mf_pattern} in {list(name_to_weight)}")
+
+        prefix_args = ()
+        if match:
+            first = match[0]
+            prefix_args = first if isinstance(first, tuple) else (first,)
+
+        per_slot = self._mf_to_hf([weight])
+        num_local = self._num_local_experts()
+
+        hf_weights = {}
+        for slot, hf_pattern in enumerate(self.hf_names):
+            for expert_id in range(num_local):
+                hf_name = hf_pattern.format(*prefix_args, expert_id)
+                hf_weights[hf_name] = per_slot[slot][expert_id]
+        return hf_weights
 
 
 @dataclass
@@ -324,8 +451,18 @@ class StackConvertOp(ConvertOp):
         return [np.stack(weights, axis=self.dim)]
 
     def _mf_to_hf(self, weights: List[np.ndarray]) -> List[np.ndarray]:
-        """Split stacked MF weights back to HF weights"""
-        raise ValueError("Currently, StackConvertOp does not support MF → HF conversion")
+        """Unstack the MF weight back into the HF weights (inverse of np.stack)."""
+        if len(self.mf_names) != 1:
+            raise ValueError(
+                f"StackConvertOp MF → HF only supports 'N hf_name to 1 mf_name', "
+                f"but got mf_names: `{self.mf_names}`.")
+        weight = weights[0]
+        num_parts = len(self.hf_names)
+        if weight.shape[self.dim] != num_parts:
+            raise ValueError(
+                f"StackConvertOp: dim {self.dim} of the MF weight "
+                f"({weight.shape[self.dim]}) must equal the number of hf_names ({num_parts}).")
+        return [np.ascontiguousarray(np.take(weight, k, axis=self.dim)) for k in range(num_parts)]
 
 
 @dataclass
@@ -386,12 +523,25 @@ class QKVConvertOp(ConvertOp):
         return [mf_qkv_weight]
 
     def _mf_to_hf(self, weights: List[np.ndarray]) -> List[np.ndarray]:
-        """
-        Split QKV fused weight into independent Q, K, V weights.
+        """Split the fused GQA QKV weight into independent Q, K, V weights."""
+        qkv_weight = weights[0]
+        nh = self.num_attention_heads // self.tensor_model_parallel_size // self.optimizer_parallel_size
+        ng = self.num_query_groups // self.tensor_model_parallel_size // self.optimizer_parallel_size
+        dim = self.kv_channels
 
-        Referenced from ROLL's QKVConvertOp._mf_to_hf() implementation.
-        """
-        raise ValueError("Currently, QKVConvertOp does not support MF → HF conversion")
+        if nh % ng != 0:
+            raise ValueError(
+                f"Number of attention heads per group ({nh}) must be divisible by "
+                f"number of query groups ({ng})")
+
+        q_per_group = dim * nh // ng
+        grouped = qkv_weight.reshape((ng, q_per_group + 2 * dim, -1))
+        q_weight = grouped[:, :q_per_group, :].reshape((-1, self.hidden_size))
+        k_weight = grouped[:, q_per_group:q_per_group + dim, :].reshape((-1, self.hidden_size))
+        v_weight = grouped[:, q_per_group + dim:, :].reshape((-1, self.hidden_size))
+        return [np.ascontiguousarray(q_weight),
+                np.ascontiguousarray(k_weight),
+                np.ascontiguousarray(v_weight)]
 
 
 @dataclass
@@ -438,8 +588,18 @@ class QKVBiasConvertOp(ConvertOp):
         return [mf_qkv_bias]
 
     def _mf_to_hf(self, weights: List[np.ndarray]) -> List[np.ndarray]:
-        """Split QKV fused bias into independent Q, K, V bias"""
-        raise ValueError("Currently, QKVBiasConvertOp does not support MF → HF conversion")
+        """Split the fused QKV bias into independent Q, K, V biases.
+
+        Exact inverse of :meth:`_hf_to_mf`, which lays the bias out as
+        ``(ng, 3 * kv_channels)``.
+        """
+        qkv_bias = weights[0]
+        ng = self.num_query_groups // self.tensor_model_parallel_size // self.optimizer_parallel_size
+        dim = self.kv_channels
+        grouped = qkv_bias.reshape((ng, 3 * dim))
+        return [np.ascontiguousarray(grouped[:, :dim].reshape(-1)),
+                np.ascontiguousarray(grouped[:, dim:2 * dim].reshape(-1)),
+                np.ascontiguousarray(grouped[:, 2 * dim:].reshape(-1))]
 
 
 @dataclass
@@ -493,40 +653,3 @@ class ScaleSplitConvertOp(ConvertOp):
     def _mf_to_hf(self, weights: List[np.ndarray]) -> List[np.ndarray]:
         """Concatenate N MF weights back to single HF weight along dim=0."""
         return [np.concatenate(weights, axis=0)]
-
-
-@dataclass
-class MatMulConvertOp(ConvertOp):
-    """
-    Matrix multiplication operation (2:1 mapping).
-
-    HF → MF: Multiplies two HF weights (A @ B) to produce one MF weight.
-    This is used when the HF checkpoint stores a low-rank decomposition
-    (e.g. wo_a and wo_b) but the MF model expects the combined weight.
-
-    Example::
-
-        wo_a.shape = [H, R],  wo_b.shape = [R, H]
-        → linear_o_group_proj = wo_a @ wo_b  shape: [H, H]
-    """
-
-    def __post_init__(self):
-        super().__post_init__()
-        if len(self.hf_names) != 2:
-            raise ValueError(
-                f"MatMulConvertOp requires exactly 2 hf_names (A and B), "
-                f"but got {len(self.hf_names)}: `{self.hf_names}`."
-            )
-        if len(self.mf_names) != 1:
-            raise ValueError(
-                f"MatMulConvertOp requires exactly 1 mf_name, "
-                f"but got {len(self.mf_names)}: `{self.mf_names}`."
-            )
-
-    def _hf_to_mf(self, weights: List[np.ndarray]) -> List[np.ndarray]:
-        """Compute weights[0] @ weights[1] → MF weight"""
-        return [np.matmul(weights[0], weights[1])]
-
-    def _mf_to_hf(self, weights: List[np.ndarray]) -> List[np.ndarray]:
-        """MF → HF is not supported (low-rank decomposition is not unique)."""
-        raise ValueError("Currently, MatMulConvertOp does not support MF → HF conversion")
