@@ -1701,8 +1701,9 @@ class TransformerConfig:
     moe_shared_expert_overlap: bool = field(
         default=False,
         metadata={
-            "description": "Enable overlapping between shared expert computations and dispatcher communications. "
-                           "Without this, the shared epxerts execute after the routed experts.",
+            "description": "Enable overlapping between shared expert computations and dispatcher "
+                           "communications. Without this, the shared experts execute after the routed "
+                           "experts. Only the alltoall dispatcher supports this optimization.",
             "usage": ParamUsage.TRAINING,
             "source": ParamSource.MEGATRON,
             "mode": ParamMode.COMMON
@@ -2297,6 +2298,14 @@ class TransformerConfig:
                 )
         elif self.shared_expert_num > 0:
             self.moe_shared_expert_intermediate_size = self.moe_ffn_hidden_size * self.shared_expert_num
+
+        if self.moe_shared_expert_overlap and self.shared_expert_num > 0 \
+                and self.moe_token_dispatcher_type != "alltoall":
+            raise ValueError(
+                "moe_shared_expert_overlap only supports "
+                "moe_token_dispatcher_type='alltoall', but got "
+                f"'{self.moe_token_dispatcher_type}'."
+            )
 
         if self.moe_expert_capacity_factor is not None:
             if self.moe_expert_capacity_factor < 0:

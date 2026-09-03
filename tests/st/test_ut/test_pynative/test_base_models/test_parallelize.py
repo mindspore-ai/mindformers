@@ -91,6 +91,85 @@ def test_apply_moe_ep_overlap_tp_propagates_use_safe_tokens(monkeypatch):
 @pytest.mark.level0
 @pytest.mark.platform_x86_cpu
 @pytest.mark.env_onecard
+def test_apply_moe_ep_tp_wires_shared_expert_overlap(monkeypatch):
+    """An all-to-all EP strategy owns shared experts only when overlap is requested."""
+    shared_experts = object()
+    overlap_flags = []
+    mlp = SimpleNamespace(
+        experts=object(),
+        shared_experts=shared_experts,
+        config=SimpleNamespace(moe_shared_expert_overlap=True),
+        set_shared_expert_overlap=overlap_flags.append,
+    )
+    model = SimpleNamespace(model=SimpleNamespace(
+        config=SimpleNamespace(moe_permute_fusion=False),
+        decoder=SimpleNamespace(layers=[SimpleNamespace(mlp=mlp)]),
+        mtp=None,
+    ))
+    captured = {}
+
+    def _capture_strategy(*args, **kwargs):
+        del args
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(parallelize, "ExpertParallel", _capture_strategy)
+    monkeypatch.setattr(parallelize, "set_comm_ops_inplace", lambda _: None)
+    monkeypatch.setattr(parallelize, "parallelize_module", lambda **_: None)
+
+    parallelize.apply_moe_ep_tp(
+        model,
+        ep_mesh=object(),
+        moe_token_dispatcher_type="alltoall",
+    )
+
+    assert captured["shared_experts"] is shared_experts
+    assert overlap_flags == [True]
+
+
+@pytest.mark.level0
+@pytest.mark.platform_x86_cpu
+@pytest.mark.env_onecard
+def test_shared_expert_overlap_rejects_non_alltoall_dispatcher():
+    """The optimization cannot be silently enabled on a different dispatcher."""
+    moe_layer = SimpleNamespace(
+        config=SimpleNamespace(moe_shared_expert_overlap=True),
+        shared_experts=object(),
+    )
+
+    with pytest.raises(ValueError, match="only supports.*alltoall"):
+        parallelize._shared_experts_for_a2a_overlap(
+            moe_layer, "alltoall_deredundancy")
+
+
+@pytest.mark.level0
+@pytest.mark.platform_x86_cpu
+@pytest.mark.env_onecard
+def test_shared_expert_overlap_rejects_pipeline_b_f_overlap():
+    """The two independent side-stream overlap protocols must not be composed."""
+    shared_experts = object()
+    mlp = SimpleNamespace(
+        experts=object(),
+        shared_experts=shared_experts,
+        config=SimpleNamespace(moe_shared_expert_overlap=True),
+    )
+    model = SimpleNamespace(model=SimpleNamespace(
+        config=SimpleNamespace(moe_permute_fusion=False),
+        decoder=SimpleNamespace(layers=[SimpleNamespace(mlp=mlp)]),
+        mtp=None,
+    ))
+
+    with pytest.raises(ValueError, match="cannot be combined.*pipeline_parallel_overlap_b_f"):
+        parallelize.apply_moe_ep_overlap_tp(
+            model,
+            overlap=SimpleNamespace(coordinator=object()),
+            ep_mesh=object(),
+        )
+
+
+@pytest.mark.level0
+@pytest.mark.platform_x86_cpu
+@pytest.mark.env_onecard
 def test_tag_dsv4_tp_replicated_grad_norm_params_excludes_sharded_and_indexer_weights():
     """Only already-global full-attention gradients are TP replica-counted."""
     parameters = {

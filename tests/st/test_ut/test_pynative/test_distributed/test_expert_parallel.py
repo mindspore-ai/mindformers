@@ -14,6 +14,8 @@
 # limitations under the License.
 # ============================================================================
 """Tests for expert parallel in pynative mode."""
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 import mindspore as ms
@@ -23,6 +25,7 @@ from hyper_parallel.core.dtensor.placement_types import Shard
 
 from mindformers.pynative.distributed import utils
 import mindformers.pynative.distributed.ep_overlap as ep_overlap_mod
+import mindformers.pynative.distributed.expert_parallel as expert_parallel_mod
 from mindformers.pynative.distributed.activation_checkpoint import recompute_context_fn
 from mindformers.pynative.distributed.ep_overlap import OverlapExpertParallel
 from mindformers.pynative.distributed.expert_parallel import ExpertParallel
@@ -295,7 +298,7 @@ class TestExpertParallel:
             lambda grouped_counts, ep_degree: calls.append("group_list") or "group_list")
         monkeypatch.setattr(
             expert_parallel, "_main_a2a",
-            lambda flat_in, input_splits, output_splits, block_size:
+            lambda flat_in, input_splits, output_splits, block_size, **kwargs:
             calls.append("main_a2a") or "flat_out")
         monkeypatch.setattr(
             expert_parallel, "_build_resort_routing_map",
@@ -338,6 +341,105 @@ class TestExpertParallel:
 
         assert calls.index("main_a2a") < calls.index("routing_map") < calls.index("B")
         assert result[-1] == "routing_map"
+
+    @pytest.mark.level0
+    @pytest.mark.platform_x86_cpu
+    @pytest.mark.env_onecard
+    def test_shared_expert_fc_stages_bracket_token_a2a(self, monkeypatch):
+        """A2A launches before FC, while its autograd node is attached after FC."""
+        calls = []
+
+        class FakeSharedExperts:
+            """Record split shared-expert scheduling calls."""
+
+            @staticmethod
+            def wait_current_stream():
+                calls.append("shared_wait")
+
+            @staticmethod
+            def overlap_fc1(ctx):
+                calls.append(("shared_fc1", ctx))
+
+            @staticmethod
+            def overlap_fc2(ctx):
+                calls.append(("shared_fc2", ctx))
+
+        shared_expert_ctx = SimpleNamespace(
+            intermediate="shared_intermediate",
+            output="shared_output",
+        )
+        expert_parallel = ExpertParallel(shared_experts=FakeSharedExperts())
+        monkeypatch.setattr(
+            expert_parallel,
+            "_shared_expert_prelaunch_a2a",
+            lambda slot, *args, **kwargs:
+            calls.append("dispatch_launch" if slot.startswith("input") else "combine_launch")
+            or (f"{slot}.output", f"{slot}.work"),
+        )
+        monkeypatch.setattr(
+            expert_parallel,
+            "_finish_prelaunched_a2a",
+            lambda *args, **kwargs:
+            calls.append("dispatch_attach" if args[1].startswith("input") else "combine_attach")
+            or (("dispatched" if args[1].startswith("input") else "combined"), args[6]),
+        )
+
+        dispatched = expert_parallel._dispatch_a2a_with_shared_expert(
+            "input", [1], [1], 4, shared_expert_ctx=shared_expert_ctx)
+        combined = expert_parallel._combine_a2a_with_shared_expert(
+            "output", [1], [1], 4, shared_expert_ctx=shared_expert_ctx)
+
+        assert dispatched == "dispatched"
+        assert combined == "combined"
+        assert calls == [
+            "shared_wait",
+            "dispatch_launch",
+            ("shared_fc1", shared_expert_ctx),
+            "dispatch_attach",
+            "shared_wait",
+            "combine_launch",
+            ("shared_fc2", shared_expert_ctx),
+            "combine_attach",
+        ]
+
+    @pytest.mark.level0
+    @pytest.mark.platform_x86_cpu
+    @pytest.mark.env_onecard
+    def test_prelaunched_a2a_backward_launches_lazy_reverse_before_shared_grad(
+            self, monkeypatch):
+        """The coupled boundary launches reverse A2A and returns shared grad first."""
+        calls = []
+        main_stream = object()
+        ctx = SimpleNamespace(
+            main_stream=main_stream,
+            recv_splits=[8, 12],
+            send_splits=[4, 16],
+            group="ep_group",
+        )
+        monkeypatch.setattr(
+            expert_parallel_mod.ms.runtime,
+            "set_cur_stream",
+            lambda stream: calls.append(("set_stream", stream)),
+        )
+        monkeypatch.setattr(
+            expert_parallel_mod._platform,
+            "differentiable_all_to_all_single_async",
+            lambda grad, send, recv, group:
+            calls.append(("reverse_a2a", grad.shape, send, recv, group)) or "lazy_grad",
+        )
+        grad = ms.Tensor([[1.0, 2.0], [3.0, 4.0]], ms.float32)
+        shared_grad = ms.Tensor([5.0], ms.float32)
+
+        result = expert_parallel_mod._PrelaunchedA2A.backward(
+            ctx, grad, shared_grad)
+
+        assert result[0] is shared_grad
+        assert result[1] == "lazy_grad"
+        assert result[2:] == (None, None, None, None, None, None)
+        assert calls == [
+            ("set_stream", main_stream),
+            ("reverse_a2a", (4,), [8, 12], [4, 16], "ep_group"),
+        ]
 
     @pytest.mark.level1
     @pytest.mark.platform_x86_cpu

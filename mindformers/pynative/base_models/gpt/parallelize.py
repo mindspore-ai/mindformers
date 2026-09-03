@@ -1016,6 +1016,24 @@ def apply_non_moe_tp(
         "(MC2 fusion %s).", "ENABLED" if enable_mc2 else "disabled")
 
 
+def _shared_experts_for_a2a_overlap(moe_layer, moe_token_dispatcher_type):
+    """Resolve the shared expert owned by an all-to-all dispatcher, if requested."""
+    config = getattr(moe_layer, "config", None)
+    if not getattr(config, "moe_shared_expert_overlap", False):
+        return None
+    shared_experts = getattr(moe_layer, "shared_experts", None)
+    if shared_experts is None:
+        # Match Megatron: the option is inert when no shared expert is configured.
+        return None
+    if moe_token_dispatcher_type != "alltoall":
+        raise ValueError(
+            "moe_shared_expert_overlap only supports "
+            "moe_token_dispatcher_type='alltoall', but got "
+            f"'{moe_token_dispatcher_type}'."
+        )
+    return shared_experts
+
+
 def apply_moe_ep_tp(
         model: nn.Cell,
         tp_mesh: DeviceMesh = None,
@@ -1062,6 +1080,9 @@ def apply_moe_ep_tp(
         if not hasattr(transformer_block.mlp, 'experts'):
             continue
 
+        shared_experts = _shared_experts_for_a2a_overlap(
+            transformer_block.mlp, moe_token_dispatcher_type)
+
         # ============ Apply EP to Experts ============
         # Determine which mesh and plan to use for experts
         experts_mesh = ep_mesh
@@ -1074,7 +1095,8 @@ def apply_moe_ep_tp(
         if moe_token_dispatcher_type == "alltoall":
             experts_plan = ExpertParallel(model.model.config.moe_permute_fusion,
                                           async_d2h=expert_async_d2h,
-                                          use_safe_tokens=use_safe_tokens)
+                                          use_safe_tokens=use_safe_tokens,
+                                          shared_experts=shared_experts)
         elif moe_token_dispatcher_type == "alltoall_deredundancy":
             experts_plan = DeredundancyExpertParallel(
                 npu_nums_per_device,
@@ -1091,6 +1113,8 @@ def apply_moe_ep_tp(
                 device_mesh=experts_mesh,
                 parallelize_plan=experts_plan,
             )
+            if shared_experts is not None:
+                transformer_block.mlp.set_shared_expert_overlap(True)
 
     return model
 
@@ -1155,6 +1179,14 @@ def apply_moe_ep_overlap_tp(
         layer for layer in transformer_layers
         if hasattr(layer.mlp, "experts")
     ]
+    if any(
+            _shared_experts_for_a2a_overlap(layer.mlp, moe_token_dispatcher_type) is not None
+            for layer in moe_layers
+    ):
+        raise ValueError(
+            "moe_shared_expert_overlap cannot be combined with "
+            "pipeline_parallel_overlap_b_f. Disable one of the two overlap modes."
+        )
     last_idx = len(moe_layers) - 1
 
     # Expert weights live on the meta device during model build; sharding them

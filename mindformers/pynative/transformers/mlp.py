@@ -106,16 +106,14 @@ class MLP(nn.Cell):
         self.add = mint.add
         self.transpose = mint.transpose
 
-    def construct(self, hidden_states: Tensor, input_ids: Tensor = None) -> Tensor:
-        """Construct function of mlp block.
+    def _forward_fc1_and_act(self, hidden_states: Tensor) -> Tensor:
+        """Run the first projection and activation.
 
-        Args:
-            hidden_states (Tensor): Input tensor of shape (seq_len, bs, hidden_size).
-            input_ids (Tensor, optional): Token IDs; accepted so a TransformerLayer can call
-                dense MLP and MoELayer with the same signature, but ignored here (dense MLP has
-                no router). Default: None.
+        Keeping this half of the MLP in a separate method lets shared experts
+        schedule FC1 independently from FC2 while an MoE token dispatcher has
+        all-to-all communication in flight.  The regular dense-MLP path still
+        calls the two halves back-to-back in :meth:`construct`.
         """
-        del input_ids
         # [seq_len, bs, hidden_size] -> [seq_len, bs, ffn_hidden_size]
         intermediate_parallel = self.linear_fc1(hidden_states)
 
@@ -136,6 +134,22 @@ class MLP(nn.Cell):
                 intermediate_parallel = self.mul(act_out, x1)
         else:
             intermediate_parallel = self.activation_func(intermediate_parallel)
+        return intermediate_parallel
+
+    def _forward_fc2(self, intermediate_parallel: Tensor) -> Tensor:
+        """Run the second projection of the MLP."""
         # [seq_len, bs, hidden_size] -> [seq_len, bs, ffn_hidden_size]
-        output = self.linear_fc2(intermediate_parallel)
-        return output
+        return self.linear_fc2(intermediate_parallel)
+
+    def construct(self, hidden_states: Tensor, input_ids: Tensor = None) -> Tensor:
+        """Construct function of mlp block.
+
+        Args:
+            hidden_states (Tensor): Input tensor of shape (seq_len, bs, hidden_size).
+            input_ids (Tensor, optional): Token IDs; accepted so a TransformerLayer can call
+                dense MLP and MoELayer with the same signature, but ignored here (dense MLP has
+                no router). Default: None.
+        """
+        del input_ids
+        intermediate_parallel = self._forward_fc1_and_act(hidden_states)
+        return self._forward_fc2(intermediate_parallel)
