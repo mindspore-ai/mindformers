@@ -646,9 +646,9 @@ def _clean_and_parse_comm_config(full_target_ids, select_layer_to_modules, comm_
     return layer_to_modules
 
 
-def _wrap_cell_recompute(cell):
+def _wrap_cell_recompute(cell, *, early_stop=True):
     """``checkpoint_wrapper`` a cell under the recompute marker."""
-    return checkpoint_wrapper(cell, context_fn=recompute_context_fn)
+    return checkpoint_wrapper(cell, context_fn=recompute_context_fn, early_stop=early_stop)
 
 
 def _set_pattern_recompute(layer, p_list, add_prim_attr=False, info=''):
@@ -846,7 +846,11 @@ def apply_recompute(
 
         # Step 2: full recompute
         if need_recompute and layer_id in full_target_ids:
-            model.layers[layer_id] = _wrap_cell_recompute(model.layers[layer_id])
+            # A full TransformerLayer contains communication and custom autograd
+            # boundaries whose replay-time side effects must run to completion.
+            model.layers[layer_id] = _wrap_cell_recompute(
+                model.layers[layer_id], early_stop=False
+            )
             logger.info(f"Set full recompute at layer {layer_id}")
 
         # Step 3: select recompute
