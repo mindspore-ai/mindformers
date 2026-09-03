@@ -20,6 +20,6 @@ safetensors
 tensorboardX
 deprecated>=1.2.0
 pybind11 # for megatron dataset
-transformers==4.57.1
-datasets>=4.0.0
+transformers>=5.3.0
+datasets>=5.0.1
 mindspore~=2.9.0
