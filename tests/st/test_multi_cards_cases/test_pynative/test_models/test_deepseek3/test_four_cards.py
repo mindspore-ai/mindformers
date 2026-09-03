@@ -103,14 +103,11 @@ def test_fsdp_tp2_ep2_muon_qk_clip_gbs2():
     Feature: DeepSeek3 Muon optimizer QK-clip under tensor parallelism.
     Description: Train DeepSeek3 with the Muon optimizer and qk_clip_enabled=True under
                  tensor parallel 2 (+ expert parallel 2) on 4 cards, global batch size 2.
-                 Muon + qk_clip turns on forward max-attention-logit tracking; with tensor
-                 parallel >= 2 the per-head ``max_logits_val`` is sharded over the head dim,
-                 so ``FlashAttention._update_max_logits`` must compare the local ``amax``
-                 head count against the LOCAL shard length of ``max_logits_val``. Comparing
-                 it against the GLOBAL head count wrongly takes the head-slice branch and
-                 indexes the local shard with global coordinates (e.g. ``max_logits_val[4:8]``
-                 on a length-4 local shard -> empty -> ``For 'Maximum' ... input1.shape = [0]``).
-                 Regression guard for that qk_clip x tensor-parallel forward crash.
+                 Muon + qk_clip turns on forward max-attention-logit tracking, and with
+                 tensor parallel >= 2 the per-head ``max_logits_val`` is head-sharded, so
+                 ``FlashAttention._update_max_logits`` must write the local shard rather
+                 than index it with global head coordinates. Regression guard for that
+                 qk_clip x tensor-parallel forward crash.
     Expectation: Training exits with code 0 and loss values match expected values.
     """
     expected_losses = [

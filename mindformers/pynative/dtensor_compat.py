@@ -35,7 +35,7 @@ hyper_parallel symbol is referenced.
 from hyper_parallel import DTensor
 from hyper_parallel.core.dtensor.layout import infer_slice_area_by_layout
 
-__all__ = ["inplace_copy", "slice_specs_for_layout"]
+__all__ = ["inplace_copy", "local_shard", "slice_specs_for_layout", "to_local"]
 
 
 def slice_specs_for_layout(layout, full_shape, rank_count):
@@ -49,6 +49,18 @@ def slice_specs_for_layout(layout, full_shape, rank_count):
               for begin, end in infer_slice_area_by_layout(layout, inner_rank_id, full_shape))
         for inner_rank_id in range(rank_count)
     )
+
+
+def to_local(tensor):
+    """Return ``tensor``'s local shard, or ``tensor`` itself when it is not a DTensor."""
+    return tensor.to_local() if isinstance(tensor, DTensor) else tensor
+
+
+def local_shard(tensor, dim, shards):
+    """Return this rank's index among the ``shards`` pieces its partition splits ``dim`` into."""
+    if not isinstance(tensor, DTensor):
+        return 0
+    return int(tensor.layout.get_split_id(dim)) % shards
 
 
 def inplace_copy(dst, src):

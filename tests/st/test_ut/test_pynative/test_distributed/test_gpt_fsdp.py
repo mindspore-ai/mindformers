@@ -152,10 +152,8 @@ def test_apply_fsdp_wraps_each_layer_once(monkeypatch):
     assert [module for module, _ in wrapped] == [decoder_layer, mtp_layer, model]
     assert mtp_layer.transformer_layer not in [module for module, _ in wrapped]
     assert all(call[1]["comm_fusion"] is False for call in wrapped)
-    expected_ignored = {decoder_max_logits, mtp_max_logits}
-    assert wrapped[0][1]["ignored_params"] == expected_ignored
-    assert wrapped[1][1]["ignored_params"] == expected_ignored
-    assert wrapped[2][1]["ignored_params"] == expected_ignored
+    # A non-persistent buffer is not a parameter, so FSDP needs no opt-out for it.
+    assert all("ignored_params" not in call[1] for call in wrapped)
     assert decoder_max_logits not in wrapped[0][1]["replicate_params"]
     assert mtp_max_logits not in wrapped[1][1]["replicate_params"]
 
@@ -229,4 +227,5 @@ def test_qk_clip_reduce_group_uses_loss_mesh(monkeypatch):
 
     parallelize._setup_qk_clip_reduce_group(object(), parallel_dims)
 
+    # The apply path is purely local, so dp x cp is the only group needed.
     assert calls == [("loss_group", 2)]

@@ -117,7 +117,7 @@ def _build_optimizer(net, **kwargs):
         "momentum": 0.95,
         "model": _make_mock_model(lambda p: len(p.shape) == 2),
         "comm_strategy": "allgather",
-        "qk_clip_enabled": False,  # avoids model.synced_max_attention_logit_fires(...)
+        "qk_clip_enabled": False,  # avoids model.apply_qk_clip_scaling(...)
     }
     defaults.update(kwargs)
     return Muon(net.trainable_params(), **defaults)
