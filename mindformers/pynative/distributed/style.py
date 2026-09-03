@@ -21,6 +21,7 @@ from hyper_parallel.core.context_parallel.context_parallel import ContextParalle
 from hyper_parallel.core.context_parallel.dsa_context_parallel import (
     DSAIndexerContextParallel as HPDSAIndexerContextParallel,
     DSAIndexerLossContextParallel as HPDSAIndexerLossContextParallel,
+    DSASequenceReplicateCache as HPDSASequenceReplicateCache,
     DSASparseAttentionContextParallel as HPDSASparseAttentionContextParallel,
 )
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
@@ -424,12 +425,12 @@ class HPDSAContextParallelAdapter(ParallelStyle):
         )
         missing = []
         attention_attr = "sparse_flash_attention" if self.use_sparse_loss else "dense_flash_attention"
-        attention_boundary = getattr(core_attention, attention_attr, None)
+        inner_attention_boundary = getattr(core_attention, attention_attr, None)
         if indexer is None:
             missing.append("indexer")
         if compute_sparse_indices is None:
             missing.append("indexer.compute_sparse_indices")
-        if attention_boundary is None:
+        if inner_attention_boundary is None:
             missing.append(attention_attr)
         if self.indexer_loss_style is not None and indexer_loss is not None and compute_indexer_loss is None:
             missing.append("indexer_loss.compute_indexer_loss")
@@ -438,16 +439,28 @@ class HPDSAContextParallelAdapter(ParallelStyle):
                 "DSA context parallel expects the attention module to expose "
                 f"{missing} so MindFormers can explicitly wire HP boundary hooks."
             )
+        # Dense DSA canonicalizes its LSE tensors to the same sequence/head axes
+        # as the attention output, allowing the ordinary HP ContextParallel
+        # boundary to reverse all three outputs without DSA-specific HP logic.
+        attention_boundary = inner_attention_boundary
         return core_attention, indexer, indexer_loss, compute_sparse_indices, attention_boundary, compute_indexer_loss
 
-    @staticmethod
-    def _set_dsa_dense_softmax_converter_cp_rank(core_attention: nn.Cell, device_mesh: DeviceMesh):
-        """Propagate the CP local rank to the TND dense softmax converter."""
-        converter = getattr(core_attention, "softmax_converter", None)
+    def _set_dsa_dense_softmax_converter_cp_rank(
+            self, core_attention: nn.Cell, device_mesh: DeviceMesh
+    ):
+        """Set the packed-sequence partition rank seen by dense teacher FA."""
+        dense_attention = getattr(core_attention, "dense_flash_attention", None)
+        converter = getattr(dense_attention, "softmax_converter", None)
         set_cp_rank = getattr(converter, "set_cp_rank", None)
         if set_cp_rank is None:
             return
-        set_cp_rank(device_mesh.get_local_rank())
+        if not isinstance(self.attention_style, HPContextParallelAdapter):
+            raise TypeError("Dense DSA context parallel expects HPContextParallelAdapter.")
+        hp_style = self.attention_style.hp_style
+        cp_size = device_mesh.mesh.numel()
+        ulysses_degree = hp_style.ulysses_degree or cp_size
+        # Colossal: cp_rank; pure Ulysses: 0; Hybrid: Colossal-row rank.
+        set_cp_rank(device_mesh.get_local_rank() // ulysses_degree)
 
     def _apply_attention_style(self, module, core_attention, attention_boundary, device_mesh):
         """Apply the sparse or dense main-attention CP boundary style."""
@@ -467,7 +480,6 @@ class HPDSAContextParallelAdapter(ParallelStyle):
             self.attention_style._apply(attention_boundary, device_mesh)
         else:
             self.attention_style.apply(attention_boundary, device_mesh)
-
 
     def _apply(self, module: nn.Cell, device_mesh: DeviceMesh) -> nn.Cell:
         (
@@ -598,19 +610,48 @@ def build_hp_cp_style(
 
 def build_hp_dsa_cp_style(
         method: str,
+        cp_size: int,
+        ulysses_degree_in_cp: Optional[int] = None,
         input_layout: Optional[str] = None,
         async_enabled: bool = False,
         use_sparse_loss: bool = True,
 ) -> HPDSAContextParallelAdapter:
     """Build a MindFormers wrapper for Hyper-Parallel DSA CP style.
 
-    DSA currently supports Colossal-style CP only. The DSA kernels use BSND or
-    TND layouts directly, so this builder deliberately does not apply the
-    normal FlashAttention QKV layout conversion.
+    The DSA Indexer, Indexer loss, and sparse-attention kernel always keep
+    Colossal-style sequence sharding.  During dense Indexer warm-up only, the
+    teacher FlashAttention may additionally use Ulysses or Hybrid CP. The
+    MindFormers dense boundary canonicalizes its LSE outputs to the same axes
+    as attention output, so the standard Hyper-Parallel style is sufficient.
     """
     method = method.lower()
-    if method != "colossal":
-        raise NotImplementedError("DSA context parallel currently supports only colossal CP.")
+    if method not in ("colossal", "ulysses", "hybrid"):
+        raise NotImplementedError(f"unsupported DSA context parallel method: {method}")
+    if use_sparse_loss and method != "colossal":
+        raise NotImplementedError(
+            "DSA sparse stage currently supports only colossal CP; Ulysses/Hybrid "
+            "are supported only by the dense teacher attention in DSA warm-up."
+        )
+    if not use_sparse_loss and async_enabled and method != "colossal":
+        raise NotImplementedError(
+            "DSA dense teacher Ulysses/Hybrid currently requires context_parallel_async=false."
+        )
+
+    if method == "colossal":
+        ulysses_degree = 1
+    elif method == "ulysses":
+        ulysses_degree = cp_size if ulysses_degree_in_cp is None else ulysses_degree_in_cp
+        if ulysses_degree != cp_size:
+            raise ValueError("DSA dense teacher Ulysses CP requires ulysses_degree_in_cp == context_parallel.")
+    else:
+        if ulysses_degree_in_cp is None:
+            raise ValueError("DSA dense teacher Hybrid CP requires ulysses_degree_in_cp to be set.")
+        ulysses_degree = ulysses_degree_in_cp
+        if ulysses_degree <= 1 or ulysses_degree >= cp_size or cp_size % ulysses_degree != 0:
+            raise ValueError(
+                "DSA dense teacher Hybrid CP requires 1 < ulysses_degree_in_cp < "
+                "context_parallel and exact divisibility."
+            )
 
     input_layout = input_layout.upper() if isinstance(input_layout, str) else input_layout
     if input_layout in (None, "BNSD"):
@@ -622,6 +663,9 @@ def build_hp_dsa_cp_style(
 
     indexer_cls = HPAsyncDSAIndexerContextParallel if async_enabled else HPDSAIndexerContextParallel
     indexer_loss_cls = HPAsyncDSAIndexerLossContextParallel if async_enabled else HPDSAIndexerLossContextParallel
+    shared_replicate_cache = (
+        HPDSASequenceReplicateCache() if use_sparse_loss and not async_enabled else None
+    )
 
     indexer_style = indexer_cls(layout=dsa_layout, mode="colossal", use_local_output=False)
     if use_sparse_loss:
@@ -632,6 +676,8 @@ def build_hp_dsa_cp_style(
             layout=dsa_layout,
             mode="colossal",
             use_local_output=True,
+            shared_replicate_cache=shared_replicate_cache,
+            share_key_value=shared_replicate_cache is not None,
         )
         # The sparse kernel op also consumes attention softmax_{max,sum}
         # (forward pos 6/7), so the boundary must shard them along seq like the
@@ -642,16 +688,23 @@ def build_hp_dsa_cp_style(
             softmax_max_index=6,
             softmax_sum_index=7,
             use_local_output=True,
+            shared_replicate_cache=shared_replicate_cache,
         )
     else:
-        seq_dim, head_dim = (0, 1) if dsa_layout == "TND" else (1, 2)
-        attention_style = HPContextParallelAdapter(HPContextParallel(
-            seq_dim=seq_dim,
-            head_dim=head_dim,
-            ulysses_degree=1,
-            qkv_indices=(0, 1, 2),
-            use_local_output=True,
-        ))
+        if dsa_layout == "BSND":
+            seq_dim, head_dim = 1, 2
+        else:
+            seq_dim, head_dim = 0, 1
+        attention_style = HPContextParallelAdapter(
+            HPContextParallel(
+                seq_dim=seq_dim,
+                head_dim=head_dim,
+                ulysses_degree=ulysses_degree,
+                qkv_indices=(0, 1, 2),
+                qkv_kwarg_names=("query", "key", "value"),
+                use_local_output=True,
+            )
+        )
         # softmax_{max,sum} (pos 6/7) and the indexer softmax (pos 10/11) are
         # per-query-position; the boundary shards them along seq like the query
         # side so the kernel op receives DTensors. topk_index=None disables the
