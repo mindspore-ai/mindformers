@@ -28,7 +28,24 @@ introduces no numerical change.
 """
 from hyper_parallel import DTensor
 
-__all__ = ["inplace_copy"]
+__all__ = ["inplace_copy", "local_shard", "to_local"]
+
+
+def to_local(tensor):
+    """Return ``tensor``'s local shard, or ``tensor`` itself when it is not a DTensor."""
+    return tensor.to_local() if isinstance(tensor, DTensor) else tensor
+
+
+def local_shard(tensor, dim, shards):
+    """Return this rank's index among the ``shards`` pieces its partition splits ``dim`` into.
+
+    ``Layout.get_split_id`` already numbers a rank across every mesh axis that shards
+    ``dim``, innermost axis last, so the modulo drops the outer axes -- the ones that
+    select which partition this rank is in rather than where it sits inside it.
+    """
+    if not isinstance(tensor, DTensor):
+        return 0
+    return int(tensor.layout.get_split_id(dim)) % shards
 
 
 def inplace_copy(dst, src):

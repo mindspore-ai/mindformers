@@ -2774,8 +2774,8 @@ class Muon(MainParamsMixin, Optimizer):
 
         Builds:
           - ``param_idx_for_slot`` — flat slot order seen by
-            :meth:`_construct_deredundency` (skips ``max_logits_val`` /
-            non-optim_filter / non-muon params, in parameter order).
+            :meth:`_construct_deredundency` (skips non-optim_filter /
+            non-muon params, in parameter order).
           - ``phase0_groups`` — ``(local_shape, grad_dtype, m_dtype)`` →
             ``[slot, …]`` used by the Phase 0 batched momentum update.
           - ``phase4_groups`` — ``(local_shape, param_dtype, m_dtype)`` →
@@ -2786,16 +2786,10 @@ class Muon(MainParamsMixin, Optimizer):
           - ``local_groups_slots`` — ``group_sig`` → ``[slot, …]`` for
             non-redist (3D / local) weights, used by the Phase 1.5 local NS.
         """
-        param_idx_for_slot = []
-        for i in range(len(self._parameters)):
-            pname = self.param_name_tuple[i]
-            if "max_logits_val" in pname:
-                continue
-            if not self.optim_filter[i]:
-                continue
-            if not self.use_muon[i]:
-                continue
-            param_idx_for_slot.append(i)
+        param_idx_for_slot = [
+            i for i in range(len(self._parameters))
+            if self.optim_filter[i] and self.use_muon[i]
+        ]
 
         phase0_groups = {}
         phase0_group_slot_bytes = {}  # p0_key -> per-slot Phase 0 transient bytes
@@ -2923,13 +2917,8 @@ class Muon(MainParamsMixin, Optimizer):
             optim_result = self._construct_deredundency(
                 gradients, weight_decay, lr,
                 bias_correction1, bias_correction2, one_minus_beta2)
-            if self.qk_clip_enabled and self.model.synced_max_attention_logit_fires(self.logit_threshold):
-                self.model.apply_qk_clip_scaling(
-                    self.logit_threshold,
-                    self.muon_split_fn,
-                    self.muon_merge_fn,
-                    fp32_param_map=self._fp32_param_map,
-                )
+            if self.qk_clip_enabled:
+                self.model.apply_qk_clip_scaling(self.logit_threshold, self._fp32_param_map)
             self._copy_main_params_to_model_params()
             return optim_result
 
@@ -2937,10 +2926,6 @@ class Muon(MainParamsMixin, Optimizer):
         optim_result = []
         for i, (param, gradient, use_muon) in enumerate(zip(self.fp32_params, gradients, self.use_muon)):
             param_name = self.param_name_tuple[i]
-
-            if "max_logits_val" in param_name:
-                optim_result.append(op_cast(gradient, param.dtype))
-                continue
 
             if not self.optim_filter[i]:
                 optim_result.append(gradient)
@@ -2973,13 +2958,8 @@ class Muon(MainParamsMixin, Optimizer):
 
             optim_result.append(result)
 
-        if self.qk_clip_enabled and self.model.synced_max_attention_logit_fires(self.logit_threshold):
-            self.model.apply_qk_clip_scaling(
-                self.logit_threshold,
-                self.muon_split_fn,
-                self.muon_merge_fn,
-                fp32_param_map=self._fp32_param_map,
-            )
+        if self.qk_clip_enabled:
+            self.model.apply_qk_clip_scaling(self.logit_threshold, self._fp32_param_map)
 
         self._copy_main_params_to_model_params()
 
@@ -3042,10 +3022,6 @@ class Muon(MainParamsMixin, Optimizer):
 
         for i, (param, gradient, use_muon) in enumerate(zip(self.fp32_params, gradients, self.use_muon)):
             param_name = self.param_name_tuple[i]
-
-            if "max_logits_val" in param_name:
-                optim_result[i] = op_cast(gradient, param.dtype)
-                continue
 
             if not self.optim_filter[i]:
                 optim_result[i] = gradient

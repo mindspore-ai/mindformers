@@ -21,14 +21,13 @@ import math
 
 from mindspore import nn, Tensor, mint, ops
 from hyper_parallel import DTensor
-from hyper_parallel.core.dtensor.dtensor import distribute_tensor
 
 from mindformers.parallel_core.utils.spec_utils import ModuleSpec, build_module
 from mindformers.parallel_core.transformer_config import MLATransformerConfig
 from mindformers.pynative.base_models.common.embeddings.rope_utils import ApplyRotaryPosEmb
 from mindformers.pynative.base_models.common.embeddings.yarn_rotary_pos_embedding import _yarn_get_mscale
 from mindformers.pynative.layers.identity_op import IdentityOp
-from mindformers.pynative.dtensor_compat import inplace_copy
+from mindformers.pynative.dtensor_compat import local_shard
 
 
 @dataclass
@@ -135,157 +134,43 @@ class MultiLatentAttention(nn.Cell):
         self.v_handoff = IdentityOp()
 
     @staticmethod
-    def _to_full_tensor_with_layout(tensor):
-        """Return full tensor and original DTensor layout metadata when needed."""
-        if not isinstance(tensor, DTensor):
-            return tensor, None
-        return tensor.full_tensor(), (tensor.device_mesh, tensor.placements)
-
-    @staticmethod
     def _to_local_tensor(tensor):
         """Return the local tensor for a DTensor, otherwise pass through."""
         return tensor.to_local() if isinstance(tensor, DTensor) else tensor
 
-    @staticmethod
-    def _restore_tensor_layout(tensor, layout):
-        """Restore a tensor back to the original DTensor local layout."""
-        if layout is None:
-            return tensor
-        device_mesh, placements = layout
-        return distribute_tensor(tensor, device_mesh, placements).to_local()
-
-    @staticmethod
-    def _get_scale_broadcast(scales, head_dim):
-        """Broadcast per-head QK-clip scales to projection weight rows."""
-        scale_broadcast = mint.tile(
-            mint.unsqueeze(scales, 1), (1, head_dim)
-        ).reshape(-1)
-        return mint.unsqueeze(scale_broadcast, 1)
-
-    @staticmethod
-    def _local_head_count(tensor, head_dims):
-        """Return the number of complete local heads represented by tensor rows."""
-        rows = int(tensor.shape[0])
-        rows_per_head = sum(int(dim) for dim in head_dims)
-        if rows_per_head <= 0 or rows % rows_per_head != 0:
-            return None
-        return rows // rows_per_head
-
-    def _get_qk_clip_weight(self, param_name, fp32_param_map=None):
-        """Return the MLA projection weight addressed by an optimizer parameter name.
-
-        When ``fp32_param_map`` is provided (Muon mixed-precision path), the fp32
-        master copy is returned so QK-clip scales the value the optimizer reads,
-        not the bf16/fp16 model parameter that gets overwritten on the next
-        copy-back.
-        """
-        for attr in ("linear_qb", "linear_kvb", "linear_qkv"):
-            if f"self_attention.{attr}.weight" in param_name:
-                param = getattr(getattr(self, attr, None), "weight", None)
-                if param is None:
-                    return None
-                if fp32_param_map is not None:
-                    fp32_param = fp32_param_map.get(param.name)
-                    if fp32_param is not None:
-                        return fp32_param
-                return param
-        return None
-
-    def can_apply_qk_clip_to_local_weights(self, scales):
-        """Check whether local MLA projection shards align with local head scales."""
+    def apply_qk_clip(self, scales, fp32_param_map):
+        """Scale this layer's MLA projections by its per-head QK-clip factors, with no collective."""
+        root = mint.sqrt(scales)
+        q_rows = self._row_scales(((self.qk_head_dim, root), (self.qk_pos_emb_head_dim, scales)))
         if self.config.q_lora_rank is None:
-            return False
-
-        scale_heads = int(scales.shape[0])
-        q_weight = getattr(getattr(self, "linear_qb", None), "weight", None)
-        kv_weight = getattr(getattr(self, "linear_kvb", None), "weight", None)
-        if q_weight is None or kv_weight is None:
-            return False
-
-        q_local = self._to_local_tensor(q_weight)
-        kv_local = self._to_local_tensor(kv_weight)
-        q_heads = self._local_head_count(q_local, (self.qk_head_dim, self.qk_pos_emb_head_dim))
-        kv_heads = self._local_head_count(kv_local, (self.qk_head_dim, self.v_head_dim))
-        return q_heads == scale_heads and kv_heads == scale_heads
-
-    def try_apply_qk_clip_to_local_weights(self, param_prefix, scales, split_fn, merge_fn,
-                                           fp32_param_map=None):
-        """Apply QK-clip on local TP shards without gathering full projection weights."""
-        if not self.can_apply_qk_clip_to_local_weights(scales):
-            return False
-
-        self._apply_qk_clip_to_local_weight(
-            f"{param_prefix}.linear_qb.weight", scales, split_fn, merge_fn,
-            fp32_param_map=fp32_param_map)
-        self._apply_qk_clip_to_local_weight(
-            f"{param_prefix}.linear_kvb.weight", scales, split_fn, merge_fn,
-            fp32_param_map=fp32_param_map)
-        return True
-
-    def _apply_qk_clip_to_local_weight(self, param_name, scales, split_fn, merge_fn,
-                                       fp32_param_map=None):
-        """Apply QK-clip to one local MLA projection shard."""
-        param = self._get_qk_clip_weight(param_name, fp32_param_map=fp32_param_map)
-        if param is None:
-            return
-        local_param = self._to_local_tensor(param)
-
-        if "self_attention.linear_qb.weight" in param_name:
-            nope, pe = split_fn(param_name, local_param)
-            nope = nope * self._get_scale_broadcast(mint.sqrt(scales), self.qk_head_dim)
-            pe = pe * self._get_scale_broadcast(scales, self.qk_pos_emb_head_dim)
-            weights = merge_fn(param_name, [nope, pe])
-        elif "self_attention.linear_kvb.weight" in param_name:
-            k_nope, v = split_fn(param_name, local_param)
-            k_nope = k_nope * self._get_scale_broadcast(mint.sqrt(scales), self.qk_head_dim)
-            weights = merge_fn(param_name, [k_nope, v])
+            # Without a q LoRA the query heads lead the concat qkv weight; its tail is not scaled.
+            tail = self.linear_qkv.output_size - int(q_rows.shape[0])
+            q_rows = mint.cat([q_rows, mint.ones((tail,), dtype=q_rows.dtype)])
+            self._clip_projection(self.linear_qkv, q_rows, fp32_param_map)
         else:
-            return
+            self._clip_projection(self.linear_qb, q_rows, fp32_param_map)
+        self._clip_projection(
+            self.linear_kvb,
+            self._row_scales(((self.qk_head_dim, root), (self.v_head_dim, mint.ones_like(scales)))),
+            fp32_param_map,
+        )
 
-        inplace_copy(param, weights)
+    def _clip_projection(self, linear, row_scales, fp32_param_map):
+        """Multiply one projection's local weight rows by their share of ``row_scales``."""
+        # Muon keeps fp32 master copies; scale the value the optimizer reads.
+        weight = fp32_param_map.get(linear.weight.name, linear.weight)
+        local = self._to_local_tensor(weight)
+        shards = int(row_scales.shape[0]) // int(local.shape[0])
+        local.mul_(row_scales.reshape(shards, -1, 1)[local_shard(weight, 0, shards)])
 
-    def apply_qk_clip_to_weights(self, param_prefix, scales, split_fn, merge_fn,
-                                 fp32_param_map=None):
-        """Apply QK-clip scaling to all MLA projection weights owned by this layer."""
-        for weight_name in ("linear_qb.weight", "linear_kvb.weight", "linear_qkv.weight"):
-            self.apply_qk_clip_to_weight(f"{param_prefix}.{weight_name}", scales, split_fn, merge_fn,
-                                         fp32_param_map=fp32_param_map)
-
-    def apply_qk_clip_to_weight(self, param_name, scales, split_fn, merge_fn,
-                                fp32_param_map=None):
-        """Apply QK-clip scaling to an MLA projection weight in-place."""
-        if "self_attention.linear_qkv.weight" in param_name and self.config.q_lora_rank is not None:
-            return
-
-        param = self._get_qk_clip_weight(param_name, fp32_param_map=fp32_param_map)
-        if param is None:
-            return
-
-        full_param, param_layout = self._to_full_tensor_with_layout(param)
-
-        if "self_attention.linear_qb.weight" in param_name:
-            nope, pe = split_fn(param_name, full_param)
-            nope = nope * self._get_scale_broadcast(mint.sqrt(scales), self.qk_head_dim)
-            pe = pe * self._get_scale_broadcast(scales, self.qk_pos_emb_head_dim)
-            weights = merge_fn(param_name, [nope, pe])
-        elif "self_attention.linear_kvb.weight" in param_name:
-            k_nope, v = split_fn(param_name, full_param)
-            k_nope = k_nope * self._get_scale_broadcast(mint.sqrt(scales), self.qk_head_dim)
-            weights = merge_fn(param_name, [k_nope, v])
-        elif "self_attention.linear_qkv.weight" in param_name:
-            # Concat MLA. With LoRA: [q_down, kv_lora, k_pe] has no per-head structure to scale.
-            parts = split_fn(param_name, full_param)
-            if len(parts) != 4:
-                return
-            q_nope, q_pe, kv_lora, k_pe = parts
-            q_nope = q_nope * self._get_scale_broadcast(mint.sqrt(scales), self.qk_head_dim)
-            q_pe = q_pe * self._get_scale_broadcast(scales, self.qk_pos_emb_head_dim)
-            weights = merge_fn(param_name, [q_nope, q_pe, kv_lora, k_pe])
-        else:
-            return
-
-        weights = self._restore_tensor_layout(weights, param_layout)
-        inplace_copy(param, weights)
+    @staticmethod
+    def _row_scales(segments):
+        """Expand ``(rows, per-head factor)`` segments into one factor per weight row."""
+        per_head = mint.cat(
+            [mint.tile(mint.unsqueeze(factor, 1), (1, rows)) for rows, factor in segments],
+            dim=1,
+        )
+        return per_head.reshape(-1)
 
     def construct(self, x: Tensor, attention_mask=None, rotary_pos_emb=None,
                   prefix_keys_values=None, pad_zeros=None, actual_seq_len=None, mscale=1.0,
