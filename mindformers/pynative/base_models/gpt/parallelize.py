@@ -1485,6 +1485,25 @@ def _uses_dsa_cp_kernel(gpt_model):
     )
 
 
+def _uses_ulysses_head_sharding(gpt_model):
+    """Return whether CP will split attention heads on a generic/DSA boundary.
+
+    CSA owns its complete CP schedule in ``DSv4HybridAttentionContextParallel``
+    and does not use the generic sequence-to-head all-to-all.  Excluding CSA
+    here prevents a generic Ulysses head-divisibility check from rejecting a
+    model whose CSA wrapper never performs that split.
+    """
+    decoder = getattr(gpt_model, "decoder", None)
+    blocks = list(getattr(decoder, "layers", ()) or ())
+    mtp = getattr(gpt_model, "mtp", None)
+    blocks.extend(list(getattr(mtp, "layers", ()) or ()))
+    return any(
+        name.endswith("core_attention") and not isinstance(cell, CompressedSparseAttention)
+        for block in blocks
+        for name, cell in block.cells_and_names()
+    )
+
+
 def apply_context_parallel_attention(
     model: nn.Cell,
     cp_mesh: DeviceMesh,
@@ -1510,6 +1529,7 @@ def apply_context_parallel_attention(
     if decoder_layers is None:
         raise ValueError("Unable to locate GPT decoder layers for context parallel application.")
     uses_dsa_cp_kernel = _uses_dsa_cp_kernel(gpt_model)
+    uses_ulysses_head_sharding = _uses_ulysses_head_sharding(gpt_model)
     if async_enabled and method == "colossal" and not uses_dsa_cp_kernel:
         raise NotImplementedError(
             "Async context parallel currently supports 'ulysses' and 'hybrid' only. "
@@ -1552,8 +1572,8 @@ def apply_context_parallel_attention(
                     "CP feeds per-batch cos/sin to the fused RoPE op, which rejects it in tiling. "
                     "Set apply_rope_fusion=false, or enable use_eod_attn_mask_compression."
                 )
-        if async_enabled and method in ("ulysses", "hybrid"):
-            # Async Ulysses (and hybrid's inner Ulysses group) splits the local
+        if method in ("ulysses", "hybrid") and uses_ulysses_head_sharding:
+            # Ulysses (and hybrid's inner Ulysses group) splits the local
             # per-TP-rank heads. Validate that count rather than the global head
             # count so an invalid TP x CP layout fails during setup instead of in FA.
             num_heads = getattr(model_config, "num_attention_heads", None)
@@ -1567,7 +1587,7 @@ def apply_context_parallel_attention(
                 heads_per_rank = num_heads // tp_size
                 if heads_per_rank % ulysses_degree != 0:
                     raise ValueError(
-                        f"Async {method} CP requires per-TP-rank attention heads "
+                        f"{method.capitalize()} CP requires per-TP-rank attention heads "
                         f"(num_attention_heads // tensor_parallel = {num_heads} // {tp_size} "
                         f"= {heads_per_rank}) to be divisible by ulysses_degree "
                         f"({ulysses_degree})."
@@ -1582,15 +1602,17 @@ def apply_context_parallel_attention(
         attention_variant=None,
         dsa_use_sparse_loss=getattr(model_config, "dsa_indexer_use_sparse_loss", True),
     )
-    dsa_cp_style = build_context_parallel_attention_style(
-        method=method,
-        cp_size=cp_size,
-        ulysses_degree_in_cp=ulysses_degree,
-        input_layout=input_layout,
-        async_enabled=async_enabled,
-        attention_variant="dsa",
-        dsa_use_sparse_loss=getattr(model_config, "dsa_indexer_use_sparse_loss", True),
-    )
+    dsa_cp_style = None
+    if uses_dsa_cp_kernel:
+        dsa_cp_style = build_context_parallel_attention_style(
+            method=method,
+            cp_size=cp_size,
+            ulysses_degree_in_cp=ulysses_degree,
+            input_layout=input_layout,
+            async_enabled=async_enabled,
+            attention_variant="dsa",
+            dsa_use_sparse_loss=getattr(model_config, "dsa_indexer_use_sparse_loss", True),
+        )
 
     def _find_one_module(transformer_block, block_label, suffix):
         matches = [

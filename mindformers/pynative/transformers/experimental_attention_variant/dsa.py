@@ -69,12 +69,16 @@ class DSASparseFlashAttention(nn.Cell):
 class DSADenseFlashAttention(nn.Cell):
     """Hookable boundary for the DSA dense flash attention op."""
 
-    def __init__(self, input_layout: str, head_num: int, softmax_scale: float, sparse_mode: int):
+    def __init__(
+            self, input_layout: str, head_num: int, softmax_scale: float,
+            sparse_mode: int, softmax_converter: nn.Cell
+    ):
         super().__init__()
         self.input_layout = input_layout
         self.head_num = head_num
         self.softmax_scale = softmax_scale
         self.sparse_mode = sparse_mode
+        self.softmax_converter = softmax_converter
         self._build_flash_attention()
 
     def _build_flash_attention(self):
@@ -101,7 +105,10 @@ class DSADenseFlashAttention(nn.Cell):
             actual_seq_qlen=actual_seq_qlen,
             actual_seq_kvlen=actual_seq_kvlen,
         )
-        return attention_output, softmax_max[..., :1], softmax_sum[..., :1]
+        softmax_max, softmax_sum = self.softmax_converter.to_cp_layout(
+            softmax_max[..., :1], softmax_sum[..., :1], actual_seq_qlen
+        )
+        return attention_output, softmax_max, softmax_sum
 
 
 class DSASoftmaxConverter(nn.Cell):
@@ -156,6 +163,22 @@ class DSASoftmaxConverter(nn.Cell):
         softmax_max = self.reshape(self.stack(softmax_maxs), (n, t, 1))
         softmax_sum = self.reshape(self.stack(softmax_sums), (n, t, 1))
         return softmax_max, softmax_sum
+
+    def to_cp_layout(self, softmax_max, softmax_sum, actual_seq_len=None):
+        """Canonicalize LSE stats to the attention output's sequence/head axes."""
+        softmax_max, softmax_sum = self(softmax_max, softmax_sum, actual_seq_len)
+        if self.is_tnd:
+            # Indexer-loss layout [N, T, 1] -> generic CP layout [T, N, 1].
+            axes = (1, 0, 2)
+        else:
+            # FlashAttention layout [B, N, S, 1] -> generic CP layout [B, S, N, 1].
+            axes = (0, 2, 1, 3)
+        return self.transpose(softmax_max, axes), self.transpose(softmax_sum, axes)
+
+    def from_cp_layout(self, softmax_max, softmax_sum):
+        """Restore LSE stats from the generic CP layout to indexer-loss layout."""
+        axes = (1, 0, 2) if self.is_tnd else (0, 2, 1, 3)
+        return self.transpose(softmax_max, axes), self.transpose(softmax_sum, axes)
 
 
 def _to_local_tensor(value):
@@ -222,8 +245,8 @@ class DSAttention(nn.Cell):
                 softmax_scale=self.softmax_scale,
                 input_layout=self.input_layout,
                 sparse_mode=config.sparse_mode,
+                softmax_converter=DSASoftmaxConverter(self.input_layout),
             )
-            self.softmax_converter = DSASoftmaxConverter(self.input_layout)
 
     def construct(
             self, query, key, value, topk_indices, attention_mask=None,
@@ -268,6 +291,9 @@ class DSAttention(nn.Cell):
                 actual_seq_qlen=actual_seq_qlen,
                 actual_seq_kvlen=actual_seq_kvlen,
             )
-            if self.is_tnd:
-                softmax_max, softmax_sum = self.softmax_converter(softmax_max, softmax_sum, actual_seq_qlen)
+            softmax_max = _to_local_tensor(softmax_max)
+            softmax_sum = _to_local_tensor(softmax_sum)
+            softmax_max, softmax_sum = self.dense_flash_attention.softmax_converter.from_cp_layout(
+                softmax_max, softmax_sum
+            )
         return attention_output, softmax_max, softmax_sum
