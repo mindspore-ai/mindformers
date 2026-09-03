@@ -19,6 +19,7 @@ import json
 import shutil
 import pytest
 
+import numpy as np
 import mindspore as ms
 
 from mindformers.checkpoint.sharded_tensor import get_sharded_tensor_from_strategy_metadata
@@ -191,6 +192,40 @@ def test_save_metadata_json_with_none(tmp_path):
 @pytest.mark.level0
 @pytest.mark.platform_x86_cpu
 @pytest.mark.env_onecard
+@pytest.mark.level0
+@pytest.mark.platform_x86_cpu
+@pytest.mark.env_onecard
+def test_get_metadata_of_checkpoint_skips_safetensors_metadata_block(tmp_path):
+    """
+    Feature: Test get_metadata_of_checkpoint on a HuggingFace checkpoint.
+    Description: transformers' save_pretrained always writes a `__metadata__`
+        annotation block into the safetensors header, so every checkpoint
+        published from a PyTorch model carries one. Build such a directory and
+        read its metadata.
+    Expectation: The annotation block is skipped rather than treated as a tensor
+        entry, and the real tensors are returned.
+    """
+    from safetensors import serialize_file
+    from mindformers.checkpoint.layout_adapter import LayoutAdapter
+
+    checkpoint_dir = tmp_path / "hf_ckpt"
+    checkpoint_dir.mkdir()
+    weight = np.zeros((2, 3), dtype=np.float32)
+    serialize_file(
+        {"model.embed_tokens.weight": {"dtype": "float32", "shape": [2, 3],
+                                       "data": weight.tobytes()}},
+        str(checkpoint_dir / "model.safetensors"),
+        metadata={"format": "pt"},
+    )
+
+    if not LayoutAdapter.is_pynative_mode():
+        pytest.skip("the HF header path is only taken in pynative mode")
+
+    sharded_tensor_metas, _ = get_metadata_of_checkpoint(str(checkpoint_dir))
+    assert "__metadata__" not in sharded_tensor_metas
+    assert "model.embed_tokens.weight" in sharded_tensor_metas
+
+
 def test_get_metadata_of_checkpoint():
     """
     Feature: Test get_metadata_of_checkpoint.

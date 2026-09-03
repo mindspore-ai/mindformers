@@ -229,7 +229,10 @@ class DeepseekV4PreTrainedModel(DeepseekV3PreTrainedModel):
             mf_names="decoder.layers.{}.mlp.shared_experts.linear_fc2.weight"
         ),
         # ========== MoE Routed Experts ==========
-        # w1 (gate) + w3 (up) → experts.weight1 (stacked + interleaved)
+        # w1 (gate) + w3 (up) → experts.weight1. Routed experts stack the two
+        # contiguously ([gate | up] along the ffn axis): both the graph FFN
+        # (swiglu(fc1_output, -1)) and the pynative one (chunk(fc1_output, 2, -1))
+        # read it as first-half/second-half, unlike the MLP's fused fc1.
         ExpertsConvertOp(
             hf_names=[
                 "layers.{}.ffn.experts.{}.w1.weight",
