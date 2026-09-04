@@ -13,10 +13,18 @@
 # limitations under the License.
 # ============================================================================
 """Test recompute functional scenarios."""
+import importlib
+
+import numpy as np
 import pytest
 import mindspore as ms
-from mindspore import nn, ops
-from hyper_parallel.platform.mindspore.activation_checkpoint import CheckpointWrapper, SwapWrapper
+from mindspore import mint, nn, ops
+from hyper_parallel.platform.mindspore.activation_checkpoint import (
+    CheckpointExcludeWrapper,
+    CheckpointWrapper,
+    SwapWrapper,
+)
+from hyper_parallel.platform.mindspore.autograd_compat import enable_mindspore_backward_compat
 from hyper_parallel.core.activation_checkpoint import CheckpointPolicy
 
 from mindformers.pynative.config.config import (
@@ -25,6 +33,7 @@ from mindformers.pynative.config.config import (
     SwapConfig,
 )
 import mindformers.pynative.distributed.activation_checkpoint as ac_mod
+from mindformers.pynative.distributed import checkpoint_backend as backend_mod
 from mindformers.pynative.distributed.activation_checkpoint import (
     apply_ac,
     apply_recompute,
@@ -36,12 +45,58 @@ from mindformers.pynative.distributed.activation_checkpoint import (
 )
 
 
+def _reentrant_api():
+    """Load the optional HyperParallel reentrant API only for its tests."""
+    return importlib.import_module(
+        "hyper_parallel.platform.mindspore.activation_checkpoint.reentrant_checkpoint"
+    )
+
+
 @pytest.fixture(autouse=True)
 def _reset_config_list():
     """Isolate the module-global whitelist cache between tests."""
     ac_mod._config_list = {}
     yield
     ac_mod._config_list = {}
+
+
+@pytest.mark.level0
+@pytest.mark.platform_x86_cpu
+@pytest.mark.env_onecard
+class TestCheckpointBackendIsolation:
+    """Checkpoint implementations are loaded and selected independently."""
+
+    def test_non_reentrant_backend_does_not_import_reentrant_api(
+            self, monkeypatch):
+        """Non-reentrant construction must not load the optional API."""
+        real_import_module = importlib.import_module
+
+        def reject_reentrant_import(module_name):
+            if module_name == backend_mod.REENTRANT_CHECKPOINT_MODULE:
+                raise AssertionError("non-reentrant backend loaded reentrant API")
+            return real_import_module(module_name)
+
+        monkeypatch.setattr(
+            backend_mod.importlib, "import_module", reject_reentrant_import)
+
+        backend = ac_mod._create_checkpoint_backend(False)
+
+        assert backend.name == "non-reentrant"
+
+    def test_reentrant_backend_reports_missing_optional_api(self, monkeypatch):
+        """Reentrant construction reports an actionable missing dependency."""
+        real_import_module = importlib.import_module
+
+        def missing_reentrant_api(module_name):
+            if module_name == backend_mod.REENTRANT_CHECKPOINT_MODULE:
+                raise ModuleNotFoundError(module_name)
+            return real_import_module(module_name)
+
+        monkeypatch.setattr(
+            backend_mod.importlib, "import_module", missing_reentrant_api)
+
+        with pytest.raises(ImportError, match="MR 1291 or later"):
+            ac_mod._create_checkpoint_backend(True)
 
 
 class MockAttention(nn.Cell):
@@ -140,10 +195,12 @@ class MockMtpDecoder(MockModel):
 
 
 def _make_recompute_config(mode="None", full_recompute_layer=None,
-                 select_module=None, comm_enable=False, comm_select_module=None, exclude_op=None):
+                 select_module=None, comm_enable=False, comm_select_module=None, exclude_op=None,
+                 use_reentrant=False):
     """Build recompute and recompute_comm configs."""
     rc = RecomputeConfig(mode=mode, full_recompute_layer=full_recompute_layer,
-                         select_module=select_module, exclude_op=exclude_op)
+                         select_module=select_module, exclude_op=exclude_op,
+                         use_reentrant=use_reentrant)
     rc_comm = RecomputeCommConfig(enable=comm_enable, select_module=comm_select_module)
     return rc, rc_comm
 
@@ -170,6 +227,285 @@ class TestFullRecompute:
         apply_recompute(model, rc, rc_comm)
         assert isinstance(model.layers[0], CheckpointWrapper)
         assert isinstance(model.layers[1], CheckpointWrapper)
+
+    def test_full_recompute_single_layer_reentrant(self):
+        reentrant_api = _reentrant_api()
+        model = MockModel(num_layers=2)
+        rc, rc_comm = _make_recompute_config(
+            mode="full", full_recompute_layer=["0"], use_reentrant=True)
+        apply_recompute(model, rc, rc_comm)
+        assert isinstance(
+            model.layers[0], reentrant_api.ReentrantCheckpointWrapper)
+        assert not isinstance(
+            model.layers[1], reentrant_api.ReentrantCheckpointWrapper)
+
+    def test_reentrant_exclude_only_wraps_active_checkpoint_boundaries(self):
+        """Do not install a reentrant exclude outside a checkpoint boundary."""
+        reentrant_api = _reentrant_api()
+        model = MockModel(num_layers=2)
+        rc, rc_comm = _make_recompute_config(
+            mode="full",
+            full_recompute_layer=["0"],
+            exclude_op={"attention": ["0-1"]},
+            use_reentrant=True,
+        )
+
+        apply_recompute(model, rc, rc_comm)
+
+        assert isinstance(
+            model.layers[0], reentrant_api.ReentrantCheckpointWrapper)
+        assert isinstance(
+            model.layers[0].attention,
+            reentrant_api.ReentrantCheckpointExcludeWrapper,
+        )
+        assert isinstance(model.layers[1].attention, MockAttention)
+
+    def test_reentrant_exclude_routes_callable_and_comm_registry(self):
+        """Callable attributes and registered comm ops use the same routing."""
+        reentrant_api = _reentrant_api()
+        backend = ac_mod._create_checkpoint_backend(True)
+
+        class CallableLayer(nn.Cell):
+            def __init__(self):
+                super().__init__()
+                self.operator = lambda value: value * 2
+                self._comm_ops = {"input.allgather": {"fn": lambda value: value}}
+
+            def construct(self, value):
+                return self.operator(value)
+
+        layer = CallableLayer()
+        ac_mod._set_pattern_exclude(layer, ["operator"], backend)
+        ac_mod._set_pattern_exclude(
+            layer, ["input", "allgather"], backend)
+
+        assert isinstance(
+            layer.operator, reentrant_api.ReentrantCheckpointExcludeWrapper)
+        assert isinstance(
+            layer._comm_ops["input.allgather"]["fn"],
+            reentrant_api.ReentrantCheckpointExcludeWrapper,
+        )
+
+    def test_reentrant_exclude_preserves_gradients_and_skips_replay(self):
+        """The excluded child runs once while the surrounding layer replays."""
+        enable_mindspore_backward_compat()
+
+        class CountingMiddle(nn.Cell):
+            def __init__(self):
+                super().__init__()
+                self.weight = ms.Parameter(
+                    ms.Tensor([3.0], ms.float32), name="weight")
+                self.calls = 0
+
+            def construct(self, value):
+                self.calls += 1
+                return value * self.weight
+
+        class CountingLayer(nn.Cell):
+            def __init__(self):
+                super().__init__()
+                self.middle = CountingMiddle()
+                self.calls = 0
+
+            def construct(self, value):
+                self.calls += 1
+                hidden = value * value
+                return self.middle(hidden) * hidden
+
+        class CountingModel(nn.Cell):
+            def __init__(self):
+                super().__init__()
+                self.layers = nn.CellList([CountingLayer()])
+                self.config = type("Config", (), {"num_layers": 1})()
+                self.layer_start = 0
+                self.layer_end = 0
+
+        reference = CountingModel()
+        actual = CountingModel()
+        actual_layer = actual.layers[0]
+        rc, rc_comm = _make_recompute_config(
+            mode="full",
+            full_recompute_layer=["0"],
+            exclude_op={"middle": ["0"]},
+            use_reentrant=True,
+        )
+        apply_recompute(actual, rc, rc_comm)
+
+        reference_input = ms.Tensor([2.0], ms.float32)
+        actual_input = ms.Tensor([2.0], ms.float32)
+        reference_input.requires_grad = True
+        actual_input.requires_grad = True
+        reference_loss = reference.layers[0](reference_input).sum()
+        actual_loss = actual.layers[0](actual_input).sum()
+        reference_loss.backward()
+        actual_loss.backward()
+
+        np.testing.assert_allclose(actual_loss.asnumpy(), reference_loss.asnumpy())
+        np.testing.assert_allclose(
+            actual_input.grad.asnumpy(), reference_input.grad.asnumpy())
+        np.testing.assert_allclose(
+            actual_layer.middle.weight.grad.asnumpy(),
+            reference.layers[0].middle.weight.grad.asnumpy(),
+        )
+        assert actual_layer.calls == 2
+        assert actual_layer.middle.calls == 1
+
+    def test_reentrant_exclude_accumulates_multiple_microbatch_gradients(self):
+        """Each backward replays independently and accumulates parameter grads."""
+        enable_mindspore_backward_compat()
+        backend = ac_mod._create_checkpoint_backend(True)
+
+        class CountingMiddle(nn.Cell):
+            def __init__(self):
+                super().__init__()
+                self.weight = ms.Parameter(
+                    ms.Tensor([3.0], ms.float32), name="weight")
+                self.calls = 0
+
+            def construct(self, value):
+                self.calls += 1
+                return value * self.weight
+
+        class CountingLayer(nn.Cell):
+            def __init__(self):
+                super().__init__()
+                self.middle = backend.wrap_exclude(CountingMiddle())
+                self.calls = 0
+
+            def construct(self, value):
+                self.calls += 1
+                hidden = value * value
+                return self.middle(hidden) * hidden
+
+        layer = CountingLayer()
+        wrapped = backend.wrap_cell(layer)
+        input_grads = []
+        for value in (2.0, 3.0):
+            microbatch = ms.Tensor([value], ms.float32)
+            microbatch.requires_grad = True
+            wrapped(microbatch).sum().backward()
+            input_grads.append(microbatch.grad.asnumpy().item())
+
+        assert input_grads == [96.0, 324.0]
+        assert layer.middle.weight.grad.asnumpy().tolist() == [97.0]
+        assert layer.calls == 4
+        assert layer.middle.calls == 2
+
+    def test_reentrant_recompute_gradients_and_metadata(self):
+        """Custom backward replays once and preserves input/weight gradients."""
+        enable_mindspore_backward_compat()
+
+        class MetadataParamCell(nn.Cell):
+            """Count original and replay calls while exercising metadata."""
+
+            def __init__(self):
+                super().__init__()
+                self.weight = ms.Parameter(ms.Tensor([3.0], ms.float32), name="weight")
+                self.forward_calls = 0
+                self.replay_calls = 0
+                self.key = ("reentrant_recompute", id(self))
+
+            def construct(self, x):
+                cached = get_recompute_metadata(self.key)
+                if cached is None:
+                    self.forward_calls += 1
+                    save_for_recompute(self.key, "forward-value")
+                else:
+                    assert cached == "forward-value"
+                    self.replay_calls += 1
+                return x * x * self.weight, None
+
+        cell = MetadataParamCell()
+        wrapped = ac_mod._create_checkpoint_backend(True).wrap_cell(cell)
+        x = ms.Tensor([2.0], ms.float32)
+        x.requires_grad = True
+
+        output = wrapped(x)[0].sum()
+        output.backward()
+
+        assert output.asnumpy().item() == 12.0
+        assert x.grad.asnumpy().tolist() == [12.0]
+        assert cell.weight.grad.asnumpy().tolist() == [4.0]
+        assert cell.forward_calls == 1
+        assert cell.replay_calls == 1
+
+    def test_reentrant_recompute_restores_rng(self):
+        """Replay must use the same random values without perturbing the caller RNG."""
+        enable_mindspore_backward_compat()
+
+        class RandomCell(nn.Cell):
+            """Capture random values produced by original and replay forwards."""
+
+            def __init__(self):
+                super().__init__()
+                self.forward_random = None
+                self.replay_random = None
+
+            def construct(self, x):
+                random_value = mint.rand_like(x)
+                if is_in_recompute():
+                    self.replay_random = random_value
+                else:
+                    self.forward_random = random_value
+                return x * random_value
+
+        ms.set_seed(42)
+        cell = RandomCell()
+        wrapped = ac_mod._create_checkpoint_backend(True).wrap_cell(cell)
+        x = ms.Tensor([1.0, 1.0, 1.0, 1.0], ms.float32)
+        x.requires_grad = True
+
+        wrapped(x).sum().backward()
+
+        assert cell.forward_random is not None
+        assert cell.replay_random is not None
+        assert np.array_equal(cell.forward_random.asnumpy(), cell.replay_random.asnumpy())
+        assert np.array_equal(x.grad.asnumpy(), cell.forward_random.asnumpy())
+
+    def test_reentrant_recompute_supports_pipeline_prefire(self):
+        """A collected replay is recorded before backward and reused there."""
+        reentrant_api = _reentrant_api()
+        from hyper_parallel.platform.mindspore.pipeline_parallel.backward import (  # pylint: disable=C0415
+            forward_and_gradfn,
+        )
+        enable_mindspore_backward_compat()
+
+        class CountingCell(nn.Cell):
+            def __init__(self):
+                super().__init__()
+                self.weight = ms.Parameter(ms.Tensor([3.0], ms.float32), name="weight")
+                self.calls = 0
+
+            def construct(self, x):
+                self.calls += 1
+                return x * self.weight
+
+        cell = CountingCell()
+        wrapped = ac_mod._create_checkpoint_backend(True).wrap_cell(cell)
+        x = ms.Tensor([2.0], ms.float32)
+
+        with reentrant_api.reentrant_recompute_handle_collector_ctx() as handles:
+            output, grad_fn = forward_and_gradfn(
+                lambda value: wrapped(value).sum(),
+                x,
+                weights=tuple(wrapped.trainable_params()),
+                grad_position=-1,
+            )
+        assert output.asnumpy().item() == 6.0
+        assert cell.calls == 1
+        assert len(handles) == 1
+
+        session_id = (0, 0)
+        handles[0].recompute(session_id)
+        assert cell.calls == 2
+        with reentrant_api.reentrant_recompute_session_ctx(session_id=session_id):
+            input_grads, weight_grads = grad_fn(sens=ms.Tensor(1.0, ms.float32))
+        reentrant_api.clear_reentrant_recompute_session(session_id)
+
+        assert input_grads[0].asnumpy().tolist() == [3.0]
+        assert weight_grads == (None,)
+        assert cell.weight.grad.asnumpy().tolist() == [2.0]
+        assert cell.calls == 2
 
 
 @pytest.mark.level0
@@ -242,7 +578,7 @@ class TestRecomputeInvocationMetadata:
                 return hidden * hidden
 
         cell = MetadataCell()
-        wrapped = ac_mod.checkpoint_wrapper(cell, context_fn=recompute_context_fn)
+        wrapped = ac_mod._create_checkpoint_backend(False).wrap_cell(cell)
         x = ops.ones((1,), ms.float32) * 2
 
         grad = ms.grad(lambda value: wrapped(value).sum())(x)
@@ -279,7 +615,179 @@ class TestSelectRecompute:
         assert isinstance(model.layers[0].attention, CheckpointWrapper)
         assert isinstance(model.layers[1].mlp, CheckpointWrapper)
 
-    # ======================== Swap ========================
+    def test_select_recompute_reentrant(self):
+        """Selected child Cells use independent reentrant boundaries."""
+        reentrant_api = _reentrant_api()
+        model = MockModel(num_layers=2)
+        rc, rc_comm = _make_recompute_config(
+            mode="select",
+            select_module={"attention": ["0"], "mlp": ["1"]},
+            use_reentrant=True,
+        )
+
+        apply_recompute(model, rc, rc_comm)
+
+        assert isinstance(
+            model.layers[0].attention,
+            reentrant_api.ReentrantCheckpointWrapper,
+        )
+        assert isinstance(
+            model.layers[1].mlp,
+            reentrant_api.ReentrantCheckpointWrapper,
+        )
+
+    def test_select_callable_reentrant_preserves_gradient(self):
+        """Instance-owned callable targets also use reentrant replay."""
+        reentrant_api = _reentrant_api()
+        enable_mindspore_backward_compat()
+
+        class CountingCallable:
+            def __init__(self):
+                self.calls = 0
+
+            def __call__(self, value):
+                self.calls += 1
+                return value * value
+
+        class CallableLayer(nn.Cell):
+            def __init__(self):
+                super().__init__()
+                self.operator = CountingCallable()
+
+            def construct(self, value):
+                return self.operator(value)
+
+        model = MockModel(num_layers=1)
+        model.layers[0] = CallableLayer()
+        operator = model.layers[0].operator
+        rc, rc_comm = _make_recompute_config(
+            mode="select",
+            select_module={"operator": ["0"]},
+            use_reentrant=True,
+        )
+
+        apply_recompute(model, rc, rc_comm)
+
+        assert isinstance(
+            model.layers[0].operator,
+            reentrant_api.ReentrantCheckpointWrapper,
+        )
+        value = ms.Tensor([3.0], ms.float32)
+        value.requires_grad = True
+        model.layers[0](value).sum().backward()
+        assert operator.calls == 2
+        assert value.grad.asnumpy().tolist() == [6.0]
+
+    def test_mixed_full_select_reentrant_keeps_router_out_of_replay(self):
+        """Full and selected activation replay while every router executes once."""
+        reentrant_api = _reentrant_api()
+        enable_mindspore_backward_compat()
+
+        class CountingOp(nn.Cell):
+            def __init__(self, factor):
+                super().__init__()
+                self.factor = factor
+                self.calls = 0
+
+            def construct(self, value):
+                self.calls += 1
+                return value * self.factor
+
+        class CountingLayer(nn.Cell):
+            def __init__(self):
+                super().__init__()
+                self.router = CountingOp(2.0)
+                self.activation = CountingOp(3.0)
+                self.calls = 0
+
+            def construct(self, value):
+                self.calls += 1
+                return self.activation(self.router(value))
+
+        class CountingModel(nn.Cell):
+            def __init__(self):
+                super().__init__()
+                self.layers = nn.CellList([CountingLayer(), CountingLayer()])
+                self.config = type("Config", (), {"num_layers": 2})()
+                self.layer_start = 0
+                self.layer_end = 1
+
+        model = CountingModel()
+        original_layers = tuple(model.layers)
+        rc, rc_comm = _make_recompute_config(
+            mode="select",
+            full_recompute_layer=["0"],
+            select_module={"activation": ["0-1"]},
+            exclude_op={"router": ["0-1"]},
+            use_reentrant=True,
+        )
+
+        apply_ac(model, rc, rc_comm, SwapConfig(enable=False), 1)
+
+        assert isinstance(
+            model.layers[0], reentrant_api.ReentrantCheckpointWrapper)
+        assert isinstance(
+            original_layers[0].router,
+            reentrant_api.ReentrantCheckpointExcludeWrapper,
+        )
+        assert isinstance(
+            original_layers[1].activation,
+            reentrant_api.ReentrantCheckpointWrapper,
+        )
+        assert isinstance(original_layers[1].router, CountingOp)
+
+        value = ms.Tensor([1.0], ms.float32)
+        value.requires_grad = True
+        output = value
+        for layer in model.layers:
+            output = layer(output)
+        output.sum().backward()
+
+        assert original_layers[0].calls == 2
+        assert original_layers[0].router.calls == 1
+        assert original_layers[0].activation.calls == 2
+        assert original_layers[1].calls == 1
+        assert original_layers[1].router.calls == 1
+        assert original_layers[1].activation.calls == 2
+        assert value.grad.asnumpy().tolist() == [36.0]
+
+
+@pytest.mark.level0
+@pytest.mark.platform_x86_cpu
+@pytest.mark.env_onecard
+class TestReentrantCompatibilityValidation:
+    """Application-level guards for callers that do not build TrainConfig."""
+
+    def test_reentrant_rejects_recompute_comm(self):
+        """Reentrant checkpointing rejects communication recompute."""
+        model = MockModel(num_layers=2)
+        rc, rc_comm = _make_recompute_config(
+            mode="full",
+            full_recompute_layer=["0"],
+            comm_enable=True,
+            comm_select_module={"attention": ["1"]},
+            use_reentrant=True,
+        )
+
+        with pytest.raises(ValueError, match="recompute_comm.enable=True"):
+            apply_ac(model, rc, rc_comm, SwapConfig(enable=False), 1)
+
+    def test_reentrant_rejects_swap(self):
+        model = MockModel(num_layers=2)
+        rc, rc_comm = _make_recompute_config(
+            mode="full", full_recompute_layer=["0"], use_reentrant=True)
+
+        with pytest.raises(ValueError, match="swap.enable=True"):
+            apply_ac(
+                model,
+                rc,
+                rc_comm,
+                SwapConfig(enable=True, layer_swap=[{"layers": ["1"]}]),
+                1,
+            )
+
+
+# ======================== Swap ========================
 
 
 def _make_swap_config(enable=True, default_prefetch=1, layer_swap=None, op_swap=None):

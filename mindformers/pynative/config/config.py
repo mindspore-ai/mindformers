@@ -821,12 +821,22 @@ class RecomputeConfig(BaseConfig):
     """
     Recompute configuration.
 
-    Validation is performed only on the enclosing :class:`TrainConfig` (this dataclass has no
-    ``__post_init__`` checks).
+    Basic mode/type compatibility is checked at construction time. Layer paths
+    and layer-id ranges are validated when activation checkpointing is applied.
     """
 
     mode: str = "None"
     """Recompute mode: ``'None'`` , ``'full'``, or ``'select'``."""
+
+    use_reentrant: bool = False
+    """Use HyperParallel custom-backward recomputation for selected boundaries.
+
+    When enabled, every invocation of a layer selected by ``full_recompute_layer``
+    keeps only its inputs and replays the complete layer from one custom-autograd
+    boundary during backward. Both whole-layer targets in
+    ``full_recompute_layer`` and module/callable targets in ``select_module``
+    are supported. The default preserves the existing saved-tensor-hook path.
+    """
 
     full_recompute_layer: Optional[Union[list, tuple]] = None
     """Layer ranges for full recomputation.
@@ -855,6 +865,16 @@ class RecomputeConfig(BaseConfig):
         if self.mode not in ["None", "full", "select"]:
             raise ValueError(
                 f"RecomputeConfig.mode must be 'None', 'full', or 'select', got {self.mode}"
+            )
+        if not isinstance(self.use_reentrant, bool):
+            raise TypeError(
+                "RecomputeConfig.use_reentrant must be bool, "
+                f"got {type(self.use_reentrant).__name__}"
+            )
+        if self.use_reentrant and self.mode == "None":
+            raise ValueError(
+                "RecomputeConfig.use_reentrant=True requires mode='full' or "
+                "mode='select'; mode='None' would disable recomputation."
             )
 
 
@@ -968,3 +988,23 @@ class TrainConfig(BaseConfig):
     swap: SwapConfig = field(default_factory=SwapConfig)
     callbacks: List[CallbackConfig] = field(default_factory=list)
     lora_config: Optional[LoraConfig] = None
+
+    def __post_init__(self):
+        """Reject unsupported reentrant combinations at config-load time."""
+        if not self.recompute.use_reentrant:
+            return
+
+        unsupported = []
+        if self.recompute_comm.enable:
+            unsupported.append("recompute_comm.enable=True")
+        if self.swap.enable:
+            unsupported.append("swap.enable=True")
+        if self.parallelism.pipeline_parallel_enable_dxdw_split:
+            unsupported.append("parallelism.pipeline_parallel_enable_dxdw_split=True")
+
+        if unsupported:
+            raise ValueError(
+                "HyperParallel reentrant recompute does not support: "
+                f"{', '.join(unsupported)}. Disable these options or set "
+                "recompute.use_reentrant=False."
+            )
