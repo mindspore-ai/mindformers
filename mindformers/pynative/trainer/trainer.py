@@ -359,25 +359,25 @@ class Trainer:
             self.train_epoch_step = self._get_dataset_size(self.train_dataset)
         else:
             self.train_epoch_step = self.config.training.steps
+        # One optimizer step consumes num_accumulation_steps micro-batches while
+        # train_epoch_step counts micro-batches, so num_epochs must be sized in
+        # micro-batches: steps // train_epoch_step would under-count the iterator
+        # capacity by exactly the accumulation factor.
+        # A mid-run StopIteration would force an iterator recreate that restarts
+        # the data stream and diverge fresh vs resumed training (the data
+        # position is driven by consumed_samples on the trainer, not by the
+        # iterator's internal offset). The bound is safe because num_epochs only
+        # caps capacity (the iterator is lazy); the loop still stops at max_steps,
+        # and consumed + remaining <= max_steps * max_accum <= (num_epochs-1)*E.
         if self.dynamic_batch_enabled and self.dynamic_scheduler is not None:
-            # Dynamic batch consumes a varying (growing) number of micro-batches per
-            # optimizer step. Size num_epochs to a safe UPPER BOUND (max_steps *
-            # max_accum, +1 epoch margin) so the iterator never exhausts mid-run.
-            # A mid-run StopIteration would force an iterator recreate that restarts
-            # the data stream and diverge fresh vs resumed training (the data
-            # position is driven by consumed_samples on the trainer, not by the
-            # iterator's internal offset). The bound is safe because num_epochs only
-            # caps capacity (the iterator is lazy); the loop still stops at max_steps,
-            # and consumed + remaining <= max_steps * max_accum <= (num_epochs-1)*E.
+            # Dynamic batch grows the accumulation over time; bound it with the maximum.
             max_accum = self.dynamic_scheduler.max_gbs // self._base_units
-            max_total_micros = self.config.training.steps * max_accum
-            self.train_num_epochs = max(
-                (max_total_micros + self.train_epoch_step - 1)
-                // self.train_epoch_step + 1, 1)
         else:
-            self.train_num_epochs = max(
-                self.config.training.steps // self.train_epoch_step, 1
-            )
+            max_accum = self.num_accumulation_steps
+        max_total_micros = self.config.training.steps * max_accum
+        self.train_num_epochs = max(
+            (max_total_micros + self.train_epoch_step - 1)
+            // self.train_epoch_step + 1, 1)
 
         # Create evaluate dataset
         self.eval_dataset = self._create_dataset(
