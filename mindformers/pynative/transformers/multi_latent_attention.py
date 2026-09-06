@@ -113,6 +113,7 @@ class MultiLatentAttention(nn.Cell):
             config=self.config,
             layer_number=self.layer_index,
             softmax_scale=self.softmax_scale,
+            **self.core_attention_extra_kwargs(),
         )
 
         self.linear_proj = build_module(
@@ -171,6 +172,16 @@ class MultiLatentAttention(nn.Cell):
             dim=1,
         )
         return per_head.reshape(-1)
+
+    def core_attention_extra_kwargs(self):
+        """Extra kwargs for the core-attention build. Empty by default.
+
+        ``layer_number`` is handed to ``core_attention`` as ``self.layer_index``, which
+        clamps 0 to 1 and therefore makes global layers 0 and 1 indistinguishable. A
+        subclass whose core attention needs the *true* layer index must pass it through
+        this hook instead; ``self.layer_number`` is already set when this runs.
+        """
+        return {}
 
     def construct(self, x: Tensor, attention_mask=None, rotary_pos_emb=None,
                   prefix_keys_values=None, pad_zeros=None, actual_seq_len=None, mscale=1.0,
