@@ -142,6 +142,12 @@ class DSAIndexerLoss(nn.Cell):
         self.nope_dim = config.kv_lora_rank if self.sparse_loss else config.qk_head_dim
         self.pe_dim = config.qk_pos_emb_head_dim
         self.loss_coeff = config.dsa_indexer_loss_coeff
+        # With calculate_per_token_loss the trainer divides every gradient once by the
+        # globally reduced token count, so this loss must stay a raw local sum instead of a
+        # local mean -- otherwise that division shrinks it by the token count. Same switch as
+        # Megatron's experimental_attention_variant/dsa.py (``kl_per_row.sum()`` vs
+        # ``kl_per_row.mean()``).
+        self.calculate_per_token_loss = config.calculate_per_token_loss
         self.sparse_count = config.dsa_indexer_topk
         self.num_attention_heads = config.num_attention_heads
         softmax_scale = softmax_scale or config.kv_channels ** -0.5
@@ -169,8 +175,17 @@ class DSAIndexerLoss(nn.Cell):
             topk_indices, softmax_max, softmax_sum, q_rope, k_rope,
             softmax_max_index, softmax_sum_index,
             actual_seq_qlen, actual_seq_klen)
+        if self.calculate_per_token_loss:
+            # The fused kernel already returns the sum over rows; leave it unnormalised.
+            return indexer_loss
+        return indexer_loss / self.token_count(query)
+
+    def token_count(self, query):
+        """Rows this loss is averaged over, i.e. its per-token normaliser.
+
+        Exposed so callers can report a comparable per-token value even when
+        ``calculate_per_token_loss`` makes ``construct`` return the raw sum.
+        """
         if self.is_tnd:
-            loss_scale = query.shape[0]
-        else:
-            loss_scale = query.shape[0] * query.shape[1]
-        return indexer_loss / loss_scale
+            return query.shape[0]
+        return query.shape[0] * query.shape[1]

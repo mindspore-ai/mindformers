@@ -330,7 +330,8 @@ class DSASelfAttention(MLASelfAttention):
 
         Returns ``(contribution, reported)``: what enters the graph, and what the tracker
         records. Under sharing each layer contributes its term scaled by the group size but
-        reports the term itself, so the tracker stays on the unshared scale.
+        reports its per-token mean before group scaling, so the tracker stays on the
+        unshared scale even when the graph contribution is an unnormalised token sum.
 
         Sharing leaves Shared layers without any indexer either way; the two modes differ
         only in what supervises the Full layer's indexer:
@@ -361,13 +362,17 @@ class DSASelfAttention(MLASelfAttention):
         if not deferred:
             if not is_leader:
                 return None, None
-            loss = self.core_attention.indexer_loss(
+            loss_fn = self.core_attention.indexer_loss
+            loss = loss_fn(
                 query, key, q_index, k_index, idx_weights,
                 topk_indices, softmax_max, softmax_sum,
                 softmax_max_index, softmax_sum_index,
                 actual_seq_len, actual_seq_len
             )
-            return loss, loss
+            reported_loss = loss
+            if self.config.calculate_per_token_loss:
+                reported_loss = loss / loss_fn.token_count(query)
+            return loss, reported_loss
 
         if is_leader:
             # Publish this layer's indexer teacher so every layer its Top-K serves can call
@@ -380,7 +385,8 @@ class DSASelfAttention(MLASelfAttention):
         if group.leader_indexer_loss is None:
             return None, None
         l_q_index, l_k_index, l_weights, l_max_index, l_sum_index = group.leader_projections
-        term = group.leader_indexer_loss(
+        loss_fn = group.leader_indexer_loss
+        term = loss_fn(
             query, key, l_q_index, l_k_index, l_weights,
             topk_indices, softmax_max, softmax_sum,
             l_max_index, l_sum_index,
@@ -392,7 +398,10 @@ class DSASelfAttention(MLASelfAttention):
         # "Unpack is being triggered for a tensor, make sure to do this only once!". Scaling
         # per layer keeps every term inside its own region and still totals the group mean,
         # because the terms are only ever added together through the loss.
-        return term / self.index_share_group_size, term
+        reported_loss = term
+        if self.config.calculate_per_token_loss:
+            reported_loss = term / loss_fn.token_count(query)
+        return term / self.index_share_group_size, reported_loss
 
     def _dsa_dense_qkv(self, q_a, compressed_kv, k_pe, seq_len, bs, rotary_pos_emb):
         """Generate QKV for the DSA dense warm-up stage."""
