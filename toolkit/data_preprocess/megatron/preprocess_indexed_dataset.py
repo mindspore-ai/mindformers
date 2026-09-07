@@ -12,11 +12,15 @@ import json
 import os
 import sys
 import multiprocessing
+from contextlib import ExitStack
 import numpy as np
-import nltk
-from nltk.tokenize.punkt import PunktLanguageVars
+# The `from nltk.tokenize.punkt import …` below also acts as the runtime
+# presence check for nltk: if nltk isn't installed, ImportError fires at
+# module import time and the script fails fast with a clear traceback.
+# We don't import the top-level `nltk` package, so pylint has nothing to
+# flag as unused.
+from nltk.tokenize.punkt import PunktLanguageVars, PunktSentenceTokenizer, PunktTokenizer
 
-# pylint: disable=W0611
 from mindformers.dataset.blended_datasets.indexed_dataset import IndexedDatasetBuilder
 from mindformers.models import build_tokenizer
 
@@ -54,15 +58,14 @@ class Encoder:
         """initializer"""
         # Use Encoder class as a container for global data
         if self.args.split_sentences:
-            library = os.path.join("tokenizers", "punkt", f"{self.args.lang}.pickle")
-            url = f"nltk:{library}"
-            splitter = nltk.load(url)
+            # nltk>=3.10 deprecates the punkt/<lang>.pickle resource path,
+            # so we instantiate PunktTokenizer / PunktSentenceTokenizer directly.
+            # They use the punkt_tab resource internally (no pickle deserialization),
+            # avoiding the CVE-prone punkt/<lang>.pickle load path.
             if self.args.keep_newlines:
-                # pylint: disable=W0212
-                Encoder.splitter = nltk.tokenize.punkt.PunktSentenceTokenizer(train_text=splitter._params,
-                                                                              lang_vars=CustomLanguageVars())
+                Encoder.splitter = PunktSentenceTokenizer(lang_vars=CustomLanguageVars())
             else:
-                Encoder.splitter = splitter
+                Encoder.splitter = PunktTokenizer(self.args.lang)
 
         else:
             Encoder.splitter = IdentitySplitter()
@@ -128,64 +131,60 @@ class Partition:
         """split_sentence"""
         input_file_name, output_file_name = file_name
         print("Opening", input_file_name)
-        fin = open(input_file_name, 'r', encoding='utf-8')
-        fout = open(output_file_name, 'w')
+        with open(input_file_name, 'r', encoding='utf-8') as fin, \
+                open(output_file_name, 'w', encoding='utf-8') as fout, \
+                multiprocessing.Pool(self.workers, initializer=encoder.initializer) as pool:
 
-        encoder = Encoder(self.args)
-        pool = multiprocessing.Pool(self.workers, initializer=encoder.initializer)
-        split_docs = pool.imap(encoder.split, fin, 32)
+            encoder = Encoder(self.args)
+            split_docs = pool.imap(encoder.split, fin, 32)
 
-        proc_start = time.time()
-        total_bytes_processed = 0
-        for i, (doc, bytes_processed) in enumerate(split_docs, start=1):
-            total_bytes_processed += bytes_processed
-            fout.write(doc + "\n")
-            self.print_processing_stats(i, proc_start, total_bytes_processed)
-
-        fin.close()
-        fout.close()
+            proc_start = time.time()
+            total_bytes_processed = 0
+            for i, (doc, bytes_processed) in enumerate(split_docs, start=1):
+                total_bytes_processed += bytes_processed
+                fout.write(doc + "\n")
+                self.print_processing_stats(i, proc_start, total_bytes_processed)
 
 
     def process_json_file(self, file_name):
         """Processing json file"""
         input_file_name, output_prefix = file_name
         print("Opening", input_file_name)
-        fin = open(input_file_name, 'r', encoding='utf-8')
+        with open(input_file_name, 'r', encoding='utf-8') as fin, \
+                multiprocessing.Pool(self.workers, initializer=encoder.initializer) as pool:
 
-        startup_start = time.time()
-        encoder = Encoder(self.args)
-        pool = multiprocessing.Pool(self.workers, initializer=encoder.initializer)
-        encoded_docs = pool.imap(encoder.encode, fin, 32)
+            startup_start = time.time()
+            encoder = Encoder(self.args)
+            encoded_docs = pool.imap(encoder.encode, fin, 32)
 
-        level = "document"
-        if self.args.split_sentences:
-            level = "sentence"
+            level = "document"
+            if self.args.split_sentences:
+                level = "sentence"
 
-        output_bin_files = {}
-        output_idx_files = {}
-        builders = {}
+            output_bin_files = {}
+            output_idx_files = {}
+            builders = {}
 
-        for key in self.args.json_keys:
-            output_bin_files[key] = "{}_{}_{}.bin".format(output_prefix,
-                                                          key, level)
-            output_idx_files[key] = "{}_{}_{}.idx".format(output_prefix,
-                                                          key, level)
-            builders[key] = IndexedDatasetBuilder(
-                output_bin_files[key],
-                dtype=np.int32,
-            )
+            for key in self.args.json_keys:
+                output_bin_files[key] = "{}_{}_{}.bin".format(output_prefix,
+                                                              key, level)
+                output_idx_files[key] = "{}_{}_{}.idx".format(output_prefix,
+                                                              key, level)
+                builders[key] = IndexedDatasetBuilder(
+                    output_bin_files[key],
+                    dtype=np.int32,
+                )
 
-        startup_end = time.time()
-        proc_start = time.time()
-        total_bytes_processed = 0
-        print("Time to startup:", startup_end - startup_start)
-        for i, (doc, sentence_lens, bytes_processed) in enumerate(encoded_docs, start=1):
-            total_bytes_processed += bytes_processed
-            for key in doc.keys():
-                builders[key].add_document(np.array(doc[key], dtype=np.int32), sentence_lens[key])
-            self.print_processing_stats(i, proc_start, total_bytes_processed)
+            startup_end = time.time()
+            proc_start = time.time()
+            total_bytes_processed = 0
+            print("Time to startup:", startup_end - startup_start)
+            for i, (doc, sentence_lens, bytes_processed) in enumerate(encoded_docs, start=1):
+                total_bytes_processed += bytes_processed
+                for key in doc.keys():
+                    builders[key].add_document(np.array(doc[key], dtype=np.int32), sentence_lens[key])
+                self.print_processing_stats(i, proc_start, total_bytes_processed)
 
-        fin.close()
         builders[key].finalize(output_idx_files[key])
 
 
@@ -344,30 +343,40 @@ def partition_file(args):
         split_sentences_present = check_files_exist(in_ss_out_names, 'sentence_split', args.partitions)
         if not partitions_present and not split_sentences_present:
             # populate .jsonl partition files from parent files
-            partitioned_input_files = []
-            for idx in range(args.partitions):
-                partitioned_input_file = open(in_ss_out_names[idx]['partition'], 'w')
-                partitioned_input_files.append(partitioned_input_file)
-            index = 0
-            if args.keep_sequential_samples:
-                line_count = 0
-            for in_file_name in in_file_names:
-                # support for gzip files
-                if in_file_name.endswith(".gz"):
-                    fin = gzip.open(in_file_name, 'rt')
-                else:
-                    fin = open(in_file_name, 'r', encoding='utf-8')
-                for line in fin:
-                    partitioned_input_files[index].write(line)
-                    if args.keep_sequential_samples:
-                        line_count += 1
-                        if line_count % partition_size == 0:
-                            index += 1
+            # ExitStack lets us open every partition file up front while still
+            # guaranteeing they are all closed on exit, even if a write fails.
+            with ExitStack() as partition_stack:
+                partitioned_input_files = [
+                    partition_stack.enter_context(
+                        open(in_ss_out_names[idx]['partition'], 'w', encoding='utf-8')
+                    )
+                    for idx in range(args.partitions)
+                ]
+                index = 0
+                if args.keep_sequential_samples:
+                    line_count = 0
+                for in_file_name in in_file_names:
+                    # support for gzip files
+                    if in_file_name.endswith(".gz"):
+                        with gzip.open(in_file_name, 'rt', encoding='utf-8') as fin:
+                            for line in fin:
+                                partitioned_input_files[index].write(line)
+                                if args.keep_sequential_samples:
+                                    line_count += 1
+                                    if line_count % partition_size == 0:
+                                        index += 1
+                                else:
+                                    index = (index + 1) % args.partitions
                     else:
-                        index = (index + 1) % args.partitions
-                fin.close()
-            for idx in range(args.partitions):
-                partitioned_input_files[idx].close()
+                        with open(in_file_name, 'r', encoding='utf-8') as fin:
+                            for line in fin:
+                                partitioned_input_files[index].write(line)
+                                if args.keep_sequential_samples:
+                                    line_count += 1
+                                    if line_count % partition_size == 0:
+                                        index += 1
+                                else:
+                                    index = (index + 1) % args.partitions
 
     assert args.workers % args.partitions == 0
     partition = Partition(args, args.workers // args.partitions)

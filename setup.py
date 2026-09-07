@@ -125,8 +125,8 @@ class Install(install):
 
 if __name__ == '__main__':
     version_info = sys.version_info
-    if (version_info.major, version_info.minor) < (3, 7):
-        sys.stderr.write('Python version should be at least 3.7\r\n')
+    if (version_info.major, version_info.minor) < (3, 10):
+        sys.stderr.write('Python version should be at least 3.10\r\n')
         sys.exit(1)
 
     write_commit_id()
@@ -160,7 +160,7 @@ if __name__ == '__main__':
             'build_py': BuildPy,
             'install': Install,
         },
-        python_requires='>=3.7',
+        python_requires='>=3.10',
         install_requires=get_install_requires(),
         classifiers=[
             'Development Status :: 4 - Beta',
@@ -170,9 +170,6 @@ if __name__ == '__main__':
             'Intended Audience :: Developers',
             'License :: OSI Approved :: Apache Software License',
             'Programming Language :: Python :: 3 :: Only',
-            'Programming Language :: Python :: 3.7',
-            'Programming Language :: Python :: 3.8',
-            'Programming Language :: Python :: 3.9',
             'Programming Language :: Python :: 3.10',
             'Programming Language :: Python :: 3.11',
             'Topic :: Scientific/Engineering',
