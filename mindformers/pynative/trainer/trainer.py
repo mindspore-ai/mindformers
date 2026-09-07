@@ -85,6 +85,7 @@ from .utils import (
     _build_callback,
     _build_lora_model,
     _calculate_global_grad_norm,
+    scale_grads_,
     compute_parameters,
     set_auxiliary_loss_backward_scale,
     _sync_mtp_embedding_weights_after_init,
@@ -119,6 +120,23 @@ class TrainMode(enum.Enum):
     PRETRAIN = "pretrain"
 
 
+def _to_local(value):
+    """Return the local tensor of a DTensor-like value, or the value itself."""
+    return value.to_local() if isinstance(value, DTensor) else value
+
+
+def _as_loss_scalar(value):
+    """Normalise a per-token numerator/denominator to a float32 tensor of shape (1,)."""
+    if not isinstance(value, Tensor):
+        value = Tensor([float(value)], dtype=ms.float32)
+    return ops.cast(ops.reshape(value, (1,)), ms.float32)
+
+
+def _is_per_token_pair(outputs):
+    """Whether a model output is the ``(token-loss sum, token count)`` per-token pair."""
+    return isinstance(outputs, (tuple, list)) and len(outputs) == 2
+
+
 def _cast_grad_to_fp32(grad):
     """Backward hook: cast gradient to fp32 if it is in a lower-precision dtype."""
     if grad.dtype in (ms.bfloat16, ms.float16):
@@ -149,6 +167,10 @@ class Trainer:
     """
     Trainer for training models in MindFormers.
     """
+
+    # Class-level default so paths that bypass ``__init__`` (``Trainer.__new__`` in tests,
+    # subclasses that build their own state) still see the flag.
+    calculate_per_token_loss = False
 
     def __init__(
             self,
@@ -274,6 +296,13 @@ class Trainer:
         self._init_distributed_dataset_group()
         self._distributed_dataset_receiver = None
 
+        # Per-token loss changes how micro-batches and ranks are combined: each contributes
+        # an unnormalised token-loss sum and a token count, and the division happens once per
+        # optimizer step by the globally reduced count. This makes the loss independent of the
+        # micro-batch grouping, which is what makes cross-parallelism comparisons meaningful.
+        self.calculate_per_token_loss = bool(
+            getattr(self.config.model, "calculate_per_token_loss", False))
+
         # Create model
         self.model = self._create_model(model, self.config.model)
         # DSA dense warm-up driving its backward per layer: the step-end backward has nothing
@@ -299,6 +328,7 @@ class Trainer:
                 parallelism=self.config.parallelism,
                 enable_parallel=self.enable_parallel,
                 gradient_accumulation_steps=self.num_accumulation_steps,
+                calculate_per_token_loss=self.calculate_per_token_loss,
             )
 
         # After parallelism, parameters will be reset
@@ -1598,6 +1628,7 @@ class Trainer:
             Tuple[Tensor, Tensor]: Accumulated loss and global gradient norm.
         """
         loss = 0.0
+        denominator = 0.0
         grad_norm = 0.0
         for micro_step in range(self.num_accumulation_steps):
             # Keep reduce-scatter enabled on every micro-batch so full, unsharded
@@ -1613,20 +1644,35 @@ class Trainer:
                 micro_loss = self._forward_backward(self.model, micro_inputs)
             except Exception as e:
                 raise RuntimeError(f"Error in training step {step}.") from e
+            if self.calculate_per_token_loss and _is_per_token_pair(micro_loss):
+                micro_loss, micro_denominator = micro_loss
+                denominator += micro_denominator
+                # Report the token-weighted micro-batch loss so the monitor keeps showing a
+                # loss value rather than an unnormalised sum.
+                micro_loss_report = micro_loss / micro_denominator
+            else:
+                micro_loss_report = micro_loss
             if isinstance(micro_loss, DTensor):
                 micro_loss = micro_loss.to_local()
             loss += micro_loss
 
-            self.monitor.record("local_loss", micro_loss,
+            self.monitor.record("local_loss", micro_loss_report,
                                 context={"micro_step": micro_step, "model": self.model})
 
             # Only perform optimizer step after gradient accumulation
             if micro_step >= self.num_accumulation_steps - 1:
+                per_token_step = self.calculate_per_token_loss and not isinstance(denominator, float)
+                if per_token_step:
+                    loss, denominator = self._finalize_per_token_grads(loss, denominator)
                 # Compute grad norm and update optimizer
                 grad_norm = self._optimizer_update()
 
                 # Loss reduction for parallel training
-                if self.enable_parallel:
+                if per_token_step:
+                    # Already globally reduced as sum(loss)/sum(tokens) -- a second
+                    # all_reduce would average an already-global value.
+                    loss = loss / denominator
+                elif self.enable_parallel:
                     all_reduce(loss, op=ops.ReduceOp.SUM)
                     loss /= self.world_size
                 if self.monitor.should_record("device_loss"):
@@ -1654,6 +1700,15 @@ class Trainer:
         """
         inputs = self._collect_micro_batches(self.num_accumulation_steps)
         loss = self.compute_pp_loss(inputs)
+
+        if self.calculate_per_token_loss:
+            # Every rank takes part in the reduction (non-last stages contribute 0), so the
+            # gradient divisor is identical across the pipeline.
+            numerator, denominator = loss if isinstance(loss, tuple) else (0.0, 0.0)
+            numerator, denominator = self._finalize_per_token_grads(numerator, denominator)
+            global_norm = self._optimizer_update()
+            return numerator / denominator, global_norm
+
         global_norm = self._optimizer_update()
 
         if self.has_last:
@@ -1731,6 +1786,7 @@ class Trainer:
             parallelism=self.config.parallelism,
             enable_parallel=self.enable_parallel,
             gradient_accumulation_steps=new_accum,
+            calculate_per_token_loss=self.calculate_per_token_loss,
         )
         if self.parallel_dims and self.parallel_dims.pp_enabled:
             self._update_pipeline_microbatch(new_accum)
@@ -1775,11 +1831,18 @@ class Trainer:
                 f"aborting to avoid split/schedule mismatch."
             ) from e
         sched.build_exec_order()
+        # Must mirror the initial seed built in ``apply_pp``: with
+        # ``calculate_per_token_loss`` the micro-batches' token-loss sums are accumulated
+        # rather than averaged, and the single division happens in
+        # ``_finalize_per_token_grads``, so the 1/accum factor must stay out of the seed.
+        # Hard-coding True here would make a runtime accum change silently rescale every
+        # gradient by 1/accum relative to the initial seed, with no visible effect on the
+        # reported loss.
         new_loss_scale = float(get_loss_sense(
             parallelism=self.config.parallelism,
             enable_parallel=self.enable_parallel,
             gradient_accumulation_steps=new_num_accum,
-            apply_gradient_accumulation=True,
+            apply_gradient_accumulation=not self.calculate_per_token_loss,
         ).asnumpy().item())
         for stage in sched.stages:
             stage.loss_scale = new_loss_scale
@@ -1854,18 +1917,31 @@ class Trainer:
             # Use user-defined loss function
             loss = self.compute_loss_func(outputs, labels)
         else:
-            # Extract loss from model output
-            # We don't use .loss here since the model may return tuples instead of ModelOutput
-            if isinstance(outputs, dict):
-                loss = outputs["loss"]
-            elif isinstance(outputs, (Tensor, DTensor)):
-                loss = outputs
-            else:
-                # Assume first element is loss
-                loss = outputs[0]
+            loss = self._extract_model_loss(outputs)
 
         # return value must be Tensor or DTensor
         return loss
+
+    def _extract_model_loss(self, outputs):
+        """Extract the loss from supported model output forms.
+
+        We don't use ``.loss`` here since the model may return tuples instead of ModelOutput.
+        """
+        if isinstance(outputs, dict):
+            return outputs["loss"]
+        if isinstance(outputs, (Tensor, DTensor)):
+            return outputs
+        if self.calculate_per_token_loss:
+            if len(outputs) < 2:
+                raise ValueError(
+                    "calculate_per_token_loss=True requires model output "
+                    "(loss_sum, token_count)."
+                )
+            # Keep the pair: dividing here would normalise by this micro-batch's own token
+            # count, which is what the switch is meant to avoid. _finalize_per_token_grads
+            # performs the single global division at the end of the optimizer step.
+            return outputs[0], outputs[1]
+        return outputs[0]
 
     def compute_pp_loss(self, inputs: Dict[str, Any]):
         """
@@ -1898,6 +1974,14 @@ class Trainer:
                 # Assume first element is loss
                 if len(outputs) == 0:
                     loss = None
+                elif self.calculate_per_token_loss:
+                    # Sum the micro-batches' unnormalised token-loss and token counts; the
+                    # schedule already back-propagated each micro-batch.
+                    denominator = 0.0
+                    for output in outputs:
+                        loss += _to_local(output[0])
+                        denominator += _to_local(output[1])
+                    return loss, denominator
                 else:
                     for output in outputs:
                         if isinstance(output[0], DTensor):
@@ -1928,6 +2012,14 @@ class Trainer:
             gradient_accumulation_steps=self.num_accumulation_steps,
             apply_gradient_accumulation=False,
         )
+
+        if self.calculate_per_token_loss and isinstance(loss, (tuple, list)):
+            # Back-propagate the raw token-loss sum: micro-batches accumulate (no
+            # 1/num_accumulation_steps) and _finalize_per_token_grads divides the whole
+            # gradient buffer once by the globally reduced token count.
+            numerator, denominator = loss
+            numerator.backward(sense)
+            return _to_local(numerator), _to_local(denominator)
 
         if self.num_accumulation_steps > 1:
             loss = loss / self.num_accumulation_steps
@@ -1986,6 +2078,46 @@ class Trainer:
                 f"check the data, the learning rate and the model configuration."
             )
         return True
+
+    def _finalize_per_token_grads(self, numerator, denominator):
+        """Normalise the accumulated gradients by the globally reduced token count.
+
+        The ``calculate_per_token_loss`` counterpart of Megatron's ``finalize_model_grads``.
+        Micro-batches back-propagate raw token-loss sums scaled by the loss sense
+        ``s = 1/(dp*tp*cp)``, and gradients are summed across ranks. Dividing the whole
+        buffer by the *mean* per-rank token count ``D = sum_r(D_r) / (dp*tp*cp)`` therefore
+        yields ``sum_r(N_r) / sum_r(D_r)`` -- the global per-token loss gradient, independent
+        of how tokens were split into micro-batches or across data-parallel ranks. (Megatron
+        divides by the raw sum instead, because its DDP sets the gradient scaling factor to
+        1.0 under per-token loss; here the 1/(dp*tp*cp) sense stays, hence the mean.) TP
+        replication cancels because it multiplies numerator and denominator alike.
+
+        Ranks that hold no loss (non-last pipeline stages) contribute 0 to the reduction, so
+        the same divisor lands on every rank of the pipeline -- Megatron instead broadcasts
+        the count from the last pipeline rank and then all-reduces over DP.
+
+        Args:
+            numerator (Tensor): This rank's accumulated token-loss sum.
+            denominator (Tensor): This rank's accumulated token count.
+
+        Returns:
+            Tuple[Tensor, Tensor]: The globally reduced numerator and denominator, for
+            reporting ``numerator / denominator`` as the step loss.
+        """
+        numerator = _as_loss_scalar(numerator)
+        denominator = _as_loss_scalar(denominator)
+        if self.enable_parallel:
+            reduced = ops.concat((numerator, denominator))
+            all_reduce(reduced, op=ops.ReduceOp.SUM)
+            numerator, denominator = reduced[0:1], reduced[1:2]
+            # dp*tp*cp == world_size / pipeline_parallel: the ranks whose gradients are
+            # summed together for one pipeline stage.
+            divisor = float(denominator.item()) / (
+                self.world_size // int(self.config.parallelism.pipeline_parallel))
+        else:
+            divisor = float(denominator.item())
+        scale_grads_(self.optimizer.parameters, 1.0 / divisor)
+        return numerator, denominator
 
     def _optimizer_update(self):
         """
