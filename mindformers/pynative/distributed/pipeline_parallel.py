@@ -131,10 +131,11 @@ class ScaledLossPipelineStage(PipelineStage):
                     "calculate_per_token_loss=True requires last-stage output "
                     "(loss_sum, token_count)."
                 )
-
-            denominator = outputs[1].to_local() if hasattr(outputs[1], "to_local") else outputs[1]
-            denominator_for_numerator = denominator.reshape(scaled_sens[0].shape)
-            scaled_sens[0] /= denominator_for_numerator
+            # Do NOT normalise by this micro-batch's token count here: that would make the
+            # loss depend on the micro-batch split again, which is exactly what the switch
+            # exists to avoid. The single global division happens once per optimizer step in
+            # ``Trainer._finalize_per_token_grads`` (Megatron's finalize_model_grads).
+            # The token count itself carries no gradient, so its seed is zeroed.
             for index in range(1, len(scaled_sens)):
                 scaled_sens[index] *= 0
             return scaled_sens

@@ -28,27 +28,35 @@ from mindformers.pynative.trainer import Trainer
 @pytest.mark.level0
 @pytest.mark.platform_x86_cpu
 @pytest.mark.env_onecard
-def test_compute_loss_normalizes_explicit_per_token_output():
-    """Per-token mode reports loss_sum divided by token_count."""
+def test_compute_loss_keeps_the_per_token_pair():
+    """Per-token mode hands the (loss_sum, token_count) pair through unchanged.
+
+    Dividing here would normalise by this micro-batch's own token count, which is exactly
+    what the switch exists to avoid. The single global division happens once per optimizer
+    step in ``_finalize_per_token_grads``.
+    """
     trainer = Trainer.__new__(Trainer)
     trainer.compute_loss_func = None
+    trainer.calculate_per_token_loss = True
     trainer.config = SimpleNamespace(
         model=SimpleNamespace(calculate_per_token_loss=True)
     )
 
     outputs = (ms.Tensor(12.0, ms.float32), ms.Tensor([3.0], ms.float32))
-    loss = trainer.compute_loss([lambda **_: outputs], {})
+    numerator, denominator = trainer.compute_loss([lambda **_: outputs], {})
 
-    np.testing.assert_allclose(loss.asnumpy(), 4.0, rtol=0, atol=0)
+    np.testing.assert_allclose(numerator.asnumpy(), 12.0, rtol=0, atol=0)
+    np.testing.assert_allclose(denominator.asnumpy(), [3.0], rtol=0, atol=0)
 
 
 @pytest.mark.level0
 @pytest.mark.platform_x86_cpu
 @pytest.mark.env_onecard
-def test_compute_pp_loss_normalizes_per_token_outputs(monkeypatch):
-    """PP reports normalized micro-batch losses and scales the loss-sum seed."""
+def test_compute_pp_loss_accumulates_per_token_outputs(monkeypatch):
+    """PP sums the micro-batches' loss and token count, and zeroes the count's seed."""
     trainer = Trainer.__new__(Trainer)
     trainer.compute_loss_func = None
+    trainer.calculate_per_token_loss = True
     trainer.config = SimpleNamespace(
         model=SimpleNamespace(calculate_per_token_loss=True)
     )
@@ -59,8 +67,10 @@ def test_compute_pp_loss_normalizes_per_token_outputs(monkeypatch):
         ]
     )
 
-    loss = trainer.compute_pp_loss({})
-    np.testing.assert_allclose(loss.asnumpy(), 3.0, rtol=0, atol=0)
+    # 12+10 = 22 and 3+5 = 8; the ratio is formed once per step, not per micro-batch.
+    numerator, denominator = trainer.compute_pp_loss({})
+    np.testing.assert_allclose(numerator.asnumpy(), 22.0, rtol=0, atol=0)
+    np.testing.assert_allclose(denominator.asnumpy(), [8.0], rtol=0, atol=0)
 
     stage = object.__new__(ScaledLossPipelineStage)
     stage.loss_scale = 0.5
@@ -76,7 +86,8 @@ def test_compute_pp_loss_normalizes_per_token_outputs(monkeypatch):
     numerator_sens, denominator_sens = stage.get_last_stage_sens(
         (numerator, denominator)
     )
-    np.testing.assert_allclose(numerator_sens.asnumpy(), 1.0 / 6.0, rtol=1e-6)
+    # loss_scale only; no per-micro-batch division by the token count.
+    np.testing.assert_allclose(numerator_sens.asnumpy(), 0.5, rtol=1e-6)
     np.testing.assert_allclose(denominator_sens.asnumpy(), 0.0, rtol=0, atol=0)
 
     stage.calculate_per_token_loss = False
