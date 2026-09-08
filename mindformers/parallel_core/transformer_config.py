@@ -1464,6 +1464,41 @@ class TransformerConfig:
         }
     )
 
+    dsa_index_share_size: int = field(
+        default=1,
+        metadata={
+            "description": "Number of consecutive layers that share one DSA indexer. The first "
+                           "layer of every group (Full) owns the indexer; the remaining "
+                           "`dsa_index_share_size - 1` layers (Shared) own no indexer at all -- no "
+                           "parameters, no projections, no `ops.lightning_indexer` call -- and in "
+                           "the sparse stage they attend with the Full layer's `topk_indices`. The "
+                           "Full layer's indexer is distilled against every layer it serves and the "
+                           "terms are averaged, so the indexer-loss kernel still runs once per "
+                           "layer; what sharing saves is the Shared layers' indexer forward and "
+                           "parameters. Defaults to 1, which disables sharing and is bit-for-bit "
+                           "identical to the unshared implementation.",
+            "usage": ParamUsage.TRAINING,
+            "source": ParamSource.MEGATRON,
+            "mode": ParamMode.COMMON
+        }
+    )
+
+    dsa_index_share_pattern: str = field(
+        default=None,
+        metadata={
+            "description": "Per-layer DSA indexer sharing pattern, as a string of 'F' (Full: this "
+                           "layer runs its own indexer) and 'S' (Shared: reuses the nearest preceding "
+                           "F layer's `topk_indices`). Its length must equal `num_layers`, or be a "
+                           "repeating unit that divides `num_layers`. Overrides `dsa_index_share_size` "
+                           "when set, and is the only way to express a non-uniform pattern. The first "
+                           "layer must be 'F'. Defaults to `None`, meaning the uniform pattern implied "
+                           "by `dsa_index_share_size`.",
+            "usage": ParamUsage.TRAINING,
+            "source": ParamSource.MEGATRON,
+            "mode": ParamMode.COMMON
+        }
+    )
+
     dsa_indexer_loss_coeff: float = field(
         default=None,
         metadata={
@@ -2155,6 +2190,16 @@ class TransformerConfig:
         if self.sequence_parallel and self.tensor_model_parallel_size <= 1:
             raise ValueError("Can not use sequence parallelism without tensor parallelism")
 
+        if ((self.dsa_index_share_size or 1) > 1 or self.dsa_index_share_pattern is not None) \
+                and self.experimental_attention_variant != "dsa":
+            # The full check lives in ``MLATransformerConfig._validate_dsa_index_share``; here we
+            # only make sure the knob is never silently ignored by a non-DSA model.
+            raise ValueError(
+                "DSA indexer sharing (`dsa_index_share_size` / `dsa_index_share_pattern`) is only meaningful when "
+                "`experimental_attention_variant` == 'dsa', but got "
+                f"experimental_attention_variant={self.experimental_attention_variant}."
+            )
+
         self.compute_dtype = convert_str_to_mstype(self.compute_dtype)
         self.layernorm_compute_dtype = convert_str_to_mstype(self.layernorm_compute_dtype)
         self.rotary_dtype = convert_str_to_mstype(self.rotary_dtype)
@@ -2651,6 +2696,7 @@ class ModelArchitecture(enum.Enum):
     YOCO = "yoco"
 
 
+
 @dataclass
 class MLATransformerConfig(TransformerConfig):
     """
@@ -2895,6 +2941,116 @@ class MLATransformerConfig(TransformerConfig):
         }
     )
 
+    def resolve_dsa_index_share_leaders(self):
+        """Return a tuple of bools: whether each global layer keeps its own DSA indexer.
+
+        A ``True`` layer ("Full") runs ``ops.lightning_indexer`` and owns indexer parameters;
+        a ``False`` layer ("Shared") has no indexer at all and reuses the ``topk_indices`` of
+        the nearest preceding ``True`` layer.
+
+        This is the single source of truth for the sharing layout: the config validation, the
+        ``TransformerBlock`` loop and every ``DSAttention`` build all derive their view of the
+        layout from this one method, so a layer can never disagree with the loop about whether
+        it owns an indexer.
+
+        MTP layers are numbered ``num_layers + i`` and run outside the block loop, so they are
+        not covered here and always keep their own indexer.
+
+        Returns:
+            tuple[bool, ...]: one entry per global layer index.
+        """
+        num_layers = self.num_layers
+        pattern = self.dsa_index_share_pattern
+        share_size = self.dsa_index_share_size or 1
+        if pattern is not None:
+            # An empty string is a mistake, not "no pattern": silently falling back to the
+            # uniform layout would hide a typo in the yaml.
+            cleaned = pattern.strip().upper()
+            if any(c not in "FS" for c in cleaned):
+                raise ValueError(
+                    f"`dsa_index_share_pattern` may only contain 'F' and 'S', but got {pattern!r}."
+                )
+            if not cleaned:
+                raise ValueError("`dsa_index_share_pattern` must not be empty.")
+            if len(cleaned) != num_layers:
+                if num_layers % len(cleaned) != 0:
+                    raise ValueError(
+                        f"`dsa_index_share_pattern` has length {len(cleaned)}, which neither equals "
+                        f"`num_layers` ({num_layers}) nor divides it, so it cannot tile the model."
+                    )
+                cleaned = cleaned * (num_layers // len(cleaned))
+            if cleaned[0] != "F":
+                raise ValueError(
+                    "The first layer must be 'F' in `dsa_index_share_pattern`: a Shared layer has no "
+                    f"preceding Full layer to inherit indices from, but got {pattern!r}."
+                )
+            return tuple(c == "F" for c in cleaned)
+
+        return tuple(i % share_size == 0 for i in range(num_layers))
+
+    def _validate_dsa_index_share(self):
+        """Validate DSA indexer Top-K sharing against the stage / MTP layer layout."""
+        share_size = self.dsa_index_share_size
+        if share_size is None:
+            share_size = self.dsa_index_share_size = 1
+        if not isinstance(share_size, int) or isinstance(share_size, bool) or share_size < 1:
+            raise ValueError(
+                f"`dsa_index_share_size` must be a positive integer, but got {share_size}."
+            )
+        pattern = self.dsa_index_share_pattern
+        if pattern is not None:
+            # ``is not None`` rather than truthiness: an empty pattern must reach
+            # ``resolve_dsa_index_share_leaders`` and be rejected there, not silently turn
+            # sharing off. Raises on a malformed pattern; the result is recomputed
+            # identically wherever the layout is needed, so nothing is cached here.
+            leaders = self.resolve_dsa_index_share_leaders()
+            if all(leaders):
+                return
+            self._validate_dsa_index_share_stage_alignment(leaders)
+            # A pattern makes groups just like ``share_size`` does, so it needs the same
+            # pipeline-chunk check; the longest group is what has to fit inside a chunk.
+            starts = [i for i, is_leader in enumerate(leaders) if is_leader]
+            bounds = starts[1:] + [len(leaders)]
+            share_size = max(end - start for start, end in zip(starts, bounds))
+        elif share_size == 1:
+            return
+        elif self.num_layers % share_size != 0:
+            raise ValueError(
+                f"`num_layers` ({self.num_layers}) must be divisible by "
+                f"`dsa_index_share_size` ({share_size}) so that no sharing group is truncated."
+            )
+        else:
+            self._validate_dsa_index_share_stage_alignment(self.resolve_dsa_index_share_leaders())
+        pp_size = self.pipeline_model_parallel_size or 1
+        vpp_size = self.virtual_pipeline_model_parallel_size or 1
+        chunks = pp_size * vpp_size
+        if chunks > 1:
+            if self.num_layers % chunks != 0:
+                # Uneven ``offset`` layouts are checked exactly in ``TransformerBlock``,
+                # where the per-stage layer range is known.
+                return
+            layers_per_chunk = self.num_layers // chunks
+            if layers_per_chunk % share_size != 0:
+                raise ValueError(
+                    f"Each pipeline chunk holds {layers_per_chunk} layers, which is not divisible "
+                    f"by the sharing group size ({share_size}); a sharing group would then span "
+                    "two pipeline stages. Shrink the groups or rebalance the stages."
+                )
+
+    @staticmethod
+    def _validate_dsa_index_share_stage_alignment(leaders):
+        """Reject a layout whose very first layer is Shared.
+
+        Everything else about stage alignment depends on the per-stage layer range, which
+        only ``TransformerBlock`` knows exactly (the pynative ``parallelism:`` block never
+        reaches ``pipeline_model_parallel_size``), so the exact check lives there.
+        """
+        if leaders and not leaders[0]:
+            raise ValueError(
+                "The first DSA layer must keep its own indexer; it has no preceding layer to "
+                "inherit Top-K indices from."
+            )
+
     def __post_init__(self):
         """
         Python dataclass method that is used to modify attributes after initialization.
@@ -2909,6 +3065,7 @@ class MLATransformerConfig(TransformerConfig):
                 raise ValueError("CurrentLy, when `experimental_attention_variant` == 'dsa', "
                                  "`kv_lora_rank` only supports 512, `qk_pos_emb_head_dim` only supports 64, "
                                  "`dsa_indexer_head_dim` only supports 128, `dsa_indexer_n_heads` only supports 64.")
+            self._validate_dsa_index_share()
 
         if self.experimental_attention_variant == 'dsv4_hybrid':
             if not self.multi_latent_attention:

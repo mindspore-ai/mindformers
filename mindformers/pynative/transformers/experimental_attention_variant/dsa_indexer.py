@@ -306,8 +306,10 @@ class DSAIndexer(nn.Cell):
             rotary_pos_emb: Rotary position embedding.
 
         Returns:
-            Tuple containing the unfrozen indexer Q/K/weights followed by
-            Top-K outputs and dense-stage statistics.
+            Tuple containing the unfrozen indexer Q/K/weights followed by the Top-K outputs
+            and dense-stage statistics. In the dense warm-up stage the two selection outputs
+            are ``None`` (no ``ops.lightning_indexer`` call) and the softmax statistics carry
+            the indexer's own LSE instead.
         """
         q, k, weights = self.get_qk_index(x, qr, rotary_pos_emb)
         # Block gradient flow from main loss to indexer inputs via custom autograd Function.

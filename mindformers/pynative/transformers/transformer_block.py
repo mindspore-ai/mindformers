@@ -10,6 +10,9 @@ from typing import Union, List, Optional
 from mindspore import nn, Tensor, mint
 from mindformers.pynative.layers.layer_norm import get_norm_cls
 from mindformers.parallel_core.transformer_config import TransformerConfig
+from mindformers.pynative.transformers.experimental_attention_variant.dsa_attention import (
+    IndexShareGroup,
+)
 from mindformers.parallel_core.utils.spec_utils import ModuleSpec, build_module
 from mindformers.pynative.transformers.transformer_layer import BaseTransformerLayer
 from mindformers.tools.logger import logger
@@ -178,8 +181,51 @@ class TransformerBlock(nn.Cell):
             logger.warning("The context parallel way conflicts with sequence parallel way. "
                            "The sequence parallel way has no effect and ignored.")
         self.seq_length_in_cfg = config.seq_length
+        self.dsa_index_share_leaders = self._resolve_dsa_index_share_layout(config)
 
         self._build_layers(config)
+
+    def _resolve_dsa_index_share_layout(self, config: TransformerConfig):
+        """Return the per-layer Full/Shared layout, or None when sharing is off.
+
+        The layout is keyed by the *global* layer index, so a group must never span two
+        pipeline chunks: a Shared layer reaches its leader through a per-invocation Python
+        object that does not cross a stage boundary. The pynative ``parallelism:`` block
+        never reaches ``TransformerConfig.pipeline_model_parallel_size``, so the config-level
+        check cannot see the stage layout at all -- this is the check that actually binds.
+        """
+        if (config.dsa_index_share_size or 1) == 1 and not config.dsa_index_share_pattern:
+            return None
+        if config.experimental_attention_variant != "dsa":
+            return None
+        leaders = config.resolve_dsa_index_share_leaders()
+        if all(leaders):
+            return None
+        layer_end = self.layer_end if self.layer_end is not None else config.num_layers - 1
+        # A group must start and end inside this stage: a Shared layer reads the leader's
+        # Top-K out of a per-invocation Python object, which cannot cross a stage boundary.
+        if not leaders[self.layer_start]:
+            raise ValueError(
+                f"The DSA indexer sharing layout leaves global layer {self.layer_start} Shared, "
+                f"but it is the first layer of this pipeline stage (global layers "
+                f"[{self.layer_start}, {layer_end}]), so its group leader lives on another "
+                f"stage and is unreachable. Align the layout to the stage boundaries."
+            )
+        if layer_end + 1 < len(leaders) and not leaders[layer_end + 1]:
+            raise ValueError(
+                f"The DSA indexer sharing layout leaves global layer {layer_end + 1} Shared, "
+                f"but this pipeline stage ends at layer {layer_end}, so that layer's group "
+                f"would span two stages. Align the layout to the stage boundaries."
+            )
+        num_groups = sum(1 for i in range(self.layer_start, layer_end + 1) if leaders[i])
+        logger.info(
+            "DSA indexer Top-K sharing is enabled: global layers [%s, %s] form %s "
+            "sharing group(s); pattern %s",
+            self.layer_start, layer_end, num_groups,
+            "".join("F" if leaders[i] else "S"
+                    for i in range(self.layer_start, layer_end + 1)),
+        )
+        return leaders
 
     def _build_layers(self, config: TransformerConfig):
         """build transformer layers."""
@@ -244,9 +290,20 @@ class TransformerBlock(nn.Cell):
         if self.hc and self.pre_process:
             hidden_states = expand_hyper_connection_streams(hidden_states, self.n, self.hidden_size)
 
+        leaders = self.dsa_index_share_leaders
+        # One group object per group per block invocation, so concurrently running
+        # micro-batches (dualpipe / overlap_b_f) never share sharing state.
+        group = None
         for index in range(self.layer_start, self.layer_end + 1):
             layer = self._get_layer(index)
             prefix_kv = prefix_keys_values[index] if prefix_keys_values is not None else None
+            # Sharing off (``leaders is None``) passes no sharing kwargs at all, so layers
+            # that predate IndexShare keep their original signature.
+            share_kwargs = {}
+            if leaders is not None:
+                if leaders[index]:
+                    group = IndexShareGroup()
+                share_kwargs = {"index_share_group": group}
             hidden_states, _ = layer(
                 hidden_states,
                 attention_mask,
@@ -255,7 +312,8 @@ class TransformerBlock(nn.Cell):
                 actual_seq_len=actual_seq_len,
                 input_ids=input_ids,
                 mscale=mscale,
-                rotary_cos_sin=rotary_cos_sin
+                rotary_cos_sin=rotary_cos_sin,
+                **share_kwargs
             )
 
         if self.hc and self.has_final_layernorm_in_this_stage():
