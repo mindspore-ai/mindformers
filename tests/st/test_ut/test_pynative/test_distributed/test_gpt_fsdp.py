@@ -110,6 +110,19 @@ def test_apply_fsdp_wraps_each_layer_once(monkeypatch):
     decoder_max_logits = _FakeParameter((8,))
     mtp_max_logits = _FakeParameter((8,))
     decoder_layer = _FakeTransformerLayer(decoder_max_logits)
+    decoder_tokens = _FakeParameter((4,))
+    decoder_expert_bias = _FakeParameter((4,))
+    decoder_tid2eid = _FakeParameter((16, 2))
+    decoder_global_tokens = _FakeParameter((4,))
+    decoder_ga_steps = _FakeParameter((1,))
+    decoder_layer.mlp.tokens_per_expert = decoder_tokens
+    decoder_layer.mlp.enable_expert_bias = True
+    decoder_layer.mlp.expert_bias = decoder_expert_bias
+    decoder_layer.mlp.router = SimpleNamespace(
+        tid2eid=decoder_tid2eid,
+        global_tokens_per_expert=decoder_global_tokens,
+        ga_steps=decoder_ga_steps,
+    )
     mtp_layer = _FakeMtpLayer()
     mtp_layer.transformer_layer.self_attention.core_attention.max_logits_val = mtp_max_logits
     decoder = SimpleNamespace(layers=[decoder_layer], final_layernorm=None, hc_head=None)
@@ -152,8 +165,18 @@ def test_apply_fsdp_wraps_each_layer_once(monkeypatch):
     assert [module for module, _ in wrapped] == [decoder_layer, mtp_layer, model]
     assert mtp_layer.transformer_layer not in [module for module, _ in wrapped]
     assert all(call[1]["comm_fusion"] is False for call in wrapped)
-    # A non-persistent buffer is not a parameter, so FSDP needs no opt-out for it.
-    assert all("ignored_params" not in call[1] for call in wrapped)
+    expected_ignored = {
+        decoder_max_logits,
+        mtp_max_logits,
+        decoder_tokens,
+        decoder_expert_bias,
+        decoder_tid2eid,
+        decoder_global_tokens,
+        decoder_ga_steps,
+    }
+    assert wrapped[0][1]["ignored_params"] == expected_ignored
+    assert wrapped[1][1]["ignored_params"] == expected_ignored
+    assert wrapped[2][1]["ignored_params"] == expected_ignored
     assert decoder_max_logits not in wrapped[0][1]["replicate_params"]
     assert mtp_max_logits not in wrapped[1][1]["replicate_params"]
 
