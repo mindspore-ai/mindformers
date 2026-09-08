@@ -22,14 +22,17 @@ from mindformers.pynative.base_models.gpt.parallelize import (
     _build_hc_head_fsdp_policy,
     _build_layer_fsdp_policy,
     _build_mtp_fsdp_policy,
+    _collect_layer_fsdp_ignored_params,
+    _split_fsdp_replicate_params,
 )
 
 
 class _FakeParam:
     """Minimal parameter-like object used by the placement policy helpers."""
 
-    def __init__(self, shape):
+    def __init__(self, shape, requires_grad=True):
         self.shape = shape
+        self.requires_grad = requires_grad
 
 
 class _FakeModule:
@@ -169,6 +172,71 @@ def test_explicit_shard_rule_falls_back_to_replicate():
 
     assert shard_plan is None
     assert replicate_params == [matrix]
+
+
+@pytest.mark.level0
+@pytest.mark.platform_x86_cpu
+@pytest.mark.env_onecard
+def test_frozen_replicate_is_ignored_but_trainable_replicate_is_managed():
+    """Only trainable shape-fallback parameters stay managed replicas."""
+    frozen = _FakeParam((3, 7), requires_grad=False)
+    trainable = _FakeParam((3, 7))
+    module = _FakeModule({"frozen": frozen, "trainable": trainable})
+
+    shard_plan, replicate_params = _build_fsdp_policy(module, 2)
+    ignored_params, managed_replicates = _split_fsdp_replicate_params(
+        module, replicate_params
+    )
+
+    assert shard_plan is None
+    assert ignored_params == {frozen}
+    assert managed_replicates == [trainable]
+
+
+@pytest.mark.level0
+@pytest.mark.platform_x86_cpu
+@pytest.mark.env_onecard
+def test_layer_runtime_state_is_ignored_not_replicated():
+    """MoE and QK-clip runtime state must stay outside the FSDP lifecycle."""
+    matrix = _FakeParam((8, 16))
+    max_logits_val = _FakeParam((1,))
+    tokens_per_expert = _FakeParam((3,))
+    expert_bias = _FakeParam((3,))
+    tid2eid = _FakeParam((32, 2))
+    global_tokens_per_expert = _FakeParam((3,))
+    ga_steps = _FakeParam((1,))
+    router = type("Router", (), {})()
+    router.tid2eid = tid2eid
+    router.global_tokens_per_expert = global_tokens_per_expert
+    router.ga_steps = ga_steps
+    layer = _FakeLayer({
+        "weight": matrix,
+        "self_attention.core_attention.max_logits_val": max_logits_val,
+        "mlp.tokens_per_expert": tokens_per_expert,
+        "mlp.expert_bias": expert_bias,
+        "mlp.router.tid2eid": tid2eid,
+        "mlp.router.global_tokens_per_expert": global_tokens_per_expert,
+        "mlp.router.ga_steps": ga_steps,
+    })
+    layer.mlp.tokens_per_expert = tokens_per_expert
+    layer.mlp.enable_expert_bias = True
+    layer.mlp.expert_bias = expert_bias
+    layer.mlp.router = router
+    layer.self_attention.core_attention.max_logits_val = max_logits_val
+
+    shard_plan, replicate_params = _build_layer_fsdp_policy(layer, 2)
+
+    ignored_params = _collect_layer_fsdp_ignored_params(layer)
+    assert ignored_params == {
+        max_logits_val,
+        tokens_per_expert,
+        expert_bias,
+        tid2eid,
+        global_tokens_per_expert,
+        ga_steps,
+    }
+    assert all(param not in replicate_params for param in ignored_params)
+    assert shard_plan is None
 
 
 @pytest.mark.level0

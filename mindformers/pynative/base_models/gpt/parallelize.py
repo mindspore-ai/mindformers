@@ -372,17 +372,56 @@ def _collect_module_replicate_params(module, shard_size):
     return replicate_params
 
 
-def _build_fsdp_policy(module, shard_size, param_rules=None, forced_replicate_params=None):
+def _split_fsdp_replicate_params(module, replicate_params, explicit_ignored_params=()):
+    """Split frozen or explicitly ignored parameters from managed replicas.
+
+    Replicated parameters that still require gradients remain managed by FSDP and
+    participate in gradient synchronization. Frozen parameters and known runtime
+    state bypass the FSDP lifecycle entirely. Explicit ignores inherited from an
+    outer wrapper are limited to parameters owned by this module.
+    """
+    replicate_params = list(replicate_params or ())
+    module_param_ids = {id(param) for _, param in module.parameters_and_names()}
+    ignored_params = {
+        param
+        for param in replicate_params
+        if id(param) in module_param_ids and not getattr(param, "requires_grad", True)
+    }
+    ignored_params.update(
+        param
+        for param in (explicit_ignored_params or ())
+        if id(param) in module_param_ids
+    )
+    ignored_ids = {id(param) for param in ignored_params}
+    managed_replicates = [
+        param for param in replicate_params if id(param) not in ignored_ids
+    ]
+    return ignored_params, managed_replicates
+
+
+def _build_fsdp_policy(
+    module,
+    shard_size,
+    param_rules=None,
+    ignored_params=None,
+):
     """Build a module's shard-placement callback and replicated parameter list.
 
     ``param_rules`` maps module-relative parameter names to either ``shard_dim``
     or ``replicate``. Parameters without a rule use the default ``Shard(0)``.
+    Parameters in ``ignored_params`` are excluded from both the placement plan and
+    the managed replicated list; they remain outside the fully-shard lifecycle.
     """
     param_rules = {} if param_rules is None else param_rules
+    ignored_param_ids = {
+        id(param) for param in (ignored_params or ())
+    }
     placement_overrides = {}
-    replicate_params = list(forced_replicate_params or ())
+    replicate_params = []
 
     for param_name, param in module.parameters_and_names():
+        if id(param) in ignored_param_ids:
+            continue
         rule = param_rules.get(param_name, {})
         unknown_keys = rule.keys() - {"shard_dim", "replicate"}
         if unknown_keys:
@@ -410,7 +449,7 @@ def _build_fsdp_policy(module, shard_size, param_rules=None, forced_replicate_pa
     unique_params = []
     seen = set()
     for param in replicate_params:
-        if id(param) not in seen:
+        if id(param) not in seen and id(param) not in ignored_param_ids:
             seen.add(id(param))
             unique_params.append(param)
     if not placement_overrides:
@@ -445,44 +484,64 @@ def _build_expert_fsdp_policy(experts, shard_size):
     return _build_fsdp_policy(experts, shard_size, param_rules=param_rules)
 
 
-def _collect_layer_forced_replicate_params(layer):
-    """Collect transformer-layer state that must remain replicated under FSDP."""
-    forced_replicate_params = []
-    if hasattr(layer.mlp, "tokens_per_expert"):
-        forced_replicate_params.append(layer.mlp.tokens_per_expert)
+def _collect_layer_fsdp_ignored_params(layer):
+    """Collect mutable runtime state that FSDP must leave unmanaged.
 
-    if getattr(layer.mlp, "enable_expert_bias", False):
-        forced_replicate_params.append(layer.mlp.expert_bias)
+    MoE counters and lookup state are updated by forward or training-step callback
+    code. QK-clip's ``max_logits_val`` is a forward statistic synchronized over
+    DP/CP explicitly. Keeping this state outside FSDP preserves its original TP/EP
+    layout and avoids FSDP gradient and lifecycle handling.
+    """
+    ignored_params = set()
+    mlp = getattr(layer, "mlp", None)
+    if mlp is not None:
+        tokens_per_expert = getattr(mlp, "tokens_per_expert", None)
+        if tokens_per_expert is not None:
+            ignored_params.add(tokens_per_expert)
 
-    if hasattr(layer.mlp, "router"):
-        if hasattr(layer.mlp.router, "tid2eid") and layer.mlp.router.tid2eid is not None:
-            forced_replicate_params.append(layer.mlp.router.tid2eid)
+        if getattr(mlp, "enable_expert_bias", False):
+            expert_bias = getattr(mlp, "expert_bias", None)
+            if expert_bias is not None:
+                ignored_params.add(expert_bias)
 
-    return forced_replicate_params
+        router = getattr(mlp, "router", None)
+        if router is not None:
+            for param_name in ("tid2eid", "global_tokens_per_expert", "ga_steps"):
+                param = getattr(router, param_name, None)
+                if param is not None:
+                    ignored_params.add(param)
+
+    self_attention = getattr(layer, "self_attention", None)
+    core_attention = getattr(self_attention, "core_attention", None)
+    max_logits_val = getattr(core_attention, "max_logits_val", None)
+    if max_logits_val is not None:
+        ignored_params.add(max_logits_val)
+
+    return ignored_params
 
 
 def _build_layer_fsdp_policy(layer, shard_size):
     """Build one transformer layer's complete FSDP policy."""
-    forced_replicate_params = _collect_layer_forced_replicate_params(layer)
+    ignored_params = _collect_layer_fsdp_ignored_params(layer)
 
     return _build_fsdp_policy(
         layer,
         shard_size,
         param_rules=_LAYER_FSDP_PARAM_RULES,
-        forced_replicate_params=forced_replicate_params,
+        ignored_params=ignored_params,
     )
 
 
 def _build_mtp_fsdp_policy(mtp_layer, shard_size):
     """Build one outer MTP unit's policy, including its transformer layer and mHC head."""
-    forced_replicate_params = _collect_layer_forced_replicate_params(
+    ignored_params = _collect_layer_fsdp_ignored_params(
         mtp_layer.transformer_layer
     )
     return _build_fsdp_policy(
         mtp_layer,
         shard_size,
         param_rules=_MTP_FSDP_PARAM_RULES,
-        forced_replicate_params=forced_replicate_params,
+        ignored_params=ignored_params,
     )
 
 
@@ -1312,6 +1371,17 @@ def apply_fsdp(
     layers = list(gpt_model.decoder.layers)
 
     mtp = getattr(gpt_model, "mtp", None)
+    # Runtime state must stay outside every FSDP wrapper, including the final root
+    # wrapper. Collect it up front so nested wrappers and the root see the same
+    # ignored-parameter identity set.
+    fsdp_ignored_params = set()
+    for layer in layers:
+        fsdp_ignored_params.update(_collect_layer_fsdp_ignored_params(layer))
+    if mtp is not None:
+        for mtp_layer in mtp.layers:
+            fsdp_ignored_params.update(
+                _collect_layer_fsdp_ignored_params(mtp_layer.transformer_layer)
+            )
     tail_modules = [
         m for m in [
             getattr(gpt_model.decoder, "final_layernorm", None),
@@ -1325,11 +1395,16 @@ def apply_fsdp(
     # --- 1. Wrap embedding ---
     if embedding is not None:
         embed_replicate_params = _collect_module_replicate_params(embedding, dense_shard_degree)
+        embed_ignored_params, embed_replicate_params = _split_fsdp_replicate_params(
+            embedding, embed_replicate_params, fsdp_ignored_params
+        )
+        fsdp_ignored_params.update(embed_ignored_params)
         with ms.DeviceCtx("meta"):
             fully_shard(
                 embedding,
                 **fsdp_config,
                 reshard_after_forward=reshard_after_forward,
+                ignored_params=fsdp_ignored_params,
                 replicate_params=embed_replicate_params,
             )
 
@@ -1339,18 +1414,27 @@ def apply_fsdp(
         if hasattr(layer.mlp, "experts") and edp_mesh is not None:
             expert_shard_plan, expert_replicate_params = _build_expert_fsdp_policy(
                 layer.mlp.experts, expert_shard_degree)
+            expert_ignored_params, expert_replicate_params = _split_fsdp_replicate_params(
+                layer.mlp.experts, expert_replicate_params, fsdp_ignored_params
+            )
+            fsdp_ignored_params.update(expert_ignored_params)
             with ms.DeviceCtx("meta"):
                 fully_shard(
                     layer.mlp.experts,
                     **efsdp_config,
                     shard_placement_fn=expert_shard_plan,
                     reshard_after_forward=reshard_after_forward,
+                    ignored_params=fsdp_ignored_params,
                     replicate_params=expert_replicate_params,
                 )
 
         layer_shard_plan, replicate_params = _build_layer_fsdp_policy(
             layer, dense_shard_degree
         )
+        layer_ignored_params, replicate_params = _split_fsdp_replicate_params(
+            layer, replicate_params, fsdp_ignored_params
+        )
+        fsdp_ignored_params.update(layer_ignored_params)
 
         with ms.DeviceCtx("meta"):
             fully_shard(
@@ -1358,6 +1442,7 @@ def apply_fsdp(
                 **fsdp_config,
                 shard_placement_fn=layer_shard_plan,
                 reshard_after_forward=reshard_after_forward,
+                ignored_params=fsdp_ignored_params,
                 replicate_params=replicate_params,
             )
 
@@ -1368,17 +1453,22 @@ def apply_fsdp(
             if is_norm_module(tail_module):
                 # Small module: wrap norm independently
                 with ms.DeviceCtx("meta"):
-                    fully_shard(tail_module, **fsdp_config)
+                    fully_shard(tail_module, **fsdp_config, ignored_params=fsdp_ignored_params)
             else:
                 # Larger module: output_layer, do not reshard_after_forward by default
                 # since FSDP would prefetch it immediately after the forward pass.
                 tail_replicate_params = _collect_module_replicate_params(
                     tail_module, dense_shard_degree)
+                tail_ignored_params, tail_replicate_params = _split_fsdp_replicate_params(
+                    tail_module, tail_replicate_params, fsdp_ignored_params
+                )
+                fsdp_ignored_params.update(tail_ignored_params)
                 with ms.DeviceCtx("meta"):
                     fully_shard(
                         tail_module,
                         **fsdp_config,
                         reshard_after_forward=reshard_policy == "always",
+                        ignored_params=fsdp_ignored_params,
                         replicate_params=tail_replicate_params,
                     )
 
@@ -1388,17 +1478,28 @@ def apply_fsdp(
             if hasattr(layer.transformer_layer.mlp, "experts") and edp_mesh is not None:
                 expert_shard_plan, expert_replicate_params = _build_expert_fsdp_policy(
                     layer.transformer_layer.mlp.experts, expert_shard_degree)
+                expert_ignored_params, expert_replicate_params = _split_fsdp_replicate_params(
+                    layer.transformer_layer.mlp.experts,
+                    expert_replicate_params,
+                    fsdp_ignored_params,
+                )
+                fsdp_ignored_params.update(expert_ignored_params)
                 with ms.DeviceCtx("meta"):
                     fully_shard(
                         layer.transformer_layer.mlp.experts, **efsdp_config,
                         shard_placement_fn=expert_shard_plan,
                         reshard_after_forward=reshard_after_forward,
+                        ignored_params=fsdp_ignored_params,
                         replicate_params=expert_replicate_params,
                     )
 
             layer_shard_plan, mtp_replicate_params = _build_mtp_fsdp_policy(
                 layer, dense_shard_degree
             )
+            mtp_ignored_params, mtp_replicate_params = _split_fsdp_replicate_params(
+                layer, mtp_replicate_params, fsdp_ignored_params
+            )
+            fsdp_ignored_params.update(mtp_ignored_params)
 
             with ms.DeviceCtx("meta"):
                 fully_shard(
@@ -1406,17 +1507,23 @@ def apply_fsdp(
                     **fsdp_config,
                     shard_placement_fn=layer_shard_plan,
                     reshard_after_forward=reshard_after_forward,
+                    ignored_params=fsdp_ignored_params,
                     replicate_params=mtp_replicate_params,
                 )
     # --- 4. Wrap root-owned state, including the decoder mHC head ---
     root_shard_plan, root_replicate_params = _build_hc_head_fsdp_policy(
         getattr(gpt_model.decoder, "hc_head", None), dense_shard_degree
     )
+    root_ignored_params, root_replicate_params = _split_fsdp_replicate_params(
+        model, root_replicate_params, fsdp_ignored_params
+    )
+    fsdp_ignored_params.update(root_ignored_params)
     with ms.DeviceCtx("meta"):
         fully_shard(
             model,
             **fsdp_config,
             shard_placement_fn=root_shard_plan,
+            ignored_params=fsdp_ignored_params,
             replicate_params=root_replicate_params,
         )
 
