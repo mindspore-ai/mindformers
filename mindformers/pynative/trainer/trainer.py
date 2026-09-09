@@ -83,6 +83,13 @@ from .utils import (
     _sync_mtp_embedding_weights_after_init,
     _DistributedDatasetReceiver,
 )
+from .inference import (
+    build_inference_tokenizer,
+    configure_inference,
+    generate_from_records,
+    normalize_input,
+    PipelineInferenceContext,
+)
 
 
 def patch_legacy_model_inference():
@@ -121,7 +128,7 @@ class Trainer:
             self,
             config: Optional[Union[str, dict]] = None,
             model: PreTrainedModel = None,
-            run_mode: Optional[str] = "train",
+            run_mode: Optional[str] = None,
             train_dataset: Optional[Dataset] = None,
             eval_dataset: Optional[Dataset] = None,
             optimizer: Optional[Any] = None,
@@ -136,8 +143,11 @@ class Trainer:
             config (Union[str, dict], optional): The configuration of the trainer.
                 It can be a path to a yaml file or a dictionary. Defaults to None.
             model (PreTrainedModel, optional): The model to train. Defaults to None.
-            run_mode (str, optional): The running mode. Can be "train", "finetune", "eval" or "predict".
-                Defaults to "train".
+            run_mode (str, optional): The running mode, ``"train"`` or
+                ``"predict"`` (same vocabulary as graph
+                mode). When set, it overrides the config's top-level
+                ``run_mode`` field; when omitted, routing follows the config
+                value. Defaults to None.
             train_dataset (Dataset, optional): The training dataset. Defaults to None.
             eval_dataset (Dataset, optional): The evaluation dataset. Defaults to None.
             optimizer (Any, optional): The optimizer. Defaults to None.
@@ -161,7 +171,29 @@ class Trainer:
         enable_mindspore_backward_compat()
 
         # Initialize config
-        self.config = self._init_config(config, run_mode)
+        self.config = self._init_config(config)
+        if run_mode is not None:
+            self.config.run_mode = run_mode
+        if self.config.run_mode not in ("train", "predict"):
+            raise ValueError(
+                f"Invalid run mode: {self.config.run_mode!r}. Must be "
+                f"'train' or 'predict'."
+            )
+
+        self.is_inference = self.config.run_mode == "predict"
+        if self.is_inference and self.config.inference is None:
+            raise ValueError(
+                "run_mode='predict' requires an `inference:` "
+                "section in the config."
+            )
+        if self.is_inference:
+            # configure_inference must run before the model is built;
+            # so must the tokenizer (pad_token_id feeds the build).
+            configure_inference(self.config)
+            self.tokenizer = build_inference_tokenizer(self.config)
+        else:
+            self.tokenizer = None
+
         configure_max_logits_tracking(self.config, callbacks, optimizer)
 
         self._setup_seed_and_determinism()
@@ -209,7 +241,10 @@ class Trainer:
         self._compute_data_parallel_size()
 
         # init data broadcast group
-        self.enable_data_broadcast = getattr(self.config.train_dataset, "use_distribute_dataset", False)
+        if self.is_inference:
+            self.enable_data_broadcast = False
+        else:
+            self.enable_data_broadcast = getattr(self.config.train_dataset, "use_distribute_dataset", False)
         self._init_distributed_dataset_group()
         self._distributed_dataset_receiver = None
 
@@ -227,11 +262,12 @@ class Trainer:
         # single-card path skips ``parallelize_model`` entirely, so without this
         # the autoscalers keep their default ``1.0`` and gradient accumulation
         # diverges from the no-accumulation run.
-        set_auxiliary_loss_backward_scale(
-            parallelism=self.config.parallelism,
-            enable_parallel=self.enable_parallel,
-            gradient_accumulation_steps=self.num_accumulation_steps,
-        )
+        if not self.is_inference:
+            set_auxiliary_loss_backward_scale(
+                parallelism=self.config.parallelism,
+                enable_parallel=self.enable_parallel,
+                gradient_accumulation_steps=self.num_accumulation_steps,
+            )
 
         # After parallelism, parameters will be reset
         self.model = self.model if isinstance(self.model, list) else [self.model]
@@ -245,15 +281,17 @@ class Trainer:
         # different values even though their gradients are synchronized and
         # checkpoint metadata treats them as one shared parameter. Canonicalize
         # the initialized local shards before optimizer states are derived.
-        with _no_grad():
-            _sync_mtp_embedding_weights_after_init(self.model)
+        # (Inference drops the MTP branch, so there is nothing to sync.)
+        if not self.is_inference:
+            with _no_grad():
+                _sync_mtp_embedding_weights_after_init(self.model)
 
         # LoRA: freeze base params AFTER parallelism + init_states. During distribute_module
         # all params must be trainable so they materialise as DTensors (including frozen
         # norms/biases and NoParallel base weights, whose TP layout inference needs DTensor
         # gamma); freezing earlier leaves them as plain Tensors and breaks TP. Only
         # lora_a/lora_b stay trainable, so the optimizer (built below) sees adapters only.
-        if getattr(self.config, "lora_config", None) is not None:
+        if not self.is_inference and getattr(self.config, "lora_config", None) is not None:
             # Under pipeline parallelism freeze runs per stage; a stage may legitimately hold
             # no adapters, so aggregate the trainable count and only error if NO stage has any.
             total_trainable = 0
@@ -266,6 +304,18 @@ class Trainer:
                     "stage. Check lora_config.target_modules against the model's module names."
                 )
             compute_parameters(self.model[0])
+
+        # Inference skips all training-only setup below (datasets, optimizer,
+        # scheduler, callbacks, monitor).
+        if self.is_inference:
+            self.train_dataset = None
+            self.eval_dataset = None
+            self.optimizer = None
+            self.lr_scheduler = None
+            self.callback_handler = None
+            self.monitor = None
+            self.state = None
+            return
 
         # Create train dataset
         self.train_dataset = self._create_dataset(
@@ -366,13 +416,12 @@ class Trainer:
         )
 
     @staticmethod
-    def _init_config(config: Union[str, dict], run_mode: str = "train") -> TrainConfig:
+    def _init_config(config: Union[str, dict]) -> TrainConfig:
         """
         Initialize trainer config from yaml file or dict instance.
 
         Args:
             config (Union[str, dict]): The configuration of the trainer.
-            run_mode (str, optional): The running mode. Defaults to "train".
 
         Returns:
             TrainConfig: The initialized trainer configuration.
@@ -391,11 +440,7 @@ class Trainer:
                 raise FileNotFoundError(f"Config file not found: {config}")
 
             logger.info(f"Loading config from yaml file: {config}")
-
-            if run_mode == "train":
-                config = TrainConfig.load_from_yaml(config)
-            else:
-                raise ValueError(f"Invalid run mode: {run_mode}")
+            config = TrainConfig.load_from_yaml(config)
 
         elif isinstance(config, dict):
             config = TrainConfig.from_dict(config)
@@ -439,6 +484,7 @@ class Trainer:
             recompute_comm=self.config.recompute_comm,
             swap=self.config.swap,
             gradient_accumulation_steps=self.num_accumulation_steps,
+            forward_only=self.is_inference,
         )
 
     def _create_model(self, model, model_config: Optional[Dict]) -> Any:
@@ -514,7 +560,9 @@ class Trainer:
         # calculate gradient accumulation steps
         base_units = parallelism.data_parallel * self.config.training.local_batch_size
         self._base_units = base_units
-        if self.dynamic_batch_enabled:
+        if self.is_inference:
+            self.num_accumulation_steps = 1
+        elif self.dynamic_batch_enabled:
             # Dynamic batch : the scheduler maps
             # consumed_samples -> GBS. Initial values come from consumed_samples=0.
             self.dynamic_scheduler = build_dynamic_scheduler(self.config, self.global_batch_size, base_units)
@@ -863,6 +911,157 @@ class Trainer:
 
         if self.communication_init:
             destroy_process_group()
+
+    def inference(self, input_data=None, max_new_tokens=None,
+                  output=None, batch_size=None, dataset_field="instruction"):
+        """Run greedy text generation with the PyNative model.
+
+        Requires ``run_mode: predict`` in the config;
+        optional arguments override their ``inference.*`` config values.
+
+        Args:
+            input_data (str, dict, or list, optional): The inference
+                prompt(s) (see ``InferenceConfig.input_data``). Defaults to
+                ``inference.input_data``.
+            max_new_tokens (int, optional): Number of tokens to generate.
+            output (str, optional): Result dump path (format by extension).
+            batch_size (int, optional): Samples decoded per forward.
+            dataset_field (str, optional): JSON key holding the prompt text
+                in each record. Defaults to ``"instruction"``.
+
+        Returns:
+            ``list[(sample_idx, generated_ids)]``; failed samples are
+            recorded as ``{"error": ...}`` lines in the output.
+        """
+        if not self.is_inference:
+            raise RuntimeError(
+                "Trainer.inference() requires `run_mode: predict` "
+                "in the config."
+            )
+        inference_config = self.config.inference
+        if input_data is None:
+            input_data = inference_config.input_data
+        if output is None:
+            output = inference_config.output
+        if max_new_tokens is None:
+            max_new_tokens = inference_config.max_new_tokens
+        if max_new_tokens <= 0:
+            raise ValueError("max_new_tokens must be positive.")
+        if batch_size is None:
+            batch_size = inference_config.batch_size
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive.")
+
+        records = normalize_input(input_data)
+
+        rank = get_rank()
+
+        pp_ctx = None
+        if self.parallel_dims is not None and self.parallel_dims.pp_enabled:
+            self._validate_pp_inference()
+            pp_mesh = self.parallel_dims.get_mesh("pp")
+            pp_ranks = pp_mesh.get_rank_list_along_axis("pp")
+            pp_ctx = PipelineInferenceContext(
+                schedule=self.schedule,
+                is_last_stage=self.has_last,
+                group=pp_mesh.get_group(),
+                # Global rank of this line's last stage: the rank list is
+                # stage-ordered, and MindSpore's broadcast src is a global
+                # rank even under a sub group.
+                src=pp_ranks[-1],
+            )
+
+        model = self.model[0]
+        for m in self.model:
+            # construct returns logits (not loss) once set_train(False).
+            m.set_train(False)
+        gpt_model = getattr(model, "model", None)
+        if getattr(gpt_model, "mtp_process", False):
+            raise RuntimeError(
+                "The inference model still has its training-only MTP loss branch "
+                "enabled. Set model.num_nextn_predict_layers to 0 before building "
+                "the model."
+            )
+
+        self._load_inference_checkpoint(model)
+
+        parallelism = self.config.parallelism
+        sequence_divisor = parallelism.tensor_parallel * parallelism.context_parallel
+
+        sample_results = generate_from_records(
+            model=self.model,
+            tokenizer=self.tokenizer,
+            records=records,
+            instruction_field=dataset_field,
+            sequence_divisor=sequence_divisor,
+            parallel_dims=self.parallel_dims,
+            max_new_tokens=max_new_tokens,
+            batch_size=batch_size,
+            max_seq_length=self.config.model.seq_length,
+            rank=rank,
+            output_path=output,
+            pp_ctx=pp_ctx,
+        )
+        if self.communication_init:
+            barrier()
+            destroy_process_group()
+        return sample_results
+
+    def _validate_pp_inference(self):
+        """Reject PP schedule features that assume backward.
+
+        Forward-only stages turn every BWD step into a no-op, so features
+        built around backward are meaningless or unsafe. Fail fast instead
+        of hanging in a collective.
+        """
+        parallelism = self.config.parallelism
+        if parallelism.pipeline_parallel_interleave_num > 1:
+            raise NotImplementedError(
+                "PP inference requires pipeline_parallel_interleave_num=1, got "
+                f"{parallelism.pipeline_parallel_interleave_num}."
+            )
+        if parallelism.pipeline_parallel_overlap_b_f:
+            raise NotImplementedError(
+                "PP inference does not support pipeline_parallel_overlap_b_f; "
+                "set it to False."
+            )
+        if self.config.swap.enable:
+            raise NotImplementedError(
+                "PP inference does not support activation swap; set swap.enable "
+                "to False."
+            )
+
+    def _load_inference_checkpoint(self, model):
+        """Load weights for inference (HF safetensors or MindFormers format).
+
+        Separate from the resume-oriented ``_load_checkpoint``: optimizer
+        snapshots and step restore do not apply to a forward-only run. The
+        weights path is the training knob ``checkpoint.load_path``; a
+        missing path raises (random weights would produce garbage), and
+        the format is detected automatically.
+        """
+        checkpoint_config = self.config.checkpoint
+        checkpoint_dir = checkpoint_config.load_path
+        if not is_checkpoint_path_valid(checkpoint_dir):
+            raise ValueError(
+                f"Inference requires valid weights under checkpoint.load_path "
+                f"(got {checkpoint_dir!r}); a forward-only run on random "
+                f"initialization would produce garbage output."
+            )
+        if is_hf_checkpoint(checkpoint_dir):
+            load_hf_checkpoint(
+                pretrained_model_dir=checkpoint_dir,
+                network=model,
+                balanced_load=checkpoint_config.load_balanced,
+                reshard_worker_num=checkpoint_config.reshard_worker_num,
+            )
+        else:
+            load_checkpoint(
+                checkpoint=get_checkpoint_path(checkpoint_dir),
+                network=model,
+                balanced_load=checkpoint_config.load_balanced,
+                reshard_worker_num=checkpoint_config.reshard_worker_num,
+            )
 
     def _load_checkpoint(
             self,

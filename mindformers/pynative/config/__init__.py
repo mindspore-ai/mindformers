@@ -14,6 +14,6 @@
 # ============================================================================
 """Config module for Pynative Trainer."""
 
-from .config import BaseConfig, TrainConfig
+from .config import BaseConfig, TrainConfig, InferenceConfig
 
-__all__ = ["BaseConfig", "TrainConfig"]
+__all__ = ["BaseConfig", "TrainConfig", "InferenceConfig"]
