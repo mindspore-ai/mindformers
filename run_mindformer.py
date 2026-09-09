@@ -63,7 +63,10 @@ def main(config):
         logger.info("Running MindFormers in PYNATIVE_MODE.")
         from mindformers.pynative.trainer import Trainer as PynativeTrainer
         trainer = PynativeTrainer(config.config)
-        trainer.train()
+        if trainer.is_inference:
+            trainer.inference()
+        else:
+            trainer.train()
         return
 
     logger.info("Running MindFormers in GRAPH_MODE.")

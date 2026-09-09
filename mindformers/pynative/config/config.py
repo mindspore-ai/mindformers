@@ -949,6 +949,49 @@ class LoraConfig(BaseConfig):
 
 
 @dataclass
+class InferenceConfig(BaseConfig):
+    """PyNative greedy text-generation configuration.
+
+    Consumed only when the top-level ``run_mode`` is
+    ``"predict"``: the pynative entry point routes to
+    ``Trainer.inference()`` and ``Trainer.__init__`` skips all
+    training-only setup (datasets, optimizer, scheduler, callbacks,
+    monitor).
+    """
+
+    max_new_tokens: int = 50
+    """Maximum number of tokens to generate."""
+
+    batch_size: int = 8
+    """Samples decoded per ``[batch, seq]`` forward. All ranks share the
+    batch boundaries; only values every rank agrees on are safe."""
+
+    output: str = "inference_result.jsonl"
+    """Result dump path, format by extension: ``.jsonl``
+    streams one sample per line, ``.json`` writes a JSON array, ``.txt`` or
+    no extension writes one generated text per line. Rank 0 is the writer."""
+
+    input_data: Optional[Union[str, list, dict]] = None
+    """Inference prompt(s): a literal ``str`` (or a ``.jsonl``/text file
+    path), a single ``dict`` record, or ``list[dict]`` / ``list[str]``."""
+
+    def __post_init__(self):
+        """Validate inference parameters."""
+        if self.max_new_tokens <= 0:
+            raise ValueError("inference.max_new_tokens must be positive.")
+        if self.batch_size <= 0:
+            raise ValueError("inference.batch_size must be positive.")
+        if self.output:
+            # Only the final extension counts (``a.tar.json`` -> ``.json``).
+            suffix = Path(str(self.output)).suffix.lower()
+            if suffix not in ("", ".jsonl", ".json", ".txt"):
+                raise ValueError(
+                    f"inference.output must end with .jsonl, .json, .txt, or "
+                    f"have no extension; got {self.output!r}."
+                )
+
+
+@dataclass
 class TrainConfig(BaseConfig):
     """
     Top-level Pynative training configuration.
@@ -972,6 +1015,13 @@ class TrainConfig(BaseConfig):
     """
 
     allow_extra = True
+    run_mode: str = "train"
+    """Run-mode routing, mirroring the graph-mode top-level field name:
+    ``train`` builds the training pipeline, ``predict`` routes to
+    ``Trainer.inference()`` (training-isomorphic forward, an ``inference``
+    section is then required). The graph-mode ``predict`` engine (KV cache +
+    LogitsProcessor) is not part of the pynative stack."""
+
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
     parallelism: ParallelismConfig = field(default_factory=ParallelismConfig)
@@ -987,3 +1037,4 @@ class TrainConfig(BaseConfig):
     swap: SwapConfig = field(default_factory=SwapConfig)
     callbacks: List[CallbackConfig] = field(default_factory=list)
     lora_config: Optional[LoraConfig] = None
+    inference: Optional[InferenceConfig] = None
