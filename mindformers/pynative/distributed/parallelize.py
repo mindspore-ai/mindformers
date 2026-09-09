@@ -139,12 +139,15 @@ def parallelize_model(
     recompute_comm: Any,
     swap: Any,
     gradient_accumulation_steps: int = 1,
+    forward_only: bool = False,
 ) -> nn.Cell:
     """Route to the correct model-specific parallelization function.
 
     Args:
         model: The model to parallelize.
         gradient_accumulation_steps: Number of micro-batches accumulated per optimizer step.
+        forward_only (bool): True for inference -- pipeline stages are built
+            without backward state (grad/recompute bookkeeping is skipped).
 
     Returns:
         The parallelized model.
@@ -158,6 +161,7 @@ def parallelize_model(
         return _PARALLELIZE_FN[model_cls](
             model, parallel_dims, parallelism, recompute, recompute_comm, swap,
             gradient_accumulation_steps=gradient_accumulation_steps,
+            forward_only=forward_only,
         )
     registered = [c.__name__ for c in _PARALLELIZE_FN]
     raise ValueError(
