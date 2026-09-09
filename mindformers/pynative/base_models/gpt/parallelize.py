@@ -777,6 +777,12 @@ def _dsa_attention_layer_plan(self_attn, tp_mesh, enable_mc2=False):
     _configure_dsa_local_fa(self_attn.core_attention, world)
     plan = _mla_attention_layer_plan(self_attn, tp_mesh, enable_mc2)
 
+    if self_attn.core_attention.indexer is None:
+        # Shared layer under DSA indexer Top-K sharing: it owns no indexer and no indexer
+        # loss, so there is nothing to gather for them and no indexer parameters to place.
+        # Everything else in the MLA plan still applies.
+        return plan, []
+
     # linear_qkv deliberately stays sequence-parallel.  Install one pre-hook on
     # the real Indexer boundary so the duplicated Indexer alone reconstructs its
     # full-sequence x/q inputs. Q/KV up-projections independently gather their

@@ -291,6 +291,8 @@ COMMON_CONFIG_MAPPING = {
     ("index_topk", "dsa_indexer_topk"): "dsa_indexer_topk",
     "dsa_indexer_loss_coeff": "dsa_indexer_loss_coeff",
     "dsa_indexer_use_sparse_loss": "dsa_indexer_use_sparse_loss",
+    "dsa_index_share_size": "dsa_index_share_size",
+    "dsa_index_share_pattern": "dsa_index_share_pattern",
     "experimental_attention_variant": "experimental_attention_variant",
 
     # Flash Attention

@@ -88,6 +88,9 @@ class _DSAWarmupLayerMixin:
                 indexer_loss,
                 self.propagate_to_previous_layer,
             )
+        # The sharing state travels in ``index_share_group`` rather than in the return
+        # value, so the layer keeps the stock ``(output, context)`` contract for every
+        # caller (MTP block, non-DSA models) whether or not sharing is on.
         return output, context
 
 
@@ -128,6 +131,7 @@ class DSATransformerLayer(_DSAWarmupLayerMixin, TransformerLayer):
             input_ids=None,
             mscale=1.0,
             rotary_cos_sin=None,
+            index_share_group=None,
     ):
         """Run a DSA layer and apply the warm-up boundary when required."""
         layer_input = hidden_states
@@ -146,6 +150,7 @@ class DSATransformerLayer(_DSAWarmupLayerMixin, TransformerLayer):
             actual_seq_len=actual_seq_len,
             mscale=mscale,
             rotary_cos_sin=rotary_cos_sin,
+            index_share_group=index_share_group,
         )
         attention_output, indexer_loss = self._split_attention_result(attention_result)
         dropout_output = self.hidden_states_dropout(attention_output)
@@ -194,6 +199,7 @@ class DSAHyperConnectionTransformerLayer(_DSAWarmupLayerMixin, HyperConnectionTr
             input_ids=None,
             mscale=1.0,
             rotary_cos_sin=None,
+            index_share_group=None,
     ):
         """Run the DSA mHC layer and apply the DSA1 warm-up boundary."""
         layer_input = hidden_states
@@ -209,6 +215,7 @@ class DSAHyperConnectionTransformerLayer(_DSAWarmupLayerMixin, HyperConnectionTr
             actual_seq_len=actual_seq_len,
             mscale=mscale,
             rotary_cos_sin=rotary_cos_sin,
+            index_share_group=index_share_group,
         )
         attention_output, indexer_loss = self._split_attention_result(attention_result)
         dropout_output = self.hidden_states_dropout(attention_output)
