@@ -56,15 +56,24 @@ class _PrelaunchedA2A(_Function):
     @staticmethod
     def forward(  # pylint: disable=arguments-differ
             ctx, shared_tensor, input_tensor, output_tensor, work,
-            send_splits, recv_splits, group, main_stream):
+            send_splits, recv_splits, group, main_stream, shared_stream):
         """Wait for the pre-launched A2A and couple both backward branches."""
         del input_tensor
         ctx.send_splits = send_splits
         ctx.recv_splits = recv_splits
         ctx.group = group
         ctx.main_stream = main_stream
+        ctx.shared_stream = shared_stream
         if work is not None:
-            work.wait()
+            # ``CommHandle.wait`` inserts a stream-side dependency on the
+            # *current* stream. This Function is applied under the shared
+            # stream so that the shared-tensor branch keeps the correct
+            # bookkeeping, while ``output_tensor`` is consumed by the routed
+            # branch on the main stream. Bind the wait to that consumer
+            # stream explicitly; otherwise main may read the preallocated A2A
+            # output before HCCL has finished writing it.
+            with ms.runtime.StreamCtx(main_stream):
+                work.wait()
         # Couple the shared branch to this communication boundary.  Backward
         # will not enter the boundary until gradients for both outputs exist,
         # then returns the shared gradient first after launching reverse A2A.
@@ -85,7 +94,14 @@ class _PrelaunchedA2A(_Function):
             ctx.send_splits,
             ctx.group,
         )
-        return shared_grad_output, grad_input, None, None, None, None, None, None
+        # Release this boundary's shared-FC backward stage only when main has
+        # reached the reverse-A2A issue point. This prevents the shared stream
+        # from running ahead into routed-expert GEMMs while the reverse A2A is
+        # still queued behind them on main.
+        reverse_a2a_ready = ms.runtime.Event()
+        reverse_a2a_ready.record(ctx.main_stream)
+        ctx.shared_stream.wait_event(reverse_a2a_ready)
+        return shared_grad_output, grad_input, None, None, None, None, None, None, None
 
 
 class ExpertParallel(ParallelStyle):
@@ -460,6 +476,7 @@ class ExpertParallel(ParallelStyle):
                 self._elem_splits(recv_splits, block_size),
                 self.ep_group,
                 shared_expert_ctx.main_stream,
+                shared_expert_ctx.shared_stream,
             )
 
     def _dispatch_a2a_with_shared_expert(
