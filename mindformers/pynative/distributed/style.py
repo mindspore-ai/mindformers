@@ -426,10 +426,16 @@ class HPDSAContextParallelAdapter(ParallelStyle):
         missing = []
         attention_attr = "sparse_flash_attention" if self.use_sparse_loss else "dense_flash_attention"
         inner_attention_boundary = getattr(core_attention, attention_attr, None)
-        if indexer is None:
-            missing.append("indexer")
-        if compute_sparse_indices is None:
-            missing.append("indexer.compute_sparse_indices")
+        # Under DSA indexer Top-K sharing a Shared layer owns no indexer at all: it attends
+        # with the Top-K its group leader selected. Its missing indexer is the design, not a
+        # misconfiguration, so only a Full layer must expose the indexer boundaries. The
+        # main-attention boundary still needs CP wiring on every layer.
+        is_index_leader = getattr(core_attention, "is_index_leader", True)
+        if is_index_leader:
+            if indexer is None:
+                missing.append("indexer")
+            if compute_sparse_indices is None:
+                missing.append("indexer.compute_sparse_indices")
         if inner_attention_boundary is None:
             missing.append(attention_attr)
         if self.indexer_loss_style is not None and indexer_loss is not None and compute_indexer_loss is None:
@@ -481,6 +487,29 @@ class HPDSAContextParallelAdapter(ParallelStyle):
         else:
             self.attention_style.apply(attention_boundary, device_mesh)
 
+    def _release_shared_replicate_cache_after_attention(self, attention_boundary):
+        """Free a Shared layer's replicated key/value once main attention is done.
+
+        ``DSASequenceReplicateCache`` exists so the indexer loss can reuse the key/value
+        AllGather that sparse attention already paid for, and it is emptied by the
+        indexer-loss completion hook. A Shared layer has no indexer loss, so that hook
+        never runs and the replicated tensors stay reachable until this layer's *next*
+        forward -- i.e. across the whole backward. Measured on 12 layers / share_size=4:
+        the 9 Shared layers each pinned 1 GiB that the Full-layer run released promptly.
+        Clearing here only drops the cache's own references; autograd still holds
+        whatever the backward needs.
+        """
+        cache = getattr(self.attention_style, "shared_replicate_cache", None)
+        if cache is None:
+            return
+
+        def _clear_cache(hook_module, args, kwargs, outputs):
+            del hook_module, args, kwargs
+            cache.clear()
+            return outputs
+
+        attention_boundary.register_forward_hook(_clear_cache, with_kwargs=True)
+
     def _apply(self, module: nn.Cell, device_mesh: DeviceMesh) -> nn.Cell:
         (
             core_attention,
@@ -490,7 +519,10 @@ class HPDSAContextParallelAdapter(ParallelStyle):
             attention_boundary,
             compute_indexer_loss,
         ) = self._resolve_dsa_boundaries(module)
-        if isinstance(self.indexer_style, HPAsyncDSAIndexerContextParallel):
+        if compute_sparse_indices is None:
+            # Shared layer: nothing to gather for an indexer it does not have.
+            pass
+        elif isinstance(self.indexer_style, HPAsyncDSAIndexerContextParallel):
             indexer_key_handoff = (
                     self._maybe_get_cell(module, "dsa_indexer_key_handoff")
                     or self._maybe_get_cell(indexer, "key_handoff")
@@ -506,6 +538,9 @@ class HPDSAContextParallelAdapter(ParallelStyle):
         if not self.use_sparse_loss:
             self._set_dsa_dense_softmax_converter_cp_rank(core_attention, device_mesh)
         self._apply_attention_style(module, core_attention, attention_boundary, device_mesh)
+        if compute_sparse_indices is None:
+            # Registered after the style so it runs behind HP's own forward hooks.
+            self._release_shared_replicate_cache_after_attention(attention_boundary)
 
         if self.indexer_loss_style is not None and compute_indexer_loss is not None:
             if isinstance(self.indexer_loss_style, HPAsyncDSAIndexerLossContextParallel):

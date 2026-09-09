@@ -186,6 +186,43 @@ def _to_local_tensor(value):
     return value.to_local() if isinstance(value, DTensor) else value
 
 
+def dsa_layer_index_share_group_size(config: MLATransformerConfig, layer_number):
+    """How many layers the group containing ``layer_number`` spans.
+
+    Each served layer scales its distillation term by this, so the terms sum to the group
+    mean while each one stays inside its own activation-checkpoint region. Both DSA stages
+    share, so the divisor must be the real group size in both -- returning 1 in the dense
+    warm-up stage would make its terms sum instead of average, handing the leader's indexer
+    ``share_size`` times the gradient the sparse stage gives it.
+    A layer that shares nothing (MTP, sharing off) is a group of one.
+    """
+    num_layers = config.num_layers
+    if layer_number is None or layer_number >= num_layers:
+        return 1
+    leaders = config.resolve_dsa_index_share_leaders()
+    start = layer_number
+    while start > 0 and not leaders[start]:
+        start -= 1
+    end = start + 1
+    while end < num_layers and not leaders[end]:
+        end += 1
+    return end - start
+
+
+def dsa_layer_is_index_leader(config: MLATransformerConfig, layer_number):
+    """Whether this layer keeps its own DSA indexer.
+
+    MTP layers are numbered ``num_layers + i`` (see ``multi_token_prediction.py``) and run
+    outside the ``TransformerBlock`` loop that forms sharing groups, so they can never reach
+    a group leader and always keep their own indexer.
+    """
+    num_layers = config.num_layers
+    if layer_number is None or layer_number >= num_layers:
+        return True
+    leaders = config.resolve_dsa_index_share_leaders()
+    return leaders[layer_number]
+
+
 class DSAttention(nn.Cell):
     """
     Sparse attention mechanism using DSA Indexer for pynative mode.
@@ -206,6 +243,7 @@ class DSAttention(nn.Cell):
         attn_mask_type: str = None,
         softmax_scale: float = None,
         cp_comm_type: str = None,
+        is_index_leader: bool = None,
     ):
         super().__init__()
         if attn_mask_type:
@@ -222,12 +260,23 @@ class DSAttention(nn.Cell):
         self.layer_number = layer_number
         self.attention_mode = 2
         self.sparse_loss = config.dsa_indexer_use_sparse_loss
-
-        self.indexer = build_module(
-            submodules.indexer, config=config
-        )
+        # A Shared layer owns no indexer at all: no parameters, no projections, no loss.
+        # It attends with the Top-K its group leader selected. ``is_index_leader`` is decided
+        # by the caller from ``resolve_dsa_index_share_leaders`` so that the block loop and
+        # every layer share one view of the layout.
+        if is_index_leader is None:
+            is_index_leader = dsa_layer_is_index_leader(config, layer_number)
+        self.is_index_leader = is_index_leader
         self.softmax_scale = softmax_scale or config.kv_channels ** -0.5
-        self.indexer_loss = DSAIndexerLoss(config, self.softmax_scale)
+
+        if self.is_index_leader:
+            self.indexer = build_module(
+                submodules.indexer, config=config
+            )
+            self.indexer_loss = DSAIndexerLoss(config, self.softmax_scale)
+        else:
+            self.indexer = None
+            self.indexer_loss = None
         self.sparse_key_handoff = IdentityOp()
         self.sparse_value_handoff = IdentityOp()
         self.sparse_key_rope_handoff = IdentityOp()

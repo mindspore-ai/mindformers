@@ -21,6 +21,10 @@ from mindspore.common._grad_function import _Function
 from mindformers.parallel_core.transformer_config import MLATransformerConfig
 from mindformers.pynative.layers.identity_op import IdentityOp
 from mindformers.pynative.transformers.experimental_attention_variant.indexer import _IndexerLossAutoScaler
+from mindformers.pynative.transformers.experimental_attention_variant.dsa import (
+    dsa_layer_index_share_group_size,
+    dsa_layer_is_index_leader,
+)
 from mindformers.pynative.transformers.experimental_attention_variant.utils import save_to_indexer_losses_tracker
 from mindformers.pynative.transformers.multi_latent_attention import (
     MLASelfAttention,
@@ -87,6 +91,28 @@ class _AbsorbMatmul(_Function):
         return d_x, d_w
 
 
+class IndexShareGroup:
+    """Per-invocation state for one DSA indexer-sharing group.
+
+    Created fresh by ``TransformerBlock.construct`` at every group leader, so concurrently
+    running micro-batches (dualpipe / ``overlap_b_f`` interleave forward and backward across
+    threads) never share one. It is also passed to each layer as a plain argument, so an
+    activation-recompute replay of a Shared layer still finds the leader's Top-K alive.
+    """
+
+    __slots__ = ("topk_indices", "leader_indexer_loss", "leader_projections")
+
+    def __init__(self):
+        self.topk_indices = None
+        # Set by the leader: its ``indexer_loss`` module plus the indexer projections and
+        # index softmax stats the student side needs. Each served layer calls the leader's
+        # module with its own q/k/Top-K/softmax stats, so its term is evaluated inside its
+        # own activation-checkpoint region and scaled by the group size; the terms then sum
+        # to the group mean without any accumulator crossing a region boundary.
+        self.leader_indexer_loss = None
+        self.leader_projections = None
+
+
 class DSASelfAttention(MLASelfAttention):
     """MLA-based DeepSeek Sparse Attention top-level implementation."""
 
@@ -104,13 +130,34 @@ class DSASelfAttention(MLASelfAttention):
             layer_number=layer_number,
         )
         self.sparse_loss = config.dsa_indexer_use_sparse_loss
+        self.index_share_group_size = dsa_layer_index_share_group_size(config, layer_number)
         self.dsa_value_handoff = IdentityOp()
         self.dsa_loss_key_indexer_handoff = IdentityOp()
 
+    def core_attention_extra_kwargs(self):
+        """Decide Full/Shared from the *true* global layer index.
+
+        ``MLASelfAttention`` builds ``core_attention`` with ``self.layer_index``, which is
+        ``max(1, layer_number)``. Letting ``DSAttention`` re-derive the sharing layout from
+        that clamped value reads the layout one slot too far for global layer 0, so with an
+        ``FSSS`` layout every layer builds as Shared, nobody owns an indexer, and the first
+        Shared layer attends with a ``None`` Top-K.
+        """
+        return {
+            "is_index_leader": dsa_layer_is_index_leader(self.config, self.layer_number),
+        }
+
     def construct(self, x: Tensor, attention_mask=None, rotary_pos_emb=None,
                   prefix_keys_values=None, pad_zeros=None, actual_seq_len=None,
-                  attention_loss=0., mscale=1.0, rotary_cos_sin=None):
-        """Forward pass with DSA index selection, attention and indexer loss."""
+                  attention_loss=0., mscale=1.0, rotary_cos_sin=None,
+                  index_share_group=None):
+        """Forward pass with DSA index selection, attention and indexer loss.
+
+        ``index_share_group`` is this layer's :class:`IndexShareGroup`, or None when sharing
+        is off. A Full layer fills in its ``topk_indices``; a Shared layer reads them and runs
+        no indexer at all -- it owns no indexer parameters, computes no indexer projections
+        and no indexer loss.
+        """
         del prefix_keys_values, pad_zeros, mscale, rotary_cos_sin
         ori_dtype = x.dtype
         seq_len, bs, _ = self.shape(x)
@@ -126,13 +173,38 @@ class DSASelfAttention(MLASelfAttention):
         q_compress = q_a
         x_detached = _DSADetachFunction.apply(x)
         q_compress_detached = _DSADetachFunction.apply(q_compress)
-        (
-            q_index, k_index, idx_weights,
-            topk_indices, _, softmax_max_index, softmax_sum_index,
-        ) = self.core_attention.indexer(
-            x_detached, q_compress_detached, rotary_pos_emb,
-            actual_seq_len, actual_seq_len,
-        )
+        is_leader = self.core_attention.is_index_leader
+        if is_leader:
+            (
+                q_index, k_index, idx_weights,
+                topk_indices, _, softmax_max_index, softmax_sum_index,
+            ) = self.core_attention.indexer(
+                x_detached, q_compress_detached, rotary_pos_emb,
+                actual_seq_len, actual_seq_len,
+            )
+            # Dense warm-up produces no Top-K (``dsa_indexer.py`` returns None when not
+            # ``sparse_loss``); there the group shares the leader's *indexer*, not its
+            # selection, so leave ``topk_indices`` unset rather than publishing a None.
+            if index_share_group is not None and topk_indices is not None:
+                index_share_group.topk_indices = topk_indices.detach()
+        else:
+            # Shared layer: no indexer module exists on this layer at all.
+            q_index = k_index = idx_weights = None
+            softmax_max_index = softmax_sum_index = None
+            topk_indices = index_share_group.topk_indices if index_share_group else None
+            # Dense warm-up runs ``dense_flash_attention``, which takes no Top-K, and its
+            # leader produces none (``dsa_indexer.py``: ``topk_indices = None`` when not
+            # ``sparse_loss``). A missing Top-K is only a layout error in the sparse stage.
+            if topk_indices is None and self.sparse_loss:
+                # Without this the None flows into ops.sparse_flash_attention and surfaces as
+                # "missing 1 required positional argument: sparse_indices", which says nothing
+                # about the layout. Name the layer and the disagreement instead.
+                raise RuntimeError(
+                    f"DSA layer {self.layer_number} is a Shared layer but no group leader "
+                    "supplied Top-K indices. Its own view of the sharing layout disagrees "
+                    "with the one TransformerBlock used to form the groups; both must come "
+                    "from resolve_dsa_index_share_leaders() with the same global layer index."
+                )
 
         v_absorb = None
         if self.sparse_loss:
@@ -177,20 +249,78 @@ class DSASelfAttention(MLASelfAttention):
         attn_out = mint.reshape(attn_out, (attention_seq_len, bs, -1))
         output = self.linear_proj(attn_out)
         output = self.cast(output, ori_dtype)
-        indexer_loss = self.core_attention.indexer_loss(
+        indexer_loss, reported_loss = self._indexer_loss(
+            is_leader, index_share_group,
             query, key, q_index, k_index, idx_weights,
             topk_indices, softmax_max, softmax_sum,
-            softmax_max_index, softmax_sum_index,
-            actual_seq_len, actual_seq_len
+            softmax_max_index, softmax_sum_index, actual_seq_len,
         )
-        attention_loss = attention_loss + indexer_loss
-        save_to_indexer_losses_tracker(
-            indexer_loss,
-            self.layer_number + 1,
-            self.config.num_layers + (self.config.mtp_num_layers or 0),
-        )
-        output = _IndexerLossAutoScaler.apply(output, indexer_loss)
+        if indexer_loss is not None:
+            attention_loss = attention_loss + indexer_loss
+            # Report the unscaled term: the tracker averages over the layers that record
+            # one, so what it prints is the group's mean, on the same scale as an
+            # unshared run's per-layer indexer loss.
+            save_to_indexer_losses_tracker(
+                reported_loss,
+                self.layer_number + 1,
+                self.config.num_layers + (self.config.mtp_num_layers or 0),
+            )
+            output = _IndexerLossAutoScaler.apply(output, indexer_loss)
         return output, attention_loss
+
+    def _indexer_loss(self, is_leader, group,
+                      query, key, q_index, k_index, idx_weights,
+                      topk_indices, softmax_max, softmax_sum,
+                      softmax_max_index, softmax_sum_index, actual_seq_len):
+        """Return this layer's indexer loss, or None when this layer contributes none.
+
+        Returns ``(contribution, reported)``: what enters the graph, and what the tracker
+        records. Under sharing each layer contributes its term scaled by the group size but
+        reports the term itself, so the tracker stays on the unshared scale.
+
+        Sharing leaves Shared layers without any indexer: the Full layer's indexer is
+        distilled against every layer it serves and the losses are averaged, which is
+        gradient-equivalent to distilling against the averaged attention distribution
+        (IndexCache's L_multi, used by GLM-5.2). Because the fused kernel rebuilds the
+        teacher from one layer's own q/k/softmax stats and has no slot for a pre-averaged
+        teacher, this costs one kernel call per served layer: the indexer-loss cost is NOT
+        reduced, what sharing saves is the Shared layers' indexer forward.
+        """
+        if group is None:
+            if not is_leader:
+                return None, None
+            loss = self.core_attention.indexer_loss(
+                query, key, q_index, k_index, idx_weights,
+                topk_indices, softmax_max, softmax_sum,
+                softmax_max_index, softmax_sum_index,
+                actual_seq_len, actual_seq_len
+            )
+            return loss, loss
+
+        if is_leader:
+            # Publish this layer's indexer teacher so every layer its Top-K serves can call
+            # it with its own stats, inside that layer's own checkpoint region.
+            group.leader_indexer_loss = self.core_attention.indexer_loss
+            group.leader_projections = (
+                q_index, k_index, idx_weights, softmax_max_index, softmax_sum_index,
+            )
+
+        if group.leader_indexer_loss is None:
+            return None, None
+        l_q_index, l_k_index, l_weights, l_max_index, l_sum_index = group.leader_projections
+        term = group.leader_indexer_loss(
+            query, key, l_q_index, l_k_index, l_weights,
+            topk_indices, softmax_max, softmax_sum,
+            l_max_index, l_sum_index,
+            actual_seq_len, actual_seq_len,
+        )
+        # Scale here rather than summing the terms and dividing at the group end. A running
+        # sum would be produced in one layer's checkpoint region and consumed in the next,
+        # and the pipeline scheduler's backward then unpacks the same saved tensor twice:
+        # "Unpack is being triggered for a tensor, make sure to do this only once!". Scaling
+        # per layer keeps every term inside its own region and still totals the group mean,
+        # because the terms are only ever added together through the loss.
+        return term / self.index_share_group_size, term
 
     def _dsa_dense_qkv(self, q_a, compressed_kv, k_pe, seq_len, bs, rotary_pos_emb):
         """Generate QKV for the DSA dense warm-up stage."""
