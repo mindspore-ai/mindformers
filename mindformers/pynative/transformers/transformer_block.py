@@ -194,7 +194,7 @@ class TransformerBlock(nn.Cell):
         never reaches ``TransformerConfig.pipeline_model_parallel_size``, so the config-level
         check cannot see the stage layout at all -- this is the check that actually binds.
         """
-        if (config.dsa_index_share_size or 1) == 1 and not config.dsa_index_share_pattern:
+        if (config.dsa_index_topk_freq or 1) == 1 and not config.dsa_indexer_types:
             return None
         if config.experimental_attention_variant != "dsa":
             return None
@@ -302,7 +302,16 @@ class TransformerBlock(nn.Cell):
             share_kwargs = {}
             if leaders is not None:
                 if leaders[index]:
-                    group = IndexShareGroup()
+                    # Evict the previous group before the new one produces its Top-K, so at
+                    # most one group's is resident. Groups are consumed in reverse during
+                    # backward, so the evicted one is paged back only when its replay runs.
+                    if group is not None:
+                        group.evict_topk()
+                    group = IndexShareGroup(
+                        offload_topk=bool(
+                            getattr(self.config, "dsa_index_share_topk_offload", False)
+                        )
+                    )
                 share_kwargs = {"index_share_group": group}
             hidden_states, _ = layer(
                 hidden_states,
