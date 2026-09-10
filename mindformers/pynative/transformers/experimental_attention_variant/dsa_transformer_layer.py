@@ -16,7 +16,7 @@
 # MindSpore ``_Function`` subclasses intentionally use model-specific signatures.
 # pylint: disable=arguments-differ,abstract-method
 from hyper_parallel.core.dtensor.dtensor import DTensor
-from mindspore import ops
+from mindspore import Tensor, ops
 from mindspore.common._grad_function import _Function
 
 from mindformers.parallel_core.transformer_config import TransformerConfig
@@ -43,17 +43,27 @@ class _DSAWarmupLayerBoundary(_Function):
     def forward(ctx, output, layer_input, indexer_loss, propagate_to_previous_layer):
         """Return the detached trunk output and retain only lightweight metadata."""
         del layer_input
-        ctx.indexer_loss = ops.stop_gradient(indexer_loss)
+        # A layer that contributes no Indexer term leaves ``attention_loss`` at the Python
+        # ``0.`` the block passes in. That happens under ``dsa_index_share_loss: leader``,
+        # where a Shared layer owns no indexer and publishes no loss -- unlike ``served``,
+        # where every layer in the group distils against the leader's teacher and so always
+        # has a term. Record it, because a float has no gradient to seed.
+        ctx.has_indexer_loss = isinstance(indexer_loss, Tensor)
+        ctx.indexer_loss = ops.stop_gradient(indexer_loss) if ctx.has_indexer_loss else None
         ctx.propagate_to_previous_layer = propagate_to_previous_layer
         return output
 
     @staticmethod
     def backward(ctx, grad_output):
         """Return no trunk grad, a layer trigger, and the scaled Indexer-loss grad."""
-        indexer_loss = ctx.indexer_loss
-        if isinstance(indexer_loss, DTensor):
-            indexer_loss = indexer_loss.to_local()
-        indexer_grad = ops.ones_like(indexer_loss) * _IndexerLossAutoScaler.main_loss_backward_scale
+        indexer_grad = None
+        if ctx.has_indexer_loss:
+            indexer_loss = ctx.indexer_loss
+            if isinstance(indexer_loss, DTensor):
+                indexer_loss = indexer_loss.to_local()
+            indexer_grad = (
+                ops.ones_like(indexer_loss) * _IndexerLossAutoScaler.main_loss_backward_scale
+            )
         layer_input_grad = ops.zeros_like(grad_output) if ctx.propagate_to_previous_layer else None
         return None, layer_input_grad, indexer_grad, None
 

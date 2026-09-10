@@ -114,6 +114,54 @@ def test_dsa_warmup_boundary_skips_trunk_and_trains_all_local_indexers():
 
 @pytest.mark.level0
 @pytest.mark.platform_x86_cpu
+def test_dsa_warmup_boundary_tolerates_a_layer_with_no_indexer_term():
+    """A Shared layer under ``leader`` supervision contributes no Indexer loss.
+
+    ``TransformerBlock`` seeds ``attention_loss`` with the Python float ``0.``, and under
+    ``dsa_index_share_loss: leader`` a Shared layer never replaces it -- it owns no indexer
+    and publishes no term. The boundary must recognise that there is no gradient to seed
+    instead of calling ``ones_like`` on a float, while the Full layer next to it still
+    trains normally.
+    """
+    ms.set_device("CPU")
+
+    def network(x, trunk0, trunk1, indexer1):
+        # Layer 0 is Shared: no indexer, so the block's float default reaches the boundary.
+        output0 = x * trunk0
+        hidden0 = _DSAWarmupLayerBoundary.apply(
+            ops.stop_gradient(output0), x, 0.0, False
+        )
+
+        # Layer 1 is Full and keeps its own Indexer loss.
+        output1 = hidden0 * trunk1
+        loss1 = mint.sum(ops.stop_gradient(hidden0) * indexer1)
+        hidden1 = _DSAWarmupLayerBoundary.apply(
+            ops.stop_gradient(output1), hidden0, loss1, True
+        )
+        return mint.sum(hidden1)
+
+    previous_scale = _IndexerLossAutoScaler.main_loss_backward_scale
+    try:
+        _IndexerLossAutoScaler.set_loss_scale(Tensor(0.5, ms.float32))
+        inputs = (
+            Tensor([2.0], ms.float32),
+            Parameter(Tensor([3.0], ms.float32), name="trunk0"),
+            Parameter(Tensor([5.0], ms.float32), name="trunk1"),
+            Parameter(Tensor([11.0], ms.float32), name="indexer1"),
+        )
+        grads = ops.grad(network, grad_position=(0, 1, 2, 3))(*inputs)
+    finally:
+        _IndexerLossAutoScaler.set_loss_scale(previous_scale)
+
+    # Trunks stay frozen; only the Full layer's indexer gets a gradient, and it is the same
+    # value the all-layers-supervised case gives it (hidden0 = 2 * 3 = 6, scaled by 0.5).
+    expected = ([0.0], [0.0], [0.0], [3.0])
+    for actual, target in zip(grads, expected):
+        np.testing.assert_array_equal(actual.asnumpy(), target)
+
+
+@pytest.mark.level0
+@pytest.mark.platform_x86_cpu
 def test_dsa_warmup_layer_and_nested_mtp_are_not_checkpoint_wrapped():
     """Full recompute skips direct and MTP-nested DSA1 layer boundaries."""
     dsa_layer = nn.Cell()
