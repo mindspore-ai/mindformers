@@ -32,7 +32,11 @@ from mindformers.pynative.transformers.experimental_attention_variant.dsa_transf
     _DSAWarmupLayerBoundary,
 )
 from mindformers.pynative.transformers.experimental_attention_variant.indexer import (
+    DSA_WARMUP_LOSS_SINK,
     _IndexerLossAutoScaler,
+    flush_warmup_indexer_backward,
+    sum_indexer_losses,
+    warmup_indexer_loss_sink,
 )
 from mindformers.pynative.transformers.transformer_layer import (
     HyperConnectionTransformerLayer,
@@ -190,3 +194,102 @@ def test_dsa_warmup_layer_and_nested_mtp_are_not_checkpoint_wrapped():
     apply_recompute(mtp_model, recompute, recompute_comm)
 
     assert not isinstance(mtp_model.layers[0], CheckpointWrapper)
+
+
+@pytest.mark.level0
+@pytest.mark.platform_x86_cpu
+def test_warmup_loss_sink_is_published_and_restored():
+    """The sink is visible inside the block and gone again afterwards, even on a raise."""
+    assert DSA_WARMUP_LOSS_SINK.sink is None
+
+    with warmup_indexer_loss_sink(True) as sink:
+        assert sink is not None
+        assert DSA_WARMUP_LOSS_SINK.sink is sink
+    assert DSA_WARMUP_LOSS_SINK.sink is None
+
+    # Inactive publishes None, i.e. the layers keep the step-end boundary path.
+    with warmup_indexer_loss_sink(False) as sink:
+        assert sink is None
+        assert DSA_WARMUP_LOSS_SINK.sink is None
+
+    # A raising forward must not leave a stale list behind for the next call.
+    with pytest.raises(ValueError):
+        with warmup_indexer_loss_sink(True):
+            raise ValueError("forward blew up")
+    assert DSA_WARMUP_LOSS_SINK.sink is None
+
+
+@pytest.mark.level0
+@pytest.mark.platform_x86_cpu
+def test_warmup_loss_sink_nests_without_leaking():
+    """A nested block (MTP inside a decoder forward) restores the outer sink, not None."""
+    with warmup_indexer_loss_sink(True) as outer:
+        with warmup_indexer_loss_sink(True) as inner:
+            assert inner is not outer
+            assert DSA_WARMUP_LOSS_SINK.sink is inner
+        assert DSA_WARMUP_LOSS_SINK.sink is outer
+    assert DSA_WARMUP_LOSS_SINK.sink is None
+
+
+@pytest.mark.level0
+@pytest.mark.platform_x86_cpu
+def test_flush_warmup_indexer_backward_sums_the_group_once():
+    """A group's terms are summed into one backward, and the sink is emptied.
+
+    Uses a stand-in for the loss term because ``Tensor.backward`` is provided by the
+    device-side pynative autograd and is absent in a CPU-only unit test.  What matters here
+    is the contract IndexShare depends on -- one traversal per group, not one per layer.
+    """
+    backwards = []
+
+    class _Term:
+        """Minimal stand-in: adds like a loss and records its backward calls."""
+
+        def __init__(self, value):
+            self.value = value
+
+        def __add__(self, other):
+            return _Term(self.value + other.value)
+
+        def backward(self, seed):
+            backwards.append((self.value, seed))
+
+    sink = [_Term(3.0), _Term(5.0), _Term(7.0)]
+    total = sum_indexer_losses(sink)
+    assert total.value == 15.0, "every term of the group must enter one traversal"
+
+    # An empty sink is a no-op: a Shared-only group boundary must not fire a backward.
+    flush_warmup_indexer_backward([])
+    assert not backwards
+
+    # A group whose every layer contributed the block's float default is the same no-op.
+    # This is the per-layer-backward twin of the boundary's ``has_indexer_loss`` check: under
+    # ``dsa_index_share_loss: leader`` a Shared layer publishes no term, and a float carries
+    # no graph to start a backward from.
+    float_only = [0.0, 0.0]
+    flush_warmup_indexer_backward(float_only)
+    assert not backwards, "a group of graph-less zeros must not fire a backward"
+    assert not float_only, "the sink is emptied either way, or the terms leak into the next group"
+
+
+@pytest.mark.level0
+@pytest.mark.platform_x86_cpu
+def test_warmup_indexer_recompute_honours_full_recompute_layer():
+    """A DSA warm-up layer outside ``full_recompute_layer`` keeps its indexer unwrapped."""
+    def _dsa_layer_with_indexer():
+        layer = nn.Cell()
+        layer.disable_activation_recompute = True
+        layer.self_attention = nn.Cell()
+        layer.self_attention.core_attention = nn.Cell()
+        layer.self_attention.core_attention.indexer = nn.Cell()
+        return layer
+
+    selected, skipped = _dsa_layer_with_indexer(), _dsa_layer_with_indexer()
+    model = SimpleNamespace(layers=[selected, skipped], layer_start=0, layer_end=1)
+    # Only layer 0 is selected; layer 1 must stay untouched.
+    apply_recompute(model,
+                    RecomputeConfig(mode="full", full_recompute_layer=["0"]),
+                    RecomputeCommConfig(enable=False, select_module=None))
+
+    assert isinstance(selected.self_attention.core_attention.indexer, CheckpointWrapper)
+    assert not isinstance(skipped.self_attention.core_attention.indexer, CheckpointWrapper)

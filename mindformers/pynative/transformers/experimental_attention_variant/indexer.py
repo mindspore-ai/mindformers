@@ -21,6 +21,8 @@
 # limitations under the License.
 # ============================================================================
 """DSA/CSA Lightning Indexer for pynative mode."""
+import threading
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Union
 
@@ -263,6 +265,98 @@ class CSAIndexer(nn.Cell):
             topk_indices = self.cast(topk_indices, mstype.int32)
             index_scores = topk_scores
         return topk_indices, index_scores
+
+
+class _DSAWarmupLossSink(threading.local):
+    """Per-thread hand-off of the DSA warm-up indexer losses, block loop -> layer.
+
+    The block loop cannot simply pass the list to the layer as a call argument: the layer
+    call marshals its keyword arguments, so every layer but the first receives a *copy* of
+    the list and the loop never sees what the layer appended (measured on 8 cards: layer 0
+    got the original object, layers 1-7 each got a distinct one, and only layer 0 ended up
+    with gradients).  A module attribute is not an option either -- under ``overlap_b_f``
+    the forwards of different micro-batches interleave across threads and would share it.
+    Thread-local storage satisfies both: the layer forward runs in the same thread as the
+    loop that called it, and each micro-batch's thread gets its own list.
+    """
+
+    sink = None
+
+
+DSA_WARMUP_LOSS_SINK = _DSAWarmupLossSink()
+
+
+@contextmanager
+def warmup_indexer_loss_sink(active):
+    """Publish a per-call indexer-loss sink for the layers invoked inside this block.
+
+    Every caller that invokes a DSA layer's forward has to open one: the layer looks the sink
+    up on the thread-local and, finding none, falls back to the step-end boundary path -- which
+    under per-layer backward is never back-propagated, so its indexer would silently train on
+    nothing. That is why the MTP layer, which calls its transformer layer outside
+    ``TransformerBlock``'s loop, opens its own.
+
+    ``active`` False publishes ``None``, i.e. the layers keep the step-end boundary path.
+    Restores the previous value on the way out so a raising forward cannot leave a stale list
+    visible to the next call on this thread.
+    """
+    sink = [] if active else None
+    previous = DSA_WARMUP_LOSS_SINK.sink
+    DSA_WARMUP_LOSS_SINK.sink = sink
+    try:
+        yield sink
+    finally:
+        DSA_WARMUP_LOSS_SINK.sink = previous
+
+
+def sum_indexer_losses(sink):
+    """Sum one group's indexer losses into the single term whose graph is traversed once.
+
+    Separate from the backward so the grouping contract -- what IndexShare depends on, one
+    traversal per group rather than one per layer -- can be checked without a device.
+    """
+    total = sink[0]
+    for term in sink[1:]:
+        total = total + term
+    return total
+
+
+def flush_warmup_indexer_backward(sink):
+    """Back-propagate the buffered DSA warm-up indexer losses and drop their graphs.
+
+    Called at each group boundary rather than after every layer. Under DSA indexer Top-K
+    sharing the Shared layers reuse the group leader's projections, so those layers share one
+    graph: back-propagating them one at a time raises "Try to backward the graph twice".
+    Summing a group's terms first keeps that graph traversed exactly once. Without sharing a
+    group is a single layer, which degenerates to per-layer backward.
+
+    The running sum is safe here only because per-layer backward skips the indexer recompute
+    wrapper (see ``_wrap_dsa_warmup_indexer_recompute``): a sum produced in one checkpoint
+    region and consumed in another unpacks the same saved tensor twice.
+    """
+    if not sink:
+        return
+    total = sum_indexer_losses(sink)
+    if not isinstance(total, Tensor):
+        # Every term in the group was a graph-less Python zero, so there is nothing to seed
+        # a backward from. The layer-side guard already keeps those out of the sink; this
+        # second check is what keeps a future caller from turning the mistake into an
+        # ``AttributeError: 'float' object has no attribute 'backward'`` mid-forward.
+        sink.clear()
+        return
+    # ``_IndexerLossAutoScaler.backward`` does the same: the fused loss can hand back a
+    # DTensor, and ``backward`` wants a plain tensor whose shape matches the seed.
+    if isinstance(total, DTensor):
+        total = total.to_local()
+    # The seed must match ``total`` exactly. ``main_loss_backward_scale`` carries the
+    # trainer's loss sense and is shaped (1,), while the summed indexer loss is 0-d, and
+    # ``Tensor.backward`` rejects the mismatch with
+    # "grad_output[0] has a shape of (1,) and output[0] has a shape of ()".
+    # ``_DSAWarmupLayerBoundary`` gets away with the same expression only because a
+    # ``_Function``'s backward return value is not shape-checked as strictly.
+    scale = _IndexerLossAutoScaler.main_loss_backward_scale
+    total.backward(mint.ones_like(total) * mint.reshape(scale, ()))
+    sink.clear()
 
 
 class _IndexerLossAutoScaler(_Function):

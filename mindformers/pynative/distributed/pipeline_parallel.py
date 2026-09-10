@@ -233,6 +233,15 @@ class StageModelBuilder:
         """
         num_virtual_stages = self.layer_setting.num_virtual_stages
         local_stage_indices = self._get_local_stage_indices(pp_mesh)
+
+        # DSA dense warm-up driving its backward per layer: every stage has already
+        # back-propagated its own indexer losses inside its forward, and the trunk is frozen,
+        # so a stage's output carries no ``grad_fn`` -- the schedule's ``accumulate_grad``
+        # would raise "the output tensor you provided doesn't requires grad and not have a
+        # grad_fn". Build the stages forward-only; the gradients the optimizer consumes come
+        # from the in-forward backward, not from the schedule.  Narrows the caller's request
+        # rather than replacing it: inference already asks for forward-only stages.
+        has_backward = has_backward and not model_config.dsa_warmup_layerwise_backward
         
         stages = []
         model_parts = []

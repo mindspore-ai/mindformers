@@ -37,6 +37,9 @@ def _build_trainer(use_skip_step_on_nan=True, max_consecutive_skipped_steps=0):
     trainer._consecutive_skipped_steps = 0
     trainer.state = TrainerState()
     trainer.enable_parallel = False
+    # Off by default: _optimizer_update only walks the parameters for the extra
+    # zero-grad pass when DSA warm-up per-layer backward is on.
+    trainer._dsa_warmup_layerwise_backward = False
     trainer.optimizer = Mock()
     trainer.optimizer.parameters = []
     trainer.model = []
