@@ -893,6 +893,21 @@ class Trainer:
             # the fp32 master-weight lifecycle around the whole load.
             self._load_checkpoint(checkpoint_path, self.model, self.optimizer)
 
+        # A resumed run whose step already reached training.steps would fall through
+        # the training loop and exit successfully without a single step, which always
+        # means a misconfiguration (most often global_batch_size changed on resume,
+        # which rescales the checkpoint's step -- see _load_checkpoint).
+        if self._resumed and self.state.global_step >= self.state.max_steps:
+            logger.warning(
+                "Resumed global_step (%d) >= training.steps (%d): the training loop "
+                "will run 0 steps and exit immediately. If global_batch_size was changed "
+                "on resume, the checkpoint's step was rescaled by (ckpt_gbs / current_gbs) "
+                "to keep the sample budget -- increase training.steps (and "
+                "lr_scheduler.total_steps) accordingly, or set checkpoint.no_load_optim=True "
+                "to load weights only without restoring the step.",
+                self.state.global_step, self.state.max_steps,
+            )
+
         # Register gradient hooks for fp32 accumulation
         self._register_grad_hooks()
 
@@ -1163,9 +1178,11 @@ class Trainer:
                             common_info.global_step
                             * (common_info.global_batch_size / self.global_batch_size)
                         )
-                        logger.info(
+                        logger.warning(
                             f"Scaled global step: {common_info.global_step} -> {global_step} "
-                            f"(batch size changed from {common_info.global_batch_size} to {self.global_batch_size})"
+                            f"(batch size changed from {common_info.global_batch_size} to {self.global_batch_size}). "
+                            f"The step count is rescaled to keep the consumed-sample budget unchanged; "
+                            f"training.steps (and lr_scheduler.total_steps) are NOT rescaled automatically."
                         )
 
                     skip_micros = self._consumed_samples // self._base_units
