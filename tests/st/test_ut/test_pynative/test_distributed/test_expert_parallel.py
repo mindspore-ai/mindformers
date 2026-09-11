@@ -405,17 +405,101 @@ class TestExpertParallel:
     @pytest.mark.level0
     @pytest.mark.platform_x86_cpu
     @pytest.mark.env_onecard
+    def test_prelaunched_a2a_forward_waits_on_main_stream(self, monkeypatch):
+        """The pre-launched A2A is joined on its routed-output consumer stream."""
+        shared_stream = object()
+        main_stream = object()
+        active_stream = [shared_stream]
+        events = []
+
+        class FakeStreamCtx:
+            """Track nested stream contexts without requiring an Ascend device."""
+
+            def __init__(self, stream):
+                self.stream = stream
+                self.previous = None
+
+            def __enter__(self):
+                self.previous = active_stream[0]
+                active_stream[0] = self.stream
+                events.append(("enter", self.stream))
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                del exc_type, exc_value, traceback
+                events.append(("exit", self.stream))
+                active_stream[0] = self.previous
+
+        class FakeWork:
+            """Record the stream on which the communication wait is issued."""
+
+            @staticmethod
+            def wait():
+                events.append(("wait", active_stream[0]))
+
+        monkeypatch.setattr(
+            expert_parallel_mod.ms.runtime, "StreamCtx", FakeStreamCtx)
+        ctx = SimpleNamespace()
+        shared_tensor = object()
+        output_tensor = object()
+
+        result = expert_parallel_mod._PrelaunchedA2A.forward(
+            ctx,
+            shared_tensor,
+            object(),
+            output_tensor,
+            FakeWork(),
+            [4],
+            [4],
+            "ep_group",
+            main_stream,
+            shared_stream,
+        )
+
+        assert result == (output_tensor, shared_tensor)
+        assert active_stream[0] is shared_stream
+        assert events == [
+            ("enter", main_stream),
+            ("wait", main_stream),
+            ("exit", main_stream),
+        ]
+
+    @pytest.mark.level0
+    @pytest.mark.platform_x86_cpu
+    @pytest.mark.env_onecard
     def test_prelaunched_a2a_backward_launches_lazy_reverse_before_shared_grad(
             self, monkeypatch):
         """The coupled boundary launches reverse A2A and returns shared grad first."""
         calls = []
         main_stream = object()
+
+        class FakeEvent:
+            """Record where the reverse-A2A readiness event is inserted."""
+
+            def record(self, stream):
+                """Track event recording without requiring an Ascend device."""
+                calls.append(("record_ready", stream))
+
+        ready_event = FakeEvent()
+
+        class FakeSharedStream:
+            """Record the cross-stream dependency for the shared branch."""
+
+            @staticmethod
+            def wait_event(event):
+                """Track the event consumed by the shared stream."""
+                calls.append(("shared_wait_event", event))
+
+        shared_stream = FakeSharedStream()
         ctx = SimpleNamespace(
             main_stream=main_stream,
+            shared_stream=shared_stream,
             recv_splits=[8, 12],
             send_splits=[4, 16],
             group="ep_group",
         )
+
+        monkeypatch.setattr(
+            expert_parallel_mod.ms.runtime, "Event", lambda: ready_event)
         monkeypatch.setattr(
             expert_parallel_mod.ms.runtime,
             "set_cur_stream",
@@ -435,10 +519,12 @@ class TestExpertParallel:
 
         assert result[0] is shared_grad
         assert result[1] == "lazy_grad"
-        assert result[2:] == (None, None, None, None, None, None)
+        assert result[2:] == (None, None, None, None, None, None, None)
         assert calls == [
             ("set_stream", main_stream),
             ("reverse_a2a", (4,), [8, 12], [4, 16], "ep_group"),
+            ("record_ready", main_stream),
+            ("shared_wait_event", ready_event),
         ]
 
     @pytest.mark.level1
