@@ -241,7 +241,11 @@ class StageModelBuilder:
         # grad_fn". Build the stages forward-only; the gradients the optimizer consumes come
         # from the in-forward backward, not from the schedule.  Narrows the caller's request
         # rather than replacing it: inference already asks for forward-only stages.
-        has_backward = has_backward and not model_config.dsa_warmup_layerwise_backward
+        # ``model_config`` here is the model's HF-style config, which carries a key only when
+        # the yaml sets it -- read it with a default, or every pipeline run that never mentions
+        # this switch (all of them, today) dies on an ``AttributeError``.
+        has_backward = has_backward and not getattr(
+            model_config, "dsa_warmup_layerwise_backward", False)
         
         stages = []
         model_parts = []
