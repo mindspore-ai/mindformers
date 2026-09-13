@@ -41,6 +41,10 @@ from mindformers.pynative.transformers.transformer_block import (
     expand_hyper_connection_streams,
     collapse_hyper_connection_streams,
 )
+from mindformers.pynative.transformers.experimental_attention_variant.indexer import (
+    flush_warmup_indexer_backward,
+    warmup_indexer_loss_sink,
+)
 from mindformers.parallel_core.utils.spec_utils import ModuleSpec, build_module
 from mindformers.parallel_core.transformer_config import TransformerConfig
 from mindformers.pynative.layers.linear import Linear
@@ -349,6 +353,13 @@ class MultiTokenPredictionLayer(nn.Cell):
             if self.submodules.hc_head is not None:
                 self.hc_head = build_module(self.submodules.hc_head, config=config)
 
+    def _layerwise_warmup_backward(self):
+        """Whether this layer drives the DSA warm-up backward itself; see TransformerBlock."""
+        if not self.training:
+            return False
+        return (self.config.dsa_warmup_layerwise_backward
+                and not self.config.dsa_indexer_use_sparse_loss)
+
     def construct(
             self,
             input_ids: Tensor,
@@ -395,13 +406,21 @@ class MultiTokenPredictionLayer(nn.Cell):
             hidden_states = expand_hyper_connection_streams(
                 hidden_states, self.hc_num_streams, self.hc_hidden_size
             )
-        hidden_states, _ = self.transformer_layer(
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            rotary_pos_emb=rotary_pos_emb,
-            actual_seq_len=actual_seq_len,
-            mscale=mscale
-        )
+        # This layer is invoked outside ``TransformerBlock``'s loop, so it has to publish its
+        # own indexer-loss sink: without one the DSA layer finds none on the thread-local and
+        # falls back to the step-end boundary path, which per-layer warm-up backward never
+        # back-propagates -- the MTP indexer would stay trainable but never receive a
+        # gradient, silently. One layer is one group, so the flush is right after the call.
+        with warmup_indexer_loss_sink(self._layerwise_warmup_backward()) as warmup_sink:
+            hidden_states, _ = self.transformer_layer(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                rotary_pos_emb=rotary_pos_emb,
+                actual_seq_len=actual_seq_len,
+                mscale=mscale
+            )
+            if warmup_sink is not None:
+                flush_warmup_indexer_backward(warmup_sink)
         if self.hc:
             if self.hc_head is not None:
                 hidden_states = self.hc_head(hidden_states)

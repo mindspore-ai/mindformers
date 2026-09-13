@@ -47,6 +47,12 @@ class _FakeMtpLayer(_FakeModule):
 
 
 class _FakeMesh:
+    """Stands in for the FSDP device mesh; carries the attributes apply_fsdp reads."""
+
+    # The DSA warm-up grad-sync setup reads this to decide which axes an unsharded
+    # indexer gradient must be summed over.
+    mesh_dim_names = ("fsdp",)
+
     def size(self):
         return 2
 
@@ -126,6 +132,8 @@ def test_apply_fsdp_wraps_each_layer_once(monkeypatch):
         pp_enabled=False,
         fsdp=2,
         get_mesh=lambda *_: _FakeMesh(),
+        # No TP in this setup, so the grad-sync mesh is the FSDP domain alone.
+        get_optional_mesh=lambda dims: None if dims == "tp" else _FakeMesh(),
     )
     parallelism = SimpleNamespace(
         dense_fsdp_shard_size=None,
@@ -150,6 +158,9 @@ def test_apply_fsdp_wraps_each_layer_once(monkeypatch):
     parallelize.apply_fsdp(model, parallel_dims, parallelism)
 
     assert [module for module, _ in wrapped] == [decoder_layer, mtp_layer, model]
+    # DSA warm-up per-layer backward is off here, so no indexer weight is taken out of FSDP.
+    assert not any(getattr(p, "_warmup_layerwise_grad", False)
+                   for p in (decoder_max_logits, mtp_max_logits))
     assert mtp_layer.transformer_layer not in [module for module, _ in wrapped]
     assert all(call[1]["comm_fusion"] is False for call in wrapped)
     # A non-persistent buffer is not a parameter, so FSDP needs no opt-out for it.

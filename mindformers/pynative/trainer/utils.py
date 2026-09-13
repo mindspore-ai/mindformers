@@ -628,6 +628,39 @@ def _maybe_sync_embedding_grad(param, grad) -> None:
     grad._pp_replica_count = getattr(param, "_embedding_grad_sync_size", 1)
 
 
+def _maybe_sync_warmup_indexer_grad(param, grad):
+    """Restate a DSA warm-up indexer gradient as a DTensor and reduce it via its layout.
+
+    These weights are kept out of FSDP (see ``_tag_warmup_indexer_grad_sync``) so that the
+    per-layer warm-up backward, fired mid-forward, cannot trip FSDP's unshard/reshard
+    lifecycle. The *parameter* is still a ``Replicate()`` DTensor on the TP mesh, but only
+    FSDP re-wraps a gradient with a layout -- an ignored parameter's ``.grad`` arrives as a
+    bare Tensor, so the information "this is a per-rank partial that must be summed, after
+    which every rank holds the same thing" is gone. Muon then falls into its ``local_2d``
+    branch purely because ``isinstance(grad, DTensor)`` is False.
+
+    Saying it in the type system instead of by hand: the raw gradient *is* ``Partial()`` on
+    the mesh the weight is replicated over, and ``redistribute`` to ``Replicate()`` *is* the
+    all-reduce. That also lets ``_get_grad_factor`` derive the grad-norm replica count from
+    the placements, rather than us stamping ``_pp_replica_count`` ourselves.
+
+    Returns the gradient to use (a DTensor when the parameter is tagged, else the input
+    unchanged). Called once per optimizer step from ``_calculate_global_grad_norm``.
+    """
+    mesh = getattr(param, "_warmup_grad_mesh", None)
+    if mesh is None or isinstance(grad, DTensor):
+        return grad
+
+    from hyper_parallel.core.dtensor.placement_types import Partial, Replicate as _Replicate
+
+    n = len(mesh.mesh_dim_names or ()) or 1
+    # ``Partial`` defaults to reduce_op="sum", which is what the managed weights get:
+    # ``disable_fsdp_gradient_division`` puts FSDP on "sum" because the loss is already
+    # scaled by the global batch size.
+    partial = DTensor.from_local(grad, mesh, [Partial()] * n)
+    return partial.redistribute(mesh, [_Replicate()] * n)
+
+
 def _sync_mtp_embedding_weights_after_init(model_parts) -> int:
     """Synchronize PP copies of the MTP-shared embedding after delayed init.
 
@@ -783,6 +816,9 @@ def _calculate_global_grad_norm(
             if replica_count and replica_count > 1:
                 # Reuse the grad-factor carrier already used by PP embedding sync.
                 setattr(grad, "_pp_replica_count", replica_count)
+            # After the count above, which assigns rather than accumulates.
+            # May return a new DTensor-wrapped gradient, so rebind before appending.
+            grad = _maybe_sync_warmup_indexer_grad(param, grad)
             grads.append(grad)
 
     if not grads:

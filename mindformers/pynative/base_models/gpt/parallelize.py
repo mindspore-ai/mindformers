@@ -372,17 +372,23 @@ def _collect_module_replicate_params(module, shard_size):
     return replicate_params
 
 
-def _build_fsdp_policy(module, shard_size, param_rules=None, forced_replicate_params=None):
+def _build_fsdp_policy(module, shard_size, param_rules=None, forced_replicate_params=None,
+                       ignored_params=None):
     """Build a module's shard-placement callback and replicated parameter list.
 
     ``param_rules`` maps module-relative parameter names to either ``shard_dim``
     or ``replicate``. Parameters without a rule use the default ``Shard(0)``.
+    Parameters in ``ignored_params`` are excluded from both the placement plan and the
+    replicated list; they stay outside the fully-shard lifecycle altogether.
     """
     param_rules = {} if param_rules is None else param_rules
+    ignored_param_ids = {id(param) for param in (ignored_params or ())}
     placement_overrides = {}
     replicate_params = list(forced_replicate_params or ())
 
     for param_name, param in module.parameters_and_names():
+        if id(param) in ignored_param_ids:
+            continue
         rule = param_rules.get(param_name, {})
         unknown_keys = rule.keys() - {"shard_dim", "replicate"}
         if unknown_keys:
@@ -445,6 +451,51 @@ def _build_expert_fsdp_policy(experts, shard_size):
     return _build_fsdp_policy(experts, shard_size, param_rules=param_rules)
 
 
+def _tag_warmup_indexer_grad_sync(layers, mtp, grad_mesh):
+    """Mark the DSA warm-up indexer weights so their gradients regain a DTensor layout.
+
+    :func:`_collect_layer_warmup_ignored_params` keeps these weights out of FSDP so a per-layer
+    backward fired mid-forward cannot trip the unshard/reshard lifecycle. The parameters stay
+    ``Replicate()`` DTensors on the TP mesh (``_dsa_attention_layer_plan`` puts them there),
+    but *only FSDP re-wraps a gradient as a DTensor* -- an ignored parameter's ``.grad`` comes
+    back as a bare Tensor, and the layout that says "sum me over these meshes, then I am
+    replicated" is lost. Muon then classifies it as ``local_2d`` purely because
+    ``isinstance(grad, DTensor)`` is False.
+
+    Rather than hand-rolling the reductions (an all-reduce per mesh) plus a hand-maintained
+    replica count for the grad-norm, tag the mesh the gradient must be summed over and let
+    ``_maybe_sync_warmup_indexer_grad`` restate it declaratively: the raw per-rank gradient is
+    ``Partial()`` on that mesh, and redistributing it to ``Replicate()`` is exactly the
+    reduction. ``_get_grad_factor`` then reads the replica count off the placements by itself.
+
+    Every such weight also gets ``_warmup_layerwise_grad``. That marker, not the mesh, is what
+    the trainer's ``zero_grad`` keys off: FSDP walks only its *managed* parameters, so these
+    have to be cleared by hand every step, and that is true even when there is no mesh to
+    reduce over. Under pure pipeline parallelism (dp = tp = 1) ``grad_mesh`` is ``None`` and
+    conflating the two left the gradients accumulating across steps -- the global grad norm
+    then drifted toward 2x the single-stage value by step 100.
+    """
+    all_layers = list(layers)
+    if mtp is not None:
+        all_layers.extend(mtp_layer.transformer_layer for mtp_layer in mtp.layers)
+
+    tagged = 0
+    for layer in all_layers:
+        if not getattr(layer, "layerwise_warmup_backward", False):
+            continue
+        self_attention = getattr(layer, "self_attention", None)
+        core_attention = getattr(self_attention, "core_attention", None)
+        indexer = getattr(core_attention, "indexer", None)
+        if indexer is None:
+            continue
+        for param in indexer.get_parameters():
+            param._warmup_layerwise_grad = True
+            if grad_mesh is not None and grad_mesh.size() > 1:
+                param._warmup_grad_mesh = grad_mesh
+            tagged += 1
+    return tagged
+
+
 def _collect_layer_forced_replicate_params(layer):
     """Collect transformer-layer state that must remain replicated under FSDP."""
     forced_replicate_params = []
@@ -461,7 +512,30 @@ def _collect_layer_forced_replicate_params(layer):
     return forced_replicate_params
 
 
-def _build_layer_fsdp_policy(layer, shard_size):
+def _collect_layer_warmup_ignored_params(layer):
+    """Collect the indexer weights that FSDP must leave unmanaged under per-layer backward.
+
+    Per-layer warm-up backward makes this layer's indexer gradients land while the block is
+    still running later layers' forwards. For an FSDP-managed parameter that fires the owning
+    cell's backward pre-hook, which unshards it mid-forward and aborts on device. Leaving the
+    indexer unmanaged avoids that; the DP reduction FSDP would have done for it is issued
+    explicitly instead (see ``_tag_warmup_indexer_grad_sync``).
+
+    This is stronger than the ``forced_replicate_params`` list: a replicated parameter is
+    still inside the fully-shard lifecycle and still gets the pre-hook. Only ``ignored_params``
+    takes it out entirely.
+    """
+    if not getattr(layer, "layerwise_warmup_backward", False):
+        return set()
+    self_attention = getattr(layer, "self_attention", None)
+    core_attention = getattr(self_attention, "core_attention", None)
+    indexer = getattr(core_attention, "indexer", None)
+    if indexer is None:
+        return set()
+    return set(indexer.get_parameters())
+
+
+def _build_layer_fsdp_policy(layer, shard_size, ignored_params=None):
     """Build one transformer layer's complete FSDP policy."""
     forced_replicate_params = _collect_layer_forced_replicate_params(layer)
 
@@ -470,10 +544,11 @@ def _build_layer_fsdp_policy(layer, shard_size):
         shard_size,
         param_rules=_LAYER_FSDP_PARAM_RULES,
         forced_replicate_params=forced_replicate_params,
+        ignored_params=ignored_params,
     )
 
 
-def _build_mtp_fsdp_policy(mtp_layer, shard_size):
+def _build_mtp_fsdp_policy(mtp_layer, shard_size, ignored_params=None):
     """Build one outer MTP unit's policy, including its transformer layer and mHC head."""
     forced_replicate_params = _collect_layer_forced_replicate_params(
         mtp_layer.transformer_layer
@@ -483,6 +558,7 @@ def _build_mtp_fsdp_policy(mtp_layer, shard_size):
         shard_size,
         param_rules=_MTP_FSDP_PARAM_RULES,
         forced_replicate_params=forced_replicate_params,
+        ignored_params=ignored_params,
     )
 
 
@@ -1350,6 +1426,43 @@ def apply_fsdp(
     layers = list(gpt_model.decoder.layers)
 
     mtp = getattr(gpt_model, "mtp", None)
+    # The ignored parameters must stay outside every FSDP wrapper, including the final
+    # root wrapper. Collect them up front so nested wrappers and the root see the same
+    # identity set.
+    fsdp_ignored_params = set()
+    for layer in layers:
+        fsdp_ignored_params.update(_collect_layer_warmup_ignored_params(layer))
+    if mtp is not None:
+        for mtp_layer in mtp.layers:
+            fsdp_ignored_params.update(
+                _collect_layer_warmup_ignored_params(mtp_layer.transformer_layer)
+            )
+    # Sum over every mesh axis the (unsharded) indexer weight is replicated on: the FSDP
+    # domain and, when tp > 1, the TP axis.  The TP axis looks redundant -- the TP-paired
+    # ranks hold bit-identical indexer gradients, because ``_dsa_attention_layer_plan``
+    # all-gathers the indexer's sequence input and the loss's head-bearing inputs so every
+    # TP rank runs the same complete indexer -- but summing it and declaring the result
+    # ``Replicate()`` on the same axis is what makes ``_get_grad_factor`` divide the global
+    # grad norm by the whole domain, counting this weight exactly once.  The two halves are
+    # a pair: dropping only the sum leaves the division behind and the grad norm comes out
+    # a factor sqrt(tp) low (measured against the FSDP-managed path: 2.8e-04 -> 2.9e-01).
+    grad_mesh_dims = list(dp_mesh.mesh_dim_names or ()) if dp_mesh is not None else []
+    if parallel_dims.get_optional_mesh("tp") is not None:
+        grad_mesh_dims.append("tp")
+    grad_mesh = parallel_dims.get_optional_mesh(grad_mesh_dims) if grad_mesh_dims else None
+    tagged = _tag_warmup_indexer_grad_sync(layers, mtp, grad_mesh)
+    if tagged:
+        logger.info(
+            "DSA warm-up per-layer backward: %d indexer parameters kept outside FSDP; "
+            "the trainer clears their gradients each step, and %s.", tagged,
+            f"sums them as Partial on mesh {grad_mesh_dims} before the optimizer step"
+            if grad_mesh is not None and grad_mesh.size() > 1
+            else "no cross-rank sum is needed (the weight is replicated nowhere)",
+        )
+    # Pass the opt-out only when there is something to opt out of, so runs without DSA
+    # warm-up per-layer backward reach ``fully_shard`` with exactly the arguments they had
+    # before this feature existed.
+    ignored_kwargs = {"ignored_params": fsdp_ignored_params} if fsdp_ignored_params else {}
     tail_modules = [
         m for m in [
             getattr(gpt_model.decoder, "final_layernorm", None),
@@ -1387,7 +1500,7 @@ def apply_fsdp(
                 )
 
         layer_shard_plan, replicate_params = _build_layer_fsdp_policy(
-            layer, dense_shard_degree
+            layer, dense_shard_degree, ignored_params=fsdp_ignored_params
         )
 
         with ms.DeviceCtx("meta"):
@@ -1397,6 +1510,7 @@ def apply_fsdp(
                 shard_placement_fn=layer_shard_plan,
                 reshard_after_forward=reshard_after_forward,
                 replicate_params=replicate_params,
+                **ignored_kwargs,
             )
 
     # --- 3. Wrap final_layernorm and output_layer independently ---
@@ -1435,7 +1549,7 @@ def apply_fsdp(
                     )
 
             layer_shard_plan, mtp_replicate_params = _build_mtp_fsdp_policy(
-                layer, dense_shard_degree
+                layer, dense_shard_degree, ignored_params=fsdp_ignored_params
             )
 
             with ms.DeviceCtx("meta"):
@@ -1445,6 +1559,7 @@ def apply_fsdp(
                     shard_placement_fn=layer_shard_plan,
                     reshard_after_forward=reshard_after_forward,
                     replicate_params=mtp_replicate_params,
+                    **ignored_kwargs,
                 )
     # --- 4. Wrap root-owned state, including the decoder mHC head ---
     root_shard_plan, root_replicate_params = _build_hc_head_fsdp_policy(
@@ -1456,6 +1571,7 @@ def apply_fsdp(
             **fsdp_config,
             shard_placement_fn=root_shard_plan,
             replicate_params=root_replicate_params,
+            **ignored_kwargs,
         )
 
     # --- 5. Disable gradient division ---

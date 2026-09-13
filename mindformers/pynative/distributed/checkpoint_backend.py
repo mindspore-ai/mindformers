@@ -15,11 +15,20 @@
 """Activation-checkpoint implementation backends."""
 
 import importlib
+import inspect
 
 from hyper_parallel.core.activation_checkpoint import (
     checkpoint_exclude_wrapper,
     checkpoint_wrapper,
 )
+
+
+def _accepts_kwarg(func, name):
+    """Whether ``func`` accepts keyword ``name``; False if it cannot be inspected."""
+    try:
+        return name in inspect.signature(func).parameters
+    except (TypeError, ValueError):
+        return False
 
 
 REENTRANT_CHECKPOINT_MODULE = (
@@ -37,8 +46,20 @@ class CheckpointBackend:
     def __init__(self, context_fn):
         self._context_fn = context_fn
 
-    def wrap_cell(self, cell):
-        """Wrap a Cell checkpoint boundary."""
+    def wrap_cell(self, cell, **checkpoint_kwargs):
+        """Wrap a Cell checkpoint boundary.
+
+        ``checkpoint_kwargs`` carries optional knobs (currently ``early_stop``) that not
+        every backend accepts; callers must gate them on :meth:`supports_kwarg`.
+        """
+        raise NotImplementedError
+
+    def supports_kwarg(self, name):
+        """Whether :meth:`wrap_cell` accepts keyword ``name`` on this backend.
+
+        Each backend answers for the function it actually calls -- the two differ, so
+        probing one on behalf of the other silently mis-gates the keyword.
+        """
         raise NotImplementedError
 
     def wrap_callable(self, operator):
@@ -72,8 +93,20 @@ class NonReentrantCheckpointBackend(CheckpointBackend):
 
     name = "non-reentrant"
 
-    def wrap_cell(self, cell):
-        return checkpoint_wrapper(cell, context_fn=self._context_fn)
+    def wrap_cell(self, cell, **checkpoint_kwargs):
+        return checkpoint_wrapper(cell, context_fn=self._context_fn, **checkpoint_kwargs)
+
+    def supports_kwarg(self, name):
+        # ``CheckpointWrapper`` stores whatever it is given and forwards it verbatim to
+        # ``checkpoint``, so that is the signature to probe -- not ``checkpoint_wrapper``'s.
+        # ``early_stop`` only reached ``checkpoint`` in later HyperParallel versions; on
+        # older ones it would be passed on to the wrapped cell's ``construct`` and blow up.
+        del self
+        try:
+            from hyper_parallel.core.activation_checkpoint import checkpoint  # pylint: disable=C0415
+        except ImportError:
+            return False
+        return _accepts_kwarg(checkpoint, name)
 
     def wrap_callable(self, operator):
         del self
@@ -108,9 +141,15 @@ class ReentrantCheckpointBackend(CheckpointBackend):
                 "(MR 1291 or later)."
             ) from exc
 
-    def wrap_cell(self, cell):
+    def wrap_cell(self, cell, **checkpoint_kwargs):
         return self._checkpoint_wrapper(
-            cell, context_fn=self._context_fn)
+            cell, context_fn=self._context_fn, **checkpoint_kwargs)
+
+    def supports_kwarg(self, name):
+        # The reentrant wrapper consumes its own keywords and never forwards them to
+        # ``checkpoint``, so probe it directly. It takes no ``early_stop`` and needs none:
+        # it replays the whole forward, so there is no early stop to disable.
+        return _accepts_kwarg(self._checkpoint_wrapper, name)
 
     def wrap_callable(self, operator):
         return self._checkpoint_wrapper(

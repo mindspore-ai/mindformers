@@ -261,6 +261,19 @@ class StageModelBuilder:
         """
         num_virtual_stages = self.layer_setting.num_virtual_stages
         local_stage_indices = self._get_local_stage_indices(pp_mesh)
+
+        # DSA dense warm-up driving its backward per layer: every stage has already
+        # back-propagated its own indexer losses inside its forward, and the trunk is frozen,
+        # so a stage's output carries no ``grad_fn`` -- the schedule's ``accumulate_grad``
+        # would raise "the output tensor you provided doesn't requires grad and not have a
+        # grad_fn". Build the stages forward-only; the gradients the optimizer consumes come
+        # from the in-forward backward, not from the schedule.  Narrows the caller's request
+        # rather than replacing it: inference already asks for forward-only stages.
+        # ``model_config`` here is the model's HF-style config, which carries a key only when
+        # the yaml sets it -- read it with a default, or every pipeline run that never mentions
+        # this switch (all of them, today) dies on an ``AttributeError``.
+        has_backward = has_backward and not getattr(
+            model_config, "dsa_warmup_layerwise_backward", False)
         
         stages = []
         model_parts = []

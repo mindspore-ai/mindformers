@@ -787,6 +787,39 @@ class TestReentrantCompatibilityValidation:
             )
 
 
+class TestEarlyStopGating:
+    """``early_stop`` must be gated on the function each backend actually calls.
+
+    The DSA warm-up indexer wrapper wants ``early_stop=False`` so a replay runs its
+    context-parallel collectives to completion. Only the non-reentrant path can take it:
+    ``CheckpointWrapper`` forwards its keywords verbatim to ``checkpoint``. The reentrant
+    wrapper consumes its own keywords and takes no ``early_stop`` -- it replays the whole
+    forward, so there is nothing to disable -- and passing one raises ``TypeError``.
+    """
+
+    def test_non_reentrant_probes_checkpoint_not_the_wrapper(self, monkeypatch):
+        backend = ac_mod._create_checkpoint_backend(False)
+
+        def fake_checkpoint(function, *args, early_stop=True, **kwargs):
+            del function, args, early_stop, kwargs
+
+        module = importlib.import_module("hyper_parallel.core.activation_checkpoint")
+        monkeypatch.setattr(module, "checkpoint", fake_checkpoint, raising=False)
+        assert backend.supports_kwarg("early_stop")
+        assert not backend.supports_kwarg("no_such_kwarg")
+
+    def test_reentrant_reports_no_early_stop(self):
+        """The reentrant backend must answer for its own wrapper, not for ``checkpoint``."""
+        try:
+            backend = ac_mod._create_checkpoint_backend(True)
+        except ImportError:
+            pytest.skip("this HyperParallel build has no reentrant checkpoint")
+        assert not backend.supports_kwarg("early_stop"), (
+            "reentrant_checkpoint_wrapper takes no early_stop; gating on checkpoint's "
+            "signature instead would pass it through and raise TypeError"
+        )
+
+
 # ======================== Swap ========================
 
 
