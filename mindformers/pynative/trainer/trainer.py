@@ -250,6 +250,12 @@ class Trainer:
 
         # Create model
         self.model = self._create_model(model, self.config.model)
+        # DSA dense warm-up driving its backward per layer: the step-end backward has nothing
+        # left to do. Read once here rather than per micro-batch.
+        model_cfg = self.config.model
+        self._dsa_warmup_layerwise_backward = bool(
+            getattr(model_cfg, "dsa_warmup_layerwise_backward", False)
+        ) and not bool(getattr(model_cfg, "dsa_indexer_use_sparse_loss", True))
         self.parallel_dims = None
         if self.enable_parallel:
             # Apply parallelism to model
@@ -1715,6 +1721,16 @@ class Trainer:
         if self.num_accumulation_steps > 1:
             loss = loss / self.num_accumulation_steps
 
+        if self._dsa_warmup_layerwise_backward:
+            # DSA warm-up with per-layer backward has already back-propagated every layer's
+            # indexer loss during this forward, and the trunk is frozen, so nothing in the
+            # model is still reachable from the language-model loss -- it legitimately has no
+            # ``grad_fn`` and ``backward`` would raise "the output tensor you provided
+            # doesn't requires grad and not have a grad_fn". Manufacturing a graph edge just
+            # to give it a landing point is what keeps every layer's activations alive to the
+            # end of the step (measured at 16k: 24 GiB -> 44 GiB peak).
+            return loss
+
         loss.backward(sense)
         return loss
 
@@ -1780,11 +1796,21 @@ class Trainer:
         if not self._should_skip_optimizer_step(global_norm):
             with _no_grad():
                 self.optimizer(grads)
-
         # zero grad
         for m in self.model:
             if hasattr(m, "zero_grad"):
                 m.zero_grad()
+                # FSDP's ``zero_grad`` walks its *managed* parameters only. Parameters kept
+                # out of FSDP on purpose -- the DSA warm-up indexer weights under per-layer
+                # backward -- would otherwise keep accumulating across steps, and their
+                # gradient norm grows with the step count. Key off the marker rather than
+                # ``_warmup_grad_mesh``: under pure pipeline parallelism there is no mesh to
+                # reduce over, but the gradients still have to be cleared. Only walk the
+                # parameters when that mode is on, so ordinary runs keep paying nothing.
+                if self._dsa_warmup_layerwise_backward:
+                    for param in m.trainable_params():
+                        if getattr(param, "_warmup_layerwise_grad", False):
+                            param.grad = None
             else:
                 for param in m.trainable_params():
                     param.grad = None

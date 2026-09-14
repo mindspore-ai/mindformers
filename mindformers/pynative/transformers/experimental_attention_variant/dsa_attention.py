@@ -15,7 +15,7 @@
 """Top-level DeepSeek Sparse Attention module for pynative mode."""
 # MindSpore ``Cell``/``_Function`` subclasses intentionally use operator-specific signatures.
 # pylint: disable=arguments-differ,abstract-method
-from mindspore import Tensor, mint
+from mindspore import Tensor, mint, ops
 from mindspore.common._grad_function import _Function
 
 from mindformers.parallel_core.transformer_config import MLATransformerConfig
@@ -165,6 +165,19 @@ class DSASelfAttention(MLASelfAttention):
         self.sparse_loss = config.dsa_indexer_use_sparse_loss
         self.index_share_loss_mode = config.dsa_index_share_loss
         self.index_share_group_size = dsa_layer_index_share_group_size(config, layer_number)
+        # Per-layer warm-up backward runs this layer's indexer backward in the middle of the
+        # block's forward, so that backward must not leave the indexer's own subgraph: any
+        # gradient reaching an earlier layer's output tensor fires FSDP's backward pre-hook,
+        # which unshards that layer while the forward is still using it (device-side abort in
+        # ``alloc_unsharded_param_buffers``). ``_DSADetachFunction`` returns *zeros* rather
+        # than nothing, so it does not stop that walk; and the indexer loss also reads the
+        # dense path's ``query``/``key``/softmax statistics, a second way back into the trunk.
+        # Both are cut properly below. The trunk is frozen in this stage, so nothing that is
+        # being trained loses gradient by cutting them.
+        self.layerwise_warmup_backward = (
+            not config.dsa_indexer_use_sparse_loss
+            and config.dsa_warmup_layerwise_backward
+        )
         self.dsa_value_handoff = IdentityOp()
         self.dsa_loss_key_indexer_handoff = IdentityOp()
 
@@ -205,8 +218,15 @@ class DSASelfAttention(MLASelfAttention):
         if self.q_layernorm is not None:
             q_a = self.q_layernorm(q_a)
         q_compress = q_a
-        x_detached = _DSADetachFunction.apply(x)
-        q_compress_detached = _DSADetachFunction.apply(q_compress)
+        # ``_DSADetachFunction`` returns *zeros* rather than nothing, so the autograd walk
+        # does not stop at it. Under per-layer warm-up backward that walk would reach an
+        # earlier layer's output and fire FSDP's backward pre-hook mid-forward; cut for real.
+        if self.layerwise_warmup_backward:
+            x_detached = x.detach()
+            q_compress_detached = q_compress.detach()
+        else:
+            x_detached = _DSADetachFunction.apply(x)
+            q_compress_detached = _DSADetachFunction.apply(q_compress)
         is_leader = self.core_attention.is_index_leader
         if is_leader:
             (
@@ -327,6 +347,16 @@ class DSASelfAttention(MLASelfAttention):
           produce no loss term at all. The trade is supervision coverage, and the paper's
           gradient-equivalence no longer holds.
         """
+        # The teacher is built from the dense path's own q/k/softmax statistics, which is a
+        # second way back into the frozen trunk. Under per-layer warm-up backward that walk
+        # would reach an earlier layer mid-forward and fire FSDP's backward pre-hook, so cut
+        # it. Only the teacher is cut -- the indexer's own projections must keep gradient.
+        if self.layerwise_warmup_backward:
+            query = query.detach()
+            key = key.detach()
+            softmax_max = softmax_max.detach()
+            softmax_sum = softmax_sum.detach()
+
         deferred = group is not None and self.index_share_loss_mode == "served"
         if not deferred:
             if not is_leader:

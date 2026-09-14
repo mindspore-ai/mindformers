@@ -484,6 +484,51 @@ def _build_expert_fsdp_policy(experts, shard_size):
     return _build_fsdp_policy(experts, shard_size, param_rules=param_rules)
 
 
+def _tag_warmup_indexer_grad_sync(layers, mtp, grad_mesh):
+    """Mark the DSA warm-up indexer weights so their gradients regain a DTensor layout.
+
+    :func:`_collect_layer_fsdp_ignored_params` keeps these weights out of FSDP so a per-layer
+    backward fired mid-forward cannot trip the unshard/reshard lifecycle. The parameters stay
+    ``Replicate()`` DTensors on the TP mesh (``_dsa_attention_layer_plan`` puts them there),
+    but *only FSDP re-wraps a gradient as a DTensor* -- an ignored parameter's ``.grad`` comes
+    back as a bare Tensor, and the layout that says "sum me over these meshes, then I am
+    replicated" is lost. Muon then classifies it as ``local_2d`` purely because
+    ``isinstance(grad, DTensor)`` is False.
+
+    Rather than hand-rolling the reductions (an all-reduce per mesh) plus a hand-maintained
+    replica count for the grad-norm, tag the mesh the gradient must be summed over and let
+    ``_maybe_sync_warmup_indexer_grad`` restate it declaratively: the raw per-rank gradient is
+    ``Partial()`` on that mesh, and redistributing it to ``Replicate()`` is exactly the
+    reduction. ``_get_grad_factor`` then reads the replica count off the placements by itself.
+
+    Every such weight also gets ``_warmup_layerwise_grad``. That marker, not the mesh, is what
+    the trainer's ``zero_grad`` keys off: FSDP walks only its *managed* parameters, so these
+    have to be cleared by hand every step, and that is true even when there is no mesh to
+    reduce over. Under pure pipeline parallelism (dp = tp = 1) ``grad_mesh`` is ``None`` and
+    conflating the two left the gradients accumulating across steps -- the global grad norm
+    then drifted toward 2x the single-stage value by step 100.
+    """
+    all_layers = list(layers)
+    if mtp is not None:
+        all_layers.extend(mtp_layer.transformer_layer for mtp_layer in mtp.layers)
+
+    tagged = 0
+    for layer in all_layers:
+        if not getattr(layer, "layerwise_warmup_backward", False):
+            continue
+        self_attention = getattr(layer, "self_attention", None)
+        core_attention = getattr(self_attention, "core_attention", None)
+        indexer = getattr(core_attention, "indexer", None)
+        if indexer is None:
+            continue
+        for param in indexer.get_parameters():
+            param._warmup_layerwise_grad = True
+            if grad_mesh is not None and grad_mesh.size() > 1:
+                param._warmup_grad_mesh = grad_mesh
+            tagged += 1
+    return tagged
+
+
 def _collect_layer_fsdp_ignored_params(layer):
     """Collect mutable runtime state that FSDP must leave unmanaged.
 
@@ -516,6 +561,17 @@ def _collect_layer_fsdp_ignored_params(layer):
     max_logits_val = getattr(core_attention, "max_logits_val", None)
     if max_logits_val is not None:
         ignored_params.add(max_logits_val)
+
+    if getattr(layer, "layerwise_warmup_backward", False):
+        # Per-layer warm-up backward makes this layer's indexer gradients land while the block
+        # is still running later layers' forwards. For an FSDP-managed parameter that fires
+        # the owning cell's backward pre-hook, which unshards it mid-forward and aborts on
+        # device. Leaving the indexer unmanaged avoids that; the DP reduction FSDP would have
+        # done for it is issued explicitly instead (see ``_tag_warmup_indexer_grad_sync``).
+        indexer = getattr(core_attention, "indexer", None)
+        if indexer is not None:
+            for param in indexer.get_parameters():
+                ignored_params.add(param)
 
     return ignored_params
 
@@ -1388,6 +1444,28 @@ def apply_fsdp(
             fsdp_ignored_params.update(
                 _collect_layer_fsdp_ignored_params(mtp_layer.transformer_layer)
             )
+    # Sum over every mesh axis the (unsharded) indexer weight is replicated on: the FSDP
+    # domain and, when tp > 1, the TP axis.  The TP axis looks redundant -- the TP-paired
+    # ranks hold bit-identical indexer gradients, because ``_dsa_attention_layer_plan``
+    # all-gathers the indexer's sequence input and the loss's head-bearing inputs so every
+    # TP rank runs the same complete indexer -- but summing it and declaring the result
+    # ``Replicate()`` on the same axis is what makes ``_get_grad_factor`` divide the global
+    # grad norm by the whole domain, counting this weight exactly once.  The two halves are
+    # a pair: dropping only the sum leaves the division behind and the grad norm comes out
+    # a factor sqrt(tp) low (measured against the FSDP-managed path: 2.8e-04 -> 2.9e-01).
+    grad_mesh_dims = list(dp_mesh.mesh_dim_names or ()) if dp_mesh is not None else []
+    if parallel_dims.get_optional_mesh("tp") is not None:
+        grad_mesh_dims.append("tp")
+    grad_mesh = parallel_dims.get_optional_mesh(grad_mesh_dims) if grad_mesh_dims else None
+    tagged = _tag_warmup_indexer_grad_sync(layers, mtp, grad_mesh)
+    if tagged:
+        logger.info(
+            "DSA warm-up per-layer backward: %d indexer parameters kept outside FSDP; "
+            "the trainer clears their gradients each step, and %s.", tagged,
+            f"sums them as Partial on mesh {grad_mesh_dims} before the optimizer step"
+            if grad_mesh is not None and grad_mesh.size() > 1
+            else "no cross-rank sum is needed (the weight is replicated nowhere)",
+        )
     tail_modules = [
         m for m in [
             getattr(gpt_model.decoder, "final_layernorm", None),
