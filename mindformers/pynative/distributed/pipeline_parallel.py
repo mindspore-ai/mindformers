@@ -145,6 +145,20 @@ class ScaledLossPipelineStage(PipelineStage):
             )
         return restore_repeat_num(p_sens, outputs[0]) * scale
 
+    def bwd_send_specs(self, micro_index):
+        """Skip backward-send bookkeeping on forward-only (inference) stages.
+
+        The scheduler unconditionally emits a ``BWD_SEND`` step for every
+        non-first stage, and ``args_recv_info`` is populated by ``FWD_RECV``
+        regardless of ``has_backward``. But ``bwd_cache`` is only written by
+        the backward path, which never runs here, so the base ``pop`` would
+        raise ``KeyError``. Return an empty spec list instead (the caller
+        iterates it, so ``None`` would break).
+        """
+        if not self._has_backward:
+            return []
+        return super().bwd_send_specs(micro_index)
+
 
 class PpLayerSetting:
     """
@@ -239,6 +253,8 @@ class StageModelBuilder:
         model_config,
         pp_mesh,
         tp_mesh=None,
+        has_backward: bool = True,
+        dyn_shape: bool = False,
     ) -> tuple[list[PipelineStage], list[nn.Cell]]:
         """
         Build pipeline parallel stages.
@@ -274,6 +290,8 @@ class StageModelBuilder:
                 group=pp_mesh.get_group(),
                 mesh=pp_mesh,
                 tp_mesh=tp_mesh,
+                has_backward=has_backward,
+                dyn_shape=dyn_shape,
             )
             stages.append(stage)
         

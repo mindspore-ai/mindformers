@@ -1978,6 +1978,7 @@ def apply_pp(
         recompute_comm,
         swap,
         gradient_accumulation_steps: int = 1,
+        forward_only: bool = False,
 ):
     """Apply pipeline parallelism to the GPTModel.
 
@@ -1989,6 +1990,9 @@ def apply_pp(
     :func:`apply_moe_ep_overlap_tp` installs :class:`OverlapExpertParallel` on
     every MoE layer, and registers it on the schedule for the
     ``OVERLAP_B_F`` callback.
+
+    ``forward_only=True`` builds stages with ``has_backward=False`` --
+    the inference path, where backward chunks become no-ops.
     """
     calculate_per_token_loss = bool(
         getattr(model.config, "calculate_per_token_loss", False)
@@ -2000,7 +2004,10 @@ def apply_pp(
     # tp_mesh lets each stage resolve the rank group for TP/SP-sharded activations
     # crossing the PP boundary (the pp_mesh's flat world root can't resolve "tp").
     tp_mesh = parallel_dims.get_optional_mesh("tp")
-    stages, model_parts = builder.build_stages(model_cls, model.config, pp_mesh, tp_mesh)
+    stages, model_parts = builder.build_stages(
+        model_cls, model.config, pp_mesh, tp_mesh,
+        has_backward=not forward_only, dyn_shape=forward_only
+    )
     # PP rebuilds fresh per-stage models from config, discarding any LoRA injected into
     # the original model. Re-inject into each stage on meta device BEFORE SPMD parallelism
     # so the adapters pick up TP/FSDP layouts. strict=False: an embedding-only stage may
@@ -2095,6 +2102,7 @@ def parallelize_gptmodel(
         recompute_comm: Any,
         swap: Any,
         gradient_accumulation_steps: int = 1,
+        forward_only: bool = False,
 ) -> List[nn.Cell]:
     """Apply pipeline parallelism to the GPTModel."""
 
@@ -2116,6 +2124,7 @@ def parallelize_gptmodel(
             recompute_comm=recompute_comm,
             swap=swap,
             gradient_accumulation_steps=gradient_accumulation_steps,
+            forward_only=forward_only,
         )
 
     _apply_spmd_parallelism(model, parallel_dims, parallelism, recompute, recompute_comm, swap)
