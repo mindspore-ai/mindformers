@@ -265,7 +265,23 @@ class DSAttention(nn.Cell):
         # by the caller from ``resolve_dsa_index_share_leaders`` so that the block loop and
         # every layer share one view of the layout.
         if is_index_leader is None:
-            is_index_leader = dsa_layer_is_index_leader(config, layer_number)
+            # Do NOT fall back to ``dsa_layer_is_index_leader(config, layer_number)`` here:
+            # ``MultiLatentAttention`` builds this with its clamped ``layer_index``
+            # (``max(1, layer_number)``), which reads the layout one slot off for global
+            # layer 0 -- with an ``FSSS`` layout every layer would then build as Shared,
+            # nobody would own an indexer, and the first Shared layer would attend with a
+            # ``None`` Top-K. ``DSASelfAttention.core_attention_extra_kwargs`` exists to
+            # pass the value derived from the true global index; a caller that skips it
+            # must say so explicitly rather than get a silently wrong layout.
+            if (config.dsa_index_topk_freq or 1) > 1 or config.dsa_indexer_types is not None:
+                raise ValueError(
+                    "DSA indexer Top-K sharing is enabled, so `is_index_leader` must be passed "
+                    "explicitly from the true global layer index (see "
+                    "`DSASelfAttention.core_attention_extra_kwargs`); deriving it here from "
+                    f"`layer_number` ({layer_number}) would read the sharing layout one slot off "
+                    "for global layer 0."
+                )
+            is_index_leader = True
         self.is_index_leader = is_index_leader
         self.softmax_scale = softmax_scale or config.kv_channels ** -0.5
 
