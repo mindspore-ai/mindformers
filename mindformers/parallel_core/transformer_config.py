@@ -1559,6 +1559,23 @@ class TransformerConfig:
         }
     )
 
+    dsa_warmup_layerwise_backward: bool = field(
+        default=False,
+        metadata={
+            "description": "In the DSA dense warm-up stage, back-propagate each layer's indexer "
+                           "loss as soon as that layer's forward finishes, instead of accumulating "
+                           "every layer's loss and back-propagating once at the end of the step. "
+                           "The trunk is frozen in this stage and each layer's indexer loss is "
+                           "independent, so the two are mathematically equivalent, but the former "
+                           "lets a layer's indexer activations be released before the next layer "
+                           "runs -- peak memory stops growing with depth. Off by default; only "
+                           "meaningful when `dsa_indexer_use_sparse_loss` is False.",
+            "usage": ParamUsage.TRAINING,
+            "source": ParamSource.MF,
+            "mode": ParamMode.COMMON
+        }
+    )
+
     dsa_indexer_loss_coeff: float = field(
         default=None,
         metadata={
@@ -2343,6 +2360,17 @@ class TransformerConfig:
                                  "please set use_flash_attention=True.")
             if ms.get_auto_parallel_context("pipeline_scheduler") == "zero_bubble_v":
                 raise ValueError("When experimental_attention_variant == 'dsa', zero_bubble_v is not supported.")
+            if self.dsa_warmup_layerwise_backward and self.dsa_indexer_use_sparse_loss:
+                raise ValueError(
+                    "`dsa_warmup_layerwise_backward` requires the dense warm-up stage "
+                    "(`dsa_indexer_use_sparse_loss=False`): the sparse stage trains the trunk, "
+                    "so its backward cannot be driven per layer."
+                )
+        elif self.dsa_warmup_layerwise_backward:
+            raise ValueError(
+                "`dsa_warmup_layerwise_backward` is only meaningful when "
+                "`experimental_attention_variant` is 'dsa'."
+            )
 
         if self.use_flash_attention:
             if self.use_eod_attn_mask_compression and not self.use_ring_attention:

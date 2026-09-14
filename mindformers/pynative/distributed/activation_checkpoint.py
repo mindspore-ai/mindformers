@@ -895,11 +895,29 @@ def apply_recompute(
     for layer_id in range(model.layer_start, model.layer_end + 1):
         layer = model.layers[layer_id]
         if _disables_activation_recompute(layer):
-            logger.info(
-                "Skip activation recompute at DSA warm-up layer %s: "
-                "the frozen trunk is detached by the layer backward boundary.",
-                layer_id,
-            )
+            # The frozen trunk is detached by the layer backward boundary, so replaying it
+            # would be pure waste -- but the indexer is the one thing warm-up actually
+            # trains, and skipping the wrapper for the whole layer leaves every one of its
+            # activations resident. They then grow linearly with depth: measured at 1M
+            # sequence length, ~8 GiB per layer (indexer q/k concat and the Hadamard output),
+            # which OOMs past the fourth layer. Wrap the indexer subtree alone: its
+            # activations are recomputed from the layer's inputs at backward time, while the
+            # trunk stays un-replayed.  Honour ``full_recompute_layer`` the same way the
+            # normal path does -- a layer the user did not select stays unwrapped, so the
+            # per-layer selection keeps working in warm-up.
+            if need_recompute and layer_id in plan.full_target_ids:
+                _wrap_dsa_warmup_indexer_recompute(layer, layer_id, backend)
+            elif not need_recompute:
+                # Distinguish the two reasons: reporting "not selected" while recompute is
+                # off globally sends the reader hunting through ``full_recompute_layer``
+                # for a linear memory growth that is simply recompute being disabled.
+                logger.info(
+                    "Skip activation recompute at DSA warm-up layer %s: recompute is "
+                    "disabled (recompute.mode is None).", layer_id)
+            else:
+                logger.info(
+                    "Skip activation recompute at DSA warm-up layer %s: not selected by "
+                    "full_recompute_layer.", layer_id)
             continue
         # Step 1: exclude (must be before checkpoint_wrapper)
         if plan.exclude_layer_to_modules:
@@ -950,6 +968,50 @@ def apply_recompute(
                 add_prim_attr=True,
             )
 
+
+
+def _wrap_dsa_warmup_indexer_recompute(layer, layer_id, backend):
+    """Recompute only the indexer of a DSA warm-up layer, not its frozen trunk.
+
+    ``early_stop=False`` because the indexer carries context-parallel collectives whose
+    replay-time side effects must run to completion, matching the full-layer wrapper. The
+    keyword only exists on newer HyperParallel builds, so it is gated on
+    :meth:`CheckpointBackend.supports_kwarg`; where it is missing the replay follows the backend's own
+    default, exactly as the full-layer wrapper next to it already does.
+    """
+    if getattr(layer, "layerwise_warmup_backward", False):
+        # Per-layer warm-up backward already releases each layer's indexer activations before
+        # the next layer runs, so there is nothing left to trade compute for. Wrapping the
+        # indexer on top would only replay it once more for no gain.
+        logger.info(
+            "Skip activation recompute at DSA warm-up layer %s: per-layer backward keeps "
+            "no activation resident.",
+            layer_id,
+        )
+        return
+    attention = getattr(layer, "self_attention", None)
+    core_attention = getattr(attention, "core_attention", None) if attention is not None else None
+    indexer = getattr(core_attention, "indexer", None) if core_attention is not None else None
+    if indexer is None:
+        # A layer whose spec builds no indexer has nothing to recompute and leaves nothing
+        # resident, so the frozen trunk is all there is to skip.
+        logger.info(
+            "Skip activation recompute at DSA warm-up layer %s: frozen trunk, no indexer.",
+            layer_id,
+        )
+        return
+    early_stop_kwargs = {"early_stop": False} if backend.supports_kwarg("early_stop") else {}
+    if not early_stop_kwargs:
+        logger.warning(
+            "This HyperParallel build's checkpoint() takes no early_stop; the DSA warm-up "
+            "indexer at layer %s is replayed with the default policy. If a context-parallel "
+            "collective inside the indexer is skipped on replay, ranks desync.", layer_id)
+    core_attention.indexer = backend.wrap_cell(indexer, **early_stop_kwargs)
+    logger.info(
+        "Recompute only the indexer at DSA warm-up layer %s: the frozen trunk is detached "
+        "by the layer backward boundary, so only the indexer's activations need to live.",
+        layer_id,
+    )
 
 
 def _disables_activation_recompute(module):
