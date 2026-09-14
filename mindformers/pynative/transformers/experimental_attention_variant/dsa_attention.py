@@ -100,10 +100,19 @@ class IndexShareGroup:
     activation-recompute replay of a Shared layer still finds the leader's Top-K alive.
     """
 
-    __slots__ = ("topk_indices", "leader_indexer_loss", "leader_projections")
+    __slots__ = ("_topk_device", "_topk_host", "_offload_topk",
+                 "leader_indexer_loss", "leader_projections")
 
-    def __init__(self):
-        self.topk_indices = None
+    def __init__(self, offload_topk=False):
+        self._topk_device = None
+        self._topk_host = None
+        # With activation recompute on, a Shared layer's attention is replayed in backward,
+        # so the sparse kernel does not hold the Top-K for the whole step -- this object,
+        # captured by the layer's checkpoint closure, is what keeps it alive. One group's
+        # Top-K is [B, S, topk] and every group in the stage holds one at once. Evicting the
+        # previous group to host memory bounds the device working set to a single group, at
+        # the cost of one D2H per group plus one H2D when the replay asks for it again.
+        self._offload_topk = offload_topk
         # Set by the leader: its ``indexer_loss`` module plus the indexer projections and
         # index softmax stats the student side needs. Each served layer calls the leader's
         # module with its own q/k/Top-K/softmax stats, so its term is evaluated inside its
@@ -111,6 +120,30 @@ class IndexShareGroup:
         # to the group mean without any accumulator crossing a region boundary.
         self.leader_indexer_loss = None
         self.leader_projections = None
+
+    @property
+    def topk_indices(self):
+        """Return the group leader's Top-K, paging it back from host memory if evicted."""
+        if self._topk_device is None and self._topk_host is not None:
+            self._topk_device = self._topk_host.move_to("Ascend")
+        return self._topk_device
+
+    @topk_indices.setter
+    def topk_indices(self, value):
+        self._topk_device = value
+        self._topk_host = None
+
+    def evict_topk(self):
+        """Move this group's Top-K to host memory; a later read pages it back.
+
+        Called when the next group starts, so at most one group's Top-K is resident. A no-op
+        unless ``dsa_index_share_topk_offload`` is on, and unless this group actually holds a
+        device tensor (the dense warm-up stage produces no Top-K at all).
+        """
+        if not self._offload_topk or self._topk_device is None:
+            return
+        self._topk_host = self._topk_device.move_to("CPU")
+        self._topk_device = None
 
 
 class DSASelfAttention(MLASelfAttention):
@@ -130,6 +163,7 @@ class DSASelfAttention(MLASelfAttention):
             layer_number=layer_number,
         )
         self.sparse_loss = config.dsa_indexer_use_sparse_loss
+        self.index_share_loss_mode = config.dsa_index_share_loss
         self.index_share_group_size = dsa_layer_index_share_group_size(config, layer_number)
         self.dsa_value_handoff = IdentityOp()
         self.dsa_loss_key_indexer_handoff = IdentityOp()
@@ -278,15 +312,23 @@ class DSASelfAttention(MLASelfAttention):
         records. Under sharing each layer contributes its term scaled by the group size but
         reports the term itself, so the tracker stays on the unshared scale.
 
-        Sharing leaves Shared layers without any indexer: the Full layer's indexer is
-        distilled against every layer it serves and the losses are averaged, which is
-        gradient-equivalent to distilling against the averaged attention distribution
-        (IndexCache's L_multi, used by GLM-5.2). Because the fused kernel rebuilds the
-        teacher from one layer's own q/k/softmax stats and has no slot for a pre-averaged
-        teacher, this costs one kernel call per served layer: the indexer-loss cost is NOT
-        reduced, what sharing saves is the Shared layers' indexer forward.
+        Sharing leaves Shared layers without any indexer either way; the two modes differ
+        only in what supervises the Full layer's indexer:
+
+        - ``served`` (default): distil against every layer the Top-K serves and average the
+          terms, which is gradient-equivalent to distilling against the averaged attention
+          distribution (IndexCache's L_multi, used by GLM-5.2). The fused kernel rebuilds the
+          teacher from one layer's own q/k/softmax stats and has no slot for a pre-averaged
+          teacher, so this costs one kernel call per served layer: the indexer-loss cost is
+          NOT reduced, what sharing saves is the Shared layers' indexer forward.
+        - ``leader``: distil against the Full layer's own distribution only -- one kernel call
+          per group, which is where the bulk of the speed-up comes from. This is what
+          Megatron's own IndexShare support does: its Shared layers build no indexer and
+          produce no loss term at all. The trade is supervision coverage, and the paper's
+          gradient-equivalence no longer holds.
         """
-        if group is None:
+        deferred = group is not None and self.index_share_loss_mode == "served"
+        if not deferred:
             if not is_leader:
                 return None, None
             loss = self.core_attention.indexer_loss(

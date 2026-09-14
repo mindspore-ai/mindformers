@@ -273,7 +273,7 @@ class DSAttention(nn.Cell):
             # ``None`` Top-K. ``DSASelfAttention.core_attention_extra_kwargs`` exists to
             # pass the value derived from the true global index; a caller that skips it
             # must say so explicitly rather than get a silently wrong layout.
-            if (config.dsa_index_share_size or 1) > 1 or config.dsa_index_share_pattern is not None:
+            if (config.dsa_index_topk_freq or 1) > 1 or config.dsa_indexer_types is not None:
                 raise ValueError(
                     "DSA indexer Top-K sharing is enabled, so `is_index_leader` must be passed "
                     "explicitly from the true global layer index (see "
