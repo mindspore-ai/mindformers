@@ -43,6 +43,7 @@ from dataclasses import replace
 from glob import glob
 
 import numpy as np
+import safetensors
 import yaml
 from safetensors import serialize_file
 
@@ -78,8 +79,7 @@ ST_TAG_TO_DTYPE = {
     'U8': (np.uint8, ms.uint8), 'BOOL': (np.bool_, ms.bool_),
 }
 
-# MindSpore float dtype -> safetensors raw-API dtype name. The raw
-# ``serialize_file`` API takes lowercase names and writes the F32/BF16/... tags.
+# MindSpore float dtype -> safetensors legacy raw-API dtype name.
 ST_FLOAT_DTYPE = {ms.float32: 'float32', ms.float16: 'float16',
                   ms.bfloat16: 'bfloat16', ms.float64: 'float64'}
 
@@ -207,7 +207,25 @@ def save_safetensors(entries, file_path):
     carry one, and MindFormers' HF metadata reader iterates the header without
     skipping it.
     """
-    serialize_file(entries, file_path)
+    tensor_spec_cls = getattr(safetensors, 'TensorSpec', None)
+    if tensor_spec_cls is None:
+        serialize_file(entries, file_path)
+        return
+
+    # TensorSpec stores a raw pointer rather than owning the bytes. Retain these
+    # views until serialize_file returns so every pointer stays valid.
+    data_views = {}
+    tensor_specs = {}
+    for name, entry in entries.items():
+        data_view = np.frombuffer(entry['data'], dtype=np.uint8)
+        data_views[name] = data_view
+        tensor_specs[name] = tensor_spec_cls(
+            dtype=entry['dtype'],
+            shape=entry['shape'],
+            data_ptr=data_view.ctypes.data,
+            data_len=data_view.nbytes,
+        )
+    serialize_file(tensor_specs, file_path)
 
 
 # =============================================================================
