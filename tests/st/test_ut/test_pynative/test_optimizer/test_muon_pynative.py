@@ -1101,6 +1101,44 @@ class TestMuonDeredundencyBatchedPath:
         assert ops[0].tensor is info['x_ret']
         assert ops[0].peer == 0
 
+    @pytest.mark.level0
+    @pytest.mark.platform_arm_ascend910b_training
+    @pytest.mark.env_onecard
+    @pytest.mark.parametrize("with_compact_meta", [True, False])
+    def test_scatter_replica_local_domain_sends_each_rank_its_block(self, with_compact_meta):
+        """
+        Feature: allgather_deredundency P2P scatter on a replica-local (compacted) domain.
+        Description: dp_shard=4 x tp=2 with a TP-replicated weight (e.g. linear_qkv under
+            sequence parallel). ``_get_replica_local_layout_info`` compacts rank 0's
+            domain to (0, 2, 4, 6) while the layout still spans ranks 0..7. With and
+            without the compacted mesh/tensor_map metadata, the owner must send every
+            destination the row block ``distribute_tensor`` gives it; slicing the full
+            layout and pairing it positionally with the compacted list sent ranks 2/4/6
+            someone else's rows and never delivered d2/d3.
+        Expectation: rank ``2 * k`` receives row block ``k`` of the NS output.
+        """
+        from hyper_parallel.core.dtensor.layout import Layout  # pylint: disable=import-outside-toplevel
+        # Rows sharded over dp, replicated over tp.
+        layout = Layout((4, 2), ("dp", "tp"), init_backend=False)("dp", "None")
+        rank_list, mesh_shape, tensor_map = muon_mod._get_replica_local_layout_info(  # pylint: disable=protected-access
+            0, layout.rank_list, layout.mesh_shape, layout.tensor_map)
+        assert tuple(rank_list) == (0, 2, 4, 6)
+
+        full_np = np.arange(8 * 3, dtype=np.float32).reshape(8, 3)
+        info = {'rank_list_tuple': rank_list, 'assigned_rank': 0, 'layout': layout}
+        if with_compact_meta:
+            info.update({'mesh_shape_tuple': mesh_shape, 'tensor_map_list': tensor_map})
+        ok, ops = muon_mod._build_local_shard_scatter_ops(  # pylint: disable=protected-access
+            info, x_ret_full=Tensor(full_np, mstype.float32), rank_id=0)
+
+        assert ok
+        blocks = full_np.reshape(4, 2, 3)
+        assert np.array_equal(info['x_ret'].asnumpy(), blocks[0])
+        sent = {op.peer: op.tensor.asnumpy() for op in ops}
+        assert sorted(sent) == [2, 4, 6]
+        for block_id, dst_rank in enumerate((2, 4, 6), start=1):
+            assert np.array_equal(sent[dst_rank], blocks[block_id]), dst_rank
+
     @staticmethod
     def _run(momentum=0.95, seed_momentum=False):
         """One deredundency optimiser step; returns net, opt, grads, m0, groups."""

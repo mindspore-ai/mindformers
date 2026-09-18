@@ -14,11 +14,13 @@
 # ============================================================================
 """Utils for DeepSeek3 multi-cards training tests."""
 
+import fcntl
 import os
 import random
 import re
 import shutil
 import subprocess
+from contextlib import contextmanager
 
 import numpy as np
 import yaml
@@ -79,18 +81,49 @@ def set_random_seed(seed=SEED):
     ms.set_seed(seed)
 
 
+@contextmanager
+def _shared_artifact_lock(path):
+    """Serialize creation of an artifact shared by case files that run concurrently.
+
+    The four-card case files in this directory (``test_four_cards`` and
+    ``test_recompute_exclude``) are scheduled in parallel and share one dataset and
+    one checkpoint. Without this lock both can find the artifact missing and build it
+    at the same time, and MindRecord fails the loser with "mindrecord files already
+    exist", taking down every case in that file.
+    """
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path + ".lock", "w", encoding="utf-8") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def _dataset_ready(dataset_file):
+    """Whether both MindRecord files of a generated dataset are in place."""
+    return os.path.exists(dataset_file) and os.path.exists(dataset_file + ".db")
+
+
 def generate_dataset(dataset_path):
     """Generate the fixed MindRecord dataset used by DeepSeek3 precision tests."""
     dataset_file = os.path.join(dataset_path, "dataset.mindrecord")
-    if os.path.exists(dataset_file) and os.path.exists(dataset_file + ".db"):
+    if _dataset_ready(dataset_file):
         return
-    generate_mindrecord_file(
-        seq_length=4096,
-        batch_size=2,
-        train_steps=1000,
-        dataset_path=dataset_file,
-        data_schema=DATA_SCHEMA,
-    )
+    with _shared_artifact_lock(dataset_file):
+        if _dataset_ready(dataset_file):
+            return
+        # A previous run aborted mid-write: MindRecord refuses to write over it.
+        for leftover in (dataset_file, dataset_file + ".db"):
+            if os.path.exists(leftover):
+                os.remove(leftover)
+        generate_mindrecord_file(
+            seq_length=4096,
+            batch_size=2,
+            train_steps=1000,
+            dataset_path=dataset_file,
+            data_schema=DATA_SCHEMA,
+        )
 
 
 def build_case_config(base_config, local_config_path, checkpoint_path, dataset_path, updates):
@@ -185,6 +218,14 @@ def save_model_checkpoints(config, save_path):
     patch_pynative_modules()
     if os.path.isdir(save_path):
         return
+    with _shared_artifact_lock(str(save_path)):
+        if os.path.isdir(save_path):
+            return
+        _save_model_checkpoints(config, save_path)
+
+
+def _save_model_checkpoints(config, save_path):
+    """Build the model on the meta device and write the shared initial checkpoint."""
     print(f"Save checkpoint to {save_path}")
 
     config = TrainConfig.load_from_yaml(config)
