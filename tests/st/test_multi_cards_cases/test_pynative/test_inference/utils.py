@@ -19,6 +19,7 @@ import os
 import random
 import shutil
 import subprocess
+import tempfile
 
 import yaml
 
@@ -71,6 +72,31 @@ PROMPTS = [
 ]
 
 
+def _read_json_or_none(path):
+    """Parsed contents of ``path``, or None when it is missing or not readable yet.
+
+    Case files that share this checkpoint directory run concurrently, so a reader
+    can arrive while a writer has the file truncated.
+    """
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as fp:
+            return json.load(fp)
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def _write_json_atomic(path, payload):
+    """Write JSON via a temp file + rename, so readers never see a partial file."""
+    directory = os.path.dirname(path) or "."
+    with tempfile.NamedTemporaryFile("w", dir=directory, delete=False,
+                                     encoding="utf-8") as fp:
+        json.dump(payload, fp)
+        temp_path = fp.name
+    os.replace(temp_path, path)
+
+
 def build_wordlevel_tokenizer(vocab_dir):
     """Write a deterministic WordLevel tokenizer.json into the checkpoint dir.
 
@@ -86,16 +112,11 @@ def build_wordlevel_tokenizer(vocab_dir):
         "eos_token": "<unk>",
     }
     tokenizer_config_path = os.path.join(vocab_dir, "tokenizer_config.json")
-    existing_config = None
-    if os.path.exists(tokenizer_config_path):
-        with open(tokenizer_config_path, "r") as fp:
-            existing_config = json.load(fp)
-    if existing_config != tokenizer_config:
-        with open(tokenizer_config_path, "w") as fp:
-            json.dump(tokenizer_config, fp)
+    if _read_json_or_none(tokenizer_config_path) != tokenizer_config:
+        _write_json_atomic(tokenizer_config_path, tokenizer_config)
 
     tokenizer_path = os.path.join(vocab_dir, "tokenizer.json")
-    if os.path.exists(tokenizer_path):
+    if _read_json_or_none(tokenizer_path) is not None:
         return tokenizer_path
 
     words = sorted({
@@ -124,8 +145,7 @@ def build_wordlevel_tokenizer(vocab_dir):
         "decoder": None,
         "model": {"type": "WordLevel", "vocab": vocab, "unk_token": "<unk>"},
     }
-    with open(tokenizer_path, "w") as fp:
-        json.dump(tokenizer, fp)
+    _write_json_atomic(tokenizer_path, tokenizer)
     return tokenizer_path
 
 

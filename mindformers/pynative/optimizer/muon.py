@@ -748,9 +748,14 @@ def _slice_full_tensor_for_layout_rank(full_tensor, layout, rank):
     return full_tensor[slice_spec].clone()
 
 
-def _list_full_tensor_local_shards(full_tensor, layout):
-    """Return every rank's local shard in DTensor layout rank order."""
-    rank_list = tuple(int(rank) for rank in layout.rank_list)
+def _list_full_tensor_local_shards(full_tensor, layout, rank_list=None):
+    """Return each rank's local shard, in ``rank_list`` order (default: the full layout).
+
+    Slices are selected by global rank, so ``rank_list`` may be a replica-local
+    subset of ``layout.rank_list`` (see :func:`_get_replica_local_layout_info`).
+    """
+    if rank_list is None:
+        rank_list = tuple(int(rank) for rank in layout.rank_list)
     return [
         _slice_full_tensor_for_layout_rank(full_tensor, layout, rank)
         for rank in rank_list
@@ -994,7 +999,7 @@ def _build_local_shard_scatter_ops(info, x_ret_full, rank_id):
             shards = _list_full_tensor_local_shards_cached(
                 x_ret_full, rank_list, info['mesh_shape_tuple'], info['tensor_map_list'])
         else:
-            shards = _list_full_tensor_local_shards(x_ret_full, info['layout'])
+            shards = _list_full_tensor_local_shards(x_ret_full, info['layout'], rank_list)
         p2p_tensors = []
         local_output = None
         for dst_rank, shard in zip(rank_list, shards):
