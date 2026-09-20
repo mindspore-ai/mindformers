@@ -1209,7 +1209,8 @@ class Trainer:
             )
         else:
             load_checkpoint(
-                checkpoint=get_checkpoint_path(checkpoint_dir),
+                # Forward-only run: the optimizer side of the checkpoint is never read.
+                checkpoint=get_checkpoint_path(checkpoint_dir, require_optimizer=False),
                 network=model,
                 balanced_load=checkpoint_config.load_balanced,
                 reshard_worker_num=checkpoint_config.reshard_worker_num,
@@ -1247,9 +1248,13 @@ class Trainer:
 
         self._prepare_adapter_load(checkpoint_path, models)
 
-        checkpoint_path = get_checkpoint_path(checkpoint_path)
-        logger.info(f"Loading checkpoint from: {checkpoint_path}")
         checkpoint = self.config.checkpoint
+        # With `no_load_optim=True` only the model weights are read back, so the optimizer
+        # files must not take part in the integrity check of the checkpoint directory.
+        checkpoint_path = get_checkpoint_path(
+            checkpoint_path, require_optimizer=not checkpoint.no_load_optim
+        )
+        logger.info(f"Loading checkpoint from: {checkpoint_path}")
 
         if is_hf_checkpoint(checkpoint_path):
             if not checkpoint.no_load_optim:
@@ -1264,8 +1269,6 @@ class Trainer:
                     reshard_worker_num=checkpoint.reshard_worker_num
                 )
         else:
-            checkpoint = self.config.checkpoint
-
             if not checkpoint.no_load_optim:
                 if optimizer is None:
                     raise ValueError("If no_load_optim is False, optimizer is required.")
