@@ -43,9 +43,20 @@ def _build_trainer(global_batch_size=8):
     return trainer
 
 
-def _mock_checkpoint_load(monkeypatch):
-    """Mock checkpoint IO while exercising the real Trainer resume logic."""
-    monkeypatch.setattr(trainer_module, "get_checkpoint_path", lambda path: path)
+def _passthrough_checkpoint_path(path, **_):
+    """Stand-in for `get_checkpoint_path`, tolerating the keyword arguments the trainer passes."""
+    return path
+
+
+def _mock_checkpoint_load(monkeypatch, get_checkpoint_path=None):
+    """Mock checkpoint IO while exercising the real Trainer resume logic.
+
+    `get_checkpoint_path` accepts the keyword arguments the trainer passes (currently
+    `require_optimizer`); pass a Mock to assert on them.
+    """
+    if get_checkpoint_path is None:
+        get_checkpoint_path = _passthrough_checkpoint_path
+    monkeypatch.setattr(trainer_module, "get_checkpoint_path", get_checkpoint_path)
     monkeypatch.setattr(trainer_module, "is_hf_checkpoint", lambda _: False)
     monkeypatch.setattr(trainer_module, "has_optimizer_ckpt", lambda _: True)
     load_checkpoint = Mock()
@@ -120,7 +131,8 @@ def test_pipeline_checkpoint_load_manages_shared_optimizer_once(monkeypatch, tmp
     )
     trainer = _build_trainer()
     trainer.config.checkpoint.no_load_optim = no_load_optim
-    load_checkpoint = _mock_checkpoint_load(monkeypatch)
+    get_checkpoint_path = Mock(side_effect=lambda path, **_: path)
+    load_checkpoint = _mock_checkpoint_load(monkeypatch, get_checkpoint_path)
     models = [object(), object()]
     optimizer = Mock()
     events = []
@@ -129,6 +141,11 @@ def test_pipeline_checkpoint_load_manages_shared_optimizer_once(monkeypatch, tmp
     optimizer.reload_main_params_from_model.side_effect = lambda: events.append("reload")
 
     trainer._load_checkpoint(str(checkpoint_path), models, optimizer)
+
+    # Weights-only resume must not make the optimizer files part of the integrity check.
+    get_checkpoint_path.assert_called_once_with(
+        str(checkpoint_path), require_optimizer=not no_load_optim
+    )
 
     expected_events = [models[0], models[1], "reload"]
     if no_load_optim:
