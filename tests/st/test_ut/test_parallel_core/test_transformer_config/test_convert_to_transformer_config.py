@@ -245,3 +245,51 @@ def test_passed_in_dtype_case():
 
     with pytest.raises(ValueError):
         convert_str_to_mstype('fp8')
+
+
+@pytest.mark.level0
+@pytest.mark.platform_x86_cpu
+@pytest.mark.env_onecard
+@pytest.mark.parametrize("hidden_act", ['swiglu', 'fusedswiglu'])
+def test_swiglu_forces_gated_linear_unit(hidden_act):
+    """
+    Feature: Test SwiGLU / gated_linear_unit consistency normalization.
+    Description: SwiGLU halves the width of linear_fc1's output, so linear_fc1 must emit
+        2 * ffn_hidden_size for linear_fc2 to receive the ffn_hidden_size features it expects.
+        Configure a SwiGLU activation together with gated_linear_unit=False.
+    Expectation: gated_linear_unit is normalized to True, so that the MLP widths line up
+        instead of failing inside the first step with a MatMul shape error.
+    """
+    config = TransformerConfig(
+        num_layers=2,
+        hidden_size=1024,
+        num_attention_heads=16,
+        ffn_hidden_size=2048,
+        hidden_act=hidden_act,
+        gated_linear_unit=False,
+        add_bias_linear=False,
+    )
+
+    assert config.gated_linear_unit is True
+
+
+@pytest.mark.level0
+@pytest.mark.platform_x86_cpu
+@pytest.mark.env_onecard
+def test_non_gated_activation_keeps_gated_linear_unit_off():
+    """
+    Feature: Test SwiGLU / gated_linear_unit consistency normalization.
+    Description: Configure a shape-preserving activation with gated_linear_unit=False.
+    Expectation: gated_linear_unit stays False; only gated activations are normalized.
+    """
+    config = TransformerConfig(
+        num_layers=2,
+        hidden_size=1024,
+        num_attention_heads=16,
+        ffn_hidden_size=2048,
+        hidden_act='silu',
+        gated_linear_unit=False,
+        add_bias_linear=False,
+    )
+
+    assert config.gated_linear_unit is False
