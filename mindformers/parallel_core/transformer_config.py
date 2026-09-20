@@ -2602,6 +2602,24 @@ class TransformerConfig:
                 )
             self.hidden_act = 'fusedswiglu'
 
+        if self.hidden_act in ('swiglu', 'fusedswiglu') and not self.gated_linear_unit:
+            # SwiGLU is intrinsically gated: it splits its input in half and returns
+            # ffn_hidden_size features. linear_fc1 must therefore emit
+            # 2 * ffn_hidden_size, which is exactly what gated_linear_unit does.
+            # With gated_linear_unit=False the MLP feeds linear_fc2, whose input
+            # width is ffn_hidden_size, only ffn_hidden_size // 2 features, and the
+            # mismatch surfaces far from its cause: a MatMul shape error raised in
+            # the first training step.
+            logger.warning(
+                "hidden_act is '%s', a gated activation, but gated_linear_unit is False. "
+                "linear_fc1 would emit ffn_hidden_size features and SwiGLU would halve them, "
+                "leaving linear_fc2 with half the features it expects. "
+                "Setting gated_linear_unit to True. Use a shape-preserving activation such as "
+                "'silu' if a non-gated MLP is really intended.",
+                self.hidden_act,
+            )
+            self.gated_linear_unit = True
+
         if self.activation_func_clamp_value is not None:
             # Clamp is only defined for SwiGLU activation (aligns Megatron
             # transformer_config.py:2199-2205). hidden_act is normalized to
