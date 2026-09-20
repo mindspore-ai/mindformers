@@ -1034,7 +1034,8 @@ class ReshardLoader:
 
         Matching rules:
             1. Priority direct match: `search_rank == storage_rank`;
-            2. Redundancy removal scenario: `search_rank` in `rank_group`.
+            2. Redundancy removal scenario: `search_rank` in `rank_group`;
+            3. Layout-less source: any storage rank holds the full tensor.
         """
         # Rule 1: Direct Match.
         if search_rank in param_storage_infos:
@@ -1045,6 +1046,13 @@ class ReshardLoader:
             rank_group = info.get("rank_group", [])
             if search_rank in rank_group:
                 return info["file_name"]
+
+        # Rule 3: A layout-less source (a plain, non-distributed tensor such as the FSDP-ignored
+        # ``tid2eid``) holds the full tensor on every owning rank. Its ReshardHandler has no rank
+        # list and always reports search_rank 0, but under pipeline parallelism the owning ranks
+        # (and so the saving rank) need not include rank 0, so any stored copy is valid.
+        if param_storage_infos and self._resolve_src_tensor(param_name).layout is None:
+            return next(iter(param_storage_infos.values()))["file_name"]
 
         # Throw an error when not found the file.
         raise ValueError(
