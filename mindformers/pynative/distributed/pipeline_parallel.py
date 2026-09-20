@@ -245,7 +245,7 @@ class StageModelBuilder:
         # the yaml sets it -- read it with a default, or every pipeline run that never mentions
         # this switch (all of them, today) dies on an ``AttributeError``.
         has_backward = has_backward and not getattr(
-            model_config, "dsa_warmup_layerwise_backward", False)
+            model_config, "dsa_indexer_layerwise_backward", False)
         
         stages = []
         model_parts = []

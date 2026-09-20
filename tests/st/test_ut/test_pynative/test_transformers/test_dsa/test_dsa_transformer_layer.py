@@ -122,7 +122,7 @@ def test_dsa_warmup_boundary_tolerates_a_layer_with_no_indexer_term():
     """A Shared layer under ``leader`` supervision contributes no Indexer loss.
 
     ``TransformerBlock`` seeds ``attention_loss`` with the Python float ``0.``, and under
-    ``dsa_index_share_loss: leader`` a Shared layer never replaces it -- it owns no indexer
+    ``dsa_indexer_share_loss: leader`` a Shared layer never replaces it -- it owns no indexer
     and publishes no term. The boundary must recognise that there is no gradient to seed
     instead of calling ``ones_like`` on a float, while the Full layer next to it still
     trains normally.
@@ -264,7 +264,7 @@ def test_flush_warmup_indexer_backward_sums_the_group_once():
 
     # A group whose every layer contributed the block's float default is the same no-op.
     # This is the per-layer-backward twin of the boundary's ``has_indexer_loss`` check: under
-    # ``dsa_index_share_loss: leader`` a Shared layer publishes no term, and a float carries
+    # ``dsa_indexer_share_loss: leader`` a Shared layer publishes no term, and a float carries
     # no graph to start a backward from.
     float_only = [0.0, 0.0]
     flush_warmup_indexer_backward(float_only)

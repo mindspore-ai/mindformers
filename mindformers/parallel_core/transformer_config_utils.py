@@ -291,11 +291,11 @@ COMMON_CONFIG_MAPPING = {
     ("index_topk", "dsa_indexer_topk"): "dsa_indexer_topk",
     "dsa_indexer_loss_coeff": "dsa_indexer_loss_coeff",
     "dsa_indexer_use_sparse_loss": "dsa_indexer_use_sparse_loss",
-    "dsa_index_topk_freq": "dsa_index_topk_freq",
-    "dsa_index_skip_topk_offset": "dsa_index_skip_topk_offset",
-    "dsa_index_share_loss": "dsa_index_share_loss",
-    "dsa_index_share_topk_offload": "dsa_index_share_topk_offload",
-    "dsa_indexer_types": "dsa_indexer_types",
+    ("index_topk_freq", "dsa_indexer_topk_freq"): "dsa_indexer_topk_freq",
+    ("index_skip_topk_offset", "dsa_indexer_skip_topk_offset"): "dsa_indexer_skip_topk_offset",
+    "dsa_indexer_share_loss": "dsa_indexer_share_loss",
+    "dsa_indexer_share_topk_offload": "dsa_indexer_share_topk_offload",
+    ("indexer_types", "dsa_indexer_types"): "dsa_indexer_types",
     "experimental_attention_variant": "experimental_attention_variant",
 
     # Flash Attention

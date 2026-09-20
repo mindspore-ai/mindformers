@@ -45,7 +45,7 @@ class _DSAWarmupLayerBoundary(_Function):
         """Return the detached trunk output and retain only lightweight metadata."""
         del layer_input
         # A layer that contributes no Indexer term leaves ``attention_loss`` at the Python
-        # ``0.`` the block passes in. That happens under ``dsa_index_share_loss: leader``,
+        # ``0.`` the block passes in. That happens under ``dsa_indexer_share_loss: leader``,
         # where a Shared layer owns no indexer and publishes no loss -- unlike ``served``,
         # where every layer in the group distils against the leader's teacher and so always
         # has a term. Record it, because a float has no gradient to seed.
@@ -107,7 +107,7 @@ class _DSAWarmupLayerMixin:
         self.layer_number = layer_number
         self.dsa_warmup = not self.config.dsa_indexer_use_sparse_loss
         self.layerwise_warmup_backward = (
-            self.dsa_warmup and getattr(self.config, "dsa_warmup_layerwise_backward", False)
+            self.dsa_warmup and getattr(self.config, "dsa_indexer_layerwise_backward", False)
         )
         # The frozen trunk is never worth replaying, so the full-layer wrapper is always
         # skipped in warm-up (!8692). Whether the *indexer* inside still gets wrapped is
@@ -133,7 +133,7 @@ class _DSAWarmupLayerMixin:
     def _finish_layer(self, output, layer_input, indexer_loss, context):
         """Install the DSA1 graph boundary without changing forward numerics.
 
-        With ``dsa_warmup_layerwise_backward`` the boundary is not needed at all: it exists to
+        With ``dsa_indexer_layerwise_backward`` the boundary is not needed at all: it exists to
         seed the indexer gradient and wake the previous layer during the step-end backward,
         and the block loop does both explicitly instead. All that remains of it is cutting the
         frozen trunk, which is what ``_DSAWarmupTrunkCut`` is for. The layer's indexer loss
@@ -168,7 +168,7 @@ class _DSAWarmupLayerMixin:
                 output = _DSAWarmupTrunkCut.apply(output.detach())
                 # Same predicate as ``_DSAWarmupLayerBoundary``: a layer that contributes no
                 # Indexer term leaves this at the Python ``0.`` the attention starts from --
-                # under ``dsa_index_share_loss: leader`` every Shared layer does, because it
+                # under ``dsa_indexer_share_loss: leader`` every Shared layer does, because it
                 # owns no indexer. A float carries no graph, so buffering it would only put a
                 # term into the group sum that ``backward`` cannot start from.
                 if isinstance(indexer_loss, Tensor):

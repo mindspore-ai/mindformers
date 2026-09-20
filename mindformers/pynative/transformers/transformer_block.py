@@ -112,6 +112,24 @@ def _get_block_submodules(
         raise Exception(f"specialize for {spec.module.__name__}.")
     raise Exception(f"specialize for {type(spec).__name__}.")
 
+
+def _describe_dsa_index_share_group(leaders, shared_layer):
+    """Name the sharing group a Shared layer belongs to and how to fix a stage split.
+
+    The group size is spelled out because ``dsa_indexer_topk_freq`` is easily read as a
+    number of groups rather than the size of one.
+    """
+    leader = max(i for i in range(shared_layer) if leaders[i])
+    end = next((i for i in range(shared_layer, len(leaders)) if leaders[i]), len(leaders))
+    pattern = "".join("F" if is_leader else "S" for is_leader in leaders)
+    return (
+        f"That group is global layers [{leader}, {end - 1}] ({end - leader} layers); layout "
+        f"{pattern} has {sum(leaders)} group(s) over {len(leaders)} layers "
+        "(`dsa_indexer_topk_freq` is the size of a group, not the number of groups). "
+        "Put a Full layer on every stage boundary or rebalance the stages."
+    )
+
+
 class CustomIndexCellList(nn.CellList):
     """
     Custom CellList that supports indexed access.
@@ -212,7 +230,7 @@ class TransformerBlock(nn.Cell):
         never reaches ``TransformerConfig.pipeline_model_parallel_size``, so the config-level
         check cannot see the stage layout at all -- this is the check that actually binds.
         """
-        if (config.dsa_index_topk_freq or 1) == 1 and not config.dsa_indexer_types:
+        if (config.dsa_indexer_topk_freq or 1) == 1 and not config.dsa_indexer_types:
             return None
         if config.experimental_attention_variant != "dsa":
             return None
@@ -223,17 +241,18 @@ class TransformerBlock(nn.Cell):
         # A group must start and end inside this stage: a Shared layer reads the leader's
         # Top-K out of a per-invocation Python object, which cannot cross a stage boundary.
         if not leaders[self.layer_start]:
+            group = _describe_dsa_index_share_group(leaders, self.layer_start)
             raise ValueError(
                 f"The DSA indexer sharing layout leaves global layer {self.layer_start} Shared, "
                 f"but it is the first layer of this pipeline stage (global layers "
                 f"[{self.layer_start}, {layer_end}]), so its group leader lives on another "
-                f"stage and is unreachable. Align the layout to the stage boundaries."
+                f"stage and is unreachable. {group}"
             )
         if layer_end + 1 < len(leaders) and not leaders[layer_end + 1]:
             raise ValueError(
                 f"The DSA indexer sharing layout leaves global layer {layer_end + 1} Shared, "
                 f"but this pipeline stage ends at layer {layer_end}, so that layer's group "
-                f"would span two stages. Align the layout to the stage boundaries."
+                f"would span two stages. {_describe_dsa_index_share_group(leaders, layer_end + 1)}"
             )
         num_groups = sum(1 for i in range(self.layer_start, layer_end + 1) if leaders[i])
         logger.info(
@@ -271,11 +290,11 @@ class TransformerBlock(nn.Cell):
         else:
             self.final_layernorm = None
 
-    def _layerwise_warmup_backward(self):
-        """Whether this block drives the DSA warm-up backward per layer."""
+    def _layerwise_backward(self):
+        """Whether this block drives the DSA backward per layer."""
         if not self.training:
             return False
-        return (self.config.dsa_warmup_layerwise_backward
+        return (self.config.dsa_indexer_layerwise_backward
                 and not self.config.dsa_indexer_use_sparse_loss)
 
     def _is_warmup_backward_boundary(self, index):
@@ -337,11 +356,11 @@ class TransformerBlock(nn.Cell):
         # DSA warm-up with per-layer backward: the trunk is frozen and each layer's indexer
         # loss is independent, so a layer can be back-propagated the moment its forward ends
         # and its activations released before the next layer runs. Peak memory then stops
-        # growing with depth. Off by default; see ``dsa_warmup_layerwise_backward``.
+        # growing with depth. Off by default; see ``dsa_indexer_layerwise_backward``.
         # Published on a thread-local rather than passed down as a call argument -- the layer
         # call marshals its keyword arguments, so the layer would append into a copy; see
         # ``_DSAWarmupLossSink``.
-        with warmup_indexer_loss_sink(self._layerwise_warmup_backward()) as warmup_sink:
+        with warmup_indexer_loss_sink(self._layerwise_backward()) as warmup_sink:
             for index in range(self.layer_start, self.layer_end + 1):
                 layer = self._get_layer(index)
                 prefix_kv = prefix_keys_values[index] if prefix_keys_values is not None else None
@@ -357,7 +376,7 @@ class TransformerBlock(nn.Cell):
                             group.evict_topk()
                         group = IndexShareGroup(
                             offload_topk=bool(
-                                getattr(self.config, "dsa_index_share_topk_offload", False)
+                                getattr(self.config, "dsa_indexer_share_topk_offload", False)
                             )
                         )
                     share_kwargs = {"index_share_group": group}
