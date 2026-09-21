@@ -29,6 +29,7 @@ from mindformers.pynative.config.config import (
     RecomputeCommConfig,
     RecomputeConfig,
     SwapConfig,
+    LoraConfig,
 )
 from mindformers.pynative.config.utils import check_type
 
@@ -339,6 +340,37 @@ class TestConfig:
         assert isinstance(config.parallelism, ParallelismConfig)
         assert config.training.steps == 1000  # Default in class definition
         assert config.parallelism.expert_parallel_use_safe_tokens is True
+
+    def test_adapter_checkpoint_config_requires_base_checkpoint(self):
+        """Adapter-only checkpoint saving must retain an explicit base checkpoint contract."""
+        with pytest.raises(ValueError, match="base_load_path is required"):
+            CheckpointConfig(save_trainable_only=True)
+
+        config = CheckpointConfig(
+            save_trainable_only=True,
+            base_load_path="/path/to/base/checkpoint",
+        )
+        assert config.save_trainable_only is True
+        assert config.base_load_path == "/path/to/base/checkpoint"
+
+    @pytest.mark.parametrize(
+        "overrides,error",
+        [
+            ({"target_modules": ""}, "non-empty regex"),
+            ({"target_modules": "["}, "Invalid lora_config.target_modules regex"),
+            ({"target_modules": ".*", "lora_rank": 0}, "lora_rank and lora_alpha must be positive"),
+            ({"target_modules": ".*", "lora_alpha": 0}, "lora_rank and lora_alpha must be positive"),
+        ],
+    )
+    def test_lora_config_validates_shared_options(self, overrides, error):
+        """The shared module selector and rank settings are validated."""
+        with pytest.raises(ValueError, match=error):
+            LoraConfig(**overrides)
+
+        config = LoraConfig(target_modules=r".*(linear|experts)$")
+        assert config.lora_rank == 8
+        assert config.lora_alpha == 16
+        assert config.exclude_layers is None
 
     def test_tensor_parallel_requires_sequence_parallel(self):
         """PyNative TP degrees greater than one require sequence parallelism."""

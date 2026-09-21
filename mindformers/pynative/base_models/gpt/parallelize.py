@@ -75,7 +75,10 @@ from mindformers.pynative.distributed.csa_context_parallel import DSv4HybridAtte
 from mindformers.pynative.distributed.activation_checkpoint import apply_ac
 from mindformers.pynative.layers.layer_norm import FusedLayerNorm, FusedRMSNorm
 from mindformers.pynative.distributed.tensor_parallel import NoParallel
-from mindformers.pynative.distributed.expert_parallel import ExpertParallel, DeredundancyExpertParallel
+from mindformers.pynative.distributed.expert_parallel import (
+    ExpertParallel,
+    DeredundancyExpertParallel,
+)
 from mindformers.pynative.distributed.ep_overlap import OverlapExpertParallel
 from mindformers.pynative.distributed.pipeline_parallel import PpLayerSetting, StageModelBuilder, _create_schedule, _infer_schedule_type
 from mindformers.pynative.pet.lora_adapter import build_lora_model
@@ -429,10 +432,12 @@ def _build_fsdp_policy(module, shard_size, param_rules=None, forced_replicate_pa
 
 
 def _build_expert_fsdp_policy(experts, shard_size):
-    """Prefer sharding grouped expert weights by expert, then by matrix row."""
+    """Prefer expert sharding and never shard a LoRA rank dimension."""
     param_rules = {}
     for param_name, param in experts.parameters_and_names():
-        if param_name not in ("weight1", "weight2"):
+        if param_name not in (
+                "weight1", "weight2", "weight1_lora_a", "weight1_lora_b",
+                "weight2_lora_a", "weight2_lora_b"):
             continue
         shape = param.local_shape if isinstance(param, DTensor) else param.shape
         if len(shape) != 3:
@@ -440,14 +445,14 @@ def _build_expert_fsdp_policy(experts, shard_size):
                 f"Grouped expert parameter {param_name} must be 3D, but got shape={shape}")
         if shape[0] % shard_size == 0:
             param_rules[param_name] = {"shard_dim": 0}
-        elif shape[1] % shard_size == 0:
-            param_rules[param_name] = {"shard_dim": 1}
         else:
-            param_rules[param_name] = {"replicate": True}
-            logger.warning(
-                "Neither shape[0]=%s nor shape[1]=%s of grouped expert parameter %s "
-                "is divisible by expert FSDP shard size %s; FSDP is disabled for this parameter.",
-                shape[0], shape[1], param_name, shard_size)
+            fallback_dim = 2 if param_name.endswith("_lora_b") else 1
+            if shape[fallback_dim] % shard_size == 0:
+                param_rules[param_name] = {"shard_dim": fallback_dim}
+            else:
+                param_rules[param_name] = {"replicate": True}
+                logger.warning("Grouped expert parameter %s cannot be safely FSDP-sharded by %s.",
+                               param_name, shard_size)
     return _build_fsdp_policy(experts, shard_size, param_rules=param_rules)
 
 
@@ -1006,10 +1011,12 @@ def _apply_layers_tp(
         if getattr(transformer_layer.mlp, "enable_expert_bias", False):
             distribute_param_plan.append([transformer_layer.mlp, "expert_bias", (Replicate(),)])
         if not enable_ep:
-            distribute_param_plan.extend([
-                [transformer_layer.mlp.experts, "weight1", (Replicate(),)],
-                [transformer_layer.mlp.experts, "weight2", (Replicate(),)],
-            ])
+            experts = transformer_layer.mlp.experts
+            for param_name in (
+                    "weight1", "weight2", "weight1_lora_a", "weight1_lora_b",
+                    "weight2_lora_a", "weight2_lora_b"):
+                if hasattr(experts, param_name):
+                    distribute_param_plan.append([experts, param_name, (Replicate(),)])
 
     # Routed and shared experts both keep the SP token shard. Shared-expert
     # parameters are replicated over TP, so its fc1/fc2 and optional gate compute

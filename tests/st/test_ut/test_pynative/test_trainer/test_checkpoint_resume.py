@@ -31,6 +31,8 @@ def _build_trainer(global_batch_size=8):
         checkpoint=SimpleNamespace(
             no_load_optim=False,
             load_balanced=False,
+            base_load_path="",
+            reshard_worker_num=1,
         )
     )
     trainer.dynamic_batch_enabled = False
@@ -156,3 +158,136 @@ def test_pipeline_checkpoint_load_manages_shared_optimizer_once(monkeypatch, tmp
             balanced_load=False,
         ),
     ]
+
+
+@pytest.mark.level0
+@pytest.mark.platform_x86_cpu
+@pytest.mark.env_onecard
+def test_adapter_resume_loads_base_before_adapter(monkeypatch, tmp_path):
+    """An adapter checkpoint restores its declared base before loading adapter tensors."""
+    checkpoint_path = tmp_path / "adapter"
+    checkpoint_path.mkdir()
+    base_path = tmp_path / "base"
+    base_path.mkdir()
+    (checkpoint_path / "common.json").write_text(
+        json.dumps({"global_step": 2, "global_batch_size": 8, "consumed_samples": 16}),
+        encoding="utf-8",
+    )
+    (checkpoint_path / "mindformers_adapter_config.json").write_text(
+        json.dumps({"base_fingerprint": "same-base"}), encoding="utf-8"
+    )
+    trainer = _build_trainer()
+    trainer.config.checkpoint.base_load_path = str(base_path)
+    events = []
+    trainer._load_base_checkpoint = Mock(side_effect=lambda path, _: events.append(("base", path)))
+    monkeypatch.setattr(trainer_module, "get_base_checkpoint_fingerprint", lambda _: "same-base")
+    load_checkpoint = _mock_checkpoint_load(monkeypatch)
+    load_checkpoint.side_effect = lambda **_: events.append(("adapter", str(checkpoint_path)))
+
+    trainer._load_checkpoint(str(checkpoint_path), object(), Mock())
+
+    assert events == [("base", str(base_path)), ("adapter", str(checkpoint_path))]
+
+
+@pytest.mark.level0
+@pytest.mark.platform_x86_cpu
+@pytest.mark.env_onecard
+def test_adapter_resume_rejects_mismatched_base(monkeypatch, tmp_path):
+    """A base fingerprint mismatch fails before either checkpoint is loaded."""
+    checkpoint_path = tmp_path / "adapter"
+    checkpoint_path.mkdir()
+    base_path = tmp_path / "base"
+    base_path.mkdir()
+    (checkpoint_path / "mindformers_adapter_config.json").write_text(
+        json.dumps({"base_fingerprint": "expected-base"}), encoding="utf-8"
+    )
+    trainer = _build_trainer()
+    trainer.config.checkpoint.base_load_path = str(base_path)
+    trainer._load_base_checkpoint = Mock()
+    load_checkpoint = _mock_checkpoint_load(monkeypatch)
+    monkeypatch.setattr(trainer_module, "get_base_checkpoint_fingerprint", lambda _: "different-base")
+
+    with pytest.raises(ValueError, match="fingerprint does not match"):
+        trainer._load_checkpoint(str(checkpoint_path), object(), Mock())
+
+    trainer._load_base_checkpoint.assert_not_called()
+    load_checkpoint.assert_not_called()
+
+
+@pytest.mark.level0
+@pytest.mark.platform_x86_cpu
+@pytest.mark.env_onecard
+def test_adapter_resume_warns_when_base_fingerprint_is_unavailable(monkeypatch, tmp_path, caplog):
+    """Adapter loading warns instead of silently skipping an unavailable fingerprint."""
+    checkpoint_path = tmp_path / "adapter"
+    checkpoint_path.mkdir()
+    base_path = tmp_path / "base"
+    base_path.mkdir()
+    (checkpoint_path / "mindformers_adapter_config.json").write_text(
+        json.dumps({"base_fingerprint": None}), encoding="utf-8"
+    )
+    trainer = _build_trainer()
+    trainer.config.checkpoint.base_load_path = str(base_path)
+    trainer._load_base_checkpoint = Mock()
+    monkeypatch.setattr(trainer_module, "get_base_checkpoint_fingerprint", lambda _: None)
+    model = object()
+
+    assert trainer._prepare_adapter_load(str(checkpoint_path), model) is True
+    assert "Cannot fully verify adapter base checkpoint fingerprint" in caplog.text
+    trainer._load_base_checkpoint.assert_called_once_with(str(base_path), model)
+
+
+@pytest.mark.level0
+@pytest.mark.platform_x86_cpu
+@pytest.mark.env_onecard
+@pytest.mark.parametrize(
+    "is_adapter,is_hf,expected_loader",
+    [
+        pytest.param(True, True, "mindformers", id="adapter"),
+        pytest.param(False, False, "mindformers", id="mindformers-full"),
+        pytest.param(False, True, "huggingface", id="huggingface-full"),
+    ],
+)
+def test_inference_checkpoint_selects_loader(
+        monkeypatch, tmp_path, is_adapter, is_hf, expected_loader):
+    """Inference uses the adapter-aware loader without duplicating checkpoint IO."""
+    checkpoint_path = tmp_path / "checkpoint"
+    checkpoint_path.mkdir()
+    trainer = _build_trainer()
+    trainer.config.checkpoint.load_path = str(checkpoint_path)
+    trainer._prepare_adapter_load = Mock(return_value=is_adapter)
+    model = object()
+
+    monkeypatch.setattr(trainer_module, "is_checkpoint_path_valid", lambda _: True)
+    is_hf_checkpoint = Mock(return_value=is_hf)
+    monkeypatch.setattr(trainer_module, "is_hf_checkpoint", is_hf_checkpoint)
+    monkeypatch.setattr(trainer_module, "get_checkpoint_path", lambda path, **_: path)
+    load_checkpoint = Mock()
+    load_hf_checkpoint = Mock()
+    monkeypatch.setattr(trainer_module, "load_checkpoint", load_checkpoint)
+    monkeypatch.setattr(trainer_module, "load_hf_checkpoint", load_hf_checkpoint)
+
+    trainer._load_inference_checkpoint(model)
+
+    trainer._prepare_adapter_load.assert_called_once_with(str(checkpoint_path), model)
+    if expected_loader == "huggingface":
+        load_hf_checkpoint.assert_called_once_with(
+            pretrained_model_dir=str(checkpoint_path),
+            network=model,
+            balanced_load=False,
+            reshard_worker_num=1,
+        )
+        load_checkpoint.assert_not_called()
+    else:
+        load_checkpoint.assert_called_once_with(
+            checkpoint=str(checkpoint_path),
+            network=model,
+            balanced_load=False,
+            reshard_worker_num=1,
+        )
+        load_hf_checkpoint.assert_not_called()
+
+    if is_adapter:
+        is_hf_checkpoint.assert_not_called()
+    else:
+        is_hf_checkpoint.assert_called_once_with(str(checkpoint_path))

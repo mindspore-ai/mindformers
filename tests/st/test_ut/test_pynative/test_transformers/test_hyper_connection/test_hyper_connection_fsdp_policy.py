@@ -158,6 +158,31 @@ def test_expert_fsdp_policy_replicates_when_no_preferred_dimension_is_divisible(
 @pytest.mark.level0
 @pytest.mark.platform_x86_cpu
 @pytest.mark.env_onecard
+def test_expert_fsdp_policy_never_shards_lora_rank_dimension():
+    """Expert LoRA fallback sharding uses matrix dimensions, never the low-rank dimension."""
+    weight1_lora_a = _FakeParam((3, 64, 5))
+    weight1_lora_b = _FakeParam((3, 5, 128))
+    weight2_lora_a = _FakeParam((3, 128, 5))
+    weight2_lora_b = _FakeParam((3, 5, 64))
+    experts = _FakeModule({
+        "weight1_lora_a": weight1_lora_a,
+        "weight1_lora_b": weight1_lora_b,
+        "weight2_lora_a": weight2_lora_a,
+        "weight2_lora_b": weight2_lora_b,
+    })
+
+    shard_plan, replicate_params = _build_expert_fsdp_policy(experts, 2)
+
+    assert shard_plan(weight1_lora_a).dim == 1
+    assert shard_plan(weight1_lora_b).dim == 2
+    assert shard_plan(weight2_lora_a).dim == 1
+    assert shard_plan(weight2_lora_b).dim == 2
+    assert replicate_params == []
+
+
+@pytest.mark.level0
+@pytest.mark.platform_x86_cpu
+@pytest.mark.env_onecard
 def test_explicit_shard_rule_falls_back_to_replicate():
     """An uneven explicit shard rule must not also return a shard placement."""
     matrix = _FakeParam((4, 7, 256))

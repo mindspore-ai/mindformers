@@ -46,7 +46,13 @@ from mindformers.pynative.config import TrainConfig
 from mindformers.pynative.trainer.dynamic_batch import build_dynamic_scheduler
 from mindformers.models import PreTrainedModel
 from mindformers.checkpoint.checkpoint import load_checkpoint, load_hf_checkpoint
-from mindformers.checkpoint.utils import is_hf_checkpoint, has_optimizer_ckpt, is_checkpoint_path_valid
+from mindformers.checkpoint.utils import (
+    get_adapter_manifest_path,
+    get_base_checkpoint_fingerprint,
+    has_optimizer_ckpt,
+    is_checkpoint_path_valid,
+    is_hf_checkpoint,
+)
 from mindformers.pynative.callback import (
     CallbackHandler,
     TrainerCallback,
@@ -329,7 +335,8 @@ class Trainer:
             if total_trainable == 0:
                 raise RuntimeError(
                     "LoRA enabled but no trainable adapters were found across any pipeline "
-                    "stage. Check lora_config.target_modules against the model's module names."
+                    "stage. Check lora_config.target_modules and exclude_layers "
+                    "against the model's module names."
                 )
             compute_parameters(self.model[0])
 
@@ -784,6 +791,9 @@ class Trainer:
             prefix=checkpoint.prefix,
             remove_redundancy=checkpoint.remove_redundancy,
             save_global_layout_cache=checkpoint.save_global_layout_cache,
+            save_trainable_only=checkpoint.save_trainable_only,
+            base_load_path=checkpoint.base_load_path,
+            lora_config=getattr(self.config, "lora_config", None),
         )
 
         return [
@@ -915,6 +925,8 @@ class Trainer:
 
         # Load checkpoint
         checkpoint_path = checkpoint_path or self.config.checkpoint.load_path
+        if not checkpoint_path and self.config.checkpoint.base_load_path:
+            self._load_base_checkpoint(self.config.checkpoint.base_load_path, self.model)
         if checkpoint_path:
             # A pipeline-parallel trainer shares one optimizer across all model
             # stages. Pass the complete stage list so _load_checkpoint can manage
@@ -1050,6 +1062,53 @@ class Trainer:
             destroy_process_group()
         return sample_results
 
+    def _load_base_checkpoint(self, base_path, models):
+        """Load a complete base model without touching the optimizer or train state."""
+        if not base_path or not os.path.exists(base_path):
+            raise ValueError(f"base_load_path does not exist: {base_path!r}")
+        stages = models if isinstance(models, (list, tuple)) else [models]
+        if is_hf_checkpoint(base_path):
+            for stage in stages:
+                load_hf_checkpoint(
+                    pretrained_model_dir=base_path,
+                    network=stage,
+                    balanced_load=self.config.checkpoint.load_balanced,
+                    reshard_worker_num=self.config.checkpoint.reshard_worker_num,
+                )
+            return
+        base_checkpoint = get_checkpoint_path(base_path)
+        for stage in stages:
+            load_checkpoint(
+                checkpoint=base_checkpoint,
+                network=stage,
+                balanced_load=self.config.checkpoint.load_balanced,
+                reshard_worker_num=self.config.checkpoint.reshard_worker_num,
+            )
+
+    def _prepare_adapter_load(self, checkpoint_path, models):
+        """Validate an adapter manifest and load its required base checkpoint."""
+        manifest_path = get_adapter_manifest_path(checkpoint_path)
+        if manifest_path is None:
+            return False
+
+        base_path = self.config.checkpoint.base_load_path
+        if not base_path:
+            raise ValueError("An adapter-only checkpoint requires checkpoint.base_load_path.")
+        with open(manifest_path, "r", encoding="utf-8") as stream:
+            manifest = json.load(stream)
+        expected_fingerprint = manifest.get("base_fingerprint")
+        actual_fingerprint = get_base_checkpoint_fingerprint(base_path)
+        if expected_fingerprint is None or actual_fingerprint is None:
+            logger.warning(
+                "Cannot fully verify adapter base checkpoint fingerprint: expected=%s, actual=%s. "
+                "Loading will continue using base_load_path='%s'.",
+                expected_fingerprint, actual_fingerprint, base_path,
+            )
+        elif expected_fingerprint != actual_fingerprint:
+            raise ValueError("base_load_path fingerprint does not match the adapter checkpoint.")
+        self._load_base_checkpoint(base_path, models)
+        return True
+
     def _validate_pp_inference(self):
         """Reject PP schedule features that assume backward.
 
@@ -1091,7 +1150,8 @@ class Trainer:
                 f"(got {checkpoint_dir!r}); a forward-only run on random "
                 f"initialization would produce garbage output."
             )
-        if is_hf_checkpoint(checkpoint_dir):
+        is_adapter = self._prepare_adapter_load(checkpoint_dir, model)
+        if not is_adapter and is_hf_checkpoint(checkpoint_dir):
             load_hf_checkpoint(
                 pretrained_model_dir=checkpoint_dir,
                 network=model,
@@ -1135,6 +1195,8 @@ class Trainer:
 
         if not is_checkpoint_path_valid(checkpoint_path):
             return
+
+        self._prepare_adapter_load(checkpoint_path, models)
 
         checkpoint_path = get_checkpoint_path(checkpoint_path)
         logger.info(f"Loading checkpoint from: {checkpoint_path}")
