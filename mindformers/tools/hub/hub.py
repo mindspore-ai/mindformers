@@ -102,7 +102,7 @@ def convert_file_size_to_int(size: Union[int, str]):
 
 
 # pylint: disable=C0103
-def get_checkpoint_shard_files(
+def get_checkpoint_shard_files(  # pylint: disable=W0613
         pretrained_model_name_or_path,
         index_filename,
         cache_dir=None,
@@ -191,7 +191,7 @@ def get_checkpoint_shard_files(
 
 
 # pylint: disable=C0103
-def cached_file(
+def cached_file(  # pylint: disable=W0613
         path_or_repo_id: Union[str, os.PathLike],
         filename: str,
         cache_dir: Optional[Union[str, os.PathLike]] = None,
@@ -420,7 +420,7 @@ def extract_commit_hash(resolved_file: Optional[str], commit_hash: Optional[str]
     return commit_hash if REGEX_COMMIT_HASH.match(commit_hash) else None
 
 
-def get_file_from_repo(
+def get_file_from_repo(  # pylint: disable=W0613
         path_or_repo: Union[str, os.PathLike],
         filename: str,
         cache_dir: Optional[Union[str, os.PathLike]] = None,
@@ -503,7 +503,7 @@ def get_file_from_repo(
     )
 
 
-def has_file(
+def has_file(  # pylint: disable=W0613
         path_or_repo: Union[str, os.PathLike],
         filename: str,
         revision: Optional[str] = None,
@@ -595,7 +595,7 @@ class PushToHubMixin:
         """
         return {f: os.path.getmtime(os.path.join(working_dir, f)) for f in os.listdir(working_dir)}
 
-    def _upload_modified_files(
+    def _upload_modified_files(  # pylint: disable=W0613
             self,
             working_dir: Union[str, os.PathLike],
             repo_id: str,
@@ -667,13 +667,9 @@ class PushToHubMixin:
             token=token,
         )
 
-        if token is not None:
-            import ctypes
-            ctypes.memset(id(token), 0, 64)
-
         return res
 
-    def push_to_hub(
+    def push_to_hub(  # pylint: disable=W0613
             self,
             repo_id: str,
             use_temp_dir: Optional[bool] = None,

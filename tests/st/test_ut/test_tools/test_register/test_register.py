@@ -13,9 +13,13 @@
 # limitations under the License.
 # ============================================================================
 """test register.py"""
-from mindformers.core.context.build_context import build_context, set_context
-from mindformers.tools.register.register import MindFormerRegister, MindFormerModuleType
+import sys
+
 import pytest
+
+from mindformers.core.context.build_context import build_context, set_context
+from mindformers.tools.hub.dynamic_module_utils import HubConstants
+from mindformers.tools.register.register import MindFormerRegister, MindFormerModuleType
 from .model_class import MyModel
 from .model_class_legacy import MyTool, MyModel as MyModelNew
 
@@ -127,3 +131,60 @@ class TestMindFormerRegister:
         Expected: is_exist returns True.
         """
         assert MindFormerRegister.is_exist(MindFormerModuleType.MODELS)
+
+    def test_auto_register_rejects_remote_reference_case(self, monkeypatch, tmp_path):
+        """
+        Test auto_register with a `repo_id--module.Class` reference.
+        Input: REGISTER_PATH set, class_reference pointing at a remote repository.
+        Output: ValueError is raised before any module is fetched or imported.
+        Expected: get_class_from_dynamic_module is never called.
+        """
+        monkeypatch.setenv("REGISTER_PATH", str(tmp_path))
+        calls = []
+        monkeypatch.setattr("mindformers.tools.register.register.get_class_from_dynamic_module",
+                            lambda *args, **kwargs: calls.append((args, kwargs)))
+        with pytest.raises(ValueError, match="REGISTER_PATH"):
+            MindFormerRegister.auto_register(class_reference="attacker/repo--evil.EvilTool",
+                                             module_type=MindFormerModuleType.TOOLS)
+        assert not calls
+
+    def test_auto_register_local_reference_case(self, monkeypatch, tmp_path):
+        """
+        Test auto_register with a local `module_file.class_name` reference.
+        Input: REGISTER_PATH holding the module file.
+        Output: The class is loaded from REGISTER_PATH and registered.
+        Expected: get_cls returns the loaded class.
+        """
+        register_path = tmp_path / "register_path"
+        register_path.mkdir()
+        (register_path / "auto_register_tool.py").write_text("class AutoRegisteredTool:\n    pass\n", encoding="utf-8")
+        monkeypatch.setenv("REGISTER_PATH", str(register_path))
+        monkeypatch.setattr(HubConstants, "OM_MODULES_CACHE", str(tmp_path / "modules_cache"))
+        monkeypatch.setattr(sys, "path", list(sys.path))
+        MindFormerRegister.auto_register(class_reference="auto_register_tool.AutoRegisteredTool",
+                                         module_type=MindFormerModuleType.TOOLS)
+        assert MindFormerRegister.get_cls(MindFormerModuleType.TOOLS, "AutoRegisteredTool").__name__ \
+            == "AutoRegisteredTool"
+
+    @pytest.mark.parametrize("class_reference, register_path, error", [
+        (["not", "a", "str"], "tmp", ValueError),
+        ("module_file.ClassName", None, EnvironmentError),
+        ("module_file.ClassName", "missing", EnvironmentError),
+    ], ids=["not_str", "register_path_unset", "register_path_missing"])
+    def test_auto_register_invalid_input_case(self, monkeypatch, tmp_path, class_reference, register_path, error):
+        """
+        Test auto_register input checks.
+        Input: a non-str class_reference, REGISTER_PATH unset, or REGISTER_PATH pointing at no directory.
+        Output: the matching explicit error, before any module is fetched or imported.
+        Expected: get_class_from_dynamic_module is never called.
+        """
+        if register_path is None:
+            monkeypatch.delenv("REGISTER_PATH", raising=False)
+        else:
+            monkeypatch.setenv("REGISTER_PATH", str(tmp_path if register_path == "tmp" else tmp_path / register_path))
+        calls = []
+        monkeypatch.setattr("mindformers.tools.register.register.get_class_from_dynamic_module",
+                            lambda *args, **kwargs: calls.append((args, kwargs)))
+        with pytest.raises(error):
+            MindFormerRegister.auto_register(class_reference=class_reference, module_type=MindFormerModuleType.TOOLS)
+        assert not calls

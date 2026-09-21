@@ -445,6 +445,10 @@ class MindFormerRegister:
             raise ValueError(f"auto_map must be the type of string, but get {type(class_reference)} ."
                              f"Please fill in the following format: module_file.function_name, such as,"
                              f"llama_model.LlamaForCausalLM")
+        if "--" in class_reference:
+            raise ValueError(f"auto_register only loads modules from REGISTER_PATH, but '{class_reference}' "
+                             f"references the remote repository '{class_reference.split('--')[0]}'. "
+                             f"Download the module into REGISTER_PATH and use the format module_file.class_name.")
         register_path = os.getenv("REGISTER_PATH", '')
         if not register_path:
             raise EnvironmentError("When configuring the 'auto_map' automatic registration function, "
@@ -453,7 +457,7 @@ class MindFormerRegister:
                                    "through the official startup script "
                                    "'run_mindformer.py --register_path=module_file_path' "
                                    "or use 'export REGISTER_PATH=module_file_path' to complete this action.")
-        if not os.path.realpath(register_path):
+        if not os.path.isdir(os.path.realpath(register_path)):
             raise EnvironmentError(f"REGISTER_PATH must be real path, but get {register_path}, "
                                    f"please specify the correct directory path.")
         register_path = os.path.realpath(os.getenv("REGISTER_PATH"))
