@@ -15,12 +15,14 @@
 """Test the save interval of CheckpointCallback."""
 # pylint: disable=protected-access
 
+import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 
 from mindformers.pynative.callback.checkpoint_callback import CheckpointCallback
+from mindformers.pynative.callback import checkpoint_callback as callback_module
 
 
 def _collect_saved_steps(tmp_path, start_step, interval, num_steps):
@@ -62,3 +64,47 @@ class TestCheckpointCallbackInterval:
         saved_steps = _collect_saved_steps(tmp_path, 300, 70, 220)
         assert saved_steps == [370, 440, 510]
         assert 350 not in saved_steps
+
+
+@pytest.mark.level0
+@pytest.mark.platform_x86_cpu
+@pytest.mark.env_onecard
+def test_trainable_only_checkpoint_selects_lora_and_writes_manifest(tmp_path, monkeypatch):
+    """Adapter saves pass a LoRA predicate and persist the base-checkpoint resume contract."""
+    base_path = tmp_path / "base"
+    base_path.mkdir()
+    save_path = tmp_path / "adapter"
+    captured = {}
+    monkeypatch.setattr(callback_module, "get_real_group_size", lambda: 1)
+    monkeypatch.setattr(callback_module, "get_real_rank", lambda: 0)
+    monkeypatch.setattr(callback_module, "get_base_checkpoint_fingerprint", lambda _: "base-sha256")
+    monkeypatch.setattr(callback_module, "save_checkpoint", lambda **kwargs: captured.update(kwargs))
+
+    callback = CheckpointCallback(
+        save_path=str(save_path),
+        save_trainable_only=True,
+        base_load_path=str(base_path),
+        lora_config={"target_modules": r".*experts$", "lora_rank": 4},
+    )
+    model = SimpleNamespace(parameters_dict=lambda: {
+        "model.experts.weight1": object(),
+        "model.experts.weight1_lora_a": object(),
+        "model.dense.lora_b": object(),
+    })
+    state = SimpleNamespace(global_step=7, consumed_samples=56)
+
+    callback._save_checkpoint(None, state, model=model)
+
+    choice_func = captured["model_choice_func"]
+    assert not choice_func("model.experts.weight1")
+    assert choice_func("model.experts.weight1_lora_a")
+    assert choice_func("model.dense.lora_b")
+    root_manifest = save_path / "mindformers_adapter_config.json"
+    iteration_manifest = save_path / "iteration_00000007" / "mindformers_adapter_config.json"
+    assert root_manifest.exists()
+    assert iteration_manifest.exists()
+    manifest = json.loads(root_manifest.read_text(encoding="utf-8"))
+    assert manifest["base_fingerprint"] == "base-sha256"
+    assert manifest["global_step"] == 7
+    assert manifest["consumed_samples"] == 56
+    assert manifest["lora_config"]["lora_rank"] == 4

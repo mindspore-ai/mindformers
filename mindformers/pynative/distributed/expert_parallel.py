@@ -623,7 +623,11 @@ class ExpertParallel(ParallelStyle):
         # shard on the expert dimension
         return {
             "weight1": (Shard(0),),
-            "weight2": (Shard(0),)
+            "weight2": (Shard(0),),
+            "weight1_lora_a": (Shard(0),),
+            "weight1_lora_b": (Shard(0),),
+            "weight2_lora_a": (Shard(0),),
+            "weight2_lora_b": (Shard(0),),
         }
 
     def _unsort_for_combine(self, routed_output, resort_ctx, hidden_size):
@@ -724,10 +728,15 @@ class ExpertParallel(ParallelStyle):
         # group with the same ranks under a different name on the first forward.
         self.ep_group = device_mesh.get_group()
 
+        parameter_names = {name for name, _ in module.parameters_and_names()}
+        parameter_shard_plan = {
+            name: placement for name, placement in self._get_parameter_shard_plan().items()
+            if name in parameter_names
+        }
         module = distribute_module(
             module,
             device_mesh,
-            parameter_shard_plan=self._get_parameter_shard_plan(),
+            parameter_shard_plan=parameter_shard_plan,
             input_fn=self._token_dispatch,
             output_fn=self._token_combine,
         )

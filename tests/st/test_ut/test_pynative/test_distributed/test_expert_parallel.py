@@ -27,6 +27,7 @@ from mindformers.pynative.distributed.ep_overlap import OverlapExpertParallel
 from mindformers.pynative.distributed.expert_parallel import ExpertParallel
 from mindformers.parallel_core.transformer_config import TransformerConfig
 from mindformers.pynative.layers.linear import Linear
+from mindformers.pynative.pet.moe_lora_layer import GroupedMLPWithLoRA
 from mindformers.pynative.transformers.mlp import MLP, MLPSubmodules
 from mindformers.pynative.transformers.moe.experts import GroupedMLP
 
@@ -386,3 +387,29 @@ class TestExpertParallel:
         assert set(plan.keys()) == {"weight1", "weight2"}
         assert plan["weight1"][0] == Shard(0)
         assert plan["weight2"][0] == Shard(0)
+
+    @pytest.mark.level1
+    @pytest.mark.platform_x86_cpu
+    @pytest.mark.env_onecard
+    def test_moe_lora_parameter_sharding_plan(self, monkeypatch):
+        """EP shards every routed-expert adapter parameter on the expert dimension."""
+        captured = {}
+
+        def _fake_shard_module(module, device_mesh, parameter_shard_plan):
+            _ = device_mesh
+            captured["sharding_plan"] = parameter_shard_plan
+            return module
+
+        monkeypatch.setattr(utils, "shard_module", _fake_shard_module)
+        with ms.DeviceCtx("meta"):
+            module = GroupedMLPWithLoRA(self.config, lora_rank=4, lora_alpha=8)
+
+        self.expert_parallel._apply(module, self.device_mesh)
+        plan = captured["sharding_plan"].plan
+
+        expected = {
+            "weight1", "weight2", "weight1_lora_a", "weight1_lora_b",
+            "weight2_lora_a", "weight2_lora_b",
+        }
+        assert set(plan) == expected
+        assert all(placements[0] == Shard(0) for placements in plan.values())

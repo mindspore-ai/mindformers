@@ -15,6 +15,7 @@
 """Config module for Pynative Trainer."""
 
 import dataclasses
+import re
 from dataclasses import dataclass, field, fields, is_dataclass
 from typing import (
     Any,
@@ -293,6 +294,12 @@ class CheckpointConfig(BaseConfig):
     load_path: str = ""
     """Directory to load checkpoints from"""
 
+    save_trainable_only: bool = False
+    """Save only LoRA/trainable model parameters when enabled."""
+
+    base_load_path: str = ""
+    """Immutable full base checkpoint used before loading an adapter checkpoint."""
+
     load_balanced: bool = False
     """Enable balanced loading across ranks/devices"""
 
@@ -307,6 +314,13 @@ class CheckpointConfig(BaseConfig):
 
     reshard_worker_num: int = 1
     """Number of worker threads used for checkpoint resharding"""
+
+    def __post_init__(self):
+        """Validate adapter-checkpoint options without changing full-checkpoint defaults."""
+        if self.save_trainable_only and not str(self.base_load_path).strip():
+            raise ValueError(
+                "checkpoint.base_load_path is required when save_trainable_only is True."
+            )
 
 
 @dataclass
@@ -920,14 +934,14 @@ class SwapConfig(BaseConfig):
 @dataclass
 class LoraConfig(BaseConfig):
     """
-    Configuration for LoRA (Low-Rank Adaptation) fine-tuning of Linear layers.
+    Configuration for LoRA fine-tuning of dense Linear layers and routed GroupedMLP experts.
     """
 
     target_modules: str = ""
-    """Regex matched against module dotted paths to select Linear layers to adapt (required)."""
+    """Required regex selecting dense Linear layers and routed GroupedMLP expert modules."""
 
     exclude_layers: Optional[str] = None
-    """Optional regex; matching modules are excluded even if ``target_modules`` matches."""
+    """Optional regex; matching modules are excluded. Defaults to None."""
 
     lora_rank: int = 8
     """Rank ``r`` of the low-rank adapter."""
@@ -946,6 +960,19 @@ class LoraConfig(BaseConfig):
     identity start (Delta W = 0 at step 0); trains normally once a checkpoint is loaded.
     Only set > 0 when training an un-checkpointed model (zero base weight), where a zero
     Linear output would otherwise get a zero gradient through the SwiGLU/ReLU gate."""
+
+    def __post_init__(self):
+        """Validate LoRA targets."""
+        if not isinstance(self.target_modules, str) or not self.target_modules.strip():
+            raise ValueError("lora_config.target_modules must be a non-empty regex.")
+        if self.lora_rank <= 0 or self.lora_alpha <= 0:
+            raise ValueError("lora_config.lora_rank and lora_alpha must be positive.")
+        if not 0.0 <= self.lora_dropout < 1.0:
+            raise ValueError("lora_config.lora_dropout must be in [0, 1).")
+        try:
+            re.compile(self.target_modules)
+        except re.error as exc:
+            raise ValueError(f"Invalid lora_config.target_modules regex: {exc}") from exc
 
 
 @dataclass

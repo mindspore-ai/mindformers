@@ -50,6 +50,8 @@ from mindspore.common.parameter import Parameter
 from mindformers.pynative.layers.linear import Linear
 from mindformers.pynative.layers.dropout import Dropout
 from mindformers.pynative.layers.identity_op import IdentityOp
+from mindformers.pynative.dtensor_compat import to_local
+from mindformers.pynative.pet.utils import init_lora_parameters
 
 
 class LinearWithLoRA(Linear):
@@ -98,12 +100,17 @@ class LinearWithLoRA(Linear):
         x = self.lora_dropout(input_)
         x = self.cast(x, self.compute_dtype)
 
-        lora_a = self.cast(self.lora_a, self.compute_dtype)
-        lora_b = self.cast(self.lora_b, self.compute_dtype)
-        # (..., in) @ (in, r) -> (..., r) -> (..., out). Under tensor parallelism with a row-wise
-        # base, ``tmp`` is a Partial DTensor (the first matmul contracts over the TP-sharded
-        # in-dim); hyper_parallel (>= PR #867) propagates that Partial status through the second
-        # matmul so the adapter gradient stays correct — no manual reduction needed here.
+        # Local TP executes the module with ordinary local tensors.  Match
+        # ``Linear.construct`` and materialise adapter shards before the cast:
+        # casting a DTensor first returns a plain tensor in hyper-parallel and
+        # makes its matmul dispatcher incorrectly try ``Tensor.to_local()``.
+        lora_a = to_local(self.lora_a)
+        lora_b = to_local(self.lora_b)
+        lora_a = self.cast(lora_a, self.compute_dtype)
+        lora_b = self.cast(lora_b, self.compute_dtype)
+        # (..., in) @ (in, r) -> (..., r) -> (..., out).  The parameter
+        # layouts mirror the base role: row-wise shards lora_a on its input
+        # dim, while column-wise shards lora_b on its output dim.
         tmp = self.matmul(x, self.transpose(lora_a, 1, 0))
         lora_out = self.matmul(tmp, self.transpose(lora_b, 1, 0))
         lora_out = self.cast(lora_out * self.scaling, ori_dtype)
@@ -111,7 +118,7 @@ class LinearWithLoRA(Linear):
         return self.cast(base_output, ori_dtype) + lora_out
 
     def reset_parameter(self) -> None:
-        """Initialise adapter only (base weight is loaded from the pretrained ckpt).
+        """Reset base and adapter parameters during delayed initialization.
 
         Standard LoRA init: ``lora_a`` ~ N(0, lora_a_std^2) random and ``lora_b`` = 0 (the
         default ``lora_b_std`` = 0.0), so ``Delta W = 0`` at step 0 — an exact identity start.
@@ -119,11 +126,9 @@ class LinearWithLoRA(Linear):
         un-checkpointed caveat. Uses in-place fills, matching the delayed-init idiom invoked by
         ``init_states`` after ``to_empty()``.
         """
-        self.lora_a.normal_(mean=0.0, std=self.lora_a_std)
-        if self.lora_b_std > 0.0:
-            self.lora_b.normal_(mean=0.0, std=self.lora_b_std)
-        else:
-            self.lora_b.zero_()
+        super().reset_parameter()
+        init_lora_parameters(
+            (self.lora_a,), (self.lora_b,), self.lora_a_std, self.lora_b_std)
 
     @classmethod
     def from_base(cls,

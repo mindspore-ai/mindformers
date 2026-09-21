@@ -52,8 +52,9 @@ from mindformers.checkpoint.utils import (
     get_metadata_filename,
     verify_ckpt_valid,
     FileType,
-    get_core_network
+    get_core_network,
 )
+from mindformers.pynative.pet.utils import is_lora_param_name
 from mindformers.checkpoint.fully_parallel import (
     BalancedSaveStrategy,
     build_balanced_shard_plan,
@@ -274,7 +275,7 @@ def save_checkpoint(iteration: int, network: Union[Cell, List[Cell]], optimizer:
                     keep_max_num: int = 5, user_prefix: str = None, save_checkpoint_path: str = None,
                     sharded_tensor_metas: Dict = None, remove_redundancy: bool = False,
                     current_ckpt_step_list: List[str] = None, balanced_plan_cache: Dict = None,
-                    global_model_keys=None):
+                    global_model_keys=None, model_choice_func: Optional[Callable] = None):
     """
     Saves the current state of the training process,
         including the model, optimizer, and learning rate scheduler, to a checkpoint file.
@@ -309,6 +310,8 @@ def save_checkpoint(iteration: int, network: Union[Cell, List[Cell]], optimizer:
             and cached once by the caller via `gather_param_names_on_rank0` before saving.
             In Graph mode (or single-rank jobs) it is derived locally and this argument is
             ignored.
+        model_choice_func: Optional predicate for selecting model parameters to save. When
+            omitted, every model parameter is saved.
     """
     logger.info('...... Start to save checkpoint ......')
     start_save_ckpt_time = time()
@@ -320,6 +323,9 @@ def save_checkpoint(iteration: int, network: Union[Cell, List[Cell]], optimizer:
 
     if current_ckpt_step_list is None:
         current_ckpt_step_list = []
+
+    save_selected_model_params = model_choice_func is not None
+    model_choice_func = model_choice_func or (lambda _: True)
 
     # Get the root path of all checkpoints to save.
     if save_checkpoint_path:
@@ -451,8 +457,10 @@ def save_checkpoint(iteration: int, network: Union[Cell, List[Cell]], optimizer:
         return None
 
     logger.info("....... Start saving model weight .......")
+    model_filter_func = lambda x: x in model_keys and model_choice_func(x)
     model_save_plan = save_network(network, FileType.MODEL, model_sharded_tensor_metas,
-                                   filter_func=lambda x: x in model_keys)
+                                   filter_func=model_filter_func,
+                                   choice_func=model_choice_func)
 
     if optimizer is not None:
         logger.info("....... Start saving optimizer weight .......")
@@ -472,6 +480,20 @@ def save_checkpoint(iteration: int, network: Union[Cell, List[Cell]], optimizer:
     # Save 'metadata.json'. Written by rank 0 only, but all ranks must call these functions:
     # `save_metadata_json` contains a world barrier in multi-rank jobs.
     logger.info("....... Start saving metadata.json .......")
+    metadata_model_keys = ({name for name in global_model_keys if model_choice_func(name)}
+                           if global_model_keys is not None else None)
+    metadata_metas = sharded_tensor_metas
+    if (sharded_tensor_metas is not None and global_model_keys is not None
+            and save_selected_model_params):
+        # Keep saved model tensors and all optimizer tensors. Frozen model tensors
+        # are intentionally absent from adapter-only metadata.
+        metadata_metas = {
+            rank_id: {
+                name: meta for name, meta in metas.items()
+                if name in metadata_model_keys or name not in global_model_keys
+            }
+            for rank_id, metas in sharded_tensor_metas.items()
+        }
     if remove_redundancy:
         # Balanced saving: rank 0 writes one combined 'metadata.json' covering the model
         # and optimizer shards, reusing the cached global ShardedTensor metadata and the
@@ -480,11 +502,11 @@ def save_checkpoint(iteration: int, network: Union[Cell, List[Cell]], optimizer:
         if optimizer is not None:
             balanced_plans.append((optim_save_plan, FileType.OPTIMIZER))
         save_balanced_metadata(
-            checkpoints_root_path, iteration, user_prefix, balanced_plans, sharded_tensor_metas
+            checkpoints_root_path, iteration, user_prefix, balanced_plans, metadata_metas
         )
     else:
         metadata_file_path = get_metadata_filename(checkpoints_root_path, iteration)
-        save_metadata_json(sharded_tensor_metas, global_model_keys, user_prefix, metadata_file_path)
+        save_metadata_json(metadata_metas, metadata_model_keys, user_prefix, metadata_file_path)
 
     # Save tracker file in sync save process.
     if not use_async_save:
@@ -843,6 +865,24 @@ def load_parameters(
 
     network_param_names, _, state_dict, state_dict_opt = \
         split_state_dict(network, state_dict, optimizer, state_dict_opt)
+
+    # A base checkpoint predates LoRA injection and therefore deliberately has
+    # no adapter entries.  Retain the freshly initialized adapters instead of
+    # passing them as missing keys to MindSpore, whose generic warning suggests
+    # an accidental incompatible checkpoint.  Adapter-only checkpoints do
+    # contain LoRA entries, so this branch cannot mask a missing adapter shard.
+    missing_lora = [
+        name for name in network_param_names if name not in state_dict
+        and is_lora_param_name(name)
+    ]
+    contains_lora = any(is_lora_param_name(name) for name in state_dict)
+    if missing_lora and not contains_lora:
+        current_params = network.parameters_dict()
+        state_dict.update({name: current_params[name] for name in missing_lora})
+        logger.info(
+            "Base checkpoint contains no LoRA tensors; retaining %d freshly initialized adapters.",
+            len(missing_lora),
+        )
 
     # Load parameters into network
     logger.debug(f"Network state_dict keys: {list(state_dict.keys())}")
