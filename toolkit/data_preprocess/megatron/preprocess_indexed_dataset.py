@@ -14,12 +14,13 @@ import sys
 import multiprocessing
 from contextlib import ExitStack
 import numpy as np
-# The `from nltk.tokenize.punkt import …` below also acts as the runtime
-# presence check for nltk: if nltk isn't installed, ImportError fires at
-# module import time and the script fails fast with a clear traceback.
-# We don't import the top-level `nltk` package, so pylint has nothing to
-# flag as unused.
-from nltk.tokenize.punkt import PunktLanguageVars, PunktSentenceTokenizer, PunktTokenizer
+# nltk is not a mindformers dependency and is only used for --split-sentences,
+# so a missing nltk must not stop the script from importing.
+try:
+    from nltk.tokenize.punkt import PunktLanguageVars, PunktSentenceTokenizer, PunktTokenizer
+except ImportError:
+    PunktLanguageVars = object  # base class of CustomLanguageVars below
+    PunktSentenceTokenizer = PunktTokenizer = None
 
 from mindformers.dataset.blended_datasets.indexed_dataset import IndexedDatasetBuilder
 from mindformers.models import build_tokenizer

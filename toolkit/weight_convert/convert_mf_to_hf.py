@@ -56,6 +56,7 @@ from mindformers.checkpoint.converter.convert_op import (
 from mindformers.checkpoint.converter.template import WeightTemplate
 from mindformers.checkpoint.safetensors_utils import read_safetensors_header
 from mindformers.checkpoint.utils import get_sharded_tensor_shard_id
+from mindformers.tools.check_rules import check_yaml_depth_before_loading
 
 ms.set_device(device_target='CPU')
 cpu_cast = Cast().set_device('CPU')
@@ -378,6 +379,8 @@ def convert_weights(template, mf_weights, policy, stats, config, verify_whole=Fa
 def parse_yaml_config(yaml_path):
     """Parse MindFormers YAML config and extract model configuration."""
     with open(yaml_path, 'r', encoding='utf-8') as f:
+        check_yaml_depth_before_loading(f)
+        f.seek(0)
         config = yaml.safe_load(f)
 
     model_config = config.get('model') or {}
