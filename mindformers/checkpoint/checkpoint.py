@@ -554,8 +554,10 @@ def load_checkpoint(
     # Validate mandatory network parameter
     check_the_param_for_load_ckpt(checkpoint, network)
 
-    # Determine checkpoint directory path
-    checkpoint_dir = get_checkpoint_path(checkpoint)
+    # Determine checkpoint directory path. Without an optimizer nothing here reads the
+    # optimizer files, so they must not be required to exist (callers drop the optimizer
+    # for weights-only loading, e.g. `no_load_optim=True`).
+    checkpoint_dir = get_checkpoint_path(checkpoint, require_optimizer=optimizer is not None)
 
     logger.info("..........Start Load Checkpoint..........")
     start_load_time = time()
@@ -871,7 +873,7 @@ def load_parameters(
         print_not_load_info(ckpt_not_load_opt, "Optimizer weights")
 
 
-def get_checkpoint_path(checkpoint: str) -> str:
+def get_checkpoint_path(checkpoint: str, require_optimizer: bool = True) -> str:
     """
     Retrieve a valid checkpoint directory.
 
@@ -880,6 +882,9 @@ def get_checkpoint_path(checkpoint: str) -> str:
 
     Args:
         checkpoint: Base directory containing training checkpoints.
+        require_optimizer: Whether the optimizer weights are needed by the caller. Pass `False`
+            for weights-only loading (`no_load_optim=True` or inference) so that the optimizer
+            Safetensors files are left out of the integrity check. Defaults to `True`.
 
     Returns:
         The path to the valid checkpoint directory.
@@ -922,7 +927,7 @@ def get_checkpoint_path(checkpoint: str) -> str:
         iteration = get_latest_iteration_from_tracker(checkpoint)
         checkpoint = get_checkpoint_iter_dir(checkpoint, iteration)
 
-    verify_ckpt_valid(checkpoint)
+    verify_ckpt_valid(checkpoint, require_optimizer=require_optimizer)
     logger.info(f"Get checkpoint: {checkpoint}")
 
     return checkpoint

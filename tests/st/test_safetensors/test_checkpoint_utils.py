@@ -28,7 +28,8 @@ from mindformers.tools.register import MindFormerConfig
 from mindformers.checkpoint.utils import compile_model, check_checkpoints_dir_max_num, get_checkpoint_iter_dir, \
     get_checkpoint_tracker_filename, get_common_filename, get_metadata_filename, \
     get_latest_iteration_from_tracker, get_checkpoint_name, get_sharded_tensor_shard_id, \
-    sharded_tensor_shard_id, _reverse_sharded_tensor_shard_id, _get_shard_size, verify_ckpt_valid, FileType
+    sharded_tensor_shard_id, _reverse_sharded_tensor_shard_id, _get_shard_size, verify_ckpt_valid, \
+    FileType, is_optimizer_ckpt_file
 from mindformers.models.modeling_utils import PreTrainedModel
 from mindformers.utils.load_checkpoint_utils import (
     CkptFormat, _get_checkpoint_mode, CheckpointFileMode, _check_checkpoint_path,
@@ -1200,6 +1201,66 @@ class TestCheckpointUtils:
             f.write("invalid json content")
         with pytest.raises(RuntimeError):
             verify_ckpt_valid(str(ckpt_dir))
+
+    @pytest.mark.level0
+    @pytest.mark.platform_x86_cpu
+    @pytest.mark.env_onecard
+    def test_verify_ckpt_valid_skips_optimizer_files(self, tmp_path):
+        """
+        Feature: verify_ckpt_valid with require_optimizer=False.
+        Description: A checkpoint whose optimizer files are missing must still validate when
+            the caller only loads the model weights (no_load_optim=True / inference), while
+            missing model files keep raising.
+        Expectation: No error with require_optimizer=False, FileNotFoundError otherwise.
+        """
+        ckpt_dir = tmp_path / "missing_opt_ckpt"
+        ckpt_dir.mkdir()
+        metadata_content = {
+            "storage_data": {
+                "param1": [{"file_name": "custom-model-0000002-0000008.safetensors"}],
+                "('global_step', (0,))": [{"file_name": "custom-opt-0000002-0000008.safetensors"}],
+            }
+        }
+        with open(ckpt_dir / "metadata.json", 'w', encoding='utf-8') as f:
+            json.dump(metadata_content, f)
+        (ckpt_dir / "custom-model-0000002-0000008.safetensors").touch()
+
+        # The optimizer file is missing: strict validation fails, weights-only validation passes.
+        with pytest.raises(FileNotFoundError):
+            verify_ckpt_valid(str(ckpt_dir))
+        assert verify_ckpt_valid(str(ckpt_dir), require_optimizer=False) is None
+
+        # A missing model file is still reported even when the optimizer is not required.
+        (ckpt_dir / "custom-model-0000002-0000008.safetensors").unlink()
+        (ckpt_dir / "custom-opt-0000002-0000008.safetensors").touch()
+        with pytest.raises(FileNotFoundError):
+            verify_ckpt_valid(str(ckpt_dir), require_optimizer=False)
+
+    @pytest.mark.level0
+    @pytest.mark.platform_x86_cpu
+    @pytest.mark.env_onecard
+    @pytest.mark.parametrize(
+        "file_name, expected",
+        [
+            ("opt-0000002-0000008.safetensors", True),
+            ("custom-opt-0000002-0000008.safetensors", True),
+            ("/a/b/custom-opt-0000002-0000008.safetensors", True),
+            ("model-0000002-0000008.safetensors", False),
+            ("custom-model-0000002-0000008.safetensors", False),
+            # A user prefix containing "-opt-" must not make a model file look like an
+            # optimizer file.
+            ("my-opt-7b-model-0000002-0000008.safetensors", False),
+            ("opt-0000002-0000008.ckpt", False),
+        ]
+    )
+    def test_is_optimizer_ckpt_file(self, file_name, expected):
+        """
+        Feature: is_optimizer_ckpt_file.
+        Description: Recognize optimizer checkpoint files by the full `get_checkpoint_name`
+            naming pattern instead of an "-opt-" substring search.
+        Expectation: Only real optimizer files are recognized.
+        """
+        assert is_optimizer_ckpt_file(file_name) is expected
 
     # Test check_checkpoints_dir_max_num function with tmp_path
     @pytest.mark.level0

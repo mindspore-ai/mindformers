@@ -34,10 +34,11 @@ from mindformers.checkpoint.checkpoint import (
     get_checkpoint_path,
     CommonInfo,
     load_hf_checkpoint,
+    save_metadata_json,
 )
 import mindformers.checkpoint.checkpoint as checkpoint_module
 from mindformers.checkpoint.converter.template import WeightTemplate
-from mindformers.checkpoint.sharded_tensor import build_sharded_tensor
+from mindformers.checkpoint.sharded_tensor import build_sharded_tensor, get_sharded_tensor_from_cell
 from mindformers.models.qwen3.configuration_qwen3 import Qwen3Config
 from mindformers.models.qwen3.utils import Qwen3PreTrainedModel
 from mindformers.parallel_core.transformer_config_utils import convert_to_transformer_config
@@ -46,6 +47,7 @@ from mindformers.checkpoint.utils import (
     get_checkpoint_name,
     get_checkpoint_tracker_filename,
     get_checkpoint_iter_dir,
+    is_optimizer_ckpt_file,
     FileType
 )
 
@@ -570,6 +572,103 @@ class TestLoadCheckpoint:
         for name, original_value in original_params.items():  # Verify parameters are loaded correctly
             loaded_value = new_network.parameters_dict()[name].data.asnumpy()
             np.testing.assert_array_equal(loaded_value, original_value, err_msg=f"Parameter {name} was not loaded.")
+
+    @pytest.mark.level0
+    @pytest.mark.platform_x86_cpu
+    @pytest.mark.env_onecard
+    @pytest.mark.parametrize("with_optimizer", [False, True])
+    def test_load_checkpoint_requires_optimizer_files_only_when_loading_optimizer(
+            self, tmp_path, simple_network, monkeypatch, with_optimizer):
+        """
+        Feature: load_checkpoint propagates the optimizer requirement to the integrity check.
+        Description: `load_checkpoint` resolves the checkpoint directory itself, which runs
+            `verify_ckpt_valid`. Without an optimizer it never reads the optimizer files, so
+            it must not require them to exist; with an optimizer it must.
+        Expectation: `verify_ckpt_valid` receives `require_optimizer=False` for a weights-only
+            load and `require_optimizer=True` when an optimizer is passed.
+        """
+        iteration = 300
+        save_checkpoint(
+            iteration=iteration,
+            network=simple_network,
+            optimizer=nn.Adam(simple_network.trainable_params(), learning_rate=0.001),
+            common_info=CommonInfo(epoch_num=1, global_step=iteration),
+            save_checkpoint_path=tmp_path
+        )
+
+        seen = []
+        real_verify = checkpoint_module.verify_ckpt_valid
+        monkeypatch.setattr(
+            checkpoint_module, "verify_ckpt_valid",
+            lambda checkpoint_dir, require_optimizer=True: (
+                seen.append(require_optimizer), real_verify(checkpoint_dir, require_optimizer)
+            )[1]
+        )
+
+        new_network = SimpleNet()
+        if with_optimizer:
+            new_optimizer = nn.Adam(new_network.trainable_params(), learning_rate=0.001)
+            load_checkpoint(tmp_path, new_network, optimizer=new_optimizer)
+        else:
+            load_checkpoint(tmp_path, new_network)
+
+        assert seen == [with_optimizer]
+
+    @pytest.mark.level0
+    @pytest.mark.platform_x86_cpu
+    @pytest.mark.env_onecard
+    def test_load_checkpoint_end_to_end_with_missing_optimizer_file(
+            self, tmp_path, simple_network, optimizer):
+        """
+        Feature: End-to-end weights-only load from a checkpoint whose optimizer side is incomplete.
+        Description: Build an iteration directory where the model file is present, 'metadata.json'
+            references an optimizer file, and that optimizer file is missing from disk — the shape
+            of a checkpoint whose optimizer save did not complete. Loading weights only
+            (`optimizer=None`, i.e. `no_load_optim=True`) must go through the whole
+            `load_checkpoint` path without raising.
+        Expectation: The network parameters are restored and no FileNotFoundError is raised.
+        """
+        iteration = 400
+        save_checkpoint(
+            iteration=iteration,
+            network=simple_network,
+            optimizer=optimizer,
+            common_info=CommonInfo(epoch_num=1, global_step=iteration),
+            save_checkpoint_path=tmp_path
+        )
+        original_params = {name: param.data.asnumpy().copy()
+                           for name, param in simple_network.parameters_dict().items()}
+
+        # Single-rank saving skips 'metadata.json'; write the one a multi-rank save would
+        # produce so the optimizer files are actually referenced by the metadata.
+        metadata_path = os.path.join(get_checkpoint_iter_dir(str(tmp_path), iteration), "metadata.json")
+        save_metadata_json(
+            {0: get_sharded_tensor_from_cell(simple_network, optimizer)},
+            set(simple_network.parameters_dict().keys()),
+            None,
+            metadata_path
+        )
+
+        with open(metadata_path, encoding="utf-8") as f:
+            metadata = json.load(f)
+        referenced_opt = sorted({
+            info["file_name"]
+            for infos in metadata["storage_data"].values()
+            for info in infos
+            if is_optimizer_ckpt_file(info["file_name"])
+        })
+        assert referenced_opt, "'metadata.json' should reference the optimizer files"
+
+        # Drop an optimizer file while leaving its metadata entry in place.
+        os.remove(os.path.join(os.path.dirname(metadata_path), referenced_opt[0]))
+
+        new_network = SimpleNet()
+        load_checkpoint(tmp_path, new_network)
+
+        for name, original_value in original_params.items():
+            loaded_value = new_network.parameters_dict()[name].data.asnumpy()
+            np.testing.assert_array_equal(loaded_value, original_value,
+                                          err_msg=f"Parameter {name} was not loaded.")
 
 
 class TestLoadParameters:

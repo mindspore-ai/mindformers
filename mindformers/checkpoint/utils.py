@@ -346,7 +346,28 @@ def _get_shard_size(local_shape, dtype):
     return element_count * type_size
 
 
-def verify_ckpt_valid(checkpoint_dir: str) -> Optional[str]:
+def is_optimizer_ckpt_file(file_name: str) -> bool:
+    """
+    Check whether a Safetensors file name belongs to the optimizer side of a checkpoint.
+
+    Optimizer files follow the naming pattern ``{prefix}-opt-{idx}-{total}.safetensors`` or
+    ``opt-{idx}-{total}.safetensors`` (no user prefix), see `get_checkpoint_name`. The whole
+    name is matched against that pattern rather than searching for an ``-opt-`` substring, so
+    that a model file whose user prefix happens to contain it (for instance
+    ``my-opt-7b-model-0000002-0000008.safetensors``) is not mistaken for an optimizer file.
+
+    Args:
+        file_name: The file name (or path) of a checkpoint Safetensors file.
+
+    Returns:
+        bool: `True` if the file holds optimizer parameters.
+    """
+    base_name = os.path.basename(file_name)
+    pattern = rf"(?:.+-)?{FileType.OPTIMIZER.value}-\d+-\d+\.safetensors"
+    return re.fullmatch(pattern, base_name) is not None
+
+
+def verify_ckpt_valid(checkpoint_dir: str, require_optimizer: bool = True) -> Optional[str]:
     """
     Validates the integrity of a checkpoint directory by checking metadata and Safetensors file existence.
 
@@ -356,6 +377,10 @@ def verify_ckpt_valid(checkpoint_dir: str) -> Optional[str]:
 
     Args:
         checkpoint_dir: Path to the checkpoint directory to validate.
+        require_optimizer: Whether the optimizer weights are needed by the caller. When `False`
+            (weights-only loading, e.g. `no_load_optim=True` or inference), the optimizer
+            Safetensors files referenced in the metadata are not checked, so an incomplete or
+            absent optimizer side does not block a load that never reads it. Defaults to `True`.
 
     Returns:
         Optional[str]: `None` if validation passes.
@@ -399,6 +424,10 @@ def verify_ckpt_valid(checkpoint_dir: str) -> Optional[str]:
         for storage_dict in storage_info_list:
             # Get full path to the referenced Safetensors file
             file_name = storage_dict["file_name"]
+            # Weights-only loading never reads the optimizer files, so their absence must not
+            # block the load.
+            if not require_optimizer and is_optimizer_ckpt_file(file_name):
+                continue
             file_path = os.path.join(checkpoint_dir, file_name)
 
             # Verify the file exists
