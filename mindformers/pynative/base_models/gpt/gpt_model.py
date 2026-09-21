@@ -24,6 +24,8 @@ __all__ = ['GPTModel']
 
 from typing import Literal, Optional, Union
 
+import numpy as np
+
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.dtensor.placement_types import Replicate
 
@@ -346,7 +348,15 @@ class GPTModel(nn.Cell):
                 "Set apply_rope_fusion=False or use a flattened TND input."
             )
         if actual_seq_len is not None:
-            actual_seq_len = self.reshape(actual_seq_len, (-1,))
+            # ``actual_seq_len`` arrives as host data (see the trainer's
+            # ``_keep_actual_seq_len_on_host``): flatten it in numpy and build the
+            # Tensor here, once. A device reshape would return an unfilled buffer
+            # under MS_SIMULATION_LEVEL, where no kernel is launched, and the
+            # all-zero cu_seqlens would be rejected by FlashAttentionScore.
+            if isinstance(actual_seq_len, np.ndarray):
+                actual_seq_len = Tensor(actual_seq_len.reshape(-1))
+            else:
+                actual_seq_len = self.reshape(actual_seq_len, (-1,))
 
         # Mindspore support TND layout by using actual_seq_len,
         # which indicates the partial seq_lens of eod sequences for compression mask.

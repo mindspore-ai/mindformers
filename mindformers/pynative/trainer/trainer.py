@@ -118,6 +118,25 @@ def _cast_grad_to_fp32(grad):
     return grad
 
 
+def _keep_actual_seq_len_on_host(batch: Dict[str, Any]) -> Dict[str, Any]:
+    """Carry the TND ``actual_seq_len`` column as host data.
+
+    ``actual_seq_len`` is metadata, not activation data: FlashAttention reads its
+    values on the host to build the TND cu_seqlens. Every device op it passes
+    through on the way to the kernel (the micro-batch ``concat``/``strided_slice``
+    and the model-entry ``reshape``) produces a buffer that is never filled under
+    ``MS_SIMULATION_LEVEL`` -- dryrun launches no kernels -- so the cu_seqlens
+    reaching FlashAttentionScore are all-zero and it raises "must be increasing
+    array and the last number is equal to T". Keeping the column on the host lets
+    those steps run in numpy and the value survive; the Tensor is built once, at
+    the model boundary.
+    """
+    value = batch.get("actual_seq_len")
+    if value is not None and hasattr(value, "asnumpy"):
+        batch["actual_seq_len"] = value.asnumpy()
+    return batch
+
+
 class Trainer:
     """
     Trainer for training models in MindFormers.
@@ -1351,7 +1370,9 @@ class Trainer:
         if data is not None and not isinstance(data, dict):
             if isinstance(data, (tuple, list)):
                 data = {"input_ids": data[0]} if len(data) > 0 else {}
-        return data if data is not None else {}
+        if data is None:
+            return {}
+        return _keep_actual_seq_len_on_host(data)
 
     def _get_batch_distributed(self, dataset_iter):
         """Fetch next batch in distributed dataset mode (simplified)."""
