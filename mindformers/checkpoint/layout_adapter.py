@@ -439,6 +439,12 @@ class LayoutAdapter:
                                 and values are processed parameter objects (DTensor converted to Parameter)
         """
         if not LayoutAdapter.is_pynative_mode():
+            # `save_checkpoint` takes a Cell or a list of Parameters, not a list of Cells. A single
+            # Cell is passed through as is, so MindSpore's own Graph-mode save handling applies.
+            if isinstance(network, (list, tuple)):
+                if len(network) == 1:
+                    return network[0]
+                return [param for net in network for param in net.get_parameters()]
             return network
         if DTensor is None:
             raise ImportError("DTensor is required for PyNative mode. Please install it.")
