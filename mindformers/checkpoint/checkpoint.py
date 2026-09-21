@@ -67,7 +67,8 @@ from mindformers.checkpoint.metadata import (
 )
 from mindformers.checkpoint.sharded_tensor import (
     get_sharded_tensor_from_cell,
-    get_cur_sharded_tensor
+    get_cur_sharded_tensor,
+    complete_optimizer_sharded_tensor
 )
 from mindformers.checkpoint.broadcast import single_parameter_broadcast
 
@@ -427,7 +428,8 @@ def save_checkpoint(iteration: int, network: Union[Cell, List[Cell]], optimizer:
     def save_network(net, file_type, side_sharded_tensor_metas, filter_func, choice_func=None):
         """Save one side (model or optimizer) of the checkpoint.
 
-        Returns the BalancedShardPlan when saving with redundancy removal, otherwise None.
+        Returns `(BalancedShardPlan, written_params)` when saving with redundancy removal,
+        otherwise `(None, None)`.
         """
         if remove_redundancy:
             balanced_save_strategy = BalancedSaveStrategy(
@@ -454,21 +456,21 @@ def save_checkpoint(iteration: int, network: Union[Cell, List[Cell]], optimizer:
         )
         logger.info(f"{file_type.value} checkpoint successfully saved at '{save_name}.safetensors'. "
                     f"Save time: {time() - start_save_network_time:.4f} seconds.")
-        return None
+        return None, None
 
     logger.info("....... Start saving model weight .......")
     model_filter_func = lambda x: x in model_keys and model_choice_func(x)
-    model_save_plan = save_network(network, FileType.MODEL, model_sharded_tensor_metas,
-                                   filter_func=model_filter_func,
-                                   choice_func=model_choice_func)
+    model_save_plan, model_written = save_network(network, FileType.MODEL, model_sharded_tensor_metas,
+                                                  filter_func=model_filter_func,
+                                                  choice_func=model_choice_func)
 
     if optimizer is not None:
         logger.info("....... Start saving optimizer weight .......")
-        optim_save_plan = save_network(optimizer, FileType.OPTIMIZER, optimizer_sharded_tensor_metas,
-                                       filter_func=lambda x: x not in model_keys,
-                                       choice_func=lambda x: x not in list(model_keys))
+        optim_save_plan, optim_written = save_network(optimizer, FileType.OPTIMIZER, optimizer_sharded_tensor_metas,
+                                                      filter_func=lambda x: x not in model_keys,
+                                                      choice_func=lambda x: x not in model_keys)
     else:
-        optim_save_plan = None
+        optim_save_plan, optim_written = None, None
         logger.warning("Optimizer weight will not be save!")
 
     # Save 'common.json' (rank 0 only).
@@ -498,9 +500,9 @@ def save_checkpoint(iteration: int, network: Union[Cell, List[Cell]], optimizer:
         # Balanced saving: rank 0 writes one combined 'metadata.json' covering the model
         # and optimizer shards, reusing the cached global ShardedTensor metadata and the
         # full assignments of both plans (no collective communication).
-        balanced_plans = [(model_save_plan, FileType.MODEL)]
+        balanced_plans = [(model_save_plan, FileType.MODEL, model_written)]
         if optimizer is not None:
-            balanced_plans.append((optim_save_plan, FileType.OPTIMIZER))
+            balanced_plans.append((optim_save_plan, FileType.OPTIMIZER, optim_written))
         save_balanced_metadata(
             checkpoints_root_path, iteration, user_prefix, balanced_plans, metadata_metas
         )
@@ -592,7 +594,7 @@ def load_checkpoint(
     def filter_func(param_name: str) -> bool:
         if optimizer:
             return "accu_grads" not in param_name
-        return param_name in list(network.parameters_dict().keys())
+        return param_name in network.parameters_dict()
 
     param_redundancy = None
     logger.info("..........Get Metadata of Network..........")
@@ -608,6 +610,15 @@ def load_checkpoint(
             for key, value in dst_sharded_tensor_metas_opt.items():
                 if key not in dst_sharded_tensor_metas:
                     dst_sharded_tensor_metas[key] = value
+        if optimizer and not LayoutAdapter.is_pynative_mode() and get_real_group_size() > 1:
+            # Graph mode only: the strategy metadata does not report every optimizer state (Muon's
+            # `muon_m.*` is absent on stages holding no MTP layer), and a state that is not asked
+            # for is never read back: resume then silently continues from a zeroed momentum.
+            # PyNative already takes every optimizer state from the optimizer itself (above).
+            # The balanced-load branch above takes no optimizer state at all and is left as is.
+            dst_sharded_tensor_metas = complete_optimizer_sharded_tensor(
+                dst_sharded_tensor_metas, optimizer, filter_func
+            )
 
     # Load using ReshardLoader
     # Self-trained weights do not require a template;
@@ -697,7 +708,7 @@ def load_hf_checkpoint(
 
     # 2. Get target metadata
     def filter_func(param_name: str) -> bool:
-        return param_name in list(network.parameters_dict().keys())
+        return param_name in network.parameters_dict()
 
     param_redundancy = None
     logger.info("..........Get Metadata of Network..........")
