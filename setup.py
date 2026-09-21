@@ -21,6 +21,7 @@ import os
 import shutil
 import stat
 import platform
+import subprocess
 from importlib import import_module
 from setuptools import setup, find_packages
 from setuptools.command.egg_info import egg_info
@@ -84,12 +85,33 @@ def update_permissions(path):
             os.chmod(file_fullpath, stat.S_IREAD | stat.S_IWRITE)
 
 
+def _git_output(*args):
+    """
+    Run git with an argument list, without a shell.
+
+    Returns:
+        bytes, the command's stdout, or None if git is not installed or the command fails.
+    """
+    git = shutil.which('git')
+    if git is None:
+        return None
+    try:
+        return subprocess.run([git, *args], stdout=subprocess.PIPE, check=True).stdout
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
+
 def write_commit_id():
-    ret_code = os.system("git rev-parse --abbrev-ref HEAD > ./mindformers/.commit_id "
-                         "&& git log --abbrev-commit -1 >> ./mindformers/.commit_id")
-    if ret_code != 0:
+    """Record the source branch and the last commit in mindformers/.commit_id."""
+    branch = _git_output('rev-parse', '--abbrev-ref', 'HEAD')
+    last_commit = _git_output('log', '--abbrev-commit', '-1') if branch is not None else None
+    if last_commit is None:
         sys.stdout.write("Warning: Can not get commit id information. Please make sure git is available.")
-        os.system("echo 'git is not available while building.' > ./mindformers/.commit_id")
+        commit_info = b'git is not available while building.\n'
+    else:
+        commit_info = branch + last_commit
+    with open(os.path.join('mindformers', '.commit_id'), 'wb') as f:
+        f.write(commit_info)
 
 
 class EggInfo(egg_info):

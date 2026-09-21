@@ -125,7 +125,7 @@ class IndexShareGroup:
     def topk_indices(self):
         """Return the group leader's Top-K, paging it back from host memory if evicted."""
         if self._topk_device is None and self._topk_host is not None:
-            self._topk_device = self._topk_host.move_to("Ascend")
+            self._topk_device = self._topk_host.to("Ascend")
         return self._topk_device
 
     @topk_indices.setter
@@ -142,7 +142,7 @@ class IndexShareGroup:
         """
         if not self._offload_topk or self._topk_device is None:
             return
-        self._topk_host = self._topk_device.move_to("CPU")
+        self._topk_host = self._topk_device.to("CPU")
         self._topk_device = None
 
 

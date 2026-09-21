@@ -35,6 +35,7 @@ from mindformers.pynative.transformers.experimental_attention_variant.dsa import
 )
 from mindformers.pynative.transformers.experimental_attention_variant.dsa_attention import (
     DSASelfAttention,
+    IndexShareGroup,
 )
 from mindformers.pynative.transformers.experimental_attention_variant.deepseek_v4_hybrid_attention import (
     DSv4HybridSelfAttention,
@@ -383,3 +384,49 @@ def test_unfused_indexer_loss_masks_invalid_prefix_without_nan():
 
     assert loss.shape == ()
     assert np.isfinite(loss.asnumpy()).all()
+
+
+class _DeviceTaggedTopK:
+    """Top-K stand-in exposing only ``to(device)``; the deprecated ``move_to`` is absent on purpose."""
+
+    def __init__(self, device, moves):
+        self.device = device
+        self._moves = moves
+
+    def to(self, device):
+        """Record the move and return a copy tagged with the target device."""
+        self._moves.append(device)
+        return _DeviceTaggedTopK(device, self._moves)
+
+
+@pytest.mark.level0
+@pytest.mark.platform_x86_cpu
+def test_index_share_group_offloads_topk_through_tensor_to():
+    """Evicting the shared Top-K and paging it back both go through ``Tensor.to``."""
+    moves = []
+    group = IndexShareGroup(offload_topk=True)
+    group.topk_indices = _DeviceTaggedTopK("Ascend", moves)
+
+    group.evict_topk()
+    assert moves == ["CPU"]
+
+    paged_back = group.topk_indices
+    assert paged_back.device == "Ascend"
+    assert moves == ["CPU", "Ascend"]
+    # Resident again: a second read must not trigger another H2D copy.
+    assert group.topk_indices is paged_back
+    assert moves == ["CPU", "Ascend"]
+
+
+@pytest.mark.level0
+@pytest.mark.platform_x86_cpu
+def test_index_share_group_keeps_topk_resident_without_offload():
+    """With offload off, evicting is a no-op and the Top-K never leaves the device."""
+    moves = []
+    group = IndexShareGroup(offload_topk=False)
+    topk = _DeviceTaggedTopK("Ascend", moves)
+    group.topk_indices = topk
+
+    group.evict_topk()
+    assert group.topk_indices is topk
+    assert not moves
