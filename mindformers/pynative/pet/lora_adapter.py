@@ -12,25 +12,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""LoRA injection and freezing for PyNative mode (first version: FSDP only).
+"""LoRA injection and freezing for PyNative mode.
 
 ``build_lora_model`` walks the (meta-device) base model and replaces every
-:class:`mindformers.pynative.layers.linear.Linear` whose dotted path matches
-``target_modules`` with a :class:`LinearWithLoRA`, reusing the original weight.
-MoE routed-expert grouped GEMM is not a ``Linear`` and is therefore skipped.
+:class:`mindformers.pynative.layers.linear.Linear` and routed-expert ``GroupedMLP``
+whose dotted path matches ``target_modules`` with the appropriate LoRA layer,
+reusing the original base parameters. ``exclude_layers`` excludes either kind.
 
 ``freeze_base_params`` sets ``requires_grad=False`` on everything except the
-``lora_a``/``lora_b`` adapters. The first version calls it *after* parallelism +
+``lora_a``/``lora_b`` adapters. The trainer calls it *after* parallelism +
 ``init_states`` so that frozen base weights are still materialised as DTensors
 (the ``distribute_module`` skip of ``requires_grad is False`` params is avoided).
 """
-__all__ = ["build_lora_model", "freeze_base_params"]
+__all__ = ["build_lora_model", "freeze_base_params", "is_lora_param_name"]
 
 import re
 
 from mindformers.tools.logger import logger
 from mindformers.pynative.layers.linear import Linear
 from mindformers.pynative.pet.lora_layer import LinearWithLoRA
+from mindformers.pynative.pet.moe_lora_layer import GroupedMLPWithLoRA
+from mindformers.pynative.pet.utils import is_lora_param_name
+from mindformers.pynative.transformers.moe.experts import GroupedMLP
 
 
 def _cfg_get(cfg, key, default):
@@ -43,6 +46,7 @@ def _cfg_get(cfg, key, default):
 
 
 def _resolve_lora_kwargs(cfg) -> dict:
+    """Resolve common LoRA layer arguments from the supplied configuration."""
     return {
         "lora_rank": int(_cfg_get(cfg, "lora_rank", 8)),
         "lora_alpha": int(_cfg_get(cfg, "lora_alpha", 16)),
@@ -52,18 +56,22 @@ def _resolve_lora_kwargs(cfg) -> dict:
     }
 
 
-def _replace_linears(parent, prefix, target, exclude, lora_kwargs, replaced):
-    """Recursively replace matching ``Linear`` children with ``LinearWithLoRA``."""
+def _replace_modules(parent, path_prefix, target, exclude,
+                     lora_kwargs, replaced):
+    """Recursively inject Linear and routed-expert adapters idempotently."""
     # pylint: disable=W0212
     for name, cell in list(parent._cells.items()):
         if cell is None:
             continue
-        full = f"{prefix}.{name}" if prefix else name
+        full = f"{path_prefix}.{name}" if path_prefix else name
         if exclude is not None and exclude.search(full):
             continue
-        if (isinstance(cell, Linear)
-                and not isinstance(cell, LinearWithLoRA)
-                and target.search(full)):
+        is_target = target.search(full)
+        if isinstance(cell, (LinearWithLoRA, GroupedMLPWithLoRA)):
+            if is_target:
+                replaced.append(full)
+            continue
+        if isinstance(cell, Linear) and is_target:
             new_cell = LinearWithLoRA.from_base(cell, **lora_kwargs)
             # Replace via _cells (not setattr) so Cell.__setattr__ does NOT re-derive param
             # names: the reused base weight/bias keep their original framework names, which
@@ -71,12 +79,20 @@ def _replace_linears(parent, prefix, target, exclude, lora_kwargs, replaced):
             # no "model." prefix). Name the new adapters off that same prefix for consistency.
             parent._cells[name] = new_cell   # pylint: disable=protected-access
             base_name = getattr(cell.weight, "name", None)
-            prefix = base_name[:-len(".weight")] if (base_name and base_name.endswith(".weight")) else full
-            new_cell.lora_a.name = prefix + ".lora_a"
-            new_cell.lora_b.name = prefix + ".lora_b"
+            param_prefix = base_name[:-len(".weight")] if (base_name and base_name.endswith(".weight")) else full
+            new_cell.lora_a.name = param_prefix + ".lora_a"
+            new_cell.lora_b.name = param_prefix + ".lora_b"
+            replaced.append(full)
+        elif isinstance(cell, GroupedMLP) and is_target:
+            new_cell = GroupedMLPWithLoRA.from_base(cell, **lora_kwargs)
+            parent._cells[name] = new_cell
+            for weight_name in ("weight1", "weight2"):
+                base_name = getattr(getattr(cell, weight_name), "name", None) or f"{full}.{weight_name}"
+                getattr(new_cell, f"{weight_name}_lora_a").name = base_name + "_lora_a"
+                getattr(new_cell, f"{weight_name}_lora_b").name = base_name + "_lora_b"
             replaced.append(full)
         else:
-            _replace_linears(cell, full, target, exclude, lora_kwargs, replaced)
+            _replace_modules(cell, full, target, exclude, lora_kwargs, replaced)
 
 
 def _stash_lora_config(model, config):
@@ -97,10 +113,10 @@ def build_lora_model(model, config, strict=True):
 
     Args:
         model: The base model (built on meta device).
-        config: LoRA config object exposing ``target_modules`` (regex, required),
-            ``exclude_layers`` (regex, optional), ``lora_rank``, ``lora_alpha``,
-            ``lora_dropout``, ``lora_a_std``.
-        strict: If True (default), raise when no ``Linear`` matches ``target_modules``.
+        config: LoRA config exposing ``target_modules`` for Linear layers and routed
+            GroupedMLP experts, plus rank, alpha, dropout and initialization settings.
+            ``exclude_layers`` excludes either kind.
+        strict: If True (default), raise when no supported module matches either target.
             Pipeline parallelism re-injects per stage and passes ``strict=False`` because
             a stage may legitimately hold no targetable layer (e.g. an embedding-only
             stage); the "no adapters anywhere" check is then done across all stages.
@@ -108,11 +124,8 @@ def build_lora_model(model, config, strict=True):
     Returns:
         The same ``model`` instance, mutated in place.
     """
-    target_pattern = _cfg_get(config, "target_modules", None)
-    if not target_pattern:
-        raise ValueError("lora_config.target_modules is required to enable LoRA.")
+    target = re.compile(_cfg_get(config, "target_modules", None))
     exclude_pattern = _cfg_get(config, "exclude_layers", None)
-    target = re.compile(target_pattern)
     exclude = re.compile(exclude_pattern) if exclude_pattern else None
     lora_kwargs = _resolve_lora_kwargs(config)
 
@@ -120,31 +133,22 @@ def build_lora_model(model, config, strict=True):
     _stash_lora_config(model, config)
 
     replaced = []
-    _replace_linears(model, "", target, exclude, lora_kwargs, replaced)
+    _replace_modules(model, "", target, exclude, lora_kwargs, replaced)
 
     if not replaced:
         if not strict:
-            logger.info("LoRA: no target Linear in this stage/submodel (skipped).")
+            logger.info("LoRA: no target Linear or GroupedMLP in this stage/submodel (skipped).")
             return model
         raise ValueError(
-            f"LoRA target_modules='{target_pattern}' matched no Linear layers. "
-            "Check the regex against the model's module names."
+            f"LoRA target_modules '{target.pattern}' matched no supported Linear or GroupedMLP layers."
         )
-    logger.info(
-        "LoRA injected into %d Linear layers (rank=%d, alpha=%d, dropout=%.3g). "
-        "Example targets: %s",
-        len(replaced), lora_kwargs["lora_rank"], lora_kwargs["lora_alpha"],
-        lora_kwargs["lora_dropout"], replaced[:4],
-    )
+    logger.info("LoRA injected into %d Linear/GroupedMLP modules. Example targets: %s",
+                len(replaced), replaced[:4])
     # NOTE: freezing is deferred to AFTER parallelism + init_states (see Trainer). During
     # distribute_module, params must be trainable so they all materialise as DTensors;
     # freezing here would leave frozen non-LoRA params (norms/biases, NoParallel base
     # weights) as plain Tensors and break TP layout inference.
     return model
-
-
-def _is_lora_param_name(name: str) -> bool:
-    return name.endswith(".lora_a") or name.endswith(".lora_b") or name in ("lora_a", "lora_b")
 
 
 def freeze_base_params(model):
@@ -155,7 +159,7 @@ def freeze_base_params(model):
     """
     trainable = frozen = 0
     for param in model.get_parameters():
-        if _is_lora_param_name(param.name):
+        if is_lora_param_name(param.name):
             param.requires_grad = True
             trainable += 1
         else:

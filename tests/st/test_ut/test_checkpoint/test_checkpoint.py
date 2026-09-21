@@ -43,6 +43,8 @@ from mindformers.models.qwen3.configuration_qwen3 import Qwen3Config
 from mindformers.models.qwen3.utils import Qwen3PreTrainedModel
 from mindformers.parallel_core.transformer_config_utils import convert_to_transformer_config
 from mindformers.checkpoint.utils import (
+    get_adapter_manifest_path,
+    get_base_checkpoint_fingerprint,
     get_common_filename,
     get_checkpoint_name,
     get_checkpoint_tracker_filename,
@@ -755,6 +757,52 @@ class TestGetCheckpointPath:
         Expectation: Should return empty string.
         """
         assert get_checkpoint_path("") == ""
+
+    @pytest.mark.level0
+    @pytest.mark.platform_x86_cpu
+    @pytest.mark.env_onecard
+    @pytest.mark.parametrize("at_root", [True, False])
+    def test_get_adapter_manifest_path(self, tmp_path, at_root):
+        """The adapter manifest is found at the root or latest iteration."""
+        manifest_name = "mindformers_adapter_config.json"
+        if at_root:
+            manifest_path = tmp_path / manifest_name
+        else:
+            iteration = 7
+            iteration_dir = tmp_path / f"iteration_{iteration:08d}"
+            iteration_dir.mkdir()
+            (tmp_path / "latest_checkpointed_iteration.txt").write_text(
+                str(iteration), encoding="utf-8")
+            manifest_path = iteration_dir / manifest_name
+        manifest_path.write_text("{}", encoding="utf-8")
+
+        assert get_adapter_manifest_path(str(tmp_path)) == str(manifest_path)
+
+    @pytest.mark.level0
+    @pytest.mark.platform_x86_cpu
+    @pytest.mark.env_onecard
+    def test_base_fingerprint_tracks_safetensors_stats(self, tmp_path):
+        """Safetensors size and mtime changes alter the base fingerprint."""
+        weight_path = tmp_path / "model-00001-of-00001.safetensors"
+        weight_path.write_bytes(b"weights")
+        first = get_base_checkpoint_fingerprint(str(tmp_path))
+
+        weight_path.write_bytes(b"updated-weights")
+        second = get_base_checkpoint_fingerprint(str(tmp_path))
+
+        assert first is not None
+        assert second is not None
+        assert first != second
+
+    @pytest.mark.level0
+    @pytest.mark.platform_x86_cpu
+    @pytest.mark.env_onecard
+    @pytest.mark.parametrize("metadata_name", ["metadata.json", "common.json"])
+    def test_base_fingerprint_supports_mindspore_metadata(self, tmp_path, metadata_name):
+        """MindSpore metadata files provide a base fingerprint without HF files."""
+        (tmp_path / metadata_name).write_text('{"step": 1}', encoding="utf-8")
+
+        assert get_base_checkpoint_fingerprint(str(tmp_path)) is not None
 
     @pytest.mark.level0
     @pytest.mark.platform_x86_cpu

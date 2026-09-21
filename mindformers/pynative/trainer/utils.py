@@ -361,15 +361,17 @@ def _build_model(config, parallelism_config=None, dataset_config=None):
 
 def _build_lora_model(model, config):
     """
-    Inject LoRA adapters into the base model in place (PyNative, FSDP-only first version).
+    Inject PyNative LoRA adapters into the base model in place.
 
-    Replaces target ``Linear`` layers with ``LinearWithLoRA`` and reuses the original
-    weights. Base-parameter freezing is performed separately by the trainer, after
-    parallelism + ``init_states`` (see ``freeze_base_params``).
+    ``target_modules`` selects dense ``Linear`` layers and routed ``GroupedMLP``
+    experts while reusing original base weights.
+    Base-parameter freezing is performed separately by the trainer, after
+    parallelism + ``init_states``.
 
     Args:
         model: Base model instance (built on meta device).
-        config: LoRA configuration (``target_modules`` regex required).
+        config: LoRA configuration with a ``target_modules`` regex and an optional
+            ``exclude_layers`` regex.
 
     Returns:
         The same model instance, mutated in place.
