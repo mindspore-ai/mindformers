@@ -25,6 +25,8 @@ _INDEX_HEADER = b"MMIDIDX\x00\x00"
 class DType(Enum):
     """The NumPy data type Enum for writing/reading the IndexedDataset indices"""
 
+    # Member names mirror the numpy dtype names and are looked up by name (DType[dtype.__name__]).
+    # pylint: disable=invalid-name
     uint8 = 1
     int8 = 2
     int16 = 3
@@ -33,6 +35,7 @@ class DType(Enum):
     float64 = 6
     float32 = 7
     uint16 = 8
+    # pylint: enable=invalid-name
 
     @classmethod
     def code_from_dtype(cls, value: Type[numpy.number]) -> int:
@@ -73,10 +76,9 @@ class DType(Enum):
         """
         if isinstance(key, int):
             return DType.dtype_from_code(key)().itemsize
-        elif numpy.number in key.__mro__:
+        if numpy.number in key.__mro__:
             return key().itemsize
-        else:
-            raise ValueError
+        raise ValueError
 
     @staticmethod
     def optimal_dtype(cardinality: Optional[int]) -> Type[numpy.number]:
@@ -90,11 +92,10 @@ class DType(Enum):
         """
         if cardinality is not None and cardinality < 65500:
             return numpy.uint16
-        else:
-            return numpy.int32
+        return numpy.int32
 
 
-class _IndexWriter(object):
+class _IndexWriter:
     """Object class to write the index (.idx) file
 
     Args:
@@ -205,7 +206,7 @@ class _IndexWriter(object):
         return list_ptr
 
 
-class _IndexReader(object):
+class _IndexReader:
     """Object class to read the index (.idx) file
 
     Args:
@@ -220,10 +221,12 @@ class _IndexReader(object):
 
         with open(idx_path, "rb") as stream:
             header = stream.read(9)
-            assert header == _INDEX_HEADER, f"bad header, cannot read: {idx_path}"
+            if header != _INDEX_HEADER:
+                raise ValueError(f"bad header, cannot read: {idx_path}")
 
             version = struct.unpack("<Q", stream.read(8))[0]
-            assert version == 1, f"bad version, cannot read: {idx_path}"
+            if version != 1:
+                raise ValueError(f"bad version, cannot read: {idx_path}")
 
             code = struct.unpack("<B", stream.read(1))[0]
             self.dtype = DType.dtype_from_code(code)
@@ -237,7 +240,7 @@ class _IndexReader(object):
         self.bin_buffer_mmap = numpy.memmap(idx_path, mode="r", order="C")
         self.bin_buffer = memoryview(self.bin_buffer_mmap)
 
-        logger.info(f"\tExtract the sequence lengths")
+        logger.info("\tExtract the sequence lengths")
         t_beg = time.time()
         self.sequence_lengths = numpy.frombuffer(
             self.bin_buffer, dtype=numpy.int32, count=self.sequence_count, offset=offset
@@ -245,7 +248,7 @@ class _IndexReader(object):
         t_end = time.time()
         logger.debug(f"\t> time elapsed: {t_end - t_beg:4f} seconds")
 
-        logger.info(f"\tExtract the sequence pointers")
+        logger.info("\tExtract the sequence pointers")
         t_beg = time.time()
         self.sequence_pointers = numpy.frombuffer(
             self.bin_buffer,
@@ -256,7 +259,7 @@ class _IndexReader(object):
         t_end = time.time()
         logger.debug(f"\t> time elapsed: {t_end - t_beg:4f} seconds")
 
-        logger.info(f"\tExtract the document indices")
+        logger.info("\tExtract the document indices")
         t_beg = time.time()
         self.document_indices = numpy.frombuffer(
             self.bin_buffer,
@@ -269,7 +272,7 @@ class _IndexReader(object):
 
         self.sequence_modes = None
         if multimodal:
-            logger.info(f"\tExtract the sequence modes")
+            logger.info("\tExtract the sequence modes")
             t_beg = time.time()
             self.sequence_modes = numpy.frombuffer(
                 self.bin_buffer,
@@ -283,9 +286,13 @@ class _IndexReader(object):
             t_end = time.time()
             logger.debug(f"\t> time elapsed: {t_end - t_beg:4f} seconds")
 
-        assert self.sequence_lengths.shape[0] == len(self)
-        assert self.sequence_lengths.shape[0] == self.sequence_count
-        assert self.sequence_lengths.shape[0] == self.document_indices[-1]
+        num_sequences = self.sequence_lengths.shape[0]
+        if not num_sequences == len(self) == self.sequence_count == self.document_indices[-1]:
+            raise ValueError(
+                f"Inconsistent index {idx_path}: {num_sequences} sequence lengths, "
+                f"{self.sequence_count} sequences in the header, "
+                f"last document index {self.document_indices[-1]}"
+            )
 
         logger.info(f"> total number of sequences: {len(self)}")
         logger.info(f"> total number of documents: {self.document_indices.shape[0] - 1}")
@@ -336,9 +343,9 @@ class _BinReader(ABC):
             offset (int): Start reading from this offset (in bytes).
 
         Returns:
-            numpy.ndarray: An array with `count` items and data-type `dtype` constructed from reading bytes from the data file starting at `offset`.
+            numpy.ndarray: An array with `count` items and data-type `dtype` constructed from reading bytes from the
+                data file starting at `offset`.
         """
-        pass
 
 
 class _MMapBinReader(_BinReader):
@@ -363,7 +370,8 @@ class _MMapBinReader(_BinReader):
             offset (int): Start reading from this offset (in bytes).
 
         Returns:
-            numpy.ndarray: An array with `count` items and data-type `dtype` constructed from reading bytes from the data file starting at `offset`.
+            numpy.ndarray: An array with `count` items and data-type `dtype` constructed from reading bytes from the
+                data file starting at `offset`.
         """
         return numpy.frombuffer(
             self._bin_buffer,
@@ -400,7 +408,8 @@ class _FileBinReader(_BinReader):
             offset (int): Start reading from this offset (in bytes).
 
         Returns:
-            numpy.ndarray: An array with `count` items and data-type `dtype` constructed from reading bytes from the data file starting at `offset`.
+            numpy.ndarray: An array with `count` items and data-type `dtype` constructed from reading bytes from the
+                data file starting at `offset`.
         """
         sequence = numpy.empty(count, dtype=dtype)
         with open(self._bin_path, mode='rb', buffering=0) as bin_buffer_file:
@@ -456,9 +465,10 @@ class IndexedDataset():
         """
         idx_path = get_idx_path(path_prefix)
         bin_path = get_bin_path(path_prefix)
-        assert os.path.exists(idx_path) and os.path.exists(
-            bin_path
-        ), f"One or both of the .idx and .bin files cannot be found at the path prefix {path_prefix}"
+        if not (os.path.exists(idx_path) and os.path.exists(bin_path)):
+            raise FileNotFoundError(
+                f"One or both of the .idx and .bin files cannot be found at the path prefix {path_prefix}"
+            )
         self.path_prefix = path_prefix
         self.multimodal = multimodal
         self.mmap = mmap
@@ -523,8 +533,8 @@ class IndexedDataset():
                 offset=sequence_pointer,
             )
             return (sequence, sequence_mode) if sequence_mode is not None else sequence
-        elif isinstance(idx, slice):
-            start, stop, step = idx.indices(len(self))
+        if isinstance(idx, slice):
+            start, _, step = idx.indices(len(self))
             if step != 1:
                 raise ValueError("Slices into indexed_dataset must be contiguous")
             sequence_lengths = self.index.sequence_lengths[idx]
@@ -539,8 +549,7 @@ class IndexedDataset():
                 sequence_offsets[:-1],
             )
             return (sequences, sequence_modes) if sequence_modes is not None else sequences
-        else:
-            raise TypeError("Unexpected type received for idx: {}".format(type(idx)))
+        raise TypeError("Unexpected type received for idx: {}".format(type(idx)))
 
     def get(self, idx: int, offset: int = 0, length: Optional[int] = None) -> numpy.ndarray:
         """Retrieve a single item from the dataset with the option to only
@@ -631,7 +640,7 @@ class IndexedDataset():
         )
 
 
-class IndexedDatasetBuilder(object):
+class IndexedDatasetBuilder:
     """Builder class for the IndexedDataset class
 
     Args:
@@ -645,7 +654,8 @@ class IndexedDatasetBuilder(object):
     def __init__(
         self, bin_path: str, dtype: Type[numpy.number] = numpy.int32, multimodal: bool = False
     ) -> None:
-        self.data_file = open(bin_path, "wb")
+        # Kept open across add_item / add_document calls and closed in finalize().
+        self.data_file = open(bin_path, "wb")  # pylint: disable=consider-using-with
         self.dtype = dtype
         self.multimodal = multimodal
 
@@ -704,7 +714,8 @@ class IndexedDatasetBuilder(object):
         """
         # Concatenate index
         index = _IndexReader(get_idx_path(path_prefix), multimodal=self.multimodal)
-        assert index.dtype == self.dtype
+        if index.dtype != self.dtype:
+            raise TypeError(f"Cannot add {path_prefix} of dtype {index.dtype} to a dataset of dtype {self.dtype}")
 
         offset = len(self.sequence_lengths)
         self.sequence_lengths.extend(index.sequence_lengths)

@@ -1,4 +1,18 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
+# Copyright 2024 Huawei Technologies Co., Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ============================================================================
 
 import hashlib
 import json
@@ -27,7 +41,8 @@ class BlendedDataset():
 
         weights (List[Union[int, float]]): The weights that determine the dataset blend ratios
 
-        size (Optional[int]): The number of samples to draw from the blend. If None, for each dataset index idx draw exactly weights[idx] samples from datasets[idx].
+        size (Optional[int]): The number of samples to draw from the blend. If None, for each dataset index idx draw
+            exactly weights[idx] samples from datasets[idx].
 
         config (BlendedMegatronDatasetConfig): The config
 
@@ -42,18 +57,26 @@ class BlendedDataset():
         size: Optional[int],
         config: BlendedMegatronDatasetConfig,
     ) -> None:
-        assert len(datasets) == len(weights)
-        assert len(datasets) < 32767
-        assert all(map(lambda _: type(_) == type(datasets[0]), datasets))
-        assert all(map(lambda _: _.index_split == datasets[0].index_split, datasets))
-        assert all(map(lambda _: _ > 0, weights))
-        assert all(map(lambda _: type(_) == type(weights[0]), weights))
+        if len(datasets) != len(weights):
+            raise ValueError(f"datasets and weights must be equal in number, "
+                             f"but got {len(datasets)} datasets and {len(weights)} weights")
+        if len(datasets) >= 32767:
+            raise ValueError(f"A BlendedDataset supports fewer than 32767 datasets, but got {len(datasets)}")
+        if not all(map(lambda _: type(_) is type(datasets[0]), datasets)):
+            raise TypeError("All datasets of a BlendedDataset must be of the same type")
+        if not all(map(lambda _: _.index_split == datasets[0].index_split, datasets)):
+            raise ValueError("All datasets of a BlendedDataset must belong to the same split")
+        if not all(map(lambda _: _ > 0, weights)):
+            raise ValueError(f"All blend weights must be positive, but got {weights}")
+        if not all(map(lambda _: type(_) is type(weights[0]), weights)):
+            raise TypeError(f"All blend weights must be of the same type, but got {weights}")
         if size is None and isinstance(weights[0], float):
-            assert all(map(lambda _: _ == int(_), weights))
+            if not all(map(lambda _: _ == int(_), weights)):
+                raise ValueError(f"Blend weights must be whole numbers when size is None, but got {weights}")
 
         # Alert user to unnecessary blending
         if len(datasets) == 1:
-            logger.warning(f"Building a BlendedDataset for a single MegatronDataset")
+            logger.warning("Building a BlendedDataset for a single MegatronDataset")
 
         if size is not None:
             weights = normalize(weights)
@@ -82,7 +105,8 @@ class BlendedDataset():
 
         self.dataset_index, self.dataset_sample_index = self._build_indices()
 
-        logger.info(f"build dataset indices, self.dataset_index.shape = {self.dataset_index.shape}, self.dataset_sample_index.shape = {self.dataset_sample_index.shape}")
+        logger.info(f"build dataset indices, self.dataset_index.shape = {self.dataset_index.shape}, "
+                    f"self.dataset_sample_index.shape = {self.dataset_sample_index.shape}")
 
     def __len__(self) -> int:
         return self.dataset_index.shape[0]
@@ -128,7 +152,7 @@ class BlendedDataset():
             self.built_anew_on_cache_miss = True
 
             # Build the dataset and dataset sample indexes
-            logger.info(f"\tBuild and save the dataset and dataset sample indexes")
+            logger.info("\tBuild and save the dataset and dataset sample indexes")
             t_beg = time.time()
             from mindformers.dataset.blended_datasets import helpers
 

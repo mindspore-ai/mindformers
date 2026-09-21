@@ -35,8 +35,10 @@ def weight_dequant(weight: torch.Tensor, scale: torch.Tensor, block_size: int = 
     """
     row, col = weight.shape
     scale_m, scale_n = scale.shape
-    assert scale_m == (row + block_size - 1) // block_size, "Mismatch in scale rows and weight rows."
-    assert scale_n == (col + block_size - 1) // block_size, "Mismatch in scale columns and weight columns."
+    if scale_m != (row + block_size - 1) // block_size:
+        raise ValueError("Mismatch in scale rows and weight rows.")
+    if scale_n != (col + block_size - 1) // block_size:
+        raise ValueError("Mismatch in scale columns and weight columns.")
 
     # Convert to float32 for calculation
     weight = weight.to(torch.float32)
@@ -90,7 +92,7 @@ def convert_single_file(
     for weight_name, weight in current_state_dict.items():
         if weight_name.endswith("_scale_inv"):
             continue
-        elif weight.element_size() == 1:  # FP8 weight
+        if weight.element_size() == 1:  # FP8 weight
             scale_inv_name = f"{weight_name}_scale_inv"
             try:
                 scale_inv = get_tensor_func(scale_inv_name)

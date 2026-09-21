@@ -479,7 +479,8 @@ def track_moe_metrics(
     if moe_layer_freq is None:
         num_moe_layers = num_layers
     elif isinstance(moe_layer_freq, int):
-        assert isinstance(num_layers, int)
+        if not isinstance(num_layers, int):
+            raise TypeError(f"num_layers must be an int when moe_layer_freq is an int, but got {type(num_layers)}")
         moe_layer_pattern = [1 if (i % moe_layer_freq == 0) else 0 for i in range(num_layers)]
         num_moe_layers = sum(moe_layer_pattern)
     elif isinstance(moe_layer_freq, list):

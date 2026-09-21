@@ -1,4 +1,18 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
+# Copyright 2024 Huawei Technologies Co., Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ============================================================================
 
 import math
 from concurrent.futures import ThreadPoolExecutor
@@ -20,7 +34,7 @@ TopLevelDataset = Union[BlendedDataset, MidLevelDataset]
 DistributedDataset = Union[TopLevelDataset, MidLevelDataset, LowLevelDataset]
 
 
-class BlendedMegatronDatasetBuilder(object):
+class BlendedMegatronDatasetBuilder:
     """Builder class for the BlendedDataset and MegatronDataset classes
 
     Args:
@@ -28,7 +42,9 @@ class BlendedMegatronDatasetBuilder(object):
 
         sizes (List[Optional[int]]): The minimum total number of samples to draw, or None, per split
 
-        is_built_on_rank (Callable): A callable which returns True if the dataset should be built on the current rank and False otherwise. It should be Megatron Core parallelism aware i.e. global rank, local group rank, and virtual rank may inform its return value.
+        is_built_on_rank (Callable): A callable which returns True if the dataset should be built on the current rank
+            and False otherwise. It should be Megatron Core parallelism aware i.e. global rank, local group rank, and
+            virtual rank may inform its return value.
 
         config (BlendedMegatronDatasetConfig): The config object which informs dataset creation
     """
@@ -58,10 +74,8 @@ class BlendedMegatronDatasetBuilder(object):
                     if self.config.blend_per_split[split.value] is None:
                         continue
                     weights_are_none = self.config.blend_per_split[split.value][1] is None
-                if size_is_none:
-                    assert (
-                        weights_are_none
-                    ), f"size_is_none => weights_are_none fails for {split.name} split"
+                if size_is_none and not weights_are_none:
+                    raise ValueError(f"size_is_none => weights_are_none fails for {split.name} split")
 
     def build(self) -> List[Optional[TopLevelDataset]]:
         """Build all dataset splits according to the provided blend(s)
@@ -89,14 +103,16 @@ class BlendedMegatronDatasetBuilder(object):
 
             (a) 'weights' is not None and 'size' is not None
                 - Build mid-level datasets with low-level dataset sampling in proportion to their weights and the size
-                - Build a top-level dataset of length marginally greater than 'size' with mid-level dataset sampling in proportion to their weights and the size
+                - Build a top-level dataset of length marginally greater than 'size' with mid-level dataset sampling in
+                    proportion to their weights and the size
 
             (b) 'weights' is not None and 'size' is None
                 - Error
 
             (c) 'weights' is None and 'size' is not None
                 - Build mid-level datasets with no excess low-level dataset sampling
-                - Build a top-level dataset of length 'size' with mid-level dataset sampling in proportion to their lengths and the size
+                - Build a top-level dataset of length 'size' with mid-level dataset sampling in proportion to their
+                    lengths and the size
 
                   - The 'size' of the top-level dataset is capped at the sum of the mid-level dataset lengths
 
@@ -120,17 +136,23 @@ class BlendedMegatronDatasetBuilder(object):
                         )
                     else:
                         logger.info(
-                            f"NumPy indices for {type(dataset).__name__} {dataset.split.name} split are fully cached, skipping verification"
+                            f"NumPy indices for {type(dataset).__name__} {dataset.split.name} split "
+                            f"are fully cached, skipping verification"
                         )
                         continue
                     # Check blend size
-                    assert dataset.size is None or dataset.size == dataset.dataset_index.shape[0]
+                    if dataset.size is not None and dataset.size != dataset.dataset_index.shape[0]:
+                        raise RuntimeError(
+                            f"BlendedDataset size {dataset.size} does not match its dataset index "
+                            f"length {dataset.dataset_index.shape[0]}"
+                        )
                     # Check blend access of mid-level datasets
                     _, sizes = numpy.unique(dataset.dataset_index, return_counts=True)
                     for i, dataset_and_size in enumerate(zip(dataset.datasets, sizes)):
                         if len(dataset_and_size[0]) < dataset_and_size[1]:
                             raise IndexError(
-                                f"{type(dataset).__name__} blend goes out of bounds for {type([dataset_and_size[0]]).__name__} {i} for {dataset.split.name} split"
+                                f"{type(dataset).__name__} blend goes out of bounds for "
+                                f"{type([dataset_and_size[0]]).__name__} {i} for {dataset.split.name} split"
                             )
 
         return datasets
@@ -311,11 +333,11 @@ class BlendedMegatronDatasetBuilder(object):
         ) -> None:
             with ThreadPoolExecutor(max_workers=num_workers) as executor:
                 all_futures = []
-                for i in range(len(prefixes)):
+                for i, prefix in enumerate(prefixes):
                     all_futures.append(
                         executor.submit(
                             self._build_megatron_dataset_splits,
-                            prefixes[i],
+                            prefix,
                             split,
                             sizes_per_dataset[i],
                             False,  # synchronize_ranks, barrier is called in this function
@@ -324,8 +346,8 @@ class BlendedMegatronDatasetBuilder(object):
                 for future in all_futures:
                     try:
                         megatron_datasets_split = future.result()
-                        for j in range(len(megatron_datasets_split)):
-                            megatron_datasets[j].append(megatron_datasets_split[j])
+                        for j, dataset_split in enumerate(megatron_datasets_split):
+                            megatron_datasets[j].append(dataset_split)
                     except Exception as err:
                         raise err
 
@@ -379,13 +401,15 @@ class BlendedMegatronDatasetBuilder(object):
         """Build each MidLevelDataset split from a single LowLevelDataset
 
         Args:
-            dataset_path (Optional[str]): The path on disk which defines the underlying LowLevelDataset, or None for mock dataset classes
+            dataset_path (Optional[str]): The path on disk which defines the underlying LowLevelDataset, or None for
+                mock dataset classes
 
             split (List[Tuple[float, float]]): The dataset split matrix
 
             sizes (List[int]): The number of total samples to draw from each split
 
-            synchronize_ranks (bool): Whether to call barrier for rank-0 / barrier / other-ranks behavior. Set to False when we enforce this behavior at higher level.
+            synchronize_ranks (bool): Whether to call barrier for rank-0 / barrier / other-ranks behavior. Set to False
+                when we enforce this behavior at higher level.
 
         Returns:
             List[Optional[MidLevelDataset]]: The MidLevelDataset (or None) per split
@@ -406,7 +430,7 @@ class BlendedMegatronDatasetBuilder(object):
 
         # Build the mid level dataset
         mid_level_datasets = []
-        for i, _split in enumerate(Split):
+        for i, split_type in enumerate(Split):
             if split[i] is None:
                 mid_level_datasets.append(None)
             else:
@@ -419,7 +443,7 @@ class BlendedMegatronDatasetBuilder(object):
                         dataset_path,
                         split_indices[i],
                         sizes[i],
-                        _split,
+                        split_type,
                         self.config,
                     )
                 )
@@ -427,7 +451,7 @@ class BlendedMegatronDatasetBuilder(object):
         return mid_level_datasets
 
     @staticmethod
-    def build_generic_dataset(
+    def build_generic_dataset(  # pylint: disable=bad-staticmethod-argument
         cls: Union[Type[DistributedDataset], Callable],
         is_built_on_rank: Callable,
         synchronize_ranks: bool,
@@ -439,9 +463,12 @@ class BlendedMegatronDatasetBuilder(object):
         and torch.distributed is initialized.
 
         Args:
-            cls (Union[Type[DistributedDataset], Callable]): The DistributedDataset class to be built. In special cases, e.g. when we are building the low level dataset for a RawMegatronDataset instance, we can accept a Callable which returns an Iterable.
+            cls (Union[Type[DistributedDataset], Callable]): The DistributedDataset class to be built. In special cases,
+                e.g. when we are building the low level dataset for a RawMegatronDataset instance, we can accept a
+                Callable which returns an Iterable.
 
-            synchronize_ranks (bool): Whether to call barrier for rank-0 / barrier / other-ranks behavior. Set to False when we enforce this behavior at higher level.
+            synchronize_ranks (bool): Whether to call barrier for rank-0 / barrier / other-ranks behavior. Set to False
+                when we enforce this behavior at higher level.
 
             args (Tuple[Any]): The positional arguments used to build the provided DistributedDataset class
 
@@ -449,7 +476,8 @@ class BlendedMegatronDatasetBuilder(object):
             Exception: When the dataset constructor raises an OSError
 
         Returns:
-            Optional[Union[DistributedDataset, Iterable]]: The DistributedDataset instantion, the Iterable instantiation, or None
+            Optional[Union[DistributedDataset, Iterable]]: The DistributedDataset instantion, the Iterable
+                instantiation, or None
         """
         if get_real_group_size() > 1:
             rank = get_real_rank()
@@ -462,10 +490,10 @@ class BlendedMegatronDatasetBuilder(object):
                     dataset = cls(*args)
                 except OSError as err:
                     log = (
-                        f"Failed to write dataset materials to the data cache directory. "
-                        + f"Please supply a directory to which you have write access via "
-                        + f"the path_to_cache attribute in BlendedMegatronDatasetConfig and "
-                        + f"retry. Refer to the preserved traceback above for more information."
+                        "Failed to write dataset materials to the data cache directory. "
+                        + "Please supply a directory to which you have write access via "
+                        + "the path_to_cache attribute in BlendedMegatronDatasetConfig and "
+                        + "retry. Refer to the preserved traceback above for more information."
                     )
                     raise Exception(log) from err
 
@@ -494,7 +522,8 @@ def _get_size_per_split_per_dataset(
     Returns:
         List[List[int]]: The number of samples to request per MegatronDataset per split
     """
-    assert numpy.isclose(sum(normalized_weights), 1.0)
+    if not numpy.isclose(sum(normalized_weights), 1.0):
+        raise ValueError(f"normalized_weights must sum to 1.0, but got {normalized_weights}")
 
     # Use 0.5% target margin to ensure we satiate the request
     sizes_per_dataset = [

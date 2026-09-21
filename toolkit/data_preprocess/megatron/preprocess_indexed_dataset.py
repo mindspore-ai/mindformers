@@ -1,6 +1,19 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
+# Copyright 2025 Huawei Technologies Co., Ltd
 #
 # Modified tokenizer calls and added to handle fixed-length data
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 # ============================================================================
 """Processing large data for pretraining."""
 import time
@@ -379,7 +392,8 @@ def partition_file(args):
                                 else:
                                     index = (index + 1) % args.partitions
 
-    assert args.workers % args.partitions == 0
+    if args.workers % args.partitions != 0:
+        raise ValueError(f"--workers ({args.workers}) must be divisible by --partitions ({args.partitions})")
     partition = Partition(args, args.workers // args.partitions)
 
     return in_ss_out_names, partition

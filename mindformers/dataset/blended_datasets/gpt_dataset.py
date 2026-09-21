@@ -1,4 +1,18 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+# Copyright 2024 Huawei Technologies Co., Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ============================================================================
 
 import os
 import time
@@ -60,9 +74,12 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
 
         # assert self.tokenizer is not None
 
-        assert self.reset_position_ids is not None
-        assert self.reset_attention_mask is not None
-        assert self.eod_mask_loss is not None
+        if self.reset_position_ids is None:
+            raise ValueError("reset_position_ids must be set in GPTDatasetConfig")
+        if self.reset_attention_mask is None:
+            raise ValueError("reset_attention_mask must be set in GPTDatasetConfig")
+        if self.eod_mask_loss is None:
+            raise ValueError("eod_mask_loss must be set in GPTDatasetConfig")
 
 
 class GPTDataset(MegatronDataset):
@@ -285,9 +302,10 @@ class GPTDataset(MegatronDataset):
                 sample_parts.append(
                     self.dataset.get(self.document_index[i], offset=offset, length=length)
                 )
-        assert len(document_ids) == len(
-            sample_parts
-        ), f"len(document_ids) ({len(document_ids)}) != len(sample_parts) ({len(sample_parts)})"
+        if len(document_ids) != len(sample_parts):
+            raise RuntimeError(
+                f"len(document_ids) ({len(document_ids)}) != len(sample_parts) ({len(sample_parts)})"
+            )
 
         length = sum(map(len, sample_parts))
 
@@ -386,10 +404,17 @@ class GPTDataset(MegatronDataset):
                 ) // sequence_length
 
                 # num_samples_from_final_epoch should be non-negative
-                assert num_samples_from_final_epoch >= 0
+                if num_samples_from_final_epoch < 0:
+                    raise RuntimeError(
+                        f"num_samples_from_final_epoch ({num_samples_from_final_epoch}) should be non-negative"
+                    )
 
                 # num_samples_from_final_epoch should not exceed max value
-                assert num_samples_from_final_epoch <= num_samples_per_epoch + 1
+                if num_samples_from_final_epoch > num_samples_per_epoch + 1:
+                    raise RuntimeError(
+                        f"num_samples_from_final_epoch ({num_samples_from_final_epoch}) should not exceed "
+                        f"num_samples_per_epoch + 1 ({num_samples_per_epoch + 1})"
+                    )
 
                 # Separate the final epoch if it falls below the threshold
                 threshold = 0.80
@@ -422,8 +447,10 @@ class GPTDataset(MegatronDataset):
             else:
                 drop_last_partial_sequence = True
 
-            assert document_index.dtype == numpy.int32
-            assert self.dataset.sequence_lengths.dtype == numpy.int32
+            if document_index.dtype != numpy.int32:
+                raise TypeError(f"document_index must be int32, but got {document_index.dtype}")
+            if self.dataset.sequence_lengths.dtype != numpy.int32:
+                raise TypeError(f"sequence_lengths must be int32, but got {self.dataset.sequence_lengths.dtype}")
             if len(document_index) * 2 > len(self.dataset.sequence_lengths):
                 # Heuristic: if "access density" of sequence_lengths is relatively high,
                 # force loading the mmap-ed array into memory by taking a copy.
@@ -775,7 +802,6 @@ class MockGPTDataset(GPTDataset):
         config: GPTDatasetConfig,
     ) -> None:
         config.mock = True
-        assert config.mock
 
         super().__init__(dataset, dataset_path, indices, num_samples, index_split, config)
 

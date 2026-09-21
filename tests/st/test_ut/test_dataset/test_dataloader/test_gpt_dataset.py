@@ -373,7 +373,7 @@ class TestGPTDatasetComponents:
         Expectation: Validation works correctly
         """
         # Test config validation
-        with pytest.raises(AssertionError):
+        with pytest.raises(ValueError, match="must be set in GPTDatasetConfig"):
             GPTDatasetConfig(
                 sequence_length=32,
                 random_seed=1234,

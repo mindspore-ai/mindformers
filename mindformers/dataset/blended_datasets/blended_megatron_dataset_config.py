@@ -1,4 +1,18 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+# Copyright 2024 Huawei Technologies Co., Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ============================================================================
 
 import functools
 import re
@@ -71,32 +85,31 @@ class BlendedMegatronDatasetConfig:
         """Do asserts and set fields post init
         """
         if self.blend_per_split is not None and any(self.blend_per_split):
-            assert self.blend is None, "blend and blend_per_split are incompatible"
-            assert self.split is None, "split and blend_per_split are incompatible"
-            assert len(self.blend_per_split) == len(
-                Split
-            ), f"blend_per_split must contain {len(Split)} blends"
+            if self.blend is not None:
+                raise ValueError("blend and blend_per_split are incompatible")
+            if self.split is not None:
+                raise ValueError("split and blend_per_split are incompatible")
+            if len(self.blend_per_split) != len(Split):
+                raise ValueError(f"blend_per_split must contain {len(Split)} blends")
             for split in Split:
                 if self.blend_per_split[split.value] is None:
                     logger.info(
                         f"blend not provided for {split.name} split"
                     )
                 else:
-                    assert self.blend_per_split[split.value][1] is None or len(
-                        self.blend_per_split[split.value][0]
-                    ) == len(
-                        self.blend_per_split[split.value][1]
-                    ), "blend per split prefixes and weights must be equal in number"
+                    prefixes, weights = self.blend_per_split[split.value][0], self.blend_per_split[split.value][1]
+                    if weights is not None and len(prefixes) != len(weights):
+                        raise ValueError("blend per split prefixes and weights must be equal in number")
         else:
             if self.blend is not None:
-                assert self.blend[1] is None or len(self.blend[0]) == len(
-                    self.blend[1]
-                ), "blend prefixes and weights must be equal in number"
-                assert self.split is not None, "split must be provided when blend is not None"
+                if self.blend[1] is not None and len(self.blend[0]) != len(self.blend[1]):
+                    raise ValueError("blend prefixes and weights must be equal in number")
+                if self.split is None:
+                    raise ValueError("split must be provided when blend is not None")
             else:
                 self.mock = True
                 logger.warning(
-                    f"Let mock = True, as both blend and blend_per_split are None"
+                    "Let mock = True, as both blend and blend_per_split are None"
                 )
                 self.split = "1,"
                 logger.warning(
@@ -119,8 +132,10 @@ def parse_and_normalize_split(split: str) -> List[float]:
     split = list(map(float, re.findall(r"[.0-9]+", split)))
     split = split + [0.0 for _ in range(len(Split) - len(split))]
 
-    assert len(split) == len(Split)
-    assert all(map(lambda _: _ >= 0.0, split))
+    if len(split) != len(Split):
+        raise ValueError(f"split must give at most {len(Split)} ratios, but got {len(split)}")
+    if not all(map(lambda _: _ >= 0.0, split)):
+        raise ValueError(f"split ratios must be non-negative, but got {split}")
 
     split = normalize(split)
 
@@ -144,7 +159,8 @@ def convert_split_vector_to_split_matrix(
     Args:
         vector_a (List[float]): The primary split vector
 
-        vector_b (Optional[List[float]]): An optional secondary split vector which constrains the primary split vector. Defaults to None.
+        vector_b (Optional[List[float]]): An optional secondary split vector which constrains the primary split vector.
+            Defaults to None.
 
     Returns:
         List[Tuple[float, float]]: The split matrix consisting of book-ends of each split in order

@@ -542,11 +542,12 @@ def num_floating_point_operations(args, batch_size):
                 moe_layer_pattern = args.moe_layer_freq
             else:
                 raise RuntimeError("Illegal --moe-layer-freq argument provided!")
-            assert len(moe_layer_pattern) == args.num_layers, (
-                f"Invalid length of moe_layer_pattern: {len(moe_layer_pattern)}, "
-                f"expected {args.num_layers}, "
-                f"current moe layer pattern: {args.moe_layer_freq}"
-            )
+            if len(moe_layer_pattern) != args.num_layers:
+                raise ValueError(
+                    f"Invalid length of moe_layer_pattern: {len(moe_layer_pattern)}, "
+                    f"expected {args.num_layers}, "
+                    f"current moe layer pattern: {args.moe_layer_freq}"
+                )
             num_moe_layers = sum(moe_layer_pattern)  # Number of 1s in `moe_layer_pattern`.
             num_dense_layers = args.num_layers - num_moe_layers
             num_experts_routed_to = args.moe_router_topk
@@ -583,7 +584,8 @@ def num_floating_point_operations(args, batch_size):
         ffn_expansion_factor = 3 if args.swiglu else 2
 
         if args.multi_latent_attention:
-            assert not args.group_query_attention
+            if args.group_query_attention:
+                raise ValueError("multi_latent_attention and group_query_attention cannot be enabled together")
             # Basic arithmetic
             # let B is batch size, s is seq_len, h is embedding dim,
             # for one self_attnetion block (prenorm is not included)
@@ -671,11 +673,12 @@ def num_floating_point_operations(args, batch_size):
                 ]
             elif isinstance(args.linear_attention_freq, list):
                 linear_attention_pattern = args.linear_attention_freq
-                assert len(linear_attention_pattern) == num_layers, (
-                    f"Invalid length of linear_attention_pattern: {len(linear_attention_pattern)}, "
-                    f"expected {num_layers}, "
-                    f"current linear attention pattern: {args.linear_attention_freq}"
-                )
+                if len(linear_attention_pattern) != num_layers:
+                    raise ValueError(
+                        f"Invalid length of linear_attention_pattern: {len(linear_attention_pattern)}, "
+                        f"expected {num_layers}, "
+                        f"current linear attention pattern: {args.linear_attention_freq}"
+                    )
             elif args.linear_attention_freq is None:
                 # This should be caught by config validation, but raise here as a safety check
                 raise ValueError(
