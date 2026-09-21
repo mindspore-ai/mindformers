@@ -39,10 +39,10 @@ Tags follow this format:
 
 ### Available Tags
 
-- `2.0.0-cann-9.1.0-mindspore2.10.0-910b-ubuntu22.04-py3.12`
-- `2.0.0-cann-9.1.0-mindspore2.10.0-910b-openeuler24.03-py3.12`
-- `2.0.0-cann-9.1.0-mindspore2.10.0-a3-ubuntu22.04-py3.12`
-- `2.0.0-cann-9.1.0-mindspore2.10.0-a3-openeuler24.03-py3.12`
+- `2.0.0-cann9.1.0-mindspore2.10.0-910b-ubuntu22.04-py3.12`
+- `2.0.0-cann9.1.0-mindspore2.10.0-910b-openeuler24.03-py3.12`
+- `2.0.0-cann9.1.0-mindspore2.10.0-a3-ubuntu22.04-py3.12`
+- `2.0.0-cann9.1.0-mindspore2.10.0-a3-openeuler24.03-py3.12`
 
 ### Image Repository Address
 
@@ -55,7 +55,7 @@ swr.cn-south-1.myhuaweicloud.com/ascendhub/mindformers
 **Full Image Example：**
 
 ```text
-swr.cn-south-1.myhuaweicloud.com/ascendhub/mindformers:2.0.0-cann-9.1.0-mindspore2.10.0-910b-ubuntu22.04-py3.12
+swr.cn-south-1.myhuaweicloud.com/ascendhub/mindformers:2.0.0-cann9.1.0-mindspore2.10.0-910b-ubuntu22.04-py3.12
 ```
 
 ### 构建参数
@@ -77,6 +77,10 @@ See dockerfile: [dockerfile](https://gitcode.com/mindspore/mindformers/blob/mast
 ### Building MindSpore Image
 
 ```bash
+# Enable Docker Content Trust so that image signatures are verified when building, pulling and
+# pushing images, preventing tampered or man-in-the-middle replaced images
+export DOCKER_CONTENT_TRUST=1
+
 docker build \
 --build-arg CANN_VERSION=9.1.0 \
 --build-arg CHIP_ARCH=910b \
@@ -85,9 +89,11 @@ docker build \
 --build-arg MINDSPORE_VERSION=2.10.0 \
 --build-arg MINDFORMERS_VERSION=2.0.0 \
 --build-arg PIP_INDEX_URL=https://mirrors.huaweicloud.com/repository/pypi/simple \
--t mindformers:2.0.0-cann-9.1.0-mindspore2.10.0-910b-ubuntu22.04-py3.12 \
+-t mindformers:2.0.0-cann9.1.0-mindspore2.10.0-910b-ubuntu22.04-py3.12 \
 -f Dockerfile .
 ```
+
+> Tips: `DOCKER_CONTENT_TRUST=1` relies on the registry publishing signature (Notary) data. If the registry does not publish it, the legacy builder (`DOCKER_BUILDKIT=0`) fails with `no trust data`, while BuildKit simply ignores the variable. In both cases, pin the base image by digest instead (`FROM quay.io/ascend/cann@sha256:...`), which keeps the base image verifiable.
 
 ### 运行 MindSpore Transformers 容器
 
@@ -107,6 +113,16 @@ docker run \
     -it mindspore:tag bash
 ```
 
+### Checking Container Health
+
+The image ships a `HEALTHCHECK` instruction that runs `python3 -c "import mindformers"` every 5 minutes. The result can be queried with:
+
+```bash
+docker inspect --format '{{.State.Health.Status}}' mindformers_container
+```
+
+A single probe takes under 10 seconds and peaks at about 800MB of memory. Append `--no-healthcheck` to `docker run` to turn the periodic probe off.
+
 ### Security Risks
 
 When running MindSpore Transformers in Docker containers, pay attention to the following security risks:
@@ -119,6 +135,9 @@ When running MindSpore Transformers in Docker containers, pay attention to the f
 
 - **Missing CPU and memory resource limits**:  
   Without resource limits, containers may consume excessive system resources and impact host performance. It is recommended to use the `--cpus` and `--memory` options to limit resource usage.
+
+- **Unverified image provenance**:  
+  Using images that are neither signed nor pinned by digest leaves room for tampering or man-in-the-middle replacement. It is recommended to `export DOCKER_CONTENT_TRUST=1` before building, pulling or pushing images; when the registry publishes no signature data, pin the image version by digest (`@sha256:...`) instead.
 
 ## Supported Hardware
 

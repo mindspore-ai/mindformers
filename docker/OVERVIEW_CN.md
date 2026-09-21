@@ -41,10 +41,10 @@ Tag 遵循以下格式：
 
 ### Tag
 
-- `2.0.0-cann-9.1.0-mindspore2.10.0-910b-ubuntu22.04-py3.12`
-- `2.0.0-cann-9.1.0-mindspore2.10.0-910b-openeuler24.03-py3.12`
-- `2.0.0-cann-9.1.0-mindspore2.10.0-a3-ubuntu22.04-py3.12`
-- `2.0.0-cann-9.1.0-mindspore2.10.0-a3-openeuler24.03-py3.12`
+- `2.0.0-cann9.1.0-mindspore2.10.0-910b-ubuntu22.04-py3.12`
+- `2.0.0-cann9.1.0-mindspore2.10.0-910b-openeuler24.03-py3.12`
+- `2.0.0-cann9.1.0-mindspore2.10.0-a3-ubuntu22.04-py3.12`
+- `2.0.0-cann9.1.0-mindspore2.10.0-a3-openeuler24.03-py3.12`
 
 ### 镜像仓库地址
 
@@ -57,7 +57,7 @@ swr.cn-south-1.myhuaweicloud.com/ascendhub/mindformers
 **完整镜像示例：**
 
 ```text
-swr.cn-south-1.myhuaweicloud.com/ascendhub/mindformers:2.0.0-cann-9.1.0-mindspore2.10.0-910b-ubuntu22.04-py3.12
+swr.cn-south-1.myhuaweicloud.com/ascendhub/mindformers:2.0.0-cann9.1.0-mindspore2.10.0-910b-ubuntu22.04-py3.12
 ```
 
 ### 构建参数
@@ -79,6 +79,9 @@ dockerfile详见：[dockerfile](https://gitcode.com/mindspore/mindformers/blob/m
 ### 构建 MindSpore Transformers 镜像
 
 ```bash
+# 开启 Docker 内容信任，构建、拉取、推送镜像时校验镜像签名，防止镜像被篡改或被中间人替换
+export DOCKER_CONTENT_TRUST=1
+
 docker build \
 --build-arg CANN_VERSION=9.1.0 \
 --build-arg CHIP_ARCH=910b \
@@ -87,9 +90,11 @@ docker build \
 --build-arg MINDSPORE_VERSION=2.10.0 \
 --build-arg MINDFORMERS_VERSION=2.0.0 \
 --build-arg PIP_INDEX_URL=https://mirrors.huaweicloud.com/repository/pypi/simple \
--t mindformers:2.0.0-cann-9.1.0-mindspore2.10.0-910b-ubuntu22.04-py3.12 \
+-t mindformers:2.0.0-cann9.1.0-mindspore2.10.0-910b-ubuntu22.04-py3.12 \
 -f Dockerfile .
 ```
+
+> Tips: `DOCKER_CONTENT_TRUST=1` 依赖镜像仓库提供签名数据（Notary）。若仓库未提供签名数据，旧版构建器（`DOCKER_BUILDKIT=0`）会以 `no trust data` 报错，BuildKit 则会忽略该变量；这两种情况下建议改用 digest 固定基础镜像（`FROM quay.io/ascend/cann@sha256:...`），同样能保证基础镜像可校验。
 
 ### 运行 MindSpore Transformers 容器
 
@@ -109,6 +114,16 @@ docker run \
     -it mindspore:tag bash
 ```
 
+### 查看容器健康状态
+
+镜像内置 `HEALTHCHECK` 指令，每 5 分钟执行一次 `python3 -c "import mindformers"` 探活，可通过以下命令查看探活结果：
+
+```bash
+docker inspect --format '{{.State.Health.Status}}' mindformers_container
+```
+
+单次探活耗时 10 秒以内、峰值内存约 800MB。如不需要周期性探活，可在 `docker run` 时追加 `--no-healthcheck` 关闭。
+
 ### 安全风险
 
 在使用 Docker 容器运行 MindSpore Transformers 时，需要注意以下安全风险：
@@ -121,6 +136,9 @@ docker run \
 
 - **缺少 CPU 和内存资源限制**：  
   未设置资源限制可能导致容器消耗过多系统资源，影响宿主机性能。建议使用 `--cpus` 和 `--memory` 参数限制资源使用。
+
+- **镜像来源未校验**：  
+  直接使用未签名、未固定 digest 的镜像，存在镜像被篡改或被中间人替换的风险。建议构建、拉取、推送镜像前 `export DOCKER_CONTENT_TRUST=1` 开启内容信任；镜像仓库未提供签名数据时，改用 digest（`@sha256:...`）固定镜像版本。
 
 ## 支持的硬件
 
