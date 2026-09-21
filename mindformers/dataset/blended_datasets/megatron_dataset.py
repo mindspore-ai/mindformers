@@ -1,4 +1,18 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
+# Copyright 2024 Huawei Technologies Co., Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ============================================================================
 
 import hashlib
 import json
@@ -26,7 +40,8 @@ class MegatronDataset(ABC):
 
         indices (numpy.ndarray): The set of the documents indices to expose
 
-        num_samples (Optional[int]): The minimum number of samples to build from the indexed dataset. When None, build as many samples as correspond to one epoch.
+        num_samples (Optional[int]): The minimum number of samples to build from the indexed dataset. When None, build
+            as many samples as correspond to one epoch.
 
         index_split (Split): The indices Split
 
@@ -124,7 +139,6 @@ class MegatronDataset(ABC):
         Returns:
             int: See abstract implementation
         """
-        pass
 
     @abstractmethod
     # def __getitem__(self, idx: int) -> Dict[str, Union[torch.Tensor, numpy.ndarray]]:
@@ -137,4 +151,3 @@ class MegatronDataset(ABC):
         Returns:
             Dict[str, numpy.ndarray]: See abstract implementation
         """
-        pass

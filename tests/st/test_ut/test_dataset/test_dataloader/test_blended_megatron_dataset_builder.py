@@ -277,18 +277,18 @@ class TestBlendedMegatronDatasetBuilder:
     @pytest.mark.level1
     @pytest.mark.platform_x86_cpu
     @pytest.mark.env_onecard
-    def test_builder_initialization_assertion_error(self):
+    def test_builder_initialization_value_error(self):
         """
         Feature: BlendedMegatronDatasetBuilder initialization assertion
-        Description: Test BlendedMegatronDatasetBuilder raises AssertionError when size_is_none but weights_are_not_none
-        Expectation: AssertionError is raised
+        Description: Test BlendedMegatronDatasetBuilder raises ValueError when size_is_none but weights_are_not_none
+        Expectation: ValueError is raised
         """
         config = create_test_config()
         config.mock = False
         config.blend = (["prefix1"], [0.5])
         sizes = [None, 5, 15]
 
-        with pytest.raises(AssertionError, match="size_is_none => weights_are_none fails"):
+        with pytest.raises(ValueError, match="size_is_none => weights_are_none fails"):
             BlendedMegatronDatasetBuilder(
                 cls=DummyMegatronDataset,
                 sizes=sizes,
