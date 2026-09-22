@@ -48,12 +48,17 @@ class BalanceConfig:
     model_parallel: int
 
 
-def assert_balance_supported(dataloader_type: str, balance_enabled: bool) -> None:
+def assert_balance_supported(
+        dataloader_type: str,
+        balance_enabled: bool,
+        streaming: bool = False,
+) -> None:
     """Raise if balancing is enabled for an unsupported dataloader type.
 
     Args:
         dataloader_type (str): Dataloader type name.
         balance_enabled (bool): Whether load balancing is enabled.
+        streaming (bool): Whether the dataloader uses streaming data. Default ``False``.
 
     Raises:
         ValueError: If balancing is enabled and ``dataloader_type`` is unsupported.
@@ -63,6 +68,11 @@ def assert_balance_supported(dataloader_type: str, balance_enabled: bool) -> Non
             f"balance_enabled is True but dataloader type '{dataloader_type}' is not supported. "
             f"Supported types: {list(BALANCE_SUPPORTED_LOADERS)}. Set balance_enabled to False "
             f"or switch to a supported dataloader."
+        )
+    if balance_enabled and dataloader_type == 'HFDataLoader' and streaming:
+        raise ValueError(
+            "Streaming data does not support load balancing. "
+            "Set train_dataset.balance_enabled to false."
         )
 
 
