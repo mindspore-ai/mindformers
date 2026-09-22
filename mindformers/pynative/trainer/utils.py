@@ -461,7 +461,11 @@ def _build_dataset(
     dataloader_type = dataloader_config.pop("type")
     # Fail fast if balancing is enabled for an unsupported loader type.
     balance_enabled = config.balance_enabled
-    assert_balance_supported(dataloader_type, balance_enabled)
+    assert_balance_supported(
+        dataloader_type,
+        balance_enabled,
+        streaming=dataloader_config.get('streaming', False),
+    )
 
     create_compressed_eod_mask = False
     if dataloader_type == "BlendedMegatronDatasetDataLoader":
