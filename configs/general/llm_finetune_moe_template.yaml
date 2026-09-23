@@ -26,7 +26,7 @@ train_dataset: &train_dataset
       - type: AlpacaInstructDataHandler                  # Set the data handler class
         padding: False
         tokenizer:
-          trust_remote_code: True                        # Whether to trust the code downloaded remotely, default value: `False`.
+          trust_remote_code: False                       # Whether to run custom code from the model directory. Set to `True` only for code you have reviewed.
           padding_side: "right"                          # Specifies the padding position of the Tokenizer. During training, it needs to be set as: `"right"`.
         seq_length: 4096                                 # Sequence length of data returned by the dataset
       - type: PackingHandler

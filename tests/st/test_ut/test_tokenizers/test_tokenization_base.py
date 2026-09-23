@@ -131,6 +131,18 @@ class TestTokenizerBase(unittest.TestCase):
     @pytest.mark.level1
     @pytest.mark.platform_x86_cpu
     @pytest.mark.env_onecard
+    def test_compile_jinja_template_rejects_vulnerable_jinja2(self):
+        """chat templates are not rendered by a jinja2 with known sandbox escapes (<3.1.6)."""
+        import jinja2
+        with patch.object(jinja2, "__version__", "3.1.5"):
+            with pytest.raises(ImportError, match=r"jinja2>=3\.1\.6"):
+                self.tokenizer._compile_jinja_template("{{ 'jinja2 3.1.5' }}")
+        with patch.object(jinja2, "__version__", "3.1.6"):
+            assert self.tokenizer._compile_jinja_template("{{ 'jinja2 3.1.6' }}").render() == "jinja2 3.1.6"
+
+    @pytest.mark.level1
+    @pytest.mark.platform_x86_cpu
+    @pytest.mark.env_onecard
     def test_truncate_sequences(self):
         """test truncate sequences."""
         ids = [1, 2, 3, 4, 5]

@@ -82,7 +82,8 @@ from .utils import (
     transform_and_load_checkpoint,
     load_resume_context_from_checkpoint,
     get_last_checkpoint,
-    preload_ckpt
+    preload_ckpt,
+    mask_config_tokens
 )
 from .optimizer_grouped_parameters import get_optimizer_grouped_parameters
 from .utils import set_seed, check_train_data_loader_type, \
@@ -1221,7 +1222,8 @@ class BaseTrainer:
         # set resume training for hf iterable dataset
         dataloader_config = config.train_dataset.get('data_loader', {})
         dataloader_type = dataloader_config.get('type')
-        if (config.resume_training or not config.checkpoint.no_load_optim) and dataloader_type in ['HFDataLoader', 'CommonDataLoader']:
+        if (config.resume_training or not config.checkpoint.no_load_optim) and \
+                dataloader_type in ['HFDataLoader', 'CommonDataLoader']:
             resume_step = config.runner_config.initial_step
             _resume_hf_iterable_dataset(dataset, resume_step)
 
@@ -1669,7 +1671,7 @@ class BaseTrainer:
             callbacks.insert(1, cold_hot_monitor)
 
         if get_real_rank() % 8 == 0:
-            pprint(config)
+            pprint(mask_config_tokens(config))
         logger.info(".........Model Compiling, Please Wait a Moment...........")
         if self.network_delay_inited:
             logger.info(".........train network delay initialize..........")
@@ -1755,7 +1757,7 @@ class BaseTrainer:
 
         logger.info(".........Starting Evaluate Model..........")
         if get_real_rank() % 8 == 0:
-            pprint(config)
+            pprint(mask_config_tokens(config))
         output = model.eval(dataset,
                             callbacks=callbacks,
                             dataset_sink_mode=config.runner_config.sink_mode)
@@ -1876,7 +1878,7 @@ class BaseTrainer:
                 save_file = f"{task}_result.txt"
 
         if get_real_rank() % 8 == 0:
-            pprint(config)
+            pprint(mask_config_tokens(config))
         output_results = self.pipeline_task(input_data, top_k=top_k)
 
         output_info = []

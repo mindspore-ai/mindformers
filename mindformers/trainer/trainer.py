@@ -66,7 +66,7 @@ from mindformers.checkpoint.checkpoint import get_checkpoint_path
 from mindformers.version_control import check_tft_valid
 from .build_trainer import build_trainer
 from .training_args import TrainingArguments
-from .utils import config2dict, get_last_checkpoint, convert_checkpoint_config
+from .utils import config2dict, get_last_checkpoint, convert_checkpoint_config, mask_config_tokens
 
 __all__ = ['Trainer']
 
@@ -1729,4 +1729,5 @@ def _reset_config_for_save(config: dict = None):
     for key, value in run_config.items():
         config_dict.setdefault(key, value)
 
-    return config_dict
+    # the saved yaml sits in output_dir, which push_to_hub uploads
+    return mask_config_tokens(config_dict)

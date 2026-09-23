@@ -13,11 +13,13 @@
 # limitations under the License.
 # ============================================================================
 """test trainer methods."""
+import io
 import os
 import tempfile
 import unittest
+from pprint import pprint
 from copy import deepcopy
-from contextlib import ExitStack
+from contextlib import ExitStack, redirect_stdout
 from unittest.mock import patch, MagicMock
 from collections import OrderedDict
 import pytest
@@ -32,6 +34,7 @@ except ImportError:
 
 from mindformers import Trainer, MindFormerConfig
 from mindformers.trainer.trainer import _reset_config_for_save, _save_config_to_yaml
+from mindformers.trainer.utils import mask_config_tokens
 from mindformers.models import PreTrainedTokenizerBase
 
 
@@ -967,6 +970,62 @@ class TestResetConfigForSave(unittest.TestCase):
         """test _reset_config_for_save with None."""
         result = _reset_config_for_save(None)
         assert isinstance(result, OrderedDict)
+
+    @pytest.mark.level1
+    @pytest.mark.platform_x86_cpu
+    @pytest.mark.env_onecard
+    def test_reset_config_for_save_masks_hub_token(self):
+        """test the saved yaml never holds hub_token in plaintext, while the live config and other fields are kept."""
+        for secret in ('om_secret_token_value', 'x', 'om:with space/令牌'):
+            config = MindFormerConfig()
+            config.push_to_hub = True
+            config.hub_model_id = 'me/awesome-model'
+            config.hub_private_repo = True
+            config.hub_token = secret
+            result = _reset_config_for_save(config)
+            assert result['hub_token'] == '<HUB_TOKEN>'
+            assert result['hub_model_id'] == 'me/awesome-model'
+            assert result['hub_private_repo'] is True
+            assert config.hub_token == secret
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                save_path = os.path.join(tmp_dir, 'run_test.yaml')
+                _save_config_to_yaml(save_path, result)
+                with open(save_path, 'r', encoding='utf-8') as f:
+                    saved = yaml.safe_load(f)
+                assert saved['hub_token'] == '<HUB_TOKEN>'
+                assert saved['hub_model_id'] == 'me/awesome-model'
+
+    @pytest.mark.level1
+    @pytest.mark.platform_x86_cpu
+    @pytest.mark.env_onecard
+    def test_reset_config_for_save_keeps_non_str_hub_token(self):
+        """test hub_token values that are not credentials (None / True) are saved unchanged, and none is added."""
+        for value in (None, True):
+            config = MindFormerConfig()
+            config.hub_token = value
+            assert _reset_config_for_save(config)['hub_token'] is value
+        assert 'hub_token' not in _reset_config_for_save(MindFormerConfig())
+
+    @pytest.mark.level1
+    @pytest.mark.platform_x86_cpu
+    @pytest.mark.env_onecard
+    def test_mask_config_tokens_for_print(self):
+        """test the config printed by the trainers (pprint) never shows hub_token in plaintext."""
+        config = MindFormerConfig()
+        config.model = MindFormerConfig(type='test_model', pad_token='<pad>')
+        config.hub_token = 'om_secret_token_value'
+        masked = mask_config_tokens(config)
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            pprint(masked)
+        assert 'om_secret_token_value' not in buffer.getvalue()
+        assert '<HUB_TOKEN>' in buffer.getvalue()
+        assert isinstance(masked, MindFormerConfig)
+        assert masked.model is config.model
+        assert masked.model.pad_token == '<pad>'
+        assert config.hub_token == 'om_secret_token_value'
+        plain = MindFormerConfig()
+        assert mask_config_tokens(plain) is plain
 
     @pytest.mark.level1
     @pytest.mark.platform_x86_cpu

@@ -37,7 +37,7 @@ from mindformers.utils.load_checkpoint_utils import get_load_path_after_hf_conve
 from ...core.config_args import ConfigArguments
 from ..training_args import TrainingArguments
 from ..base_trainer import BaseTrainer
-from ..utils import transform_and_load_checkpoint, get_real_rank
+from ..utils import transform_and_load_checkpoint, get_real_rank, mask_config_tokens
 
 GENERATE_METRIC_NAMES = ['ADGENMetric', 'EmF1Metric']
 SUPPORT_MODEL_NAMES = MindFormerBook().get_model_name_support_list()
@@ -233,7 +233,7 @@ class CausalLanguageModelingTrainer(BaseTrainer):
 
         logger.info('.........Starting Evaluate Model..........')
         if get_real_rank() % 8 == 0:
-            pprint(config)
+            pprint(mask_config_tokens(config))
         # generate config
         do_sample = config.model.model_config.do_sample
         top_p = config.model.model_config.top_p
@@ -269,8 +269,8 @@ class CausalLanguageModelingTrainer(BaseTrainer):
             avg_cost_time = (end_time - start_time) / input_ids.shape[0]
 
             tokens_num = 0
-            for batch_index, _ in enumerate(output_ids):
-                tokens_num += output_ids[batch_index].shape[0]
+            for output in output_ids:
+                tokens_num += output.shape[0]
             if i != 0:
                 total_tokens_num += tokens_num
                 total_time += end_time - start_time
@@ -404,8 +404,8 @@ class CausalLanguageModelingTrainer(BaseTrainer):
                 avg_cost_time = (end_time - start_time) / input_ids.shape[0]
 
                 tokens_num = 0
-                for batch_index, _ in enumerate(output_ids):
-                    tokens_num += output_ids[batch_index].shape[0]
+                for output in output_ids:
+                    tokens_num += output.shape[0]
                 if i != 0:
                     total_tokens_num += tokens_num
                     total_time += end_time - start_time

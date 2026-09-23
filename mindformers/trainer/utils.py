@@ -13,6 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """Trainer Utils."""
+import copy
 import os
 import json
 import sys
@@ -298,6 +299,23 @@ def check_wrapper_config(new_config, old_config):
                 "Please make sure to input the corresponding parameter values manually.",
                 wrapper_type)
             old_config.runner_wrapper = {}
+
+
+def mask_config_tokens(config):
+    """Return config with top-level str `*_token` values (e.g. hub_token) shown as `<HUB_TOKEN>`, for printing or saving.
+
+    Same convention as TrainingArguments.to_dict. A shallow copy is masked, so the live config keeps the real
+    token for push_to_hub; None / True (use the local login) are not credentials and are kept.
+    """
+    if not isinstance(config, dict):
+        return config
+    keys = [key for key, value in config.items() if isinstance(key, str) and key.endswith('_token')
+            and isinstance(value, str)]
+    if keys:
+        config = copy.copy(config)
+        for key in keys:
+            config[key] = f"<{key.upper()}>"
+    return config
 
 
 def config2dict(config):

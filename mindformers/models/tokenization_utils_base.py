@@ -128,7 +128,7 @@ TOKENIZER_CONFIG_NAME = 'tokenizer_config.json'
 
 __version__ = "0.0.1dev"    # copy from mindformers.__init__
 
-# pylint: disable=W0125
+# pylint: disable=W0125,W0126
 if is_tokenizers_available:
     from tokenizers import AddedToken
     from tokenizers import Encoding as EncodingFast
@@ -1747,14 +1747,17 @@ class PreTrainedTokenizerBase(SpecialTokensMixin, PushToHubMixin):
         except ImportError as e:
             raise ImportError("apply_chat_template requires jinja2 to be installed.") from e
 
-        if version.parse(jinja2.__version__) <= version.parse("3.0.0"):
+        # chat_template comes from the model's tokenizer config; jinja2<3.1.6 has sandbox escapes
+        # (CVE-2024-56326, CVE-2025-27516), so do not render it with those versions.
+        if version.parse(jinja2.__version__) < version.parse("3.1.6"):
             raise ImportError(
-                "apply_chat_template requires jinja2>=3.0.0 to be installed. Your version is " f"{jinja2.__version__}."
+                "apply_chat_template requires jinja2>=3.1.6 to be installed. Your version is " f"{jinja2.__version__}."
             )
 
         def raise_exception(message):
             raise TemplateError(message)
 
+        # chat_template is untrusted input: render it only in the sandbox, never with jinja2.Template/Environment
         jinja_env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True)
         jinja_env.globals["raise_exception"] = raise_exception
         return jinja_env.from_string(chat_template)
@@ -1811,7 +1814,7 @@ class PreTrainedTokenizerBase(SpecialTokensMixin, PushToHubMixin):
         Returns:
             A instanced tokenizer.
         """
-        tokenizer_kwargs = dict()
+        tokenizer_kwargs = {}
         class_name = None
         loaded_kwargs = {}
 
@@ -1887,7 +1890,7 @@ class PreTrainedTokenizerBase(SpecialTokensMixin, PushToHubMixin):
             if os.path.isfile(path):
                 file = None
                 try:
-                    file = open(path, 'r', encoding="utf-8")
+                    file = open(path, 'r', encoding="utf-8")  # pylint: disable=R1732
                     read_tokenizer_file_dict[item] = json.load(file)
                 except FileNotFoundError as file_not_found_error:
                     logger.error(file_not_found_error)
@@ -2344,7 +2347,7 @@ class PreTrainedTokenizerBase(SpecialTokensMixin, PushToHubMixin):
         return tokenizer
 
     @staticmethod
-    def _eventually_correct_t5_max_length(pretrained_model_name_or_path, max_model_length, init_max_model_length):
+    def _eventually_correct_t5_max_length(pretrained_model_name_or_path, max_model_length, init_max_model_length):  # pylint: disable=W0613
         # This method should be deleted in Transformers v5
         # Its only purpose is to potentially throw a warning
         # that incorrectly defined max lengths of T5's tokenizer are used
@@ -2417,7 +2420,7 @@ class PreTrainedTokenizerBase(SpecialTokensMixin, PushToHubMixin):
         # Start to save the kwargs for the tokenizer
         if file_format == 'yaml':
             kwargs['type'] = self.__class__.__name__
-            merged_dict = dict()
+            merged_dict = {}
 
             yaml_file = os.path.join(save_directory, save_name + '.yaml')
             if os.path.exists(yaml_file):
@@ -2426,7 +2429,7 @@ class PreTrainedTokenizerBase(SpecialTokensMixin, PushToHubMixin):
                     file_reader.seek(0)
                     merged_dict = yaml.safe_load(file_reader.read())
                     if merged_dict is None:
-                        merged_dict = dict()
+                        merged_dict = {}
 
             processor_name = MindFormerBook.get_tokenizer_name_to_processor()[kwargs['type']]
             merged_dict['processor'] = {"type": processor_name}
@@ -2792,7 +2795,7 @@ class PreTrainedTokenizerBase(SpecialTokensMixin, PushToHubMixin):
                 padding_strategy = PaddingStrategy.LONGEST  # Default to pad to the longest sequence in the batch
             elif not isinstance(padding, PaddingStrategy):
                 padding_strategy = PaddingStrategy(padding)
-            elif isinstance(padding, PaddingStrategy):
+            else:
                 padding_strategy = padding
         else:
             padding_strategy = PaddingStrategy.DO_NOT_PAD
@@ -2819,7 +2822,7 @@ class PreTrainedTokenizerBase(SpecialTokensMixin, PushToHubMixin):
                 )  # Default to truncate the longest sequences in pairs of inputs
             elif not isinstance(truncation, TruncationStrategy):
                 truncation_strategy = TruncationStrategy(truncation)
-            elif isinstance(truncation, TruncationStrategy):
+            else:
                 truncation_strategy = truncation
         else:
             truncation_strategy = TruncationStrategy.DO_NOT_TRUNCATE
@@ -2944,6 +2947,7 @@ class PreTrainedTokenizerBase(SpecialTokensMixin, PushToHubMixin):
         all_kwargs.update(kwargs)
         if text is None and text_target is None:
             raise ValueError("You need to specify either `text` or `text_target`.")
+        encodings, target_encodings = None, None
         if text is not None:
             # The context manager will send the inputs as normal texts and not text_target, but we shouldn't change the
             # input mode in this case.

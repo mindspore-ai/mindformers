@@ -62,7 +62,7 @@ train_dataset: &train_dataset
         seq_length: 4096
         padding: False
         tokenizer:
-          trust_remote_code: True
+          trust_remote_code: False  # Set to True only for a model directory whose custom code you have reviewed
           padding_side: 'right'
       - type: PackingHandler
         seq_length: 4096

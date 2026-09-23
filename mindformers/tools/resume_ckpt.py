@@ -157,10 +157,15 @@ def checkpoint_health_monitor(health_ckpts_record_dir, resume_ckpt_list):
         logger.error(err_msg)
         raise ValueError(err_msg)
 
-    if not not_health_ckpts:
-        not_health_ckpts_set = set(not_health_ckpts)
+    if not_health_ckpts:
+        not_health_ckpt_names = {item.get("ckpt_name") for item in not_health_ckpts}
         resume_ckpt_list = \
-            [item for item in resume_ckpt_list if os.path.basename(item) not in not_health_ckpts_set]
+            [item for item in resume_ckpt_list if os.path.basename(item) not in not_health_ckpt_names]
+        if not resume_ckpt_list:
+            err_msg = "All resumable checkpoints are marked unhealthy in health_ckpts.json, " \
+                      "please start training again."
+            logger.error(err_msg)
+            raise ValueError(err_msg)
 
     return resume_ckpt_list
 
