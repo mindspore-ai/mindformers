@@ -390,8 +390,9 @@ def test_balanced_save_strategy_save(
         checkpoint_path=checkpoint_path
     )
 
-    with patch("mindformers.checkpoint.fully_parallel.os.path.exists", return_value=False):
-        plan = strategy.save(0)
+    with patch("mindformers.checkpoint.fully_parallel.os.path.exists", return_value=False), \
+            patch("mindformers.checkpoint.fully_parallel.LayoutAdapter.is_pynative_mode", return_value=False):
+        plan, written_params = strategy.save(0)
 
     # Check that save_checkpoint was called
     mock_save_checkpoint.assert_called_once()
@@ -399,8 +400,19 @@ def test_balanced_save_strategy_save(
     mock_get_checkpoint_iter_dir.assert_called_once_with(checkpoint_path, 0)
     # Check that get_checkpoint_name was called
     mock_get_checkpoint_name.assert_called()
-    # The built plan is returned for the caller to write metadata
+    # The built plan is returned for the caller to write metadata, alongside what each rank's
+    # file was read back as holding (the mocked save writes nothing, so the readback fails and
+    # reports None rather than an empty set, which would erase the rank's shards).
     assert plan is not None
+    assert written_params == {0: None}
+
+    # PyNative does not read the files back: its distribution already matches what each file holds.
+    with patch("mindformers.checkpoint.fully_parallel.os.path.exists", return_value=False), \
+            patch("mindformers.checkpoint.fully_parallel.LayoutAdapter.is_pynative_mode", return_value=True), \
+            patch("mindformers.checkpoint.fully_parallel._read_checkpoint_param_names") as mock_read:
+        _, written_params = strategy.save(0)
+    mock_read.assert_not_called()
+    assert written_params is None
 
 
 @pytest.mark.level0
@@ -446,7 +458,7 @@ def test_save_balanced_metadata(tmp_path, mock_get_real_rank):
     os.makedirs(iter_dir, exist_ok=True)
 
     save_balanced_metadata(
-        checkpoint_path, iteration, "ckpt", [(model_plan, FileType.MODEL)], metas_per_rank
+        checkpoint_path, iteration, "ckpt", [(model_plan, FileType.MODEL, None)], metas_per_rank
     )
 
     with open(os.path.join(iter_dir, "metadata.json"), "r", encoding="utf-8") as f:
@@ -459,6 +471,78 @@ def test_save_balanced_metadata(tmp_path, mock_get_real_rank):
     assert len(metadata["state_dict_metadata"]["param2"]["chunk"]) == 1
     shard_b = sharded_tensor_shard_id("param2", (10,))
     assert metadata["storage_data"][shard_b][0]["rank_group"] == [0, 1]
+
+    # With the files read back, a parameter no file holds is dropped from both the storage
+    # mapping and the state_dict description: a description the loader cannot resolve to a
+    # file fails the load just as a storage record without a tensor does.
+    written = {
+        rank_id: {name for name in metas if name != "param3"}
+        for rank_id, metas in metas_per_rank.items()
+    }
+    save_balanced_metadata(
+        checkpoint_path, iteration, "ckpt", [(model_plan, FileType.MODEL, written)], metas_per_rank
+    )
+    with open(os.path.join(iter_dir, "metadata.json"), "r", encoding="utf-8") as f:
+        pruned = json.load(f)
+
+    assert set(pruned["state_dict_metadata"].keys()) == {"param1", "param2"}
+    assert sharded_tensor_shard_id("param3", (0,)) not in pruned["storage_data"]
+    assert set(pruned["storage_data"].keys()) < assigned_shards
+
+    # A rank that could not be read back (None) makes the readback untrustworthy for that file
+    # type, so the distribution is recorded as-is rather than having tensors erased on a guess.
+    partial = dict(written)
+    partial[0] = None
+    save_balanced_metadata(
+        checkpoint_path, iteration, "ckpt", [(model_plan, FileType.MODEL, partial)], metas_per_rank
+    )
+    with open(os.path.join(iter_dir, "metadata.json"), "r", encoding="utf-8") as f:
+        unpruned = json.load(f)
+
+    assert set(unpruned["state_dict_metadata"].keys()) == {"param1", "param2", "param3"}
+
+
+@pytest.mark.level0
+@pytest.mark.platform_x86_cpu
+@pytest.mark.env_onecard
+def test_scatter_balanced_shard_plan_uses_shipped_sharded_tensors():
+    """
+    Feature: Rebuilding the local plan from the assignment scattered by rank 0
+    Description: In Graph mode rank 0 completes optimizer states the other ranks' own strategy
+        metadata does not report, and ships each assigned shard's ShardedTensor with the
+        assignment. A shard missing from the local metadata is rebuilt from the shipped one.
+    Expectation: The shipped ShardedTensor fills the gap; without it the missing shard raises KeyError
+    """
+    import mindspore as ms
+    from mindformers.checkpoint.fully_parallel import (
+        _compute_balanced_assignment_on_rank0, _scatter_balanced_shard_plan
+    )
+    from mindformers.checkpoint.sharded_tensor import build_sharded_tensor
+    from mindformers.checkpoint.utils import sharded_tensor_shard_id
+
+    weight = build_sharded_tensor("w", ms.float32, (10,), (10,), (1,), (0,))
+    state = build_sharded_tensor("muon_m.w", ms.float32, (10,), (10,), (1,), (0,))
+    global_metas = {0: {"w": weight, "muon_m.w": state}}
+    state_id = sharded_tensor_shard_id("muon_m.w", (0,))
+    local_shard_map = {sharded_tensor_shard_id("w", (0,)): weight}  # 'muon_m.w' is not reported
+
+    def scatter_as_rank0(recv, payloads, src):
+        _ = src
+        recv[0] = payloads[0]
+
+    payloads, full_assignment = _compute_balanced_assignment_on_rank0(
+        global_metas, 1, ship_sharded_tensors=True
+    )
+    with patch("mindformers.checkpoint.fully_parallel.scatter_object_list", side_effect=scatter_as_rank0):
+        plan = _scatter_balanced_shard_plan(payloads, full_assignment, local_shard_map)
+    assert plan.cur_rank_shards[state_id][0] is state
+    assert set(plan.cur_rank_sharded_tensors) == {"w", "muon_m.w"}
+
+    payloads, full_assignment = _compute_balanced_assignment_on_rank0(global_metas, 1)
+    assert payloads[0][4] is None
+    with patch("mindformers.checkpoint.fully_parallel.scatter_object_list", side_effect=scatter_as_rank0), \
+            pytest.raises(KeyError):
+        _scatter_balanced_shard_plan(payloads, full_assignment, local_shard_map)
 
 
 @pytest.mark.level0

@@ -13,7 +13,9 @@
 # limitations under the License.
 # ============================================================================
 """save / load parallelization strategy."""
+import json
 import os
+import struct
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -21,7 +23,8 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 from mindspore import save_checkpoint
 from mindspore.nn import Cell
-from mindspore.mint.distributed import scatter_object_list
+from mindspore.mint.distributed import all_gather_object, scatter_object_list
+from mindspore.runtime import synchronize
 
 from mindformers.checkpoint.layout_adapter import LayoutAdapter
 from mindformers.checkpoint.sharded_tensor import (
@@ -95,6 +98,26 @@ class BalancedShardPlan:
     def cur_rank_param_names(self) -> List[str]:
         """Parameter names of the shards assigned to the current rank."""
         return [sharded_tensor.key for sharded_tensor, _ in self.cur_rank_shards.values()]
+
+
+def _read_checkpoint_param_names(file_path):
+    """The tensor names a just-written safetensors file holds (header only, no tensor data)."""
+    max_header_bytes = 100 * 1024 * 1024
+    try:
+        with open(file_path, 'rb') as f:
+            header_len = struct.unpack('<Q', f.read(8))[0]
+            if header_len > max_header_bytes:
+                raise ValueError(f"header claims {header_len} bytes; not a safetensors file")
+            header = json.loads(f.read(header_len))
+    except Exception as e:  # pylint: disable=broad-except
+        # Falling back to "holds nothing" would erase this rank's shards from the metadata, so a
+        # read failure must not be silent.
+        logger.warning(
+            f"Cannot read back '{file_path}' to record what it holds ({type(e).__name__}: {e}); "
+            f"its parameters are recorded from the distribution instead."
+        )
+        return None
+    return {name for name in header if name != '__metadata__'}
 
 
 class BalancedSaveStrategy():
@@ -202,9 +225,11 @@ class BalancedSaveStrategy():
             async_save (bool): Whether to use async save. Defaults to False.
 
         Returns:
-            BalancedShardPlan: The per-rank view of the balanced shard distribution used for
-                this save. Its `full_assignment` field is populated on rank 0 only. The caller
-                is responsible for writing 'metadata.json' (see `save_balanced_metadata`).
+            Tuple[BalancedShardPlan, Optional[Dict[int, Set[str]]]]: The per-rank view of the
+                balanced shard distribution used for this save (its `full_assignment` field is
+                populated on rank 0 only), and what each rank's file actually holds, read back
+                from the files (None when they were not read back). The caller is responsible
+                for writing 'metadata.json' (see `save_balanced_metadata`).
         """
         plan = self.apply_saving_parallelization()
 
@@ -240,7 +265,57 @@ class BalancedSaveStrategy():
             f"Save time: {time.time() - start_time:.4f} seconds."
         )
 
-        return plan
+        return plan, self._gather_written_params(save_file_name, async_save)
+
+    def _gather_written_params(self, save_file_name, async_save):
+        """
+        What each rank's file ends up holding, read back from the files themselves.
+
+        Predicting what `save_checkpoint` writes does not work: it drops parameters before it ever
+        consults `choice_func` (pipeline-shared, unsliced, still holding an initializer) and says
+        nothing about it, and a rank's optimizer owns a `Parameter` object for every stage's states,
+        not only its own, so a state can be distributed to a rank that cannot write it. Metadata built
+        from the distribution alone then points at a file that does not hold the tensor, and loading
+        fails on it. Reading the files back makes the metadata a record rather than a promise.
+
+        This is a collective call: every rank must reach it.
+
+        Args:
+            save_file_name (str): This rank's checkpoint file, without the format suffix.
+            async_save (bool): Whether the save was asynchronous. The file is then still being
+                written, so there is nothing to read back and the distribution is recorded as-is.
+
+        Returns:
+            Optional[Dict[int, Set[str]]]: Rank ID -> the parameter names that rank's file actually
+                holds, or None when the files were not read back.
+        """
+        if LayoutAdapter.is_pynative_mode():
+            # Graph mode only. In PyNative the distribution is built from what every rank's own
+            # cells hold, so it already matches what each file holds. Every rank runs in the same
+            # mode, so no collective is skipped on one rank only.
+            return None
+
+        if async_save:
+            # The writer thread is still running; a header read here would race it. Every rank
+            # takes this branch together, so no collective is skipped on one rank only.
+            logger.info(
+                f"Asynchronous save: the {self.file_type.value} files are not read back, and "
+                f"'metadata.json' records the shard distribution as-is."
+            )
+            return None
+
+        written = _read_checkpoint_param_names(f"{save_file_name}.{self.ckpt_format}")
+
+        npu_nums = get_real_group_size()
+        if npu_nums <= 1:
+            return {self.rank_id: written}
+
+        gathered = [None] * npu_nums
+        synchronize()
+        all_gather_object(gathered, written)
+        # A `None` entry means that rank could not be read back; its shards are then recorded from
+        # the distribution rather than dropped on a guess.
+        return dict(enumerate(gathered))
 
     def apply_saving_parallelization(self):
         """
@@ -261,7 +336,13 @@ class BalancedSaveStrategy():
 
         if self.do_cache_distribution and self.cached_distribution is not None:
             plan = self.cached_distribution
-        elif LayoutAdapter.is_pynative_mode() and get_real_group_size() > 1:
+        elif get_real_group_size() > 1:
+            # Both modes go through rank 0's single view. Letting each rank derive the
+            # distribution from its own `get_strategy_metadata` (the Graph-mode path this
+            # replaces) does not work for optimizer states: a rank knows its own pipeline
+            # stage and sees the others as empty or truncated, so each stage computes a
+            # different `distribute_shards` result and two stages can pick the same file
+            # name -- they then write the same '.tmp' and one of them fails to rename it.
             plan = _build_balanced_shard_plan_from_global_metas(
                 self.network, self.filter_func, self.global_sharded_tensor_metas
             )
@@ -290,9 +371,11 @@ def save_balanced_metadata(checkpoint_path, iteration, user_prefix, balanced_pla
         checkpoint_path (str): The root directory of the checkpoint.
         iteration (int): The current iteration number.
         user_prefix (str): The user-defined prefix of checkpoint file names.
-        balanced_plans (List[Tuple[BalancedShardPlan, FileType]]): The balanced plans of all
-            saved file types (model, and optimizer when saved). `full_assignment` of each
-            plan is populated on rank 0 only.
+        balanced_plans (List[Tuple[BalancedShardPlan, FileType, Optional[Dict[int, Set[str]]]]]):
+            The balanced plans of all saved file types (model, and optimizer when saved), each
+            with what every rank's file of that type actually holds, as returned by
+            `BalancedSaveStrategy.save`. `full_assignment` of each plan is populated on rank 0
+            only. A `None` readback records that file type's distribution as-is.
         sharded_tensor_metas (Dict[int, Dict[str, ShardedTensor]]): The global ShardedTensor
             metadata keyed by rank ID (network + optimizer combined), held on rank 0 only;
             None on all other ranks.
@@ -300,23 +383,74 @@ def save_balanced_metadata(checkpoint_path, iteration, user_prefix, balanced_pla
     if get_real_rank() != 0:
         return
 
+    # 'metadata.json' is one document describing every file type, and its two halves have to
+    # agree: a storage record without a tensor and a description that resolves to no file both
+    # fail the load. So the readback is either trusted for the whole document or not at all --
+    # one file that could not be read back sends every file type back to recording the shard
+    # distribution as-is, which is what this did before the files were read back.
+    use_readback = all(
+        written_params is not None and all(names is not None for names in written_params.values())
+        for _, _, written_params in balanced_plans
+    )
+    if not use_readback and any(written is not None for _, _, written in balanced_plans):
+        logger.warning(
+            "Some checkpoint files could not be read back; 'metadata.json' records the shard "
+            "distribution as-is."
+        )
+
     param_file_mapping = []
-    for plan, file_type in balanced_plans:
+    unwritten = []
+    # Every name that reached some file. Used below to drop descriptions of tensors no file
+    # ended up holding.
+    written_anywhere = set()
+    for plan, file_type, written_params in balanced_plans:
+        if not use_readback:
+            written_params = None
+        else:
+            for names in written_params.values():
+                written_anywhere.update(names)
+
         cur_rank_id = 0
         for rank_id, shard_groups in (plan.full_assignment or {}).items():
+            # The file id counts every rank the distribution gave something to, written or not:
+            # it has to keep step with the name each rank built for its own file in `save`.
             if not shard_groups:
                 continue
             save_file_name = get_checkpoint_name(
                 None, user_prefix, cur_rank_id, plan.total_files_num, file_type
             )
+            written_here = None if written_params is None else written_params.get(rank_id)
             for shard_id, rank_group in shard_groups.items():
+                shard_key = _reverse_sharded_tensor_shard_id(shard_id)
+                # A shard the distribution gave this rank but its file does not hold: recording
+                # it would point 'metadata.json' at a file without the tensor, and the loader
+                # resolves that record to the file and finds nothing.
+                if written_here is not None and shard_key[0] not in written_here:
+                    unwritten.append(shard_key[0])
+                    continue
                 param_file_mapping.append((
                     save_file_name + ".safetensors",
                     rank_id,
                     rank_group,
-                    _reverse_sharded_tensor_shard_id(shard_id)
+                    shard_key
                 ))
             cur_rank_id += 1
+
+    if unwritten:
+        logger.info(
+            f"{len(unwritten)} shard(s) were distributed to a rank whose file does not hold "
+            f"them and are left out of 'metadata.json', e.g. {sorted(set(unwritten))[:3]}."
+        )
+
+    if use_readback and sharded_tensor_metas is not None:
+        # Describe only tensors that reached some file. A description without a storage record is
+        # as unloadable as a storage record without a tensor -- the loader fails looking for the
+        # file. A name written by any rank keeps every rank's description of it, since resharding
+        # reads the other ranks' layouts to reassemble the tensor.
+        sharded_tensor_metas = {
+            rank_id: {name: meta for name, meta in (metas or {}).items() if name in written_anywhere}
+            for rank_id, metas in sharded_tensor_metas.items()
+        }
 
     metadata_file_path = get_metadata_filename(checkpoint_path, iteration)
     save_metadata(sharded_tensor_metas, param_file_mapping, metadata_file_path)
@@ -537,7 +671,8 @@ def _build_local_shard_map(
 
 def _compute_balanced_assignment_on_rank0(
         global_sharded_tensor_metas: Dict[int, Dict[str, ShardedTensor]],
-        world_size: int
+        world_size: int,
+        ship_sharded_tensors: bool = False
 ) -> Tuple[List[Tuple], Dict[int, Dict[str, Tuple[int, ...]]]]:
     """
     Compute the balanced shard assignment on rank 0 from the global ShardedTensor metadata.
@@ -550,11 +685,16 @@ def _compute_balanced_assignment_on_rank0(
             ShardedTensor metadata keyed by rank ID, already filtered to the target
             parameters by the caller.
         world_size (int): The total number of ranks.
+        ship_sharded_tensors (bool): Also send each rank the ShardedTensor of every shard assigned
+            to it, as rank 0 sees it. Needed when the global metadata holds shards a rank's own
+            metadata does not report (optimizer states completed on rank 0), so the rank can
+            still rebuild them. Defaults to False (a rank rebuilds from its own metadata only).
 
     Returns:
         Tuple containing:
         - scatter_payloads (List[Tuple]): Per-rank payloads `(assigned_shards,
-          param_redundancy, cur_rank_file_id, total_files_num)` to be scattered by rank 0.
+          param_redundancy, cur_rank_file_id, total_files_num, shipped_sharded_tensors)` to be
+          scattered by rank 0; `shipped_sharded_tensors` is None unless `ship_sharded_tensors`.
         - full_assignment (Dict[int, Dict[str, Tuple[int, ...]]]): The complete shard
           assignment `{rank_id: {shard_id: rank_group}}`, kept on rank 0 for writing
           'metadata.json'.
@@ -590,9 +730,16 @@ def _compute_balanced_assignment_on_rank0(
     scatter_payloads = []
     for rank_id in range(world_size):
         assigned_shards = full_assignment.get(rank_id, {})
+        shipped = None
+        if ship_sharded_tensors:
+            rank_metas = global_sharded_tensor_metas.get(rank_id) or {}
+            shipped = {
+                shard_id: rank_metas[_reverse_sharded_tensor_shard_id(shard_id)[0]]
+                for shard_id in assigned_shards
+            }
         scatter_payloads.append(
             (assigned_shards, param_redundancy_per_rank.get(rank_id, {}),
-             cur_rank_file_ids.get(rank_id), total_files_num)
+             cur_rank_file_ids.get(rank_id), total_files_num, shipped)
         )
 
     return scatter_payloads, full_assignment
@@ -608,20 +755,30 @@ def _scatter_balanced_shard_plan(
 
     Every rank rebuilds its assigned shards from its own local ShardedTensor metadata. This
     is valid because the ShardedTensor of a given shard (identified by parameter name and
-    global offset) has identical content on every rank that owns the shard.
+    global offset) has identical content on every rank that owns the shard. A shard the local
+    metadata does not report -- an optimizer state rank 0 completed from its parameter's layout --
+    is taken from the ShardedTensor rank 0 shipped with the assignment, when it shipped one.
 
     Note:
         Collective interface: **all ranks must call it** (a `scatter_object_list` from rank 0
         is performed).
     """
-    recv_payload = [(None, None, None, None)]
+    recv_payload = [(None, None, None, None, None)]
     scatter_object_list(recv_payload, scatter_payloads, src=0)
-    assigned_shards, param_redundancy, cur_rank_file_id, total_files_num = recv_payload[0]
+    assigned_shards, param_redundancy, cur_rank_file_id, total_files_num, shipped = recv_payload[0]
+    shipped = shipped or {}
 
-    cur_rank_shards = {
-        shard_id: (local_shard_map[shard_id], rank_group)
-        for shard_id, rank_group in assigned_shards.items()
-    }
+    cur_rank_shards = {}
+    for shard_id, rank_group in assigned_shards.items():
+        sharded_tensor = local_shard_map.get(shard_id)
+        if sharded_tensor is None:
+            sharded_tensor = shipped.get(shard_id)
+        if sharded_tensor is None:
+            raise KeyError(
+                f"Shard '{shard_id}' was assigned to this rank for saving, but neither this rank's "
+                f"strategy metadata nor the assignment from rank 0 describes it."
+            )
+        cur_rank_shards[shard_id] = (sharded_tensor, rank_group)
 
     return BalancedShardPlan(
         cur_rank_shards=cur_rank_shards,
@@ -701,20 +858,26 @@ def _build_balanced_shard_plan_from_global_metas(
     """
     local_rank = get_real_rank()
     world_size = get_real_group_size()
+    is_pynative = LayoutAdapter.is_pynative_mode()
 
-    local_shard_map = _build_local_shard_map(network, filter_func)
+    # Graph mode takes every assigned shard's ShardedTensor from rank 0 instead of from its own
+    # metadata: rank 0 completes optimizer states a rank's strategy metadata does not report, and
+    # the saved cells handed in here are not the compiled network `get_strategy_metadata` needs.
+    # PyNative's global metadata is gathered from what every rank reports, so its local metadata
+    # covers every assigned shard.
+    local_shard_map = _build_local_shard_map(network, filter_func) if is_pynative else {}
 
     scatter_payloads = None
     full_assignment = None
     if local_rank == 0:
         if global_sharded_tensor_metas is None:
             raise ValueError(
-                "Building the balanced shard plan in PyNative multi-rank scenarios requires "
+                "Building the balanced shard plan in multi-rank scenarios requires "
                 "the global ShardedTensor metadata on rank 0. Please fetch and cache it once "
                 "via `get_all_sharded_tensor_on_rank0` before saving, and pass it through."
             )
         scatter_payloads, full_assignment = _compute_balanced_assignment_on_rank0(
-            global_sharded_tensor_metas, world_size
+            global_sharded_tensor_metas, world_size, ship_sharded_tensors=not is_pynative
         )
 
     return _scatter_balanced_shard_plan(scatter_payloads, full_assignment, local_shard_map)

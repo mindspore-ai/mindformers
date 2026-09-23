@@ -2175,10 +2175,18 @@ class CheckpointMonitor(ModelCheckpoint):
         # memory explosion on large-scale clusters. Note: all ranks must participate in the
         # first call consistently (collective communication in PyNative mode).
         if get_real_group_size() > 1 and not self._sharded_tensor_metas_initialized:
+            model_params = cb_params.network.network.parameters_dict()
+            saved_optimizer = cb_params.network.optimizer if self.save_optimizer else None
+            # `optimizer` completes the states the strategy metadata omits (they would never be
+            # written and would restart from zero on resume); `saved_cells` keeps out what the
+            # saved cells do not own. The latter is what removes `accu_grads.*`: the strategy
+            # metadata describes the whole compiled graph and reports those buffers, but they
+            # belong to the train-one-step wrapper, not to the cells being saved.
             self._cached_sharded_tensor_metas = get_all_sharded_tensor_on_rank0(
                 network=cb_params.network,
-                filter_func=(lambda x: x in list(
-                    cb_params.network.network.parameters_dict().keys())) if not self.save_optimizer else None
+                filter_func=(lambda x: x in model_params) if not self.save_optimizer else None,
+                optimizer=saved_optimizer,
+                saved_cells=[cb_params.network.network, saved_optimizer]
             )
             self._sharded_tensor_metas_initialized = True
         sharded_tensor_metas = self._cached_sharded_tensor_metas if get_real_group_size() > 1 else None
