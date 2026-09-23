@@ -14,7 +14,7 @@
 # ============================================================================
 """Sharded Tensor"""
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import List, Dict, Optional, Tuple, Union, Callable
 
 import mindspore as ms
@@ -594,9 +594,30 @@ def get_all_sharded_tensor(
     return _build_all_sharded_tensor_from_global_layout(global_strategy_info, filter_func)
 
 
+def _owned_param_names(network: Union[Cell, List[Cell]]) -> set:
+    """
+    The parameter names the given cell(s) own, less the pipeline-shared ones.
+
+    Only ownership and the pipeline-shared flag are used, because both are the same on every rank.
+    What `save_checkpoint` additionally drops on a given rank (unsliced parameters, ones still
+    holding an initializer) depends on that rank's own instance, so rank 0 cannot decide it for
+    the others -- under pipeline parallelism every other stage's parameters look unsliced on rank 0.
+    Those drops are caught by reading the written files back (see `save_balanced_metadata`).
+    """
+    cells = network if isinstance(network, (list, tuple)) else [network]
+    names = set()
+    for cell in cells:
+        if cell is None:
+            continue
+        names.update(param.name for param in cell.get_parameters() if not _is_pipeline_shared_param(param))
+    return names
+
+
 def get_all_sharded_tensor_on_rank0(
         network: Union[Cell, List[Cell]],
-        filter_func: Callable[[str], bool] = None
+        filter_func: Callable[[str], bool] = None,
+        optimizer: Optional[Cell] = None,
+        saved_cells: Optional[List[Cell]] = None
 ) -> Optional[Dict[int, Dict[str, ShardedTensor]]]:
     """
     Collects sharded tensor metadata for all ranks, but builds and returns them on rank 0 only.
@@ -620,6 +641,24 @@ def get_all_sharded_tensor_on_rank0(
         filter_func (Optional[Callable[[str], bool]]): An optional filtering function that takes a parameter name (str)
             and returns a boolean. Only parameters for which the function returns `True` are included in the
             ShardedTensor collection. Defaults to `None` (all eligible parameters are included).
+        optimizer (Optional[Cell]): The optimizer whose states are being saved alongside the network. Its
+            states are then completed from the tracked parameters' layout, because the ones the strategy
+            metadata omits would otherwise never be written and would restart from zero on resume (see
+            `complete_optimizer_layout_index`). Defaults to `None` (no completion).
+        saved_cells (Optional[List[Cell]]): The cells that will be handed to `save_checkpoint` (the
+            model, and the optimizer when its states are saved). When given, only the parameters
+            those cells own, less the pipeline-shared ones, are kept (see `_owned_param_names`).
+            `accu_grads.*` is the case that matters: the strategy metadata describes the whole
+            compiled graph and reports those buffers, but they belong to the train-one-step wrapper,
+            not to a saved cell, so no file would ever hold them. Note that this is the set of cells
+            being saved, which is not always `network` -- the layout is often read off the training
+            wrapper while only the cells inside it are saved. Defaults to `None` (keep everything
+            the strategy metadata reports).
+
+        `optimizer` and `saved_cells` take effect in Graph mode only and are ignored in PyNative:
+        there each rank builds only its own pipeline stage, so rank 0's cells do not own the other
+        stages' parameters, and the layouts gathered from every rank already cover every optimizer
+        state.
 
     Returns:
         Optional[Dict[int, Dict[str, ShardedTensor]]]: On rank 0 (or in single-rank jobs), a nested
@@ -630,13 +669,37 @@ def get_all_sharded_tensor_on_rank0(
         RuntimeError: If no distributed strategy metadata is associated with the network (rank 0 only).
     """
     logger.info(".........Get All Ranks' Strategy Metadata on Rank 0.........")
+    if LayoutAdapter.is_pynative_mode():
+        optimizer, saved_cells = None, None
     layout_index = LayoutAdapter.get_all_layouts_on_rank0(network)
+    # Ownership is read off the local cells, so it is collected before the rank guard below -- in
+    # Graph mode every rank instantiates the whole model and optimizer, so rank 0's cells own
+    # every stage's parameters.
+    owned = _owned_param_names(saved_cells) if saved_cells is not None else None
     if get_real_group_size() > 1 and get_real_rank() != 0:
         return None
     if not layout_index or not layout_index[0]:
         raise RuntimeError('`get_strategy_metadata` returns `None`, which indicates there is no strategy '
                            'info. Please check whether this is a distributed job.')
     param_layouts, rank_param_names = layout_index
+    param_layouts, rank_param_names = complete_optimizer_layout_index(
+        param_layouts, rank_param_names, optimizer
+    )
+
+    if owned is not None:
+        dropped = {name for name in param_layouts if name not in owned}
+        if dropped:
+            logger.info(
+                f"{len(dropped)} parameter(s) reported by the strategy metadata are not owned by the "
+                f"saved cells (or are pipeline-shared) and are left out of the checkpoint metadata, "
+                f"e.g. {sorted(dropped)[:3]}."
+            )
+            param_layouts = {name: info for name, info in param_layouts.items() if name in owned}
+            rank_param_names = {
+                rank_id: [name for name in names if name in owned]
+                for rank_id, names in rank_param_names.items()
+            }
+
     return _build_all_sharded_tensor_from_layout_index(param_layouts, rank_param_names, filter_func)
 
 
@@ -673,6 +736,203 @@ def get_cur_sharded_tensor(
         param_infos=strategy_info, cur_npu_rank=get_real_rank(), filter_func=filter_func
     )
     return cur_rank_sharded_tensors
+
+
+def _find_base_param_name(param_name: str, base_names) -> Optional[str]:
+    """
+    Strip an optimizer state prefix off `param_name` and return the parameter it belongs to.
+
+    'muon_m.decoder.layers.0.mlp.linear_fc1.weight' -> 'decoder.layers.0.mlp.linear_fc1.weight'
+
+    The prefix is discovered by trying every dot boundary instead of matching a fixed list, so
+    optimizers with their own state names keep working.
+    """
+    dot = param_name.find('.')
+    while dot != -1:
+        candidate = param_name[dot + 1:]
+        if candidate in base_names:
+            return candidate
+        dot = param_name.find('.', dot + 1)
+    return None
+
+
+def _is_pipeline_shared_param(param) -> bool:
+    """
+    Whether this is a pipeline-shared parameter, which `mindspore.save_checkpoint` never writes.
+
+    `save_checkpoint` drops these before consulting `choice_func`, without a word in the log. The
+    flag is the same on every rank, so rank 0 can decide it for the whole job -- unlike the other
+    drops `save_checkpoint` makes (unsliced parameters, ones still holding an initializer), which
+    depend on each rank's own instance and are caught by reading the written files back instead.
+    """
+    return bool(getattr(param.param_info, 'is_pipeline_shared_param', False))
+
+
+def complete_optimizer_sharded_tensor(
+        sharded_tensors: Dict[str, ShardedTensor],
+        optimizer: Optional[Cell],
+        filter_func: Callable[[str], bool] = None
+) -> Dict[str, ShardedTensor]:
+    """
+    Add optimizer states that MindSpore's strategy metadata does not report.
+
+    `get_cur_sharded_tensor` derives the parameter list from the strategy metadata, which only
+    covers parameters the compiled graph exposes a sharding strategy for. Some optimizer states
+    are missing from it -- Muon's `muon_m.*` is absent on every pipeline stage that holds no MTP
+    layer, for instance. A missing entry is never requested from the checkpoint, so the state stays
+    at its initial value and resumed training silently continues with, for example, a zeroed
+    momentum. That is invisible in the first resumed step (the state is only read by the optimizer)
+    and shows up as a slowly growing loss deviation from an uninterrupted run.
+
+    An optimizer state always has the same shape and sharding as the parameter it tracks, so the
+    missing entries are rebuilt from that parameter's layout.
+
+    Args:
+        sharded_tensors (Dict[str, ShardedTensor]): Metadata built from the strategy, modified in place.
+        optimizer (Optional[Cell]): Optimizer whose states must all be present. No-op when None.
+        filter_func (Optional[Callable[[str], bool]]): Same filter applied to the strategy metadata.
+
+    Returns:
+        Dict[str, ShardedTensor]: `sharded_tensors`, with the recoverable optimizer states added.
+    """
+    if optimizer is None:
+        return sharded_tensors
+
+    recovered = {}
+    unresolved = []
+    for param in optimizer.get_parameters():
+        param_name = param.name
+        if param_name in sharded_tensors or param_name in recovered:
+            continue
+        if filter_func is not None and not filter_func(param_name):
+            continue
+
+        base_name = _find_base_param_name(param_name, sharded_tensors)
+        if base_name is None:
+            unresolved.append(param_name)
+            continue
+
+        base = sharded_tensors[base_name]
+        if base.local_shape is not None and tuple(param.data.shape) != base.local_shape:
+            # Not a plain per-element state (flattened or padded buffers land here). Rebuilding it
+            # from the parameter's layout would corrupt it, so leave it out.
+            logger.warning(
+                f"Optimizer state '{param_name}' has shape {tuple(param.data.shape)} while its parameter "
+                f"'{base_name}' is sharded as {base.local_shape}; it cannot be recovered from the "
+                f"parameter layout and will not be loaded."
+            )
+            unresolved.append(param_name)
+            continue
+
+        recovered[param_name] = replace(base, key=param_name, org_key=param_name, dtype=param.data.dtype)
+
+    if recovered:
+        logger.info(
+            f"{len(recovered)} optimizer state(s) are missing from the strategy metadata and were "
+            f"rebuilt from their parameter's layout, e.g. '{sorted(recovered)[0]}'."
+        )
+        sharded_tensors.update(recovered)
+    if unresolved:
+        # Expected for optimizer parameters that track no network parameter: bookkeeping counters
+        # and the one-element placeholders optimizers create to keep their state lists aligned.
+        logger.info(
+            f"{len(unresolved)} optimizer parameter(s) match no network parameter and are left to "
+            f"their initial value, e.g. {sorted(unresolved)[:3]}."
+        )
+    return sharded_tensors
+
+
+def complete_optimizer_layout_index(
+        param_layouts: Dict[str, list],
+        rank_param_names: Dict[int, List[str]],
+        optimizer: Optional[Cell]
+) -> Tuple[Dict[str, list], Dict[int, List[str]]]:
+    """
+    Add the optimizer states the strategy metadata omits to a gathered layout index.
+
+    The saving side reaches the global picture through a deduplicated layout index rather than
+    through per-rank `ShardedTensor` dictionaries, so the completion described in
+    `complete_optimizer_sharded_tensor` is applied to the index instead. Doing it here, after the
+    index is assembled, keeps it free of extra communication and away from the per-rank gather.
+
+    A state is credited to a rank only when that rank's own name list already contains the
+    parameter it tracks. That restraint is the point: under semi-auto parallel every rank
+    instantiates the whole optimizer, so enumerating `optimizer.get_parameters()` alone would
+    claim every stage's states on every rank. The distribution would then hand a state to a rank
+    whose file cannot hold it, and 'metadata.json' would point at that file.
+
+    Pipeline-shared states are left out, as `save_checkpoint` never writes them (see
+    `_is_pipeline_shared_param`); the index feeds 'metadata.json', which must not promise a tensor
+    that never reaches a file. Whatever else a rank's `save_checkpoint` drops is caught by reading
+    the written files back.
+
+    Args:
+        param_layouts (Dict[str, list]): Layout of each parameter, `[ms.Layout or None, dtype,
+            full_shape]`, keyed by parameter name. Modified in place.
+        rank_param_names (Dict[int, List[str]]): Parameter names owned by each rank. Modified in place.
+        optimizer (Optional[Cell]): The optimizer whose states must all be present. No-op when None.
+
+    Returns:
+        Tuple[Dict[str, list], Dict[int, List[str]]]: The completed `(param_layouts, rank_param_names)`.
+    """
+    if optimizer is None:
+        return param_layouts, rank_param_names
+
+    # Parameter name -> the optimizer states tracking it, with the dtype each state stores.
+    states_by_base: Dict[str, List[Tuple[str, ms.dtype]]] = defaultdict(list)
+    unresolved = []
+    skipped_shared = []
+    for param in optimizer.get_parameters():
+        param_name = param.name
+        if param_name in param_layouts:
+            continue
+        if _is_pipeline_shared_param(param):
+            skipped_shared.append(param_name)
+            continue
+        base_name = _find_base_param_name(param_name, param_layouts)
+        if base_name is None:
+            unresolved.append(param_name)
+            continue
+        states_by_base[base_name].append((param_name, param.data.dtype))
+
+    if not states_by_base:
+        return param_layouts, rank_param_names
+
+    recovered = set()
+    for rank_id, names in rank_param_names.items():
+        added = []
+        owned = set(names)
+        for base_name in names:
+            for state_name, state_dtype in states_by_base.get(base_name, ()):
+                if state_name in owned:
+                    continue
+                owned.add(state_name)
+                added.append(state_name)
+                if state_name not in param_layouts:
+                    base_layout, _, base_global_shape = param_layouts[base_name]
+                    # A state shares its parameter's sharding and global shape; only the stored
+                    # dtype may differ (a momentum kept in float32 for a bfloat16 weight).
+                    param_layouts[state_name] = [base_layout, state_dtype, base_global_shape]
+                    recovered.add(state_name)
+        if added:
+            rank_param_names[rank_id] = names + added
+
+    if recovered:
+        logger.info(
+            f"{len(recovered)} optimizer state(s) are missing from the strategy metadata and were "
+            f"rebuilt from their parameter's layout, e.g. '{sorted(recovered)[0]}'."
+        )
+    if unresolved:
+        logger.info(
+            f"{len(unresolved)} optimizer parameter(s) match no network parameter and are left to "
+            f"their initial value, e.g. {sorted(unresolved)[:3]}."
+        )
+    if skipped_shared:
+        logger.info(
+            f"{len(skipped_shared)} optimizer state(s) are pipeline-shared, which 'save_checkpoint' "
+            f"never writes, and are left out of the checkpoint metadata, e.g. {sorted(skipped_shared)[:3]}."
+        )
+    return param_layouts, rank_param_names
 
 
 def get_cur_sharded_tensor_after_balanced(

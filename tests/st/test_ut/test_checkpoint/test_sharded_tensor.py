@@ -181,6 +181,51 @@ def test_get_sharded_tensor_from_cell():
 @pytest.mark.level0
 @pytest.mark.platform_x86_cpu
 @pytest.mark.env_onecard
+def test_owned_param_names_ignores_per_rank_state():
+    """
+    Feature: _owned_param_names, the filter rank 0 applies for the whole job
+    Description: Under pipeline parallelism another stage's parameters look unsliced and still hold
+        an initializer on rank 0, while they are written normally on their own stage. Only
+        ownership and the pipeline-shared flag, which are the same on every rank, may filter.
+    Expectation: Unsliced / initializer-holding parameters are kept; pipeline-shared ones and
+        parameters of cells not being saved are left out
+    """
+    from mindformers.checkpoint.sharded_tensor import _owned_param_names
+
+    net = SimpleNet()
+    net.dense.weight.sliced = False   # as another pipeline stage's weight looks on rank 0
+    net.dense.bias.param_info.is_pipeline_shared_param = True
+
+    owned = _owned_param_names([net, None])
+    assert net.dense.weight.name in owned
+    assert net.dense.bias.name not in owned
+    assert "accu_grads." + net.dense.weight.name not in owned
+
+
+@pytest.mark.level0
+@pytest.mark.platform_x86_cpu
+@pytest.mark.env_onecard
+def test_preprocess_params_graph_unwraps_cell_list():
+    """
+    Feature: LayoutAdapter.preprocess_params in Graph mode
+    Description: 'save_checkpoint' wraps the network in a list, but MindSpore's save_checkpoint
+        takes a Cell or a list of Parameters, not a list of Cells
+    Expectation: A single Cell is passed through unchanged; several Cells become their Parameters
+    """
+    from unittest.mock import patch
+    from mindformers.checkpoint.layout_adapter import LayoutAdapter
+
+    net_a, net_b = SimpleNet(), SimpleNet()
+    with patch.object(LayoutAdapter, "is_pynative_mode", return_value=False):
+        assert LayoutAdapter.preprocess_params(net_a) is net_a
+        assert LayoutAdapter.preprocess_params([net_a]) is net_a
+        params = LayoutAdapter.preprocess_params([net_a, net_b])
+    assert params == list(net_a.get_parameters()) + list(net_b.get_parameters())
+
+
+@pytest.mark.level0
+@pytest.mark.platform_x86_cpu
+@pytest.mark.env_onecard
 def test_sharded_tensor_with_custom_attributes():
     """
     Feature: ShardedTensor creation with custom attributes

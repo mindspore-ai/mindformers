@@ -14,7 +14,9 @@
 # ============================================================================
 """resharding tensor"""
 
+import json
 import os
+import struct
 import copy
 from time import time
 from concurrent.futures import ThreadPoolExecutor
@@ -33,6 +35,24 @@ from mindformers.tools.logger import logger
 from mindformers.tools.utils import get_real_rank
 from mindformers.checkpoint.sharded_tensor import ShardedTensor
 from mindformers.checkpoint.utils import get_sharded_tensor_shard_id, is_hf_checkpoint
+
+
+def _peek_checkpoint_keys(file_path: str, limit: int = 5) -> str:
+    """Read the tensor names out of a safetensors header, for use in an error message."""
+    max_header_bytes = 100 * 1024 * 1024
+    try:
+        with open(file_path, 'rb') as f:
+            header_len = struct.unpack('<Q', f.read(8))[0]
+            if header_len > max_header_bytes:
+                # Not a safetensors file, or a truncated one: the length prefix is nonsense and
+                # honouring it would try to allocate it.
+                return f"<not a readable safetensors header: claims {header_len} bytes>"
+            header = json.loads(f.read(header_len))
+        names = sorted(k for k in header if k != '__metadata__')
+    except Exception as e:  # pylint: disable=broad-except
+        # Only ever used to enrich another error; never let it replace one.
+        return f"<unreadable: {type(e).__name__}: {e}>"
+    return f"{len(names)} tensor(s), e.g. {names[:limit]}"
 
 
 def check_layout(layout: Optional[Any], name: str) -> None:
@@ -1098,11 +1118,23 @@ class ReshardLoader:
                     filter_names=set(src_names),
                 )
             else:
-                state_dict_from_file = ms_load_checkpoint(
-                    file_path,
-                    format='safetensors',
-                    choice_func=lambda x, src_names_local=src_names: x in src_names_local
-                )
+                try:
+                    state_dict_from_file = ms_load_checkpoint(
+                        file_path,
+                        format='safetensors',
+                        choice_func=lambda x, src_names_local=src_names: x in src_names_local
+                    )
+                except ValueError as e:
+                    # 'The loaded parameter dict is empty after filter' says nothing about which
+                    # file or which parameters, which makes a metadata/content mismatch impossible
+                    # to place. The metadata sends us to this file for these names; report what it
+                    # actually holds.
+                    raise ValueError(
+                        f"Loaded nothing from '{file_path}'. 'metadata.json' maps {len(src_names)} "
+                        f"parameter(s) to this file, e.g. {sorted(src_names)[:5]}, but the file holds "
+                        f"none of them; it holds {_peek_checkpoint_keys(file_path, limit=5)}. The "
+                        f"checkpoint's metadata and its contents disagree."
+                    ) from e
 
             # Slicing
             for src_name, search_rank, param_slice in param_infos:

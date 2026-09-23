@@ -377,7 +377,7 @@ def get_total_params_file_mapping_info(sharded_tensor_metas, user_prefix, model_
     for cur_npu_rank, cur_rank_sharded_tensors in sharded_tensor_metas.items():
         # Get mappings of parameter file of current rank.
         for sharded_tensor in cur_rank_sharded_tensors.values():
-            if model_keys and sharded_tensor.key not in list(model_keys):
+            if model_keys and sharded_tensor.key not in model_keys:
                 ckpt_name = get_checkpoint_name(None, user_prefix, cur_npu_rank, npu_nums, FileType.OPTIMIZER)
             else:
                 ckpt_name = get_checkpoint_name(None, user_prefix, cur_npu_rank, npu_nums, FileType.MODEL)
