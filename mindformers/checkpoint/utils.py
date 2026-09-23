@@ -15,6 +15,7 @@
 """APIs of checkpoint utils."""
 
 import datetime
+import hashlib
 import os
 import re
 import json
@@ -52,6 +53,75 @@ MS_TYPE_TO_SIZE = {
     "BFloat16": 16,
     "Int4": 4
 }
+
+
+def get_base_checkpoint_fingerprint(base_path: str) -> Optional[str]:
+    """Build a fingerprint from checkpoint metadata and weight-file statistics.
+
+    Hugging Face checkpoints contribute their config/index content and each
+    safetensors file's size and modification time. MindSpore checkpoints
+    contribute ``metadata.json`` and ``common.json`` content, plus any
+    safetensors statistics. A direct checkpoint file is fingerprinted from its
+    own statistics.
+    """
+    if not base_path or not os.path.exists(base_path):
+        return None
+
+    digest = hashlib.sha256()
+    found = False
+
+    def add_file_content(path: str):
+        """Add a metadata file's relative name and content to the digest."""
+        nonlocal found
+        found = True
+        relative_path = os.path.relpath(path, base_path) if os.path.isdir(base_path) else os.path.basename(path)
+        digest.update(relative_path.encode("utf-8"))
+        with open(path, "rb") as stream:
+            digest.update(stream.read())
+
+    def add_file_stat(path: str):
+        """Add a weight file's relative name, size, and mtime to the digest."""
+        nonlocal found
+        found = True
+        stat = os.stat(path)
+        relative_path = os.path.relpath(path, base_path) if os.path.isdir(base_path) else os.path.basename(path)
+        digest.update(relative_path.encode("utf-8"))
+        digest.update(str(stat.st_size).encode("ascii"))
+        digest.update(str(stat.st_mtime_ns).encode("ascii"))
+
+    if os.path.isfile(base_path):
+        add_file_stat(base_path)
+        return digest.hexdigest()
+
+    metadata_names = {"config.json", "model.safetensors.index.json", "metadata.json", "common.json"}
+    for root, directories, files in os.walk(base_path):
+        directories.sort()
+        for name in sorted(files):
+            path = os.path.join(root, name)
+            if name in metadata_names:
+                add_file_content(path)
+            elif name.endswith(".safetensors"):
+                add_file_stat(path)
+    return digest.hexdigest() if found else None
+
+
+def get_adapter_manifest_path(checkpoint_path: str) -> Optional[str]:
+    """Return the adapter manifest at a checkpoint root or its latest iteration."""
+    if not checkpoint_path or not os.path.isdir(checkpoint_path):
+        return None
+
+    manifest_name = "mindformers_adapter_config.json"
+    manifest_path = os.path.join(checkpoint_path, manifest_name)
+    if os.path.isfile(manifest_path):
+        return manifest_path
+
+    tracker_path = get_checkpoint_tracker_filename(checkpoint_path)
+    if not os.path.isfile(tracker_path):
+        return None
+    iteration = get_latest_iteration_from_tracker(checkpoint_path)
+    manifest_path = os.path.join(
+        get_checkpoint_iter_dir(checkpoint_path, iteration), manifest_name)
+    return manifest_path if os.path.isfile(manifest_path) else None
 
 
 class FileType(Enum):

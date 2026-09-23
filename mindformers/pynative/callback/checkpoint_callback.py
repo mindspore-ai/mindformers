@@ -13,15 +13,21 @@
 # limitations under the License.
 # ============================================================================
 """Checkpoint callback for saving model checkpoints during training."""
+import json
 import os
 
 from mindformers.pynative.callback.callback import TrainerCallback
 from mindformers.tools.logger import logger
-from mindformers.tools.utils import get_real_group_size
+from mindformers.tools.utils import get_real_group_size, get_real_rank
 from mindformers.checkpoint import save_checkpoint
 from mindformers.checkpoint.checkpoint import CommonInfo, AsyncSaveManager
+from mindformers.checkpoint.utils import (
+    get_base_checkpoint_fingerprint,
+    get_checkpoint_iter_dir,
+    gather_param_names_on_rank0,
+)
 from mindformers.checkpoint.sharded_tensor import get_all_sharded_tensor_on_rank0
-from mindformers.checkpoint.utils import gather_param_names_on_rank0
+from mindformers.pynative.pet.utils import is_lora_param_name
 
 
 class CheckpointCallback(TrainerCallback):
@@ -53,6 +59,9 @@ class CheckpointCallback(TrainerCallback):
         prefix: str = "checkpoint",
         remove_redundancy: bool = False,
         save_global_layout_cache: bool = True,
+        save_trainable_only: bool = False,
+        base_load_path: str = "",
+        lora_config=None,
     ):
         """
         Initialize the CheckpointCallback.
@@ -76,6 +85,9 @@ class CheckpointCallback(TrainerCallback):
         # across saves since the parallel layout is static during training.
         self.balanced_plan_cache = {}
         self.save_global_layout_cache = save_global_layout_cache
+        self.save_trainable_only = save_trainable_only
+        self.base_load_path = base_load_path
+        self.lora_config = lora_config
         # Whether the global metadata has been fetched at least once. Non-zero ranks always
         # get None metadata, so a dedicated flag is required to keep the first collective
         # fetch consistent across all ranks.
@@ -83,6 +95,8 @@ class CheckpointCallback(TrainerCallback):
 
         if not self.save_path:
             raise ValueError("save_path must be provided for CheckpointCallback.")
+        if self.save_trainable_only and not self.base_load_path:
+            raise ValueError("base_load_path is required for trainable-only checkpoints.")
 
         # Initialize the async save manager
         self.async_save_manager = None
@@ -199,6 +213,16 @@ class CheckpointCallback(TrainerCallback):
             self.global_model_keys = gather_param_names_on_rank0(local_model_keys)
             self._sharded_tensor_metas_initialized = True
 
+        model_choice_func = None
+        if self.save_trainable_only:
+            model_choice_func = is_lora_param_name
+            model_names = set()
+            model_networks = list(model) if isinstance(model, (list, tuple)) else [model]
+            for net in model_networks:
+                model_names.update(net.parameters_dict().keys())
+            if not any(model_choice_func(name) for name in model_names):
+                raise ValueError("save_trainable_only=True but no LoRA parameters exist in the model.")
+
         try:
             # Prepare the async manager before any save operation.
             if self.async_save_manager is not None:
@@ -218,8 +242,12 @@ class CheckpointCallback(TrainerCallback):
                 sharded_tensor_metas=self.sharded_tensor_metas,
                 current_ckpt_step_list=self.current_ckpt_step_list,
                 balanced_plan_cache=self.balanced_plan_cache,
-                global_model_keys=self.global_model_keys
+                global_model_keys=self.global_model_keys,
+                model_choice_func=model_choice_func
             )
+
+            if self.save_trainable_only:
+                self._write_adapter_manifest(common_info)
 
             self._last_triggered_step = state.global_step
 
@@ -236,6 +264,32 @@ class CheckpointCallback(TrainerCallback):
 
         except (RuntimeError, ValueError, FileNotFoundError) as e:
             logger.error(f"Error saving checkpoint: {e}")
+
+    def _write_adapter_manifest(self, common_info):
+        """Write the adapter resume contract at root and iteration directories."""
+        if get_real_rank() != 0:
+            return
+        config = self.lora_config.to_dict() if hasattr(self.lora_config, "to_dict") else dict(self.lora_config or {})
+        base_fingerprint = get_base_checkpoint_fingerprint(self.base_load_path)
+        if base_fingerprint is None:
+            logger.warning(
+                "Unable to fingerprint base_load_path='%s'; the adapter manifest cannot "
+                "verify the base checkpoint during resume.", self.base_load_path,
+            )
+        manifest = {
+            "format": "mindformers_pynative_lora_adapter_v1",
+            "base_load_path": os.path.abspath(self.base_load_path),
+            "base_fingerprint": base_fingerprint,
+            "lora_config": config,
+            "global_step": common_info.global_step,
+            "consumed_samples": common_info.consumed_samples,
+        }
+        iteration_dir = get_checkpoint_iter_dir(self.save_path, int(common_info.global_step))
+        for directory in (self.save_path, iteration_dir):
+            os.makedirs(directory, exist_ok=True)
+            path = os.path.join(directory, "mindformers_adapter_config.json")
+            with open(path, "w", encoding="utf-8") as stream:
+                json.dump(manifest, stream, indent=2, ensure_ascii=False)
 
     def _create_common_info(self, state) -> CommonInfo:
         """
