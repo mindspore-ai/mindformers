@@ -238,6 +238,23 @@ class BalancedSaveStrategy():
         if self.cur_rank_file_id is None:
             self.cur_rank_file_id = plan.cur_rank_file_id
 
+        # A rank may be assigned no shard at all (every shard it holds is redundant and saved by
+        # other ranks), in which case it owns no checkpoint file and has nothing to write.
+        #
+        # A shard can only be written once, so the number of files is capped by the number of
+        # distinct shards: fewer shards than ranks necessarily leaves some ranks empty. This is
+        # expected whenever only a small subset of the parameters is trained (DSA indexer warm-up,
+        # LoRA, ...), because the optimizer then holds state for those parameters only. The
+        # optimizer file count being far below the world size is therefore normal in such runs and
+        # does not mean state was lost: every shard is still written by exactly one rank of its
+        # redundancy group and recorded in 'metadata.json'.
+        if self.cur_rank_file_id is None:
+            logger.info(
+                f"No {self.file_type.value} shard is assigned to the current rank "
+                f"(total files of this type: {self.total_files_num}), skip saving checkpoint file."
+            )
+            return plan
+
         save_ckpt_path = get_checkpoint_iter_dir(self.checkpoint_path, iteration)
         save_file_name = os.path.join(
             save_ckpt_path,
