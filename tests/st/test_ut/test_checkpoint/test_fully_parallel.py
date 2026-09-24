@@ -418,6 +418,90 @@ def test_balanced_save_strategy_save(
 @pytest.mark.level0
 @pytest.mark.platform_x86_cpu
 @pytest.mark.env_onecard
+def test_balanced_save_strategy_save_skips_rank_without_shards(
+        tmp_path, mock_network, mock_get_real_rank, mock_save_checkpoint
+):
+    """
+    Feature: BalancedSaveStrategy.save method
+    Description: A rank that is assigned no shard by the balanced plan (cur_rank_file_id is None,
+        e.g. every optimizer shard it holds is redundant and saved by other ranks)
+    Expectation: No checkpoint file is written and no file name is generated; the plan is still returned
+    """
+    empty_plan = BalancedShardPlan(total_files_num=2, cur_rank_file_id=None)
+    strategy = BalancedSaveStrategy(
+        network=mock_network,
+        checkpoint_path=str(tmp_path / "checkpoint"),
+        file_type=FileType.OPTIMIZER,
+        plan_cache={FileType.OPTIMIZER: empty_plan}
+    )
+
+    plan = strategy.save(0)
+
+    mock_save_checkpoint.assert_not_called()
+    assert plan is empty_plan
+
+
+@pytest.mark.level0
+@pytest.mark.platform_x86_cpu
+@pytest.mark.env_onecard
+def test_balanced_save_strategy_fewer_shards_than_ranks(
+        tmp_path, mock_network, mock_sharded_tensor_shard_id, mock_get_shard_size,
+        mock_save_checkpoint, mock_get_checkpoint_iter_dir
+):
+    """
+    Feature: BalancedSaveStrategy with fewer shards than ranks
+    Description: Only a small subset of the parameters is trained (DSA indexer warm-up, LoRA),
+        so the optimizer holds fewer shards than there are ranks; every shard here is held by
+        all four ranks. The real `get_checkpoint_name` is used so that a missing file id would
+        format `None` and raise, as seen on a 1024-card job.
+    Expectation: Exactly as many files as shards; the ranks that own a file are numbered from 0;
+        the remaining ranks have no file id and skip saving; every shard is still assigned to
+        exactly one rank, so nothing is lost.
+    """
+    shard_of = lambda name, offset: MockShardTensor(name, offset, (10,), "float32")
+    # Four ranks, two shards, every shard replicated on all of them.
+    distribution = {
+        rank_id: {"opt1": shard_of("opt1", (0,)), "opt2": shard_of("opt2", (10,))}
+        for rank_id in range(4)
+    }
+
+    def strategy_of(rank_id):
+        """Strategy of `rank_id`; the rank must stay patched while its plan is built lazily."""
+        return BalancedSaveStrategy(
+            network=mock_network,
+            checkpoint_path=str(tmp_path / "checkpoint"),
+            file_type=FileType.OPTIMIZER
+        )
+
+    with patch("mindformers.checkpoint.fully_parallel.get_all_sharded_tensor", return_value=distribution), \
+            patch("mindformers.checkpoint.fully_parallel.get_real_group_size", return_value=1):
+        # Two shards over four ranks: two files, owned by the two lowest ranks.
+        writing_ranks = {}
+        for rank_id in range(4):
+            with patch("mindformers.checkpoint.fully_parallel.get_real_rank", return_value=rank_id):
+                strategy = strategy_of(rank_id)
+                assert strategy.get_total_files() == 2
+                writing_ranks[rank_id] = strategy.get_cur_rank_file_id()
+        assert writing_ranks == {0: 0, 1: 1, 2: None, 3: None}
+
+        # A rank without a file id writes nothing instead of formatting `None` into the name.
+        for rank_id in (2, 3):
+            with patch("mindformers.checkpoint.fully_parallel.get_real_rank", return_value=rank_id):
+                plan = strategy_of(rank_id).save(0)
+            assert plan.cur_rank_file_id is None
+            assert plan.total_files_num == 2
+        mock_save_checkpoint.assert_not_called()
+
+        # No shard is dropped: both shards are assigned, each to exactly one rank.
+        with patch("mindformers.checkpoint.fully_parallel.get_real_rank", return_value=0):
+            assignment = strategy_of(0).apply_saving_parallelization().full_assignment
+        assigned_shards = [shard_id for shards in assignment.values() for shard_id in shards]
+        assert sorted(assigned_shards) == ["opt1_(0,)", "opt2_(10,)"]
+
+
+@pytest.mark.level0
+@pytest.mark.platform_x86_cpu
+@pytest.mark.env_onecard
 def test_save_balanced_metadata(tmp_path, mock_get_real_rank):
     """
     Feature: save_balanced_metadata writes one combined 'metadata.json' on rank 0
