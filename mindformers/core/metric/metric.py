@@ -21,9 +21,8 @@ import math
 import jieba
 import numpy as np
 from rouge_chinese import Rouge
-from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
 
-import mindspore.nn as nn
+from mindspore import nn
 import mindspore as ms
 from mindspore.ops import operations as P
 from mindspore.communication import get_group_size, get_rank
@@ -31,6 +30,7 @@ from mindformers.tools.register import MindFormerRegister, MindFormerModuleType
 from mindformers.tools.logger import logger
 from mindformers.core.loss import CrossEntropyLoss
 
+from .bleu import sentence_bleu
 from .utils import PerplexityCell
 from ...dataset.labels import cluener_labels
 
@@ -226,7 +226,7 @@ class PerplexityMetric(nn.Metric):
 
         per_stage_device_num = self.device_num // self.pipeline_stages
         stage_id = self.rank_id // per_stage_device_num
-        self.is_last_stage = (stage_id == self.pipeline_stages - 1)
+        self.is_last_stage = stage_id == self.pipeline_stages - 1
 
         self.parallel_mode = ms.get_auto_parallel_context("parallel_mode")
         self.full_batch = ms.get_auto_parallel_context("full_batch")
@@ -325,7 +325,7 @@ class ADGENMetric(nn.Metric):
 
             for k, v in result.items():
                 self.score_dict.get(k).append(round(v["f"] * 100, 4))
-            bleu_score = sentence_bleu([list(label)], list(pred), smoothing_function=SmoothingFunction().method3)
+            bleu_score = sentence_bleu([list(label)], list(pred))
             self.score_dict["bleu-4"].append(round(bleu_score * 100, 4))
 
     def eval(self):
@@ -410,7 +410,7 @@ class PromptAccMetric(nn.Metric):
 
         per_stage_device_num = self.device_num // self.pipeline_stages
         stage_id = self.rank_id // per_stage_device_num
-        self.is_last_stage = (stage_id == self.pipeline_stages - 1)
+        self.is_last_stage = stage_id == self.pipeline_stages - 1
 
         self.parallel_mode = ms.get_auto_parallel_context("parallel_mode")
         self.full_batch = ms.get_auto_parallel_context("full_batch")
@@ -628,8 +628,7 @@ class EmF1Metric(nn.Metric):
         for char in in_str:
             if char in sp_char:
                 continue
-            else:
-                out_segs.append(char)
+            out_segs.append(char)
         return ''.join(out_segs)
 
     def find_lcs(self, s1, s2):
