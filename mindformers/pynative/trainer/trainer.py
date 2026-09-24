@@ -595,6 +595,12 @@ class Trainer:
         # calculate gradient accumulation steps
         base_units = parallelism.data_parallel * self.config.training.local_batch_size
         self._base_units = base_units
+        if self.global_batch_size % base_units != 0:
+            raise ValueError(
+                f"global_batch_size({self.global_batch_size}) must be divisible by "
+                f"data_parallel({parallelism.data_parallel}) * "
+                f"local_batch_size({self.config.training.local_batch_size})."
+            )
         if self.is_inference:
             self.num_accumulation_steps = 1
         elif self.dynamic_batch_enabled:
@@ -609,11 +615,6 @@ class Trainer:
                 self.global_batch_size, self.num_accumulation_steps,
             )
         else:
-            if base_units > self.global_batch_size:
-                raise ValueError(
-                    "The product of data_parallel and local_batch_size exceeds global_batch_size, "
-                    "please increase global_batch_size or decrease local_batch_size."
-                )
             self.num_accumulation_steps = self.global_batch_size // base_units
             logger.info(
                 f"Calculate global_batch_size={self.global_batch_size}, "
