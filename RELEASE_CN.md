@@ -78,6 +78,6 @@
 
 感谢以下在本次版本增量中提交合入 PR 的开发者：
 
-[@alpha-junh](https://atomgit.com/alpha-junh) 、 [@husichao](https://atomgit.com/husichao) 、 [@jimmyisme1](https://atomgit.com/jimmyisme1) 、 [@lanshaozuishuai](https://atomgit.com/lanshaozuishuai) 、 [@lzy0920232](https://atomgit.com/lzy0920232) 、 [@qhzhuang11111111](https://atomgit.com/qhzhuang11111111) 、 [@senzhen-town](https://atomgit.com/senzhen-town) 、 [@smallsilly](https://atomgit.com/smallsilly) 、 [@Sunshine_Youngster](https://atomgit.com/Sunshine_Youngster) 、 [@wei_zhuoyi](https://atomgit.com/wei_zhuoyi) 、 [@xu-xianliang](https://atomgit.com/xu-xianliang) 、 [@zhangyihuiben](https://atomgit.com/zhangyihuiben) 、 [@zzzkeke](https://atomgit.com/zzzkeke)
+[@alpha-junh](https://atomgit.com/alpha-junh) 、 [@husichao](https://atomgit.com/husichao) 、 [@jimmyisme1](https://atomgit.com/jimmyisme1) 、 [@lanshaozuishuai](https://atomgit.com/lanshaozuishuai) 、 [@lzy0920232](https://atomgit.com/lzy0920232) 、 [@qhzhuang1](https://atomgit.com/qhzhuang1) 、 [@senzhen-town](https://atomgit.com/senzhen-town) 、 [@smallsilly](https://atomgit.com/smallsilly) 、 [@Sunshine_Youngster](https://atomgit.com/Sunshine_Youngster) 、 [@wei_zhuoyi](https://atomgit.com/wei_zhuoyi) 、 [@xu-xianliang](https://atomgit.com/xu-xianliang) 、 [@zhangyihuiben](https://atomgit.com/zhangyihuiben) 、 [@zzzkeke](https://atomgit.com/zzzkeke)
 
 欢迎以任何形式对项目提供贡献！
