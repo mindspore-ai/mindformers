@@ -2170,6 +2170,11 @@ def apply_pp(
         model_cls, model.config, pp_mesh, tp_mesh,
         has_backward=not forward_only, dyn_shape=forward_only
     )
+    # Detect MoE from the complete model before PP replaces it with rank-local
+    # stage models, so every PP rank builds the schedule with the same setting.
+    has_moe = any(
+        hasattr(layer.mlp, "experts") for layer in model.model.decoder.layers
+    )
     # PP rebuilds fresh per-stage models from config, discarding any LoRA injected into
     # the original model. Re-inject into each stage on meta device BEFORE SPMD parallelism
     # so the adapters pick up TP/FSDP layouts. strict=False: an embedding-only stage may
@@ -2230,10 +2235,6 @@ def apply_pp(
 
     micro_batch_num = parallelism.pipeline_parallel_microbatch_size
     schedule_type = _infer_schedule_type(parallelism)
-    has_moe = all(
-        any(hasattr(layer.mlp, "experts") for layer in part.model.decoder.layers)
-        for part in model_parts
-    )
     schedule = _create_schedule(schedule_type, stages, micro_batch_num, parallelism, swap=swap.enable, has_moe=has_moe)
     logger.info(f"Pipeline schedule: {schedule_type}, exec_order: {schedule.exec_order}")
 
