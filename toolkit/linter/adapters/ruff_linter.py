@@ -8,6 +8,7 @@
 #
 # Portions of this file are derived from PyTorch
 # Copyright (c) Meta Platforms, Inc. and affiliates.
+# Copyright (c) 2013 the respective contributors
 # SPDX-License-Identifier: BSD-3-Clause
 
 """Adapter for https://github.com/charliermarsh/ruff."""
