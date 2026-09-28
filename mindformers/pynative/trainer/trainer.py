@@ -675,10 +675,13 @@ class Trainer:
 
         # Build dataset from config
         logger.info("Building dataset from config...")
+        model_config = (self.model[0].get_gpt_transformer_config()
+                        if hasattr(self.model[0], "get_gpt_transformer_config") else None)
         dataset = _build_dataset(
             dataset_config,
             self.config.parallelism,
             local_batch_size=self.config.training.local_batch_size,
+            model_config=model_config,
         )
 
         if use_data_broadcast:
