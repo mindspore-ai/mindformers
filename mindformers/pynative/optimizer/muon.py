@@ -52,6 +52,7 @@ from mindformers.tools.logger import get_logger, logger
 from mindformers.pynative.optimizer.adamw import _run_adamw_opt, _run_fused_adamw_opt
 from mindformers.pynative.dtensor_compat import inplace_copy
 from mindformers.pynative.optimizer.main_params import MainParamsMixin
+from mindformers.pynative.optimizer.muon_utils import _is_lora_factor
 
 
 _HP_PLATFORM = get_platform()
@@ -104,7 +105,11 @@ def _to_local(tensor):
 
 
 def _is_expert_muon_weight(param_name):
-    """Return whether ``param_name`` is a grouped expert weight supported by Muon."""
+    """Recognize grouped expert matrices, including their per-expert LoRA factors."""
+    for suffix in ("_lora_a", "_lora_b"):
+        if param_name.endswith(suffix):
+            param_name = param_name[:-len(suffix)]
+            break
     return (
         param_name in ("experts.weight1", "experts.weight2")
         or param_name.endswith((".experts.weight1", ".experts.weight2"))
@@ -120,7 +125,8 @@ def _select_muon_matmul_op(ndim, param_name, shape):
     if ndim == 3:
         raise ValueError(
             "Muon only supports 3D weights from grouped experts "
-            f"(`*.experts.weight1/weight2`), but got param={param_name!r}, shape={shape}")
+            f"(`*.experts.weight1/weight2` or their LoRA factors), "
+            f"but got param={param_name!r}, shape={shape}")
     raise ValueError(
         f"Muon only supports 2D weights and grouped 3D expert weights, "
         f"but got param={param_name!r}, shape={shape}")
@@ -307,6 +313,10 @@ def _eval_static_tuple(spec, param_name, shape):
 
 def _match_muon_schema_rule(param_name, muon_split_fn):
     """Return the model Muon schema rule for ``param_name`` when available."""
+    # Keep grouping metadata consistent with make_muon_fns(): LoRA factors
+    # retain their native low-rank shape and bypass base-weight split rules.
+    if _is_lora_factor(param_name):
+        return None
     for rule in getattr(muon_split_fn, "_muon_schema", ()):
         if any(fnmatch(param_name, pattern) for pattern in rule["patterns"]):
             return rule
