@@ -383,6 +383,7 @@ def _build_dataset(
     config,
     parallelism,
     local_batch_size: int,
+    model_config=None,
 ):
     """
     Build dataset and dataloader.
@@ -391,6 +392,9 @@ def _build_dataset(
         config: Dataset configuration.
         parallelism: Parallelism config.
         local_batch_size (int): Per-rank micro-batch size.
+        model_config: Resolved model configuration used to confirm that the
+            dataset's compressed EOD mask will be consumed in TND layout.
+            Defaults to ``None``.
 
     Returns:
         MindSpore Dataset instance.
@@ -497,6 +501,9 @@ def _build_dataset(
         # Each batch is one micro-batch at local_batch_size granularity,
         # so all sequences in a batch share a single accumulating offset.
         per_batch_map_func = _actual_seq_len_batch_map
+        if (getattr(model_config, "use_eod_attn_mask_compression", False)
+                and getattr(model_config, "input_layout", None) == "TND"):
+            logger.info("Compressed EOD mask is active for PyNative training.")
 
     # Balance requires the compressed EOD mask (variable-length attention); the
     # actual_seq_len column it produces is the load metric used for reordering.
