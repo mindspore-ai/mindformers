@@ -134,6 +134,9 @@ class CommonInfo:
                 common_data = json.load(f)
             logger.info(f"'common.json' successfully loaded as:\n{common_data}")
 
+            # Accept checkpoints from the earlier balance implementation; its
+            # redundant plan state is not needed to restore consumption.
+            common_data.pop('data_plan_state', None)
             return cls(**common_data)
 
         except FileNotFoundError as e:

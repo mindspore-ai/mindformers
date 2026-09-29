@@ -30,12 +30,16 @@ from mindspore.dataset import GeneratorDataset
 from mindformers.tools.register import MindFormerRegister, MindFormerModuleType
 from mindformers.tools.logger import logger
 from mindformers.version_control import skip_barrier_controller
-from mindformers.tools.utils import get_real_group_size, get_real_rank, MODE
+from mindformers.tools.utils import get_real_group_size, get_real_rank, get_output_root_path, MODE
 from mindformers.core.context.build_context import get_context
 from mindformers.dataset.blended_datasets.indexed_dataset import IndexedDataset
+from mindformers.dataset.balance_metadata import (
+    DocumentEodIndex, attention_load, checked_indices, eod_boundaries, file_versions, fingerprint,
+)
 
 from .utils import is_dataset_built_on_rank
 from .blended_megatron_dataloader import MockBlendedMegatron
+from .balance_adapter import build_balanced_generator
 
 
 @dataclass
@@ -112,10 +116,16 @@ class OrderedIndexDataLoader:
             GeneratorDataset: A dataset instance ready for training.
         """
         config = cls._build_config(**kwargs)
+        balance_spec = kwargs.pop('balance_spec', None)
+        if balance_spec is not None and not config.create_compressed_eod_mask:
+            raise ValueError('Ordered balance requires compressed EOD and does not support seq_len_vector.')
 
         world_size = get_real_group_size()
         if world_size > 1 and get_context('mode') == MODE['PYNATIVE_MODE']:
             dataset = OrderedIndexDataset(config)
+            if balance_spec is not None:
+                return build_balanced_generator(dataset, kwargs.get('column_names'), balance_spec,
+                                                 False, kwargs.get('num_parallel_workers', 1))
             return GeneratorDataset(
                 dataset,
                 column_names=kwargs.get('column_names'),
@@ -156,6 +166,10 @@ class OrderedIndexDataLoader:
             )
 
         dataset = OrderedIndexDataset(config)
+
+        if balance_spec is not None:
+            return build_balanced_generator(dataset, kwargs.get('column_names'), balance_spec,
+                                             False, kwargs.get('num_parallel_workers', 1))
 
         if world_size > 1:
             skip_barrier_controller()  # barrier
@@ -306,6 +320,32 @@ class OrderedIndexDataset:
             int: Total number of samples.
         """
         return self.total_length
+
+    def configure_balance_metadata(self) -> None:
+        """Create persistent EOD indices without reading or converting training samples."""
+        cache_dir = os.path.join(self.cache_dir or os.path.join(get_output_root_path(), 'cache'),
+                                 'balance_eod')
+        revision = file_versions(self.file_list)
+        self._balance_eod_indices = [
+            DocumentEodIndex(dataset, self.config.eod_token, cache_dir,
+                             fingerprint({'file': revision[2 * i:2 * i + 2],
+                                          'eod': self.config.eod_token, 'version': 1}))
+            for i, dataset in enumerate(self.dataset_list)]
+
+    def get_balance_loads(self, indices) -> np.ndarray:
+        """Use index_map and exact truncation/padding token views to return load scalars."""
+        loads = []
+        length = self.config.sequence_length
+        for index in checked_indices(indices, len(self)):
+            child, row = (int(x) for x in self.index_map[index])
+            positions = self._balance_eod_indices[child].get(row)
+            raw_length = int(self.dataset_list[child].sequence_lengths[row])
+            positions = positions[positions <= min(raw_length, length)]
+            if raw_length < length and self.config.pad_token == self.config.eod_token:
+                positions = np.concatenate((positions, np.arange(raw_length + 1, length + 1)))
+            boundaries = eod_boundaries(positions, length, self.config.compressed_eod_mask_length)
+            loads.append(attention_load(boundaries, length))
+        return np.asarray(loads, dtype=np.int64)
 
     def _load_datasets(self):
         """
@@ -530,8 +570,10 @@ class OrderedIndexDataset:
                            f"padded to {self.config.sequence_length} + 1 with pad token: {self.config.pad_token}.")
             text = np.pad(text, (0, max_seq_length - len(text)), 'constant', constant_values=self.config.pad_token)
 
-        tokens = text[:-1]
-        labels = text[1:]
+        # IndexedDataset may return read-only mmap views; tokens/labels overlap
+        # before copying, so modifying one can otherwise corrupt the other.
+        tokens = text[:-1].copy()
+        labels = text[1:].copy()
 
         attention_mask, loss_mask, position_ids = _get_ltor_masks_and_position_ids(
             tokens,
