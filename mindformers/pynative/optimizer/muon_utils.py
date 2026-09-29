@@ -48,6 +48,11 @@ def _eval_tuple(spec, name, tensor):
 _IDENTITY_RULE = {"kind": None}
 
 
+def _is_lora_factor(param_name):
+    """Return whether ``param_name`` is a LoRA factor instead of its base weight."""
+    return param_name.endswith(("_lora_a", "_lora_b"))
+
+
 def _split_periodic(param_name, rule, tensor):
     """Split a periodic row layout."""
     part_a, part_b = _eval_tuple(rule["parts"], param_name, tensor)[:2]
@@ -145,6 +150,10 @@ def make_muon_fns(schema):
     """
 
     def _match_rule(param_name):
+        # Base-weight patterns such as ``*mlp.experts.weight1*`` also match
+        # LoRA factors, whose low-rank dimensions cannot use the base reshape.
+        if _is_lora_factor(param_name):
+            return _IDENTITY_RULE
         for rule in schema:
             if any(fnmatch(param_name, pat) for pat in rule["patterns"]):
                 return rule

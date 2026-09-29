@@ -416,7 +416,10 @@ def save_checkpoint(iteration: int, network: Union[Cell, List[Cell]], optimizer:
             )
 
         model_sharded_tensor_metas = {
-            rank_id: {name: meta for name, meta in metas.items() if name in global_model_keys}
+            rank_id: {
+                name: meta for name, meta in metas.items()
+                if name in global_model_keys and model_choice_func(name)
+            }
             for rank_id, metas in sharded_tensor_metas.items()
         }
         if optimizer is not None:
