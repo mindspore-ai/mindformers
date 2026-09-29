@@ -38,6 +38,7 @@ from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
 
 from mindformers.pynative.optimizer import muon as muon_mod
 from mindformers.pynative.optimizer.muon import Muon, newton_schulz
+from mindformers.pynative.optimizer.muon_utils import make_muon_fns
 
 
 # Classic single-triple Newton-Schulz coefficients, expanded to a 5-step schedule.
@@ -244,6 +245,26 @@ class TestMuonConfig:
             3, "layers.0.mlp.experts.weight1", (8, 16, 32)) is mint.bmm
         assert muon_mod._select_muon_matmul_op(
             3, "layers.0.mlp.experts.weight2", (8, 32, 16)) is mint.bmm
+        for weight in ("weight1", "weight2"):
+            for factor in ("a", "b"):
+                assert muon_mod._select_muon_matmul_op(
+                    3, f"layers.0.mlp.experts.{weight}_lora_{factor}",
+                    (8, 16, 4)) is mint.bmm
+
+        schema = [{
+            "patterns": ["*mlp.experts.weight1*"],
+            "kind": "reshape_concat",
+            "reshape": (None, 16, 64),
+        }]
+        split_fn, merge_fn = make_muon_fns(schema)
+        lora_name = "layers.0.mlp.experts.weight1_lora_a"
+        lora_shape = (8, 16, 4)
+        lora = object()
+        pieces = split_fn(lora_name, lora)
+        assert pieces == [lora]
+        assert merge_fn(lora_name, pieces) is lora
+        assert muon_mod._estimate_muon_piece_shapes(
+            lora_name, lora_shape, split_fn) == [lora_shape]
 
         with pytest.raises(ValueError, match="only supports 3D weights from grouped experts"):
             muon_mod._select_muon_matmul_op(
