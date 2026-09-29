@@ -40,6 +40,7 @@ from mindformers.tools.utils import (
 
 from .utils import is_dataset_built_on_rank
 from .mock_dataloader import BaseMockDataLoader
+from .balance_adapter import build_balanced_generator
 
 
 def is_compile_runtime():
@@ -137,6 +138,13 @@ class MegatronDatasetBuilder:
                 blend_dataset = blended_megatron_dataset_builder[2]
             else:
                 raise ValueError(f"Unsupported blend dataset phase: {phase}")
+
+            balance_spec = kwargs.get('balance_spec')
+            if balance_spec is not None:
+                if phase != DatasetPhaseType.TRAIN or not blended_config.create_compressed_eod_mask:
+                    raise ValueError('Megatron balancing requires train split with compressed EOD.')
+                return build_balanced_generator(blend_dataset, column_names, balance_spec,
+                                                 shuffle, kwargs.get('num_parallel_workers', 1))
 
             gen_dataset = GeneratorDataset(blend_dataset,
                                            column_names=column_names,
@@ -254,6 +262,25 @@ class MockBlendedMegatron(BaseMockDataLoader):
 class BlendedMegatronDatasetDataLoader:
     """Blended Megatron Dataset DataLoader."""
     _default_column_names = ['input_ids']
+
+    @staticmethod
+    def distributed_build_barriers(loader_config):
+        """Count the actual builder synchronizations for source-only construction.
+
+        A single unweighted prefix skips the parallel/blend builders. Each
+        nonempty split still has its own generic-builder barrier. Receivers
+        must match these calls before the trainer's size synchronization.
+        """
+        config = MegatronDatasetBuilder(loader_config.get('datasets_type', 'GPTDataset'),
+                                       loader_config.get('config', {})).init_gpt_dataset_config()
+        if config.mock:
+            return 1 + sum(split is not None for split in config.split_matrix)
+        if config.blend:
+            prefixes, weights = config.blend
+            splits = sum(split is not None for split in config.split_matrix)
+            return 1 + splits + int(len(prefixes) != 1 or weights is not None)
+        return 1 + sum(1 if len(blend[0]) == 1 else 2
+                       for blend in config.blend_per_split if blend is not None)
 
     def __new__(cls,
                 datasets_type: str,

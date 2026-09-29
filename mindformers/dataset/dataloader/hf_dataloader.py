@@ -36,9 +36,11 @@ from mindformers.version_control import skip_barrier_controller
 import mindformers.dataset.handler as custom_process
 from mindformers.tools.utils import get_real_rank
 from mindformers.tools.utils import FILE_PERMISSION
+from mindformers.dataset.balance_metadata import checked_indices, attention_load
 
 from .utils import is_dataset_built_on_rank
 from .mock_dataloader import BaseMockDataLoader
+from .balance_adapter import build_balanced_generator
 
 # Mapping between integer codes and NumPy data type strings
 DATASET_DTYPE_MAP = {
@@ -252,11 +254,13 @@ class HFDataLoader:
             num_parallel_workers: int = 1,
             **kwargs
     ):
+        balance_spec = kwargs.pop('balance_spec', None)
         ms_dataset_args = {
             'num_shards': num_shards,
             'shard_id': shard_id,
             'python_multiprocessing': python_multiprocessing,
             'num_parallel_workers': num_parallel_workers,
+            'balance_spec': balance_spec,
         }
         kwargs = process_legacy_args(**kwargs)
 
@@ -350,7 +354,8 @@ class HFDataLoader:
                      shard_id=None,
                      num_shards=None,
                      python_multiprocessing=False,
-                     num_parallel_workers=1):
+                     num_parallel_workers=1,
+                     balance_spec=None):
         """Wrap source dataset with Mindspore Dataset."""
         if getattr(config, 'streaming', False):
             hf_dataset = HFIterableDataset(config, dataset, num_shards, shard_id)
@@ -360,6 +365,9 @@ class HFDataLoader:
                     "Streaming mode only supports 'num_parallel_workers=1'. Automatically resetting the value.")
         else:
             hf_dataset = HFDataset(config, dataset)
+        if balance_spec is not None:
+            return build_balanced_generator(hf_dataset, hf_dataset.column_names, balance_spec,
+                                             config.shuffle, num_parallel_workers)
         dataset = GeneratorDataset(
             hf_dataset,
             column_names=hf_dataset.column_names,
@@ -553,6 +561,38 @@ class HFDataset:
     def __len__(self):
         """Return total number of samples in the dataset."""
         return self.dataset_size
+
+    def configure_balance_metadata(self) -> None:
+        """Project only boundaries; Arrow list offsets supply token lengths without decoding tokens."""
+        if 'actual_seq_len' not in self.dataset.column_names:
+            raise ValueError('HF balancing requires an actual_seq_len metadata column.')
+        if getattr(self.dataset, '_format_type', None) == 'custom':
+            raise ValueError('Balance metadata cannot bypass a custom HF row transform.')
+        self._balance_boundary_view = self.dataset.select_columns(['actual_seq_len']).with_format(None)
+
+
+    def get_balance_loads(self, indices) -> np.ndarray:
+        """Return exact load scalars without converting tokens, labels, masks or positions."""
+        values = checked_indices(indices, len(self))
+        if values.size == 0:
+            return np.empty(0, dtype=np.int64)
+        boundaries = self._balance_boundary_view[values.tolist()]['actual_seq_len']
+        column = self.dataset.data.column('input_ids')
+        loads = []
+        for logical_index, boundary in zip(values, boundaries):
+            physical = int(logical_index)
+            if self.dataset._indices is not None:
+                physical = int(self.dataset._indices.column(0)[physical].as_py())
+            length = len(column[physical].values)
+            boundary = np.asarray(boundary)
+            attention_load(boundary)  # Reject empty, floating, negative or unsorted raw boundaries.
+            if self.use_packed_data:
+                if boundary.size > self.compressed_eod_mask_length:
+                    raise ValueError('HF balance boundary exceeds compressed capacity.')
+                boundary = np.pad(boundary, (0, self.compressed_eod_mask_length - boundary.size),
+                                  constant_values=length)
+            loads.append(attention_load(boundary, length))
+        return np.asarray(loads, dtype=np.int64)
 
     def _iter_data(self, idx):
         """Retrieve a single sample from a regular (non-packed) dataset."""
