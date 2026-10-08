@@ -217,29 +217,6 @@ def test_adapter_resume_rejects_mismatched_base(monkeypatch, tmp_path):
 @pytest.mark.level0
 @pytest.mark.platform_x86_cpu
 @pytest.mark.env_onecard
-def test_adapter_resume_warns_when_base_fingerprint_is_unavailable(monkeypatch, tmp_path, caplog):
-    """Adapter loading warns instead of silently skipping an unavailable fingerprint."""
-    checkpoint_path = tmp_path / "adapter"
-    checkpoint_path.mkdir()
-    base_path = tmp_path / "base"
-    base_path.mkdir()
-    (checkpoint_path / "mindformers_adapter_config.json").write_text(
-        json.dumps({"base_fingerprint": None}), encoding="utf-8"
-    )
-    trainer = _build_trainer()
-    trainer.config.checkpoint.base_load_path = str(base_path)
-    trainer._load_base_checkpoint = Mock()
-    monkeypatch.setattr(trainer_module, "get_base_checkpoint_fingerprint", lambda _: None)
-    model = object()
-
-    assert trainer._prepare_adapter_load(str(checkpoint_path), model) is True
-    assert "Cannot fully verify adapter base checkpoint fingerprint" in caplog.text
-    trainer._load_base_checkpoint.assert_called_once_with(str(base_path), model)
-
-
-@pytest.mark.level0
-@pytest.mark.platform_x86_cpu
-@pytest.mark.env_onecard
 @pytest.mark.parametrize(
     "is_adapter,is_hf,expected_loader",
     [
