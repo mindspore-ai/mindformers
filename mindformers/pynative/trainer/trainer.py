@@ -124,7 +124,7 @@ def _cast_grad_to_fp32(grad):
     return grad
 
 
-def _keep_actual_seq_len_on_host(batch: Dict[str, Any]) -> Dict[str, Any]:
+def _keep_actual_seq_len_on_host(batch: Dict[str, Any], is_dryrun: bool = False) -> Dict[str, Any]:
     """Carry the TND ``actual_seq_len`` column as host data.
 
     ``actual_seq_len`` is metadata, not activation data: FlashAttention reads its
@@ -138,7 +138,7 @@ def _keep_actual_seq_len_on_host(batch: Dict[str, Any]) -> Dict[str, Any]:
     the model boundary.
     """
     value = batch.get("actual_seq_len")
-    if value is not None and hasattr(value, "asnumpy"):
+    if is_dryrun and value is not None and hasattr(value, "asnumpy"):
         batch["actual_seq_len"] = value.asnumpy()
     return batch
 
@@ -1438,7 +1438,12 @@ class Trainer:
                 data = {"input_ids": data[0]} if len(data) > 0 else {}
         if data is None:
             return {}
-        return _keep_actual_seq_len_on_host(data)
+        model = self.model[0] if self.model else None
+        model_cfg = getattr(model, "transformer_config", None)
+        if model_cfg is None:
+            model_cfg = getattr(model, "config", None)
+        is_dryrun = getattr(model_cfg, "is_dryrun", False)
+        return _keep_actual_seq_len_on_host(data, is_dryrun)
 
     def _get_batch_distributed(self, dataset_iter):
         """Fetch next batch in distributed dataset mode (simplified)."""
