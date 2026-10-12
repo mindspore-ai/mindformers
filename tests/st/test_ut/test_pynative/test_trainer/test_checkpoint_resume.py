@@ -61,7 +61,7 @@ def _mock_checkpoint_load(monkeypatch, get_checkpoint_path=None):
     monkeypatch.setattr(trainer_module, "get_checkpoint_path", get_checkpoint_path)
     monkeypatch.setattr(trainer_module, "is_hf_checkpoint", lambda _: False)
     monkeypatch.setattr(trainer_module, "has_optimizer_ckpt", lambda _: True)
-    load_checkpoint = Mock()
+    load_checkpoint = Mock(return_value=set())
     monkeypatch.setattr(trainer_module, "load_checkpoint", load_checkpoint)
     return load_checkpoint
 
@@ -124,7 +124,7 @@ def test_static_batch_resume_uses_micro_batch_cursor(
 @pytest.mark.env_onecard
 @pytest.mark.parametrize("no_load_optim", [False, True])
 def test_pipeline_checkpoint_load_manages_shared_optimizer_once(monkeypatch, tmp_path, no_load_optim):
-    """Snapshot and reload shared fp32 masters once for all pipeline stages."""
+    """Merge loaded names from all stages before refreshing shared fp32 masters."""
     checkpoint_path = tmp_path / "checkpoint"
     checkpoint_path.mkdir()
     (checkpoint_path / "common.json").write_text(
@@ -140,9 +140,14 @@ def test_pipeline_checkpoint_load_manages_shared_optimizer_once(monkeypatch, tmp
     events = []
     restore_rng_state = Mock(side_effect=lambda _: events.append("restore_rng"))
     monkeypatch.setattr(trainer_module, "restore_checkpoint_rng_state", restore_rng_state)
-    optimizer.save_main_params_snapshot.side_effect = lambda: events.append("snapshot")
-    load_checkpoint.side_effect = lambda **kwargs: events.append(kwargs["network"])
-    optimizer.reload_main_params_from_model.side_effect = lambda: events.append("reload")
+
+    def load_stage(**kwargs):
+        stage = kwargs["network"]
+        events.append(stage)
+        return {f"main_param.stage{models.index(stage)}"}
+
+    load_checkpoint.side_effect = load_stage
+    optimizer.reload_main_params_from_model.side_effect = lambda names: events.append(("reload", names))
 
     trainer._load_checkpoint(str(checkpoint_path), models, optimizer)
 
@@ -151,16 +156,15 @@ def test_pipeline_checkpoint_load_manages_shared_optimizer_once(monkeypatch, tmp
         str(checkpoint_path), require_optimizer=not no_load_optim
     )
 
-    expected_events = [models[0], models[1], "reload"]
+    loaded_names = None if no_load_optim else {"main_param.stage0", "main_param.stage1"}
+    expected_events = [models[0], models[1], ("reload", loaded_names)]
     if no_load_optim:
         restore_rng_state.assert_not_called()
-        optimizer.save_main_params_snapshot.assert_not_called()
     else:
-        expected_events[0:0] = ["restore_rng", "snapshot"]
+        expected_events.insert(0, "restore_rng")
         restore_rng_state.assert_called_once_with(str(checkpoint_path))
-        optimizer.save_main_params_snapshot.assert_called_once_with()
     assert events == expected_events
-    optimizer.reload_main_params_from_model.assert_called_once_with()
+    optimizer.reload_main_params_from_model.assert_called_once_with(loaded_names)
     loaded_optimizer = None if no_load_optim else optimizer
     loaded_global_step = None if no_load_optim else 2
     assert load_checkpoint.call_args_list == [
@@ -203,7 +207,11 @@ def test_adapter_resume_loads_base_before_adapter(monkeypatch, tmp_path):
     trainer._load_base_checkpoint = Mock(side_effect=lambda path, _: events.append(("base", path)))
     monkeypatch.setattr(trainer_module, "get_base_checkpoint_fingerprint", lambda _: "same-base")
     load_checkpoint = _mock_checkpoint_load(monkeypatch)
-    load_checkpoint.side_effect = lambda **_: events.append(("adapter", str(checkpoint_path)))
+    def load_adapter(**_kwargs):
+        events.append(("adapter", str(checkpoint_path)))
+        return set()
+
+    load_checkpoint.side_effect = load_adapter
 
     trainer._load_checkpoint(str(checkpoint_path), object(), Mock())
 

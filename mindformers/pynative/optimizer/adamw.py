@@ -203,7 +203,6 @@ class AdamW(MainParamsMixin, Optimizer):
 
         self.amsgrad = kwargs.get("amsgrad", False)
         self.maximize = kwargs.get("maximize", False)
-        self._main_params_snapshot = None
         if not self.enable_fused_opt:
             self.max_exp_avg_sq = None
         elif self.amsgrad:

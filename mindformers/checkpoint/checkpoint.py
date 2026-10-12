@@ -18,7 +18,7 @@ import json
 import shutil
 import tempfile
 from time import time
-from typing import Callable, Union, Dict, Optional, Tuple, List
+from typing import Callable, Union, Dict, Optional, Tuple, List, Set
 from dataclasses import dataclass
 
 import threading
@@ -581,7 +581,7 @@ def load_checkpoint(
         global_step: Optional[int] = None,
         balanced_load: bool = False,
         reshard_worker_num: int = 1,
-) -> None:
+) -> Set[str]:
     """
     Load weights in MindSpore Transformers format (self-trained weights).
 
@@ -595,6 +595,10 @@ def load_checkpoint(
         global_step: Optional initial global step value if not found in checkpoint.
         balanced_load: Whether to adopt the balanced loading mode.
         reshard_worker_num: Max number of workers to process reshard params.
+
+    Returns:
+        Names of optimizer parameters successfully restored, including balanced
+        broadcasts. Empty when no optimizer was loaded.
 
     Raises:
         ValueError: If the input `network` is None.
@@ -678,7 +682,7 @@ def load_checkpoint(
 
     logger.info("..........Loading State Dict into Network..........")
     # Load `state_dict` into network and optimizer.
-    load_parameters(
+    loaded_optimizer_names = load_parameters(
         network,
         state_dict,
         optimizer,
@@ -688,6 +692,7 @@ def load_checkpoint(
 
     logger.info("..........Loading Checkpoint Finished..........")
     logger.info(f"..........Loading Time Cost: {time() - start_load_time:.5f} s..........")
+    return loaded_optimizer_names
 
 
 def load_hf_checkpoint(
@@ -834,7 +839,7 @@ def load_parameters(
         state_dict_opt: Optional[Dict[str, Parameter]] = None,
         balanced_load: Optional[bool] = False,
         param_redundancy: Optional[Dict[Tuple, str]] = None
-):
+) -> Set[str]:
     """
     Loads parameters into a MindSpore network and optional optimizer, with support for redundant parameter handling.
 
@@ -849,7 +854,7 @@ def load_parameters(
     3. Separate parameters from the main state dict into network-specific and optimizer-specific (state_dict_opt).
     4. Load network parameters, track unloaded parameters, and filter out cache-related entries from unloaded logs.
     5. (If balanced load enabled) Broadcast redundant parameters across ranks to ensure consistency.
-    6. Load optimizer parameters (if optimizer and state_dict_opt are provided) and apply balanced load if enabled.
+    6. If an optimizer is provided, load its parameters and apply balanced load even with no local state.
     7. Log detailed information about loaded/unloaded parameters for both network and optimizer.
 
     Args:
@@ -866,6 +871,10 @@ def load_parameters(
         param_redundancy (Optional[Dict[Tuple[int, ...], List[str]]]): Precomputed mapping of redundant rank groups
             (tuples of rank IDs) to lists of parameter keys. Only used if `balanced_load` is True; if not provided,
             generated dynamically via `build_balanced_shard_plan`. Defaults to None.
+
+    Returns:
+        Names of optimizer parameters successfully restored. Broadcast receivers
+        are included; missing or rejected parameters are excluded.
 
     Raises:
         ValueError: If `network` is not a valid MindSpore Cell, `state_dict` is invalid (e.g., not a dict),
@@ -899,7 +908,7 @@ def load_parameters(
     if balanced_load and param_redundancy is None:
         param_redundancy = build_balanced_shard_plan(network).param_redundancy
 
-    network_param_names, _, state_dict, state_dict_opt = \
+    network_param_names, optimizer_param_names, state_dict, state_dict_opt = \
         split_state_dict(network, state_dict, optimizer, state_dict_opt)
 
     # A base checkpoint predates LoRA injection and therefore deliberately has
@@ -932,7 +941,9 @@ def load_parameters(
     print_not_load_info(ckpt_not_load, "Checkpoint weights")
 
     # Load parameters into optimizer if available
-    if optimizer and state_dict_opt:
+    loaded_optimizer_names = set()
+    # A rank with no local optimizer state must still receive balanced broadcasts.
+    if optimizer is not None:
         if LayoutAdapter.is_pynative_mode():
             state_dict_opt.update(state_dict)
         logger.debug(f"Optimizer state_dict keys: {list(state_dict_opt.keys())}")
@@ -944,9 +955,14 @@ def load_parameters(
             param_loaded_opt = {param_name for param_name in state_dict_opt if param_name not in ckpt_not_load_opt}
             single_parameter_broadcast(optimizer, param_redundancy, param_not_load_opt, param_loaded_opt)
 
+        # Broadcast removes successfully restored receiver parameters from the
+        # missing list. Use target names, including non-strict prefix matches,
+        # rather than checkpoint keys or numerical checksums.
+        loaded_optimizer_names = optimizer_param_names - set(param_not_load_opt)
         param_not_load_opt = [p for p in param_not_load_opt if p not in network_param_names]
         print_not_load_info(param_not_load_opt, "Optimizer parameters")
         print_not_load_info(ckpt_not_load_opt, "Optimizer weights")
+    return loaded_optimizer_names
 
 
 def get_checkpoint_path(checkpoint: str, require_optimizer: bool = True) -> str:

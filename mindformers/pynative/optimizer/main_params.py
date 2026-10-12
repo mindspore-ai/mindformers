@@ -13,6 +13,8 @@
 # limitations under the License.
 # ============================================================================
 """Shared fp32 master weight (main params) helpers for pynative optimizers."""
+from typing import Optional, Set
+
 from mindspore import _no_grad
 from mindspore.common import dtype as mstype
 from mindspore.ops import operations as P
@@ -23,56 +25,33 @@ from mindformers.pynative.dtensor_compat import inplace_copy
 
 op_cast = P.Cast()
 
-_CHECKSUM_TOLERANCE = 1e-6
-
 
 class MainParamsMixin:
-    """Snapshot / reload helpers for optimizers holding fp32 master weights.
+    """Reload helpers for optimizers holding fp32 master weights.
 
     Expects the host optimizer to provide ``self._parameters``, ``self.fp32_params``
-    and ``self._is_low_precision_param``, and to initialize
-    ``self._main_params_snapshot = None`` in its constructor.
+    and ``self._is_low_precision_param``.
     """
 
-    def save_main_params_snapshot(self):
-        """Save lightweight checksums of fp32 master weights before checkpoint load."""
-        self._main_params_snapshot = []
-        for fp32_param, is_lp in zip(self.fp32_params, self._is_low_precision_param):
-            if is_lp:
-                self._main_params_snapshot.append(float(fp32_param.value().sum()))
-            else:
-                self._main_params_snapshot.append(None)
-
-    def reload_main_params_from_model(self):
+    def reload_main_params_from_model(self, loaded_param_names: Optional[Set[str]] = None):
         """Refresh fp32 master weights from the model parameters.
 
-        When ``save_main_params_snapshot`` was called before checkpoint load, only
-        params whose fp32 master checksum did *not* change (i.e. not loaded from
-        checkpoint, e.g. newly unfrozen params) are refreshed — others are preserved.
-        Without a snapshot, does a full reload (weights-only resume / no_load_optim).
+        When optimizer state was loaded, pass the names actually restored by the
+        checkpoint loader. Loaded masters are preserved even if their values or
+        sums equal their initialization. Missing masters (e.g. newly unfrozen
+        parameters) are refreshed from the model. With ``None``, refresh every
+        low-precision master for weights-only loading.
 
         Runs outside the optimizer's construct(), so it must enter SkipDTensorDispatch
         itself (InplaceCopy has no parallel layout infer func under DTensor dispatch).
         _no_grad avoids the "leaf tensor that requires grad in an inplace operator"
         error: the fp32 master is a leaf Parameter and this copy is not an autograd op.
         """
-        snapshot = getattr(self, '_main_params_snapshot', None)
-        if snapshot is None:
-            self._reload_main_params(self._is_low_precision_param)
-            return
-
-        needs_reload = []
-        with _no_grad():
-            for idx, (fp32_param, is_lp) in enumerate(
-                    zip(self.fp32_params, self._is_low_precision_param)):
-                if not is_lp:
-                    needs_reload.append(False)
-                    continue
-                current = float(fp32_param.value().sum())
-                needs_reload.append(abs(current - snapshot[idx]) < _CHECKSUM_TOLERANCE)
-
+        needs_reload = [
+            is_lp and (loaded_param_names is None or fp32_param.name not in loaded_param_names)
+            for fp32_param, is_lp in zip(self.fp32_params, self._is_low_precision_param)
+        ]
         self._reload_main_params(needs_reload)
-        self._main_params_snapshot = None
 
     def _reload_main_params(self, reload_flags):
         """Copy model params into the fp32 masters selected by ``reload_flags``."""
