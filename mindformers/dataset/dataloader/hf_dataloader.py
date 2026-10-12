@@ -74,6 +74,22 @@ def _is_pack_mode(config):
     return bool(getattr(config, "create_attention_mask", False))
 
 
+def _need_auto_position_ids(config, column_names):
+    """Whether to append a generated `position_ids` column to a non-packed sample.
+
+    Only a non-packed sample is a single sequence, so `arange(seq_len)` is exactly its
+    position ids. Packed samples already get per-document position ids from `_get_packed_data`.
+    """
+    return (getattr(config, 'create_position_ids', False)
+            and 'input_ids' in column_names
+            and 'position_ids' not in column_names)
+
+
+def _make_position_ids(input_ids):
+    """Build position ids for a single (non-packed) sequence."""
+    return np.arange(len(input_ids), dtype=np.int32)
+
+
 def process_legacy_args(**kwargs):
     """Process and adapt legacy configuration arguments into the non-legacy format."""
     replace_args = {}
@@ -142,6 +158,9 @@ class HFDataLoaderConfig:
         use_broadcast_data (bool, optional): Whether to enable broadcasted mock data
             in data-parallel groups. Default is True.
         shuffle (bool, optional): Whether to shuffle the dataset (requires random-access input). Default: `False`.
+        create_position_ids (bool, optional): Whether to generate a `position_ids` column as
+            `arange(seq_len)` when the dataset lacks one in non-packed mode. Context parallel
+            requires `position_ids`, but plain SFT datasets usually do not store it. Default: `False`.
     """
 
     load: dict = None
@@ -157,6 +176,8 @@ class HFDataLoaderConfig:
     use_broadcast_data: bool = True
 
     shuffle: bool = False
+
+    create_position_ids: bool = False
 
     def __post_init__(self) -> None:
         """Post-initialization checks and setup."""
@@ -400,6 +421,7 @@ class HFDataLoader:
         use_broadcast_data = kwargs.pop('use_broadcast_data', True)
         handler = kwargs.pop('handler', None)
         shuffle = kwargs.pop('shuffle', False)
+        create_position_ids = kwargs.pop('create_position_ids', False)
 
         streaming = kwargs.get('streaming', False)
         size = kwargs.pop('size', None)
@@ -422,6 +444,7 @@ class HFDataLoader:
                 compressed_eod_mask_length=compressed_eod_mask_length,
                 use_broadcast_data=use_broadcast_data,
                 shuffle=shuffle,
+                create_position_ids=create_position_ids,
                 streaming=streaming,
                 size=size,
                 dataset_state_dir=dataset_state_dir,
@@ -438,6 +461,7 @@ class HFDataLoader:
             compressed_eod_mask_length=compressed_eod_mask_length,
             use_broadcast_data=use_broadcast_data,
             shuffle=shuffle,
+            create_position_ids=create_position_ids,
         )
 
     @staticmethod
@@ -533,6 +557,10 @@ class HFDataset:
         else:
             self.column_names = list(next(iter(deepcopy(dataset))).keys())
             self._check_columns(self.column_names)
+        self.auto_position_ids = not self.use_packed_data and _need_auto_position_ids(config, self.column_names)
+        if self.auto_position_ids:
+            logger.info(" > dataset has no `position_ids` column, generating it as arange(seq_length).")
+            self.column_names.append('position_ids')
 
         self.dataset_size = len(dataset)
 
@@ -557,6 +585,8 @@ class HFDataset:
     def _iter_data(self, idx):
         """Retrieve a single sample from a regular (non-packed) dataset."""
         sample = self.dataset[idx]
+        if self.auto_position_ids:
+            sample['position_ids'] = _make_position_ids(sample['input_ids'])
         sample = tuple(sample[col] for col in self.column_names)
         return sample
 
@@ -719,6 +749,10 @@ class HFIterableDataset:
                 self.column_names = ['input_ids', 'labels', 'loss_mask', 'position_ids', 'attention_mask']
         else:
             self.column_names = list(next(iter(deepcopy(dataset))).keys())
+        self.auto_position_ids = not self.pack_config and _need_auto_position_ids(config, self.column_names)
+        if self.auto_position_ids:
+            logger.info(" > dataset has no `position_ids` column, generating it as arange(seq_length).")
+            self.column_names.append('position_ids')
 
         self.shard_id = shard_id if shard_id is not None else 0
         if num_shards:
@@ -787,20 +821,22 @@ class HFIterableDataset:
         Fetch one sample from the underlying iterator, re-initializing if iterator exhausted.
         Returns a tuple of column values (ordered by self.column_names).
         """
-        sample = None
+        row = None
         if self.cur_iter >= self.max_iters:
             is_init_state = True
         else:
             is_init_state = False
             try:
-                sample = tuple(next(self.dataset_iter).values())
+                row = next(self.dataset_iter)
             except StopIteration:
                 is_init_state = True
 
         if is_init_state:
             self._init_state()
-            sample = tuple(next(self.dataset_iter).values())
-        return sample
+            row = next(self.dataset_iter)
+        if self.auto_position_ids:
+            row['position_ids'] = _make_position_ids(row['input_ids'])
+        return tuple(row.values())
 
     def _load_state(self, step):
         """
