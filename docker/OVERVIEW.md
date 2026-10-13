@@ -9,7 +9,7 @@
 - Where to get help
 
     - [MindSpore Transformers Documentation](https://www.mindspore.cn/mindformers/docs/zh-CN/stable/index.html)
-    - [MindSpore Transformers Community](https://www.mindspore.cn/sig/MindSpore%20Transformers)
+    - [MindSpore Transformers Community](https://www.mindspore.cn/sig/MindSpore%20Transformers/en)
     - [Issue Feedback](https://atomgit.com/mindspore/mindformers/issues)
 
 ## MindSpore Transformers
