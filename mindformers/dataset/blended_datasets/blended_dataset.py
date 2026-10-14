@@ -28,6 +28,7 @@ from mindformers.dataset.blended_datasets.megatron_dataset import MegatronDatase
 from mindformers.dataset.blended_datasets.utils import normalize
 from mindformers.tools.logger import logger
 from mindformers.tools.utils import get_rank_info, set_safe_mode_for_file_or_dir
+from mindformers.dataset.balance_metadata import checked_indices
 
 
 _VERBOSE = False
@@ -115,6 +116,26 @@ class BlendedDataset():
         dataset_id = self.dataset_index[idx]
         dataset_sample_id = self.dataset_sample_index[idx]
         return self.datasets[dataset_id][dataset_sample_id]
+
+    def configure_balance_metadata(self) -> None:
+        """Configure each child, preserving blend mapping and repeated logical slots."""
+        configured = set()
+        for child in self.datasets:
+            if id(child) not in configured:
+                child.configure_balance_metadata()
+                configured.add(id(child))
+
+    def get_balance_loads(self, indices) -> numpy.ndarray:
+        """Batch child metadata requests, scattering every repeated slot back in order."""
+        values = checked_indices(indices, len(self))
+        result = numpy.empty(len(values), dtype=numpy.int64)
+        children = self.dataset_index[values]
+        for child_id in numpy.unique(children):
+            positions = numpy.flatnonzero(children == child_id)
+            samples = self.dataset_sample_index[values[positions]]
+            unique, inverse = numpy.unique(samples, return_inverse=True)
+            result[positions] = self.datasets[int(child_id)].get_balance_loads(unique)[inverse]
+        return result
 
     def _build_indices(self) -> Tuple[numpy.ndarray, numpy.ndarray]:
         """Build and optionally cache the dataset index and the dataset sample index
