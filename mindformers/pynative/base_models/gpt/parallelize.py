@@ -1728,18 +1728,11 @@ def apply_context_parallel_attention(
             gpt_model.set_use_rotary_position_ids(True)
             # Context parallel forces explicit position_ids, so the rotary cos/sin carries a
             # per-batch dimension. The fused interleaved RoPE op (apply_rope_fusion) does not
-            # support non-broadcast batch>1 cos/sin and fails in tiling. Reject the combo early.
-            # Exception: with EOD attn-mask compression (TND layout), CP flattens the per-rank
-            # position_ids to batch=1 (see prepare_context_parallel_input's TND slicing), so
-            # cos/sin stays broadcastable and the fused op works -- allow it.
-            if getattr(model_config, "apply_rope_fusion", False) and \
-                    not getattr(model_config, "use_eod_attn_mask_compression", False):
-                raise ValueError(
-                    "Context parallel does not support apply_rope_fusion in pynative mode "
-                    "unless EOD attn-mask compression (TND layout) is enabled: without TND, "
-                    "CP feeds per-batch cos/sin to the fused RoPE op, which rejects it in tiling. "
-                    "Set apply_rope_fusion=false, or enable use_eod_attn_mask_compression."
-                )
+            # support non-broadcast batch>1 cos/sin and fails in tiling. What matters is the
+            # micro-batch size, which is only known per call: ``GPTModel.construct`` rejects
+            # ``position_ids.shape[0] > 1`` there. Rejecting every non-TND CP run up front also
+            # blocked micro-batch 1 -- the usual long-sequence setup -- whose cos/sin is batch 1
+            # and broadcastable exactly like the TND case.
         if method in ("ulysses", "hybrid") and uses_ulysses_head_sharding:
             # Ulysses (and hybrid's inner Ulysses group) splits the local
             # per-TP-rank heads. Validate that count rather than the global head
