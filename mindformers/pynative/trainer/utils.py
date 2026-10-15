@@ -309,13 +309,17 @@ def _sync_eod_compression_flag(dataset_config, model_config):
     The non-pynative trainer does this in ``_get_columns_with_strategy``.
     The pynative trainer must do it before model construction so that
     ``TransformerConfig.__post_init__`` picks the correct input_layout.
+    HF and OrderedIndex loaders use a top-level flag; Megatron uses ``config``.
     """
     if dataset_config is None:
         return
     dataloader_cfg = getattr(dataset_config, "dataloader", None)
     if dataloader_cfg is None:
         return
-    inner_cfg = getattr(dataloader_cfg, "config", None)
+    if getattr(dataloader_cfg, "type", None) in ("HFDataLoader", "OrderedIndexDataLoader"):
+        inner_cfg = dataloader_cfg
+    else:
+        inner_cfg = getattr(dataloader_cfg, "config", None)
     if inner_cfg is None:
         return
     create_compressed = False
@@ -502,6 +506,9 @@ def _build_dataset(
         create_compressed_eod_mask = dataloader_config['config']['create_compressed_eod_mask']
     elif dataloader_type == "HFDataLoader":
         dataloader_config['use_broadcast_data'] = False
+        # Context parallel requires position_ids; plain SFT datasets usually lack it.
+        # Batches are consumed by column name here, so the extra column is harmless otherwise.
+        dataloader_config.setdefault('create_position_ids', True)
         dataset = HFDataLoader(**dataloader_config)
         create_compressed_eod_mask = dataloader_config['create_compressed_eod_mask']
     elif dataloader_type == "MindDataset":
