@@ -90,15 +90,20 @@ def test_trainable_only_checkpoint_selects_lora_and_writes_manifest(tmp_path, mo
         "model.experts.weight1": object(),
         "model.experts.weight1_lora_a": object(),
         "model.dense.lora_b": object(),
+        "model.mlp.expert_bias": object(),
+        "model.mlp.tokens_per_expert": object(),
     })
     state = SimpleNamespace(global_step=7, consumed_samples=56)
 
     callback._save_checkpoint(None, state, model=model)
 
     choice_func = captured["model_choice_func"]
+    assert captured["rng_state"] is not None
     assert not choice_func("model.experts.weight1")
     assert choice_func("model.experts.weight1_lora_a")
     assert choice_func("model.dense.lora_b")
+    assert choice_func("model.mlp.expert_bias")
+    assert choice_func("model.mlp.tokens_per_expert")
     root_manifest = save_path / "mindformers_adapter_config.json"
     iteration_manifest = save_path / "iteration_00000007" / "mindformers_adapter_config.json"
     assert root_manifest.exists()
