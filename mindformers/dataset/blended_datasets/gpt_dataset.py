@@ -13,7 +13,10 @@ from mindformers.dataset.blended_datasets.megatron_dataset import MegatronDatase
 from mindformers.dataset.blended_datasets.utils import Split
 from mindformers.models.tokenization_utils_base import PreTrainedTokenizerBase
 from mindformers.tools.logger import logger
-from mindformers.tools.utils import get_rank_info, set_safe_mode_for_file_or_dir
+from mindformers.tools.utils import get_rank_info, get_output_root_path, set_safe_mode_for_file_or_dir
+from mindformers.dataset.balance_metadata import (
+    DocumentEodIndex, attention_load, checked_indices, eod_boundaries, file_versions, fingerprint,
+)
 
 
 _PAD_TOKEN_ID = -1
@@ -200,9 +203,6 @@ class GPTDataset(MegatronDataset):
                 self.config.create_attention_mask
             )
 
-            if self.config.create_compressed_eod_mask:
-                actual_seq_len = _get_eod_attention_mask(tokens, self._eod_token_id, self.config.eod_pad_length)
-
             if self.masks_and_position_ids_are_cacheable:
                 self.cached_attention_mask = attention_mask
                 self.cached_loss_mask = loss_mask
@@ -212,6 +212,11 @@ class GPTDataset(MegatronDataset):
             attention_mask = self.cached_attention_mask
             loss_mask = self.cached_loss_mask
             position_ids = self.cached_position_ids
+
+        # EOD boundaries are sample-specific even when template masks are cacheable.
+        if self.config.create_compressed_eod_mask:
+            actual_seq_len = _get_eod_attention_mask(tokens, self._eod_token_id, self.config.eod_pad_length)
+        loss_mask = loss_mask.copy()
 
         # For padded sequences, mask the loss
         loss_mask[labels == self._pad_token_id] = 0.0
@@ -231,6 +236,47 @@ class GPTDataset(MegatronDataset):
                     position_ids.astype(numpy.int32), attention_mask.astype(numpy.int32))
         return (tokens.astype(numpy.int32), labels.astype(numpy.int32),
                 loss_mask.astype(numpy.int32), position_ids.astype(numpy.int32))
+
+    def configure_balance_metadata(self) -> None:
+        """Bind document sidecars to indexed-file and sample transformation revisions."""
+        cache_dir = self.config.path_to_cache
+        if cache_dir is None and not self.config.mock:
+            cache_dir = os.path.join(self.dataset.path_prefix, 'cache', f'{type(self).__name__}_indices')
+        cache_dir = os.path.join(cache_dir or os.path.join(get_output_root_path(), 'cache'), 'balance_eod')
+        files = file_versions([self.dataset.path_prefix])
+        self._balance_eod_index = DocumentEodIndex(
+            self.dataset, self._eod_token_id, cache_dir,
+            fingerprint({'files': files, 'eod': self._eod_token_id, 'version': 1}))
+
+    def get_balance_loads(self, indices) -> numpy.ndarray:
+        """Resolve shuffle/sample/document indices using EOD positions, without token concatenation."""
+        loads = []
+        length = self.config.sequence_length
+        for index in checked_indices(indices, len(self)):
+            sample = int(self.shuffle_index[index])
+            first, first_offset = (int(x) for x in self.sample_index[sample])
+            last, last_offset = (int(x) for x in self.sample_index[sample + 1])
+            cursor = 0
+            positions = []
+            for document_position in range(first, last + 1):
+                document = int(self.document_index[document_position])
+                start = first_offset if document_position == first else 0
+                end = (last_offset + int(self.config.add_extra_token_to_sequence)
+                       if document_position == last else int(self.dataset.sequence_lengths[document]))
+                count = min(end - start, length - cursor)
+                if count <= 0:
+                    continue
+                eods = self._balance_eod_index.get(document)
+                left, right = numpy.searchsorted(eods, (start, start + count), side='right')
+                positions.extend((eods[left:right] - start + cursor).tolist())
+                cursor += count
+                if cursor == length:
+                    break
+            if cursor < length and self._pad_token_id == self._eod_token_id:
+                positions.extend(range(cursor + 1, length + 1))
+            boundaries = eod_boundaries(positions, length, self.config.eod_pad_length)
+            loads.append(attention_load(boundaries, length))
+        return numpy.asarray(loads, dtype=numpy.int64)
 
     def _query_document_sample_shuffle_indices(
         self, idx: int

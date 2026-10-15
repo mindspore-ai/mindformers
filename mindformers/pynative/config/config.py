@@ -636,8 +636,8 @@ class TrainDatasetConfig(BaseConfig):
     """Whether to broadcast dataset batches within each data domain"""
 
     balance_enabled: bool = False
-    """Whether to enable sample load balancing across DP ranks (reorder indices
-    by attention load within each global-batch window). Requires
+    """Balance DP attention load within the actual optimizer-step window,
+    moving complete baseline micro-batches to preserve their loss denominators. Requires
     ``create_compressed_eod_mask=True``."""
 
 

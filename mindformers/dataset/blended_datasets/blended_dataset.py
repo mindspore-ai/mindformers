@@ -14,6 +14,7 @@ from mindformers.dataset.blended_datasets.megatron_dataset import MegatronDatase
 from mindformers.dataset.blended_datasets.utils import normalize
 from mindformers.tools.logger import logger
 from mindformers.tools.utils import get_rank_info, set_safe_mode_for_file_or_dir
+from mindformers.dataset.balance_metadata import checked_indices
 
 
 _VERBOSE = False
@@ -27,7 +28,8 @@ class BlendedDataset():
 
         weights (List[Union[int, float]]): The weights that determine the dataset blend ratios
 
-        size (Optional[int]): The number of samples to draw from the blend. If None, for each dataset index idx draw exactly weights[idx] samples from datasets[idx].
+        size (Optional[int]): The number of samples to draw from the blend.
+            If None, draw exactly weights[idx] samples from datasets[idx].
 
         config (BlendedMegatronDatasetConfig): The config
 
@@ -44,16 +46,17 @@ class BlendedDataset():
     ) -> None:
         assert len(datasets) == len(weights)
         assert len(datasets) < 32767
-        assert all(map(lambda _: type(_) == type(datasets[0]), datasets))
+        # The blend requires identical concrete types, not merely a shared base class.
+        assert all(dataset.__class__ is datasets[0].__class__ for dataset in datasets)
         assert all(map(lambda _: _.index_split == datasets[0].index_split, datasets))
         assert all(map(lambda _: _ > 0, weights))
-        assert all(map(lambda _: type(_) == type(weights[0]), weights))
+        assert all(weight.__class__ is weights[0].__class__ for weight in weights)
         if size is None and isinstance(weights[0], float):
             assert all(map(lambda _: _ == int(_), weights))
 
         # Alert user to unnecessary blending
         if len(datasets) == 1:
-            logger.warning(f"Building a BlendedDataset for a single MegatronDataset")
+            logger.warning("Building a BlendedDataset for a single MegatronDataset")
 
         if size is not None:
             weights = normalize(weights)
@@ -82,7 +85,10 @@ class BlendedDataset():
 
         self.dataset_index, self.dataset_sample_index = self._build_indices()
 
-        logger.info(f"build dataset indices, self.dataset_index.shape = {self.dataset_index.shape}, self.dataset_sample_index.shape = {self.dataset_sample_index.shape}")
+        logger.info(
+            f"build dataset indices, self.dataset_index.shape = {self.dataset_index.shape}, "
+            f"self.dataset_sample_index.shape = {self.dataset_sample_index.shape}"
+        )
 
     def __len__(self) -> int:
         return self.dataset_index.shape[0]
@@ -91,6 +97,26 @@ class BlendedDataset():
         dataset_id = self.dataset_index[idx]
         dataset_sample_id = self.dataset_sample_index[idx]
         return self.datasets[dataset_id][dataset_sample_id]
+
+    def configure_balance_metadata(self) -> None:
+        """Configure each child, preserving blend mapping and repeated logical slots."""
+        configured = set()
+        for child in self.datasets:
+            if id(child) not in configured:
+                child.configure_balance_metadata()
+                configured.add(id(child))
+
+    def get_balance_loads(self, indices) -> numpy.ndarray:
+        """Batch child metadata requests, scattering every repeated slot back in order."""
+        values = checked_indices(indices, len(self))
+        result = numpy.empty(len(values), dtype=numpy.int64)
+        children = self.dataset_index[values]
+        for child_id in numpy.unique(children):
+            positions = numpy.flatnonzero(children == child_id)
+            samples = self.dataset_sample_index[values[positions]]
+            unique, inverse = numpy.unique(samples, return_inverse=True)
+            result[positions] = self.datasets[int(child_id)].get_balance_loads(unique)[inverse]
+        return result
 
     def _build_indices(self) -> Tuple[numpy.ndarray, numpy.ndarray]:
         """Build and optionally cache the dataset index and the dataset sample index
@@ -128,7 +154,7 @@ class BlendedDataset():
             self.built_anew_on_cache_miss = True
 
             # Build the dataset and dataset sample indexes
-            logger.info(f"\tBuild and save the dataset and dataset sample indexes")
+            logger.info("\tBuild and save the dataset and dataset sample indexes")
             t_beg = time.time()
             from mindformers.dataset.blended_datasets import helpers
 
