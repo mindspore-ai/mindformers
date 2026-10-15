@@ -33,10 +33,9 @@ from mindspore.mint.distributed import (
 from mindformers.tools.logger import logger
 from mindformers.tools.register.register import MindFormerModuleType, MindFormerRegister
 from mindformers.dataset.dataloader.balance_scheduler import (
-    BALANCE_SUPPORTED_LOADERS,
-    DatasetBalancer,
     assert_balance_supported,
 )
+from mindformers.dataset.dataloader.balance_adapter import BalanceSpec
 from mindformers.dataset.dataloader.blended_megatron_dataloader import (
     BlendedMegatronDatasetDataLoader,
 )
@@ -383,11 +382,25 @@ def _build_lora_model(model, config):
     return build_lora_model(model, config)
 
 
+def validate_balance_config(config):
+    """Reject unsupported modes on every rank before loader construction barriers."""
+    if not getattr(config, 'balance_enabled', False):
+        return
+    loader = config.dataloader.to_dict()
+    loader_type = loader.get('type')
+    assert_balance_supported(loader_type, True, streaming=loader.get('streaming', False))
+    effective = loader.get('config', {}) if loader_type == 'BlendedMegatronDatasetDataLoader' else loader
+    if (not effective.get('create_compressed_eod_mask', False)
+            or effective.get('create_seq_len_vector', False)):
+        raise ValueError('Data balancing requires the effective compressed-EOD mode.')
+
+
 def _build_dataset(
     config,
     parallelism,
     local_batch_size: int,
     model_config=None,
+    balance_scheduler=None,
 ):
     """
     Build dataset and dataloader.
@@ -406,6 +419,7 @@ def _build_dataset(
     Raises:
         ValueError: If world size is not divisible by dataset parallel size.
     """
+    validate_balance_config(config)
     dataset_parallel = parallelism.data_parallel
     def _set_ms_dataset_config():
         """
@@ -477,6 +491,15 @@ def _build_dataset(
         streaming=dataloader_config.get('streaming', False),
     )
 
+    # DP1 is a precise bypass: keep the original sampler/source/metadata path.
+    if balance_enabled and dataset_parallel > 1:
+        dataloader_config['balance_spec'] = BalanceSpec(
+            data_parallel=dataset_parallel, shard_id=shard_id,
+            local_batch_size=local_batch_size,
+            global_batch_size=dataset_parallel * local_batch_size * parallelism.pipeline_parallel_microbatch_size,
+            drop_remainder=config.drop_remainder,
+            scheduler=balance_scheduler)
+
     create_compressed_eod_mask = False
     if dataloader_type == "BlendedMegatronDatasetDataLoader":
         dataset = BlendedMegatronDatasetDataLoader(**dataloader_config)
@@ -520,15 +543,10 @@ def _build_dataset(
             "Enable create_compressed_eod_mask or set balance_enabled to False."
         )
 
-    # Apply load balancing only when the loader is supported and both preconditions hold.
-    if dataloader_type in BALANCE_SUPPORTED_LOADERS and balance_enabled and create_compressed_eod_mask:
-        global_batch_size = parallelism.data_parallel * local_batch_size \
-            * parallelism.pipeline_parallel_microbatch_size
-        dataset = DatasetBalancer(
-            dataset,
-            parallelism=parallelism,
-            global_batch_size=global_batch_size,
-        ).apply()
+    # The balance bridge already batches according to the baseline boundaries,
+    # including compressed offsets. Never apply a second batch/shuffle/shard.
+    if getattr(dataset, '_balance_plan_source', None) is not None:
+        return dataset
 
     dataset = dataset.batch(
         batch_size=local_batch_size,

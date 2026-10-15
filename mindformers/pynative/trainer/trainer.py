@@ -79,6 +79,7 @@ from ..tools.monitor import MonitorGroup
 from .utils import (
     _build_model,
     _build_dataset,
+    validate_balance_config,
     _build_optimizer,
     _build_lr_scheduler,
     _build_callback,
@@ -355,6 +356,7 @@ class Trainer:
             getattr(self.config, "train_dataset", None),
             use_data_broadcast=self.enable_data_broadcast,
         )
+        self._balance_source = getattr(self.train_dataset, '_balance_plan_source', None)
         if self.train_dataset is not None:
             self.train_epoch_step = self._get_dataset_size(self.train_dataset)
         else:
@@ -639,12 +641,18 @@ class Trainer:
         """
         # If user provided dataset instance, use it directly
         if dataset is not None:
+            if (dataset_config is not None and getattr(dataset_config, 'balance_enabled', False)
+                    and self.config.parallelism.data_parallel > 1
+                    and getattr(dataset, '_balance_plan_source', None) is None):
+                raise ValueError('Custom balanced dataset must expose a validated balance plan source.')
             logger.info("Using user-provided dataset instance.")
             return dataset
 
         # If no config, return None
         if dataset_config is None:
             return None
+
+        validate_balance_config(dataset_config)
 
         # With batch broadcast enabled, only the source rank in each TP×CP
         # domain should construct the configured dataset.  Other ranks receive
@@ -656,17 +664,17 @@ class Trainer:
                 "Rank %s skips train dataset construction; receiving batches from source rank %s.",
                 get_rank(), self.data_broadcast_src_rank,
             )
-            # Receive-only ranks must still pair the source rank's build-chain
-            # world-scope barriers (no group arg, FIFO-paired) or it deadlocks:
-            # Blended has 3 (__new__ + builder + build_generic), HF has 1 (__new__),
-            # OrderedIndex has 1 (_build_index_map, executed by every rank that
-            # constructs the dataset).
+            # Pair exactly the configured source's world-scope build barriers.
+            # Megatron counts depend on single-prefix/blend and active splits.
             loader_cfg = self._get_dataloader_config(dataset_config) or {}
             loader_type = loader_cfg.get("type")
-            if loader_type in ("BlendedMegatronDatasetDataLoader", "HFDataLoader"):
-                skip_barrier_controller(
-                    times=3 if loader_type == "BlendedMegatronDatasetDataLoader" else 1
+            if loader_type == "BlendedMegatronDatasetDataLoader":
+                from mindformers.dataset.dataloader.blended_megatron_dataloader import (
+                    BlendedMegatronDatasetDataLoader,
                 )
+                skip_barrier_controller(times=BlendedMegatronDatasetDataLoader.distributed_build_barriers(loader_cfg))
+            elif loader_type == "HFDataLoader":
+                skip_barrier_controller(times=1)
             elif loader_type == "OrderedIndexDataLoader":
                 if loader_cfg.get("use_cache", True) and loader_cfg.get("cache_dir"):
                     skip_barrier_controller(times=1)
@@ -682,6 +690,7 @@ class Trainer:
             self.config.parallelism,
             local_batch_size=self.config.training.local_batch_size,
             model_config=model_config,
+            balance_scheduler=self.dynamic_scheduler,
         )
 
         if use_data_broadcast:
@@ -958,7 +967,12 @@ class Trainer:
         self.callback_handler.on_train_begin(self.config, self.state)
 
         # Execute training loop
-        self._inner_train_loop()
+        try:
+            self._inner_train_loop()
+        finally:
+            source = getattr(self, '_balance_source', None)
+            if source is not None:
+                source.close()
 
         # Call train end callback
         self.callback_handler.on_train_end(self.config, self.state)
@@ -1237,7 +1251,18 @@ class Trainer:
 
                 global_step = common_info.global_step
                 self._resumed = True
-                if self.dynamic_batch_enabled:
+                balance_source = getattr(self, '_balance_source', None)
+                balanced = self._uses_data_balance()
+                if balanced:
+                    consumed = getattr(common_info, 'consumed_samples', None)
+                    if consumed is None:
+                        consumed = (self.dynamic_scheduler.consumed_samples_at_step(global_step)
+                                    if self.dynamic_batch_enabled else global_step * self.global_batch_size)
+                    self._consumed_samples = int(consumed)
+                    self.state.consumed_samples = self._consumed_samples
+                    if balance_source is not None:
+                        balance_source.restore(self._consumed_samples, int(global_step))
+                elif self.dynamic_batch_enabled:
                     # Dynamic: skip consumed_samples // base_units micro-batches. Use the
                     # persisted consumed_samples; fall back to recomputing from global_step
                     # for old checkpoints without the field.
@@ -1348,6 +1373,9 @@ class Trainer:
                 # Step begin callback
                 self.callback_handler.on_step_begin(self.config, self.state)
 
+                if self._uses_data_balance():
+                    self._prepare_balance_step()
+
                 # Gradient accumulation: accumulate over micro-batches
                 loss = 0.0
                 grad_norm = 0.0
@@ -1364,6 +1392,10 @@ class Trainer:
                 # state.consumed_samples for dynamic-batch resume.
                 self._consumed_samples += self.global_batch_size
                 self.state.consumed_samples = self._consumed_samples
+                if self._balance_source is not None:
+                    committed = self._balance_source.commit_step()
+                    if committed['consumed_samples'] != self._consumed_samples:
+                        raise RuntimeError('Balance/trainer committed consumption budget diverged.')
 
                 # Update state
                 self.state.global_step += 1
@@ -1386,6 +1418,32 @@ class Trainer:
 
                 # Profiler step notification
                 prof.step()
+
+    def _uses_data_balance(self) -> bool:
+        """Include receive-only ranks in balanced-step error synchronization."""
+        config = getattr(self, 'config', None)
+        return (getattr(getattr(config, 'train_dataset', None), 'balance_enabled', False)
+                and getattr(getattr(config, 'parallelism', None), 'data_parallel', 1) > 1)
+
+    def _prepare_balance_step(self) -> None:
+        """Check the local step boundary and synchronize preparation failures."""
+        error = None
+        source = self._balance_source
+        if source is not None:
+            try:
+                source.begin_step(self._consumed_samples, self.global_batch_size, self.num_accumulation_steps)
+            except Exception as exc:  # pylint: disable=broad-exception-caught
+                # All ranks must learn about any preparation failure before collectives.
+                error = exc
+        if self.enable_parallel and self.world_size > 1:
+            status = Tensor(np.asarray([int(error is not None)], dtype=np.int32))
+            all_reduce(status, op=ops.ReduceOp.MAX)
+            if int(status.asnumpy()[0]) and error is None:
+                error = RuntimeError('Another rank failed balance step preparation.')
+        if error is not None:
+            if source is not None:
+                source.close()
+            raise RuntimeError('Balance step preparation aborted before model collectives.') from error
 
     def _create_dataset_iterator(self, dataset):
         """
@@ -1464,6 +1522,7 @@ class Trainer:
         if rank == self.data_broadcast_src_rank:
             try:
                 data = next(dataset_iter)
+                packed_data = self._pack_broadcast_data(data)
             except StopIteration:
                 obj = [{"end": True, "data": None}]
                 broadcast_object_list(
@@ -1472,7 +1531,11 @@ class Trainer:
                     group=self.data_broadcast_group,
                 )
                 raise
-            obj = [{"end": False, "data": self._pack_broadcast_data(data)}]
+            except Exception as exc:
+                obj = [{"end": False, "error": f"{type(exc).__name__}: {exc}"}]
+                broadcast_object_list(obj, src=self.data_broadcast_src_rank, group=self.data_broadcast_group)
+                raise RuntimeError('Source dataset read or packing failed; terminate the distributed job.') from exc
+            obj = [{"end": False, "data": packed_data}]
         else:
             obj = [None]
 
@@ -1482,6 +1545,8 @@ class Trainer:
             group=self.data_broadcast_group,
         )
         payload = obj[0]
+        if payload.get('error'):
+            raise RuntimeError(f"Source dataset read or packing failed: {payload['error']}")
         if payload["end"]:
             raise StopIteration
         return self._unpack_broadcast_data(payload["data"])
@@ -1601,13 +1666,47 @@ class Trainer:
 
 
     def _next_batch(self) -> Dict[str, Any]:
+        """Read a micro-batch and agree on IO failures before model collectives."""
+        balanced = self._uses_data_balance()
+        if not balanced or getattr(self, '_collecting_balance_step', False):
+            return self._next_batch_unchecked()
+        data, error = None, None
+        try:
+            data = self._next_batch_unchecked()
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            # Any source read error must be synchronized across ranks.
+            error = exc
+        self._sync_balance_read_error(error)
+        return data
+
+    def _sync_balance_read_error(self, error) -> None:
+        """Make a live source's Python read failure visible to every DP/PP domain."""
+        if self.enable_parallel and self.world_size > 1:
+            status = Tensor(np.asarray([int(error is not None)], dtype=np.int32))
+            all_reduce(status, op=ops.ReduceOp.MAX)
+            if int(status.asnumpy()[0]) and error is None:
+                error = RuntimeError('Another training rank failed dataset IO.')
+        if error is not None:
+            raise RuntimeError('Balance dataset IO aborted before model collectives.') from error
+
+    def _next_batch_unchecked(self) -> Dict[str, Any]:
         """Fetch the next micro-batch; on exhaustion (epoch wrap) recreate the
         iterator and retry."""
         try:
             return self.get_batch(self._dataset_iter)
         except StopIteration:
+            if self._uses_data_balance():
+                # MindSpore reports each epoch boundary with StopIteration even
+                # when the same iterator still has future native epochs. Do not
+                # create concurrent consumers of the shared iterable bridge.
+                try:
+                    return self.get_batch(self._dataset_iter)
+                except StopIteration:
+                    if hasattr(self._dataset_iter, 'stop'):
+                        self._dataset_iter.stop()
             if self._resumed and self.dynamic_batch_enabled:
-                self.train_dataset.set_init_step(0)
+                if self._balance_source is None:
+                    self.train_dataset.set_init_step(0)
             self._dataset_iter = self._create_dataset_iterator(self.train_dataset)
             return self.get_batch(self._dataset_iter)
 
@@ -1687,6 +1786,23 @@ class Trainer:
         logger.info("Pipeline schedule rebuilt for micro_batch_num=%d.", new_num_accum)
 
     def _collect_micro_batches(self, num_micro_batches: int) -> Dict[str, Any]:
+        """Agree on whole-step PP IO errors once, before entering the schedule."""
+        balanced = self._uses_data_balance()
+        if not balanced:
+            return self._collect_micro_batches_unchecked(num_micro_batches)
+        data, error = None, None
+        self._collecting_balance_step = True
+        try:
+            data = self._collect_micro_batches_unchecked(num_micro_batches)
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            # PP ranks must agree on all read and collation failures.
+            error = exc
+        finally:
+            self._collecting_balance_step = False
+        self._sync_balance_read_error(error)
+        return data
+
+    def _collect_micro_batches_unchecked(self, num_micro_batches: int) -> Dict[str, Any]:
         """Fetch ``num_micro_batches`` micro-batches and concatenate along dim 0 into a single batch.
 
         After stacking, batch dim = ``num_micro_batches * local_batch_size`` == ``micro_batch_num * local_batch_size``,
