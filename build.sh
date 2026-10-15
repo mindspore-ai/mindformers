@@ -32,7 +32,7 @@ do
     [[ -e "${package}" ]] || break
     sha256sum ${package} > ${package}.sha256
 done
-pip install mindformers*whl -i https://pypi.tuna.tsinghua.edu.cn/simple
+pip install mindformers*whl -i https://pypi.tuna.tsinghua.edu.cn/simple --extra-index-url https://repo.mindspore.cn/pypi/simple
 cd ${BASEPATH} || exit
 rm -rf *-info $BUILD_PATH
 echo "---------------- MindFormers: build and install end   ----------------"

@@ -7,27 +7,27 @@
 * **动态图训练与推理能力增强：**
 
     * 新增动态图 [Trainer 前向推理接口](https://atomgit.com/mindspore/mindformers/issues/2536)，支持批量贪心解码，复用训练的多维并行与权重加载流程，通过 `run_mode: predict` 启动，支持文本及 JSONL 等输入和结果保存（[!8749](https://atomgit.com/mindspore/mindformers/pull/8749)）；
-    * 新增 [MoE LoRA 微调](https://atomgit.com/mindspore/mindformers/issues/2596)，将 LoRA 适配扩展至路由专家，支持仅稠密层、仅专家层及两者联合微调，并适配分布式并行、断点续训和权重合并（[!8813](https://atomgit.com/mindspore/mindformers/pull/8813)）；
     * 支持动态调整全局 batch size，通过调整梯度累积步数逐步增大训练 batch，适配流水线并行及断点续训（[!8509](https://atomgit.com/mindspore/mindformers/pull/8509)）；新增可扩展的 TensorBoard 训练监控，统一记录训练指标与配置（[!8542](https://atomgit.com/mindspore/mindformers/pull/8542)）；
+    * 新增训练性能数据 Profile 能力，支持采集与分析训练过程的性能数据，并可开启 CPU 算子采集（[!8236](https://atomgit.com/mindspore/mindformers/pull/8236)、[!8390](https://atomgit.com/mindspore/mindformers/pull/8390)）；
     * 新增 [NaN/Inf 跳步保护](https://atomgit.com/mindspore/mindformers/issues/2549)，可在全局梯度范数为 NaN/Inf 时跳过优化器更新，并设置连续跳步上限，避免无效训练持续运行；该能力默认关闭（[!8748](https://atomgit.com/mindspore/mindformers/pull/8748)）。
 
 * **DSA 长序列训练：**
 
-    * 新增动态图 DSA（DeepSeek Sparse Attention）核心组件，支持 Indexer 稠密预热与稀疏训练两个阶段，并接入模型并行及重计算（[!8505](https://atomgit.com/mindspore/mindformers/pull/8505)、[!8575](https://atomgit.com/mindspore/mindformers/pull/8575)）；
-    * 新增 [IndexShare](https://atomgit.com/mindspore/mindformers/issues/2580)，支持跨层共享 Indexer 和 Top-K 索引，减少重复计算；支持 `leader` / `served` 监督方式及可选 Top-K 换出（[!8785](https://atomgit.com/mindspore/mindformers/pull/8785)、[!8803](https://atomgit.com/mindspore/mindformers/pull/8803)）；
-    * 优化 DSA 稠密预热阶段的激活管理，新增可选的逐层反向能力，并适配流水线并行和 IndexShare，缓解长序列训练的显存压力（[!8796](https://atomgit.com/mindspore/mindformers/pull/8796)）。
+    * 新增动态图 DSA（DeepSeek Sparse Attention）核心组件，支持 Indexer 稠密预热与稀疏训练两个阶段，支撑 1M token 级长序列训练，并接入模型并行及重计算（[!8505](https://atomgit.com/mindspore/mindformers/pull/8505)、[!8575](https://atomgit.com/mindspore/mindformers/pull/8575)）；
+    * 优化 DSA 稠密预热阶段的激活管理，新增可选的逐层反向能力，并适配流水线并行，缓解长序列训练的显存压力（[!8796](https://atomgit.com/mindspore/mindformers/pull/8796)）。
 
 * **并行与数据性能优化：**
 
     * 新增基于本地 Tensor 计算的 TP/SP 路径，参数仍由 DTensor 管理，减少激活重分布开销（[!8525](https://atomgit.com/mindspore/mindformers/pull/8525)）；优化 HSDP 梯度累积，将 replicate 维的 all-reduce 延迟至最后一个 micro-batch（[!8770](https://atomgit.com/mindspore/mindformers/pull/8770)）；
     * 新增 OrderedIndexDataLoader，并支持 [TND 长序列数据负载均衡](https://atomgit.com/mindspore/mindformers/issues/2491)，通过样本索引重排改善数据并行各 rank 的注意力计算负载（[!8569](https://atomgit.com/mindspore/mindformers/pull/8569)、[!8668](https://atomgit.com/mindspore/mindformers/pull/8668)）；
+    * 新增数据集广播，通过 `use_distribute_dataset` 在 TP×CP 数据域内广播数据 batch，避免域内各 rank 重复读取与预处理，并消除所有 rank 冗余初始化数据与 index map 冗余生成（[!8424](https://atomgit.com/mindspore/mindformers/pull/8424)、[!8704](https://atomgit.com/mindspore/mindformers/pull/8704)）；
     * 优化 Muon 去冗余计算的负载分配、BF16 Newton-Schulz 计算及 HSDP 通信范围，降低热点 rank 的显存压力（[!8687](https://atomgit.com/mindspore/mindformers/pull/8687)）；重构 `exclude_op`，支持按模块、函数属性及 TP/EP 通信路径排除重计算（[!8577](https://atomgit.com/mindspore/mindformers/pull/8577)）。
 
 * **权重方案：**
 
+    * 新增动态图 DeepSeek-V4 的 Hugging Face 权重加载，支持从 HF 格式的 safetensors 权重直接构建模型并启动训练，自动完成权重重分片与布局转换（[!8567](https://atomgit.com/mindspore/mindformers/pull/8567)）；
     * 补齐 [MindFormers→Hugging Face 权重转换](https://atomgit.com/mindspore/mindformers/issues/2526)，新增离线导出工具，支持基于模型声明的转换规则导出 safetensors，并从带有 metadata 的 rank 分片权重重建参数；采用按层处理方式控制内存开销（[!8709](https://atomgit.com/mindspore/mindformers/pull/8709)、[!8761](https://atomgit.com/mindspore/mindformers/pull/8761)）；
-    * 优化动态图大规模集群的 [Checkpoint 保存与加载](https://atomgit.com/mindspore/mindformers/issues/2533)，通过 layout 去重汇聚、rank 0 集中构建与分发保存计划、缓存复用及统一写入 metadata，减少重复通信和 CPU 内存开销（[!8741](https://atomgit.com/mindspore/mindformers/pull/8741)、[!8745](https://atomgit.com/mindspore/mindformers/pull/8745)、[!8746](https://atomgit.com/mindspore/mindformers/pull/8746)）；
-    * 新增 LoRA 微调后 safetensors 权重合并工具（[!8757](https://atomgit.com/mindspore/mindformers/pull/8757)）。
+    * 优化动态图大规模集群的 [Checkpoint 保存与加载](https://atomgit.com/mindspore/mindformers/issues/2533)，通过 layout 去重汇聚、rank 0 集中构建与分发保存计划、缓存复用及统一写入 metadata，减少重复通信和 CPU 内存开销（[!8741](https://atomgit.com/mindspore/mindformers/pull/8741)、[!8745](https://atomgit.com/mindspore/mindformers/pull/8745)、[!8746](https://atomgit.com/mindspore/mindformers/pull/8746)）。
 
 ### 新模型
 
@@ -69,7 +69,6 @@
 | 变更内容 | 变更说明 |
 |----------|----------|
 | 第三方依赖 | `transformers` 由 `4.57.1` 调整为 `>=5.3.0`，`datasets` 由 `>=4.0.0` 调整为 `>=5.0.1`；移除默认依赖中的 `nltk`，ADGEN BLEU 指标改用内置实现。 |
-| IndexShare 开发期配置迁移 | 使用过本周期早期实现的用户，需将 `dsa_index_share_size` 改为 `dsa_index_topk_freq`，将 `dsa_index_share_pattern` 改为 `dsa_indexer_types`；后者采用由 `full` / `shared` 组成、长度等于模型层数的列表，不再接受 `FSSS` 等紧凑字符串（[!8803](https://atomgit.com/mindspore/mindformers/pull/8803)）。 |
 | 动态图推理 | 通过 `run_mode: predict` 和 `inference` 配置启用；权重与 tokenizer 从 `checkpoint.load_path` 加载。当前为批量贪心解码，PP 推理不支持 interleave、`overlap_b_f` 和 swap 组合（[!8749](https://atomgit.com/mindspore/mindformers/pull/8749)）。 |
 | MF→HF 离线导出 | 按模型声明的 `weight_converters` 导出，当前可发现 DeepSeek-V4、Qwen3、Qwen3-MoE 的转换规则。生成的 `config.json` 是配置子集，使用下游工具前需核对并补齐缺失的模型或推理字段（[!8761](https://atomgit.com/mindspore/mindformers/pull/8761)）。 |
 | Muon 运行环境 | 优化路径依赖 MindSpore 的 `op_precision.cube_math_type` 接口；缺少该接口时会明确报错，请确认所用 MindSpore 构建提供该能力（[!8687](https://atomgit.com/mindspore/mindformers/pull/8687)）。 |
