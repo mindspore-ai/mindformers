@@ -138,6 +138,8 @@ def test_pipeline_checkpoint_load_manages_shared_optimizer_once(monkeypatch, tmp
     models = [object(), object()]
     optimizer = Mock()
     events = []
+    restore_rng_state = Mock(side_effect=lambda _: events.append("restore_rng"))
+    monkeypatch.setattr(trainer_module, "restore_checkpoint_rng_state", restore_rng_state)
     optimizer.save_main_params_snapshot.side_effect = lambda: events.append("snapshot")
     load_checkpoint.side_effect = lambda **kwargs: events.append(kwargs["network"])
     optimizer.reload_main_params_from_model.side_effect = lambda: events.append("reload")
@@ -151,9 +153,11 @@ def test_pipeline_checkpoint_load_manages_shared_optimizer_once(monkeypatch, tmp
 
     expected_events = [models[0], models[1], "reload"]
     if no_load_optim:
+        restore_rng_state.assert_not_called()
         optimizer.save_main_params_snapshot.assert_not_called()
     else:
-        expected_events.insert(0, "snapshot")
+        expected_events[0:0] = ["restore_rng", "snapshot"]
+        restore_rng_state.assert_called_once_with(str(checkpoint_path))
         optimizer.save_main_params_snapshot.assert_called_once_with()
     assert events == expected_events
     optimizer.reload_main_params_from_model.assert_called_once_with()

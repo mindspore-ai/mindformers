@@ -39,6 +39,7 @@ from mindformers.checkpoint.checkpoint import (
 import mindformers.checkpoint.checkpoint as checkpoint_module
 from mindformers.checkpoint.converter.template import WeightTemplate
 from mindformers.checkpoint.sharded_tensor import build_sharded_tensor, get_sharded_tensor_from_cell
+from mindformers.checkpoint import utils as checkpoint_utils
 from mindformers.models.qwen3.configuration_qwen3 import Qwen3Config
 from mindformers.models.qwen3.utils import Qwen3PreTrainedModel
 from mindformers.parallel_core.transformer_config_utils import convert_to_transformer_config
@@ -50,6 +51,8 @@ from mindformers.checkpoint.utils import (
     get_checkpoint_tracker_filename,
     get_checkpoint_iter_dir,
     is_optimizer_ckpt_file,
+    restore_checkpoint_rng_state,
+    save_checkpoint_rng_state,
     FileType
 )
 
@@ -213,7 +216,8 @@ class TestSaveCheckpoint:
             network=simple_network,
             optimizer=optimizer,
             common_info=common_info,
-            save_checkpoint_path=tmp_path
+            save_checkpoint_path=tmp_path,
+            rng_state=ms.get_rng_state(),
         )
         checkpoint_dir = get_checkpoint_iter_dir(tmp_path, iteration)
         assert os.path.exists(checkpoint_dir)
@@ -221,6 +225,10 @@ class TestSaveCheckpoint:
         # Check common.json exists
         common_file = get_common_filename(tmp_path, iteration)
         assert os.path.exists(common_file)
+        saved_common = CommonInfo.load_common(common_file)
+        assert saved_common.rng_state_format == checkpoint_utils.RNG_STATE_FORMAT
+        assert saved_common.rng_world_size == 1
+        assert (tmp_path / f"iteration_{iteration:08d}" / "rng_state_rank_00000000.json").exists()
 
         # Check model file exists
         model_file = get_checkpoint_name(checkpoint_dir, None, 0, 1, FileType.MODEL) + '.safetensors'
@@ -235,6 +243,30 @@ class TestSaveCheckpoint:
         assert os.path.exists(tracker_file)
         with open(tracker_file, 'r', encoding='utf-8') as f:
             assert f.read().strip() == str(iteration)
+
+    @pytest.mark.level0
+    @pytest.mark.platform_x86_cpu
+    @pytest.mark.env_onecard
+    def test_rng_save_failure_does_not_publish_checkpoint(self, tmp_path, simple_network):
+        """The tracker remains on the last complete checkpoint if RNG persistence fails."""
+        tracker_file = get_checkpoint_tracker_filename(tmp_path)
+        with open(tracker_file, "w", encoding="utf-8") as stream:
+            stream.write("41")
+
+        with patch(
+                "mindformers.checkpoint.checkpoint.save_checkpoint_rng_state",
+                side_effect=OSError("injected RNG write failure")):
+            with pytest.raises(OSError, match="injected RNG write failure"):
+                save_checkpoint(
+                    iteration=42,
+                    network=simple_network,
+                    common_info=CommonInfo(epoch_num=1, global_step=42),
+                    save_checkpoint_path=tmp_path,
+                    rng_state=ms.get_rng_state(),
+                )
+
+        with open(tracker_file, "r", encoding="utf-8") as stream:
+            assert stream.read() == "41"
 
     @pytest.mark.level0
     @pytest.mark.platform_x86_cpu
@@ -803,6 +835,67 @@ class TestGetCheckpointPath:
         (tmp_path / metadata_name).write_text('{"step": 1}', encoding="utf-8")
 
         assert get_base_checkpoint_fingerprint(str(tmp_path)) is not None
+
+    @pytest.mark.level0
+    @pytest.mark.platform_x86_cpu
+    @pytest.mark.env_onecard
+    def test_checkpoint_rng_state_round_trip(self, tmp_path, monkeypatch):
+        """A checkpoint sidecar restores the exact MindSpore generator state."""
+        ms.manual_seed(123)
+        expected = ms.get_rng_state()
+        expected_values = expected.asnumpy().reshape(-1).tolist()
+        restored = []
+        monkeypatch.setattr(checkpoint_utils.ms, "set_rng_state", restored.append)
+
+        state_path = save_checkpoint_rng_state(str(tmp_path), expected)
+        (tmp_path / "common.json").write_text(json.dumps({
+            "rng_state_format": checkpoint_utils.RNG_STATE_FORMAT,
+            "rng_world_size": 1,
+        }), encoding="utf-8")
+        fake_state = MagicMock()
+        fake_state.reshape.return_value = fake_state
+        tensor_factory = MagicMock(return_value=fake_state)
+        monkeypatch.setattr(checkpoint_utils.ms, "Tensor", tensor_factory)
+        assert restore_checkpoint_rng_state(str(tmp_path))
+
+        assert os.path.isfile(state_path)
+        tensor_factory.assert_called_once_with(expected_values, dtype=ms.uint8)
+        fake_state.reshape.assert_called_once_with((16,))
+        assert restored == [fake_state]
+
+    @pytest.mark.level0
+    @pytest.mark.platform_x86_cpu
+    @pytest.mark.env_onecard
+    def test_legacy_checkpoint_without_rng_state_is_supported(self, tmp_path):
+        """Old checkpoints remain loadable and report that no RNG state was restored."""
+        (tmp_path / "common.json").write_text("{}", encoding="utf-8")
+        assert not restore_checkpoint_rng_state(str(tmp_path))
+
+    @pytest.mark.level0
+    @pytest.mark.platform_x86_cpu
+    @pytest.mark.env_onecard
+    def test_rng_state_topology_change_is_skipped(self, tmp_path, monkeypatch):
+        """A topology change must not block optimizer checkpoint resharding."""
+        (tmp_path / "common.json").write_text(json.dumps({
+            "rng_state_format": checkpoint_utils.RNG_STATE_FORMAT,
+            "rng_world_size": 4,
+        }), encoding="utf-8")
+        monkeypatch.setattr(checkpoint_utils, "get_real_group_size", lambda: 8)
+
+        assert not restore_checkpoint_rng_state(str(tmp_path))
+
+    @pytest.mark.level0
+    @pytest.mark.platform_x86_cpu
+    @pytest.mark.env_onecard
+    def test_declared_rng_state_must_exist(self, tmp_path):
+        """A new checkpoint missing a declared RNG sidecar is incomplete, not legacy."""
+        (tmp_path / "common.json").write_text(json.dumps({
+            "rng_state_format": checkpoint_utils.RNG_STATE_FORMAT,
+            "rng_world_size": 1,
+        }), encoding="utf-8")
+
+        with pytest.raises(FileNotFoundError, match="state file for rank 0 is missing"):
+            restore_checkpoint_rng_state(str(tmp_path))
 
     @pytest.mark.level0
     @pytest.mark.platform_x86_cpu

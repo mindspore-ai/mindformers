@@ -67,6 +67,7 @@ _MOE_ADAPTER_LABEL = MOE_ADAPTER_LABEL
 # metadata.json ``storage_data`` keys are stringified tuples, e.g. ``('param.name', (0,))``.
 _STORAGE_KEY_PATTERN = re.compile(r"^\('(.+)', \([0-9, ]*\)\)$")
 _OPTIMIZER_SAFETENSORS_PATTERN = re.compile(r"(?:.+-)?opt-\d+-\d+\.safetensors")
+_LORA_CHECKPOINT_STATE_SUFFIXES = (".expert_bias", ".tokens_per_expert")
 
 
 def _ms_dtype_of(dtype_str: str):
@@ -119,6 +120,11 @@ def _is_optimizer_param(name: str) -> bool:
 def _classify_adapter(name: str) -> Optional[Tuple[str, str, Tuple[str, str, str]]]:
     """Compatibility wrapper for the shared adapter classifier."""
     return classify_adapter(name)
+
+
+def _is_adapter_checkpoint_param(name: str) -> bool:
+    """Return whether a tensor belongs to an adapter-only training checkpoint."""
+    return _classify_adapter(name) is not None or name.endswith(_LORA_CHECKPOINT_STATE_SUFFIXES)
 
 
 def _storage_key_param(key) -> Optional[str]:
@@ -426,7 +432,7 @@ def merge_lora(base_ckpt_path: Optional[str] = None,
         adapter_params, adapter_dtypes, adapter_sources = _load_checkpoint_params(adapter_source)
         adapter_params = {
             name: value for name, value in adapter_params.items()
-            if _classify_adapter(name) is not None
+            if _is_adapter_checkpoint_param(name)
         }
         if not adapter_params:
             raise ValueError(
