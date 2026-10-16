@@ -82,6 +82,7 @@ from mindformers.pynative.distributed.expert_parallel import (
 from mindformers.pynative.distributed.ep_overlap import OverlapExpertParallel
 from mindformers.pynative.distributed.pipeline_parallel import PpLayerSetting, StageModelBuilder, _create_schedule, _infer_schedule_type
 from mindformers.pynative.pet.lora_adapter import build_lora_model
+from mindformers.pynative.pet.utils import is_lora_a_param_name
 from mindformers.pynative.distributed.parallelize import parallelize_module
 from mindformers.pynative.distributed.utils import get_loss_sense
 from mindformers.pynative.layers.flash_attention import FlashAttention
@@ -442,6 +443,20 @@ def _build_fsdp_policy(
         shape = param.local_shape if isinstance(param, DTensor) else param.shape
         normalized_dim = shard_dim if shard_dim >= 0 else shard_dim + len(shape)
         if shape[normalized_dim] % shard_size != 0:
+            # Dense LoRA A is shaped ``(rank, input_size)``.  The generic
+            # default (Shard(0)) accidentally makes its storage policy depend
+            # on whether the low-rank dimension is divisible by the FSDP
+            # degree: rank=8 shards on DP8, while rank=4 falls back to a fully
+            # replicated parameter.  Prefer the non-rank matrix dimension when
+            # no explicit rule was supplied, matching the expert-LoRA policy.
+            if (
+                "shard_dim" not in rule
+                and is_lora_a_param_name(param_name)
+                and len(shape) == 2
+                and shape[1] % shard_size == 0
+            ):
+                placement_overrides[id(param)] = Shard(1)
+                continue
             replicate_params.append(param)
             placement_overrides.pop(id(param), None)
             logger.warning("The shape[%s]=%s of parameter %s is not divisible by "
