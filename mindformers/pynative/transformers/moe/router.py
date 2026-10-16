@@ -85,8 +85,7 @@ class TopKRouter(nn.Cell):
         self.route_norm = route_norm
         self.route_scale = route_scale
         self._debug_force_load_balance = config.moe_router_force_expert_balance
-        # NOTE: add config for per token loss
-        self.calculate_per_token_loss = False
+        self.calculate_per_token_loss = config.calculate_per_token_loss
         self.moe_aux_loss_auto_scaler = MoEAuxLossAutoScaler()
 
         # The leading moe_n_hash_layers decoder layers (0-based decoder layer index) select
@@ -698,8 +697,14 @@ class TopKRouter(nn.Cell):
             # which scales both the main_loss gradient and aux_loss gradient by
             # 1/(num_local_tokens * dp_size * num_micro_batches) in finalize_model_grads function.
             # To correct this scaling, we need to scale the aux_loss by num_local_tokens here.
+            # ``grad_aux_loss_group_size`` (not Megatron's ``tp_cp_size``) because this
+            # framework's loss sense is 1/(dp*tp*cp) and the aux gradient, unlike the main
+            # loss, has no TP collective to undo the 1/tp -- the same reason the branch below
+            # uses it. Keeping the two branches on the same compensation is what makes
+            # switching calculate_per_token_loss on leave the aux gradient scale unchanged
+            # (it only gains the token weighting); Megatron's constant would inflate it by tp.
             top_scores = self.moe_aux_loss_auto_scaler(
-                top_scores, aux_loss * top_scores.shape[0] * tp_cp_size
+                top_scores, aux_loss * top_scores.shape[0] * grad_aux_loss_group_size
             )
         else:
             top_scores = self.moe_aux_loss_auto_scaler(

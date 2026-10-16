@@ -198,6 +198,7 @@ class FusedSparseFlashMlaWithIndexerLoss(_Function):
             loss_coeff,
             layer_number,
             num_layers,
+            calculate_per_token_loss=False,
     ):
         """Run fused attention and save everything required by the combined backward."""
         sparse_indices, cmp_residual, kernel_cmp_ratio = _prepare_sparse_flash_mla(
@@ -243,6 +244,7 @@ class FusedSparseFlashMlaWithIndexerLoss(_Function):
         ctx.loss_coeff = loss_coeff
         ctx.layer_number = layer_number
         ctx.num_layers = num_layers
+        ctx.calculate_per_token_loss = calculate_per_token_loss
         return output
 
     @staticmethod
@@ -292,10 +294,15 @@ class FusedSparseFlashMlaWithIndexerLoss(_Function):
                 cmp_ratio=ctx.cmp_ratio,
             )
         )
+        # calculate_per_token_loss makes the trainer divide every gradient once by the
+        # globally reduced token count, so this loss must contribute a raw sum: drop the local
+        # per-token normaliser. Mirrors Megatron's csa.py, which passes
+        # ``1 if config.calculate_per_token_loss else l_local * cp_size`` as the normaliser.
+        indexer_loss_normaliser = 1 if ctx.calculate_per_token_loss else batch_size * query_length
         grad_scale = (
             _IndexerLossAutoScaler.main_loss_backward_scale
             * ctx.loss_coeff
-            / (batch_size * query_length)
+            / indexer_loss_normaliser
         )
         d_query_index = d_query_index * grad_scale
         d_key_index = d_key_index * grad_scale
@@ -315,7 +322,7 @@ class FusedSparseFlashMlaWithIndexerLoss(_Function):
             d_key_index,
             d_weights,
             d_sinks,
-            None, None, None, None, None, None, None, None, None,
+            None, None, None, None, None, None, None, None, None, None,
         )
 
 
@@ -618,6 +625,7 @@ class CompressedSparseAttention(nn.Cell):
                 softmax_scale=self.softmax_scale,
                 loss_coeff=config.dsa_indexer_loss_coeff,
                 sparse_loss=config.dsa_indexer_use_sparse_loss,
+                calculate_per_token_loss=config.calculate_per_token_loss,
             )
         else:
             self.enable_indexer = False
@@ -704,6 +712,7 @@ class CompressedSparseAttention(nn.Cell):
                 self.dsa_indexer_loss_coeff,
                 self.layer_number,
                 self.config.num_layers + (self.config.mtp_num_layers or 0),
+                self.config.calculate_per_token_loss,
             )
         else:
             output = FusedSparseFlashMla.apply(
@@ -795,9 +804,13 @@ class CompressedSparseAttention(nn.Cell):
                         ops.stop_gradient(compressed_kv),
                         mask=causal_mask,
                     )
+                    reported_loss = indexer_loss
+                    if self.config.calculate_per_token_loss:
+                        # The loss returns (graph contribution, per-token mean) in this mode.
+                        indexer_loss, reported_loss = indexer_loss
                     if self.dsa_indexer_loss_coeff > 0:
                         save_to_indexer_losses_tracker(
-                            indexer_loss,
+                            reported_loss,
                             self.layer_number,
                             self.config.num_layers + (self.config.mtp_num_layers or 0),
                         )

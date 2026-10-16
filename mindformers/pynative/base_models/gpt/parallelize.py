@@ -2177,11 +2177,16 @@ def apply_pp(
     # Adjust the last-stage loss backward scaling so PP gradients match the single-card case.
     # DTensor repeat compensation is handled by ScaledLossPipelineStage from the actual output layout.
     # MoE/MTP losses are scaled separately by their own auto-scalers and are not affected here.
+    # With calculate_per_token_loss the micro-batches' token-loss sums are accumulated, not
+    # averaged -- the single division by the global token count happens in the trainer -- so
+    # the 1/grad_accum factor must be left out of the last-stage seed.
     main_loss_sense = get_loss_sense(
         parallelism=parallelism,
         enable_parallel=True,
         gradient_accumulation_steps=gradient_accumulation_steps,
-        apply_gradient_accumulation=True,
+        apply_gradient_accumulation=not getattr(
+            _unwrap_gptmodel(model_parts[0]).get_gpt_transformer_config(),
+            "calculate_per_token_loss", False),
         )
     loss_scale = float(main_loss_sense.asnumpy().item())
     for stage in stages:

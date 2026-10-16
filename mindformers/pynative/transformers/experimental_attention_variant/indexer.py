@@ -388,10 +388,16 @@ class _IndexerLossAutoScaler(_Function):
 class UnfusedCSAIndexerLoss(nn.Cell):
     """Indexer KL-divergence loss for the unfused CSA path."""
 
-    def __init__(self, softmax_scale, loss_coeff=1.0, sparse_loss=True):
+    def __init__(self, softmax_scale, loss_coeff=1.0, sparse_loss=True,
+                 calculate_per_token_loss=False):
         super().__init__()
         self.softmax_scale = softmax_scale
         self.loss_coeff = loss_coeff
+        # calculate_per_token_loss makes the trainer divide every gradient once by the
+        # globally reduced token count, so this loss must contribute a raw sum rather than a
+        # per-row mean. Same switch as Megatron's dsa.py (``kl_per_row.sum()`` vs
+        # ``kl_per_row.mean()``).
+        self.calculate_per_token_loss = calculate_per_token_loss
         self.sparse_loss = sparse_loss
 
         self.post_head_sum = IdentityOp()
@@ -498,6 +504,12 @@ class UnfusedCSAIndexerLoss(nn.Cell):
         normalized_target = selected_target / (target_sum + eps)
         log_target = self.log(self.max(normalized_target, eps))
         log_predicted = self.log(predicted + eps)
-        kl_div = self.mean(self.sum((log_target - log_predicted) * selected_target, dim=-1))
+        kl_per_row = self.sum((log_target - log_predicted) * selected_target, dim=-1)
+        if self.calculate_per_token_loss:
+            # (graph contribution, value to report): the gradient needs the raw sum, but the
+            # logged metric must stay a per-token mean to remain comparable across the switch.
+            return (self.sum(kl_per_row) * self.loss_coeff,
+                    self.mean(kl_per_row) * self.loss_coeff)
+        kl_div = self.mean(kl_per_row)
 
         return kl_div * self.loss_coeff

@@ -347,7 +347,10 @@ class CrossEntropyLoss(nn.Cell):
             self.cast(self.tuple_to_array((1e-8,)),mstype.float32))
         if not self.calculate_per_token_loss:
             return self.div(numerator, denominator)
-        return numerator, denominator
+        # ``numerator`` is a 0-d reduction while ``denominator`` picks up shape (1,) from the
+        # broadcast epsilon; the non-per-token loss inherits that (1,) and the trainer's backward
+        # sense is Tensor([s]). Reshape here so the per-token numerator carries the same (1,).
+        return self.reshape(numerator, (1,)), denominator
 
 
 class ChunkCrossEntropyLoss(CrossEntropyLoss):
@@ -435,7 +438,10 @@ class _ChunkCrossEntropyLoss(_Function):
             loss = seq_loss if loss is None else loss + seq_loss
             start_idx = end_idx
         if calculate_per_token_loss:
-            return loss, denominator
+            # ``numerator`` is a 0-d reduction, so the accumulated per-token loss is 0-d too;
+            # the non-per-token branch only gets (1,) from dividing by the broadcast-epsilon
+            # denominator. Reshape so it matches the trainer's Tensor([s]) backward sense.
+            return mint.reshape(loss, (1,)), denominator
         return loss
 
     @staticmethod
@@ -522,7 +528,10 @@ class _ChunkVocabParallelCrossEntropy(_Function):
             loss = seq_loss if loss is None else loss + seq_loss
             start_idx = end_idx
         if calculate_per_token_loss:
-            return loss, denominator
+            # ``numerator`` is a 0-d reduction, so the accumulated per-token loss is 0-d too;
+            # the non-per-token branch only gets (1,) from dividing by the broadcast-epsilon
+            # denominator. Reshape so it matches the trainer's Tensor([s]) backward sense.
+            return mint.reshape(loss, (1,)), denominator
         return loss
 
     @staticmethod

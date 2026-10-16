@@ -665,6 +665,8 @@ def process_mtp_loss(
             mtp_logits = mtp_logits.transpose(0, 1)
             mtp_loss = compute_language_model_loss(mtp_labels, mtp_logits, mtp_loss_mask)
             if config.calculate_per_token_loss:
+                # 该分支返回 (token-loss 和, token 数)：上报归一值，反向贡献原始和——
+                # trainer 会在 step 末用全局 token 数对整个梯度缓冲区除一次。
                 mtp_loss_numerator, mtp_loss_denominator = mtp_loss
                 mtp_loss_for_log = mtp_loss_numerator / mtp_loss_denominator
                 mtp_loss_for_backward = mtp_loss_numerator
