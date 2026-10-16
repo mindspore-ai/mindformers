@@ -200,6 +200,9 @@ class Trainer:
                  audio_processor: Optional[BaseAudioProcessor] = None,
                  save_config: bool = False,
                  reset_model: bool = False):
+        logger.warning("############################## WARNING ##############################"
+                       "MindFormers in GRAPH_MODE (mode = 0) is going to be deprecated soon.\n"
+                       "Please migrate your project to PYNATIVE_MODE (mode = 1).")
         self.args = args
         self.task = task
         self.model = model
