@@ -54,6 +54,7 @@ def set_auxiliary_loss_backward_scale(
         enable_parallel: bool,
         gradient_accumulation_steps: int = 1,
         indexer_loss_tp_replica_size: int = 1,
+        calculate_per_token_loss: bool = False,
 ) -> Tensor:
     """Set the backward grad scale for all auxiliary losses (aux/mtp/index).
 
@@ -91,11 +92,17 @@ def set_auxiliary_loss_backward_scale(
             "indexer_loss_tp_replica_size must be at least 1, but got "
             f"{indexer_loss_tp_replica_size}."
         )
+    # Per-token loss sums the micro-batch contributions instead of averaging them (the
+    # division happens once at the end, by the globally reduced token count), so the
+    # 1/num_accumulation_steps factor must be left out of the auxiliary scale as well --
+    # the router / MTP / indexer per-token branches carry their own token weighting instead.
+    # Mirrors Megatron's pipeline_parallel/schedules.py, which drops the /num_microbatches
+    # from all three autoscalers under calculate_per_token_loss.
     main_loss_sense = get_loss_sense(
         parallelism=parallelism,
         enable_parallel=enable_parallel,
         gradient_accumulation_steps=gradient_accumulation_steps,
-        apply_gradient_accumulation=True,
+        apply_gradient_accumulation=not calculate_per_token_loss,
     )
     _MoEAuxLossAutoScaler.set_loss_scale(main_loss_sense)
     _MTPLossAutoScaler.set_loss_scale(main_loss_sense)
@@ -123,6 +130,32 @@ def get_grad(param):
     """
     main_grad = getattr(param, "main_grad", None)
     return main_grad if main_grad is not None else param.grad
+
+
+def scale_grads_(parameters, scale: float) -> None:
+    """Multiply every parameter gradient in place by ``scale``.
+
+    This is the ``calculate_per_token_loss`` counterpart of Megatron's
+    ``finalize_model_grads`` (distributed/finalize_model_grads.py), which divides the whole
+    gradient buffer by the globally reduced token count via ``model_chunk.scale_gradients``:
+    micro-batches back-propagate unnormalised token-loss sums, and the normalisation happens
+    once per optimizer step. It runs before the grad-norm/clipping pass so the reported norm
+    reflects the final gradients.
+
+    Auxiliary (MoE-aux / MTP / indexer) gradients are deliberately included: their per-token
+    branches keep an unnormalised, token-weighted magnitude precisely so that this division
+    normalises them the same way.
+    """
+    if scale == 1.0:
+        return
+    for param in parameters:
+        grad = get_grad(param)
+        if grad is None:
+            continue
+        if _is_dtensor_like(grad):
+            grad.to_local().mul_(scale)
+        else:
+            grad.mul_(scale)
 
 
 def _is_dtensor_like(value):

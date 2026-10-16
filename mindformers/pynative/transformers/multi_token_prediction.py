@@ -664,12 +664,24 @@ def process_mtp_loss(
         if getattr(config, "chunk_loss_num", 0) > 1:
             mtp_logits = mtp_logits.transpose(0, 1)
             mtp_loss = compute_language_model_loss(mtp_labels, mtp_logits, mtp_loss_mask)
+            if config.calculate_per_token_loss:
+                # The chunked loss hands back (token-loss sum, token count). Report the
+                # normalised value, but contribute the raw sum: the trainer divides the whole
+                # gradient buffer once by the globally reduced token count, exactly as in the
+                # unchunked branch below.
+                mtp_loss_sum, mtp_num_tokens = mtp_loss
+                reported_loss = mtp_loss_sum / mtp_num_tokens
+                mtp_loss_contribution = mtp_loss_sum
+            else:
+                reported_loss = mtp_loss
+                mtp_loss_contribution = mtp_loss
             save_to_mtp_losses_tracker(
-                mtp_loss,
+                reported_loss,
                 mtp_layer_number,
                 config.mtp_num_layers,
             )
-            hidden_states = mtp_loss_auto_scaler(hidden_states, mtp_loss_scale * mtp_loss)
+            hidden_states = mtp_loss_auto_scaler(
+                hidden_states, mtp_loss_scale * mtp_loss_contribution)
         else:
             mtp_logits = mtp_logits.transpose(0, 1).reshape((-1, mtp_logits.shape[-1]))
             mtp_loss_mask = mint.reshape(mtp_loss_mask, (-1,))
