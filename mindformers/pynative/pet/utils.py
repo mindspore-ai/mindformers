@@ -21,6 +21,16 @@ def is_lora_param_name(name: str) -> bool:
             or name in ("lora_a", "lora_b"))
 
 
+def is_lora_checkpoint_param_name(name: str) -> bool:
+    """Return whether a parameter is required by an exact LoRA training resume.
+
+    Besides trainable LoRA weights, auxiliary-loss-free MoE routing owns mutable,
+    non-trainable state.  Dropping that state from an adapter checkpoint resets
+    expert routing on resume and changes the very next forward pass.
+    """
+    return is_lora_param_name(name) or name.endswith((".expert_bias", ".tokens_per_expert"))
+
+
 def init_lora_parameters(lora_a_params, lora_b_params, lora_a_std, lora_b_std):
     """Apply the shared LoRA initialization policy to one or more A/B parameters."""
     for param in lora_a_params:
