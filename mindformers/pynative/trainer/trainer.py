@@ -69,6 +69,7 @@ from mindformers.pynative.distributed.parallel_dims import ParallelDims
 from mindformers.pynative.distributed.parallelize import parallelize_model
 from mindformers.pynative.distributed.utils import get_loss_sense
 from mindformers.pynative.pet.lora_adapter import freeze_base_params
+from mindformers.pynative.pet.utils import reinitialize_lora_parameters
 
 from mindformers.checkpoint.checkpoint import CommonInfo, get_checkpoint_path
 from mindformers.version_control import skip_barrier_controller
@@ -310,6 +311,16 @@ class Trainer:
             with _no_grad():
                 m.init_states()
 
+        lora_config = getattr(self.config, "lora_config", None)
+        if not self.is_inference and lora_config is not None:
+            with _no_grad():
+                reinitialize_lora_parameters(
+                    self.model,
+                    seed=self.config.training.seed,
+                    lora_a_std=lora_config.lora_a_std,
+                    lora_b_std=lora_config.lora_b_std,
+                )
+
         # PP rebuilds separate input-embedding copies for the first stage and
         # the MTP stage. Delayed initialization above gives those replicas
         # different values even though their gradients are synchronized and
@@ -325,7 +336,7 @@ class Trainer:
         # norms/biases and NoParallel base weights, whose TP layout inference needs DTensor
         # gamma); freezing earlier leaves them as plain Tensors and breaks TP. Only
         # lora_a/lora_b stay trainable, so the optimizer (built below) sees adapters only.
-        if not self.is_inference and getattr(self.config, "lora_config", None) is not None:
+        if not self.is_inference and lora_config is not None:
             # Under pipeline parallelism freeze runs per stage; a stage may legitimately hold
             # no adapters, so aggregate the trainable count and only error if NO stage has any.
             total_trainable = 0
