@@ -52,6 +52,7 @@ from mindformers.checkpoint.utils import (
     has_optimizer_ckpt,
     is_checkpoint_path_valid,
     is_hf_checkpoint,
+    restore_checkpoint_rng_state,
 )
 from mindformers.pynative.callback import (
     CallbackHandler,
@@ -1314,6 +1315,7 @@ class Trainer:
                     )
 
                 self.state.global_step = global_step
+                restore_checkpoint_rng_state(checkpoint_path)
 
             # Save fp32 master checksums before checkpoint load so we can later
             # detect which params were actually loaded vs freshly initialized.

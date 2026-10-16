@@ -46,6 +46,8 @@ from mindformers.checkpoint.utils import (
     get_checkpoint_iter_dir,
     get_checkpoint_name,
     get_checkpoint_tracker_filename,
+    RNG_STATE_FORMAT,
+    save_checkpoint_rng_state,
     get_latest_iteration_from_tracker,
     get_common_filename,
     check_checkpoints_dir_max_num,
@@ -98,6 +100,12 @@ class CommonInfo:
 
     ckpt_status: int = None
     """CkptHealthStatus class, Indicates whether the checkpoint is healthy."""
+
+    rng_state_format: str = None
+    """Format marker distinguishing RNG-aware checkpoints from legacy checkpoints."""
+
+    rng_world_size: int = None
+    """World size whose per-rank RNG streams are stored in this checkpoint."""
 
     def save_common(self, common_filename: str):
         """
@@ -279,7 +287,8 @@ def save_checkpoint(iteration: int, network: Union[Cell, List[Cell]], optimizer:
                     keep_max_num: int = 5, user_prefix: str = None, save_checkpoint_path: str = None,
                     sharded_tensor_metas: Dict = None, remove_redundancy: bool = False,
                     current_ckpt_step_list: List[str] = None, balanced_plan_cache: Dict = None,
-                    global_model_keys=None, model_choice_func: Optional[Callable] = None):
+                    global_model_keys=None, model_choice_func: Optional[Callable] = None,
+                    rng_state=None):
     """
     Saves the current state of the training process,
         including the model, optimizer, and learning rate scheduler, to a checkpoint file.
@@ -316,6 +325,8 @@ def save_checkpoint(iteration: int, network: Union[Cell, List[Cell]], optimizer:
             ignored.
         model_choice_func: Optional predicate for selecting model parameters to save. When
             omitted, every model parameter is saved.
+        rng_state: MindSpore RNG state captured at the checkpoint boundary. When provided,
+            every rank persists its own stream before the checkpoint is published.
     """
     logger.info('...... Start to save checkpoint ......')
     start_save_ckpt_time = time()
@@ -478,6 +489,14 @@ def save_checkpoint(iteration: int, network: Union[Cell, List[Cell]], optimizer:
     else:
         optim_save_plan, optim_written = None, None
         logger.warning("Optimizer weight will not be save!")
+
+    # RNG streams are rank-local. Persist every rank before common metadata and the
+    # tracker makes this checkpoint visible to resume logic.
+    if rng_state is not None:
+        save_checkpoint_rng_state(cur_iter_checkpoint_dir, rng_state)
+        common_info.rng_state_format = RNG_STATE_FORMAT
+        common_info.rng_world_size = get_real_group_size()
+        barrier_world("All ranks saved checkpoint RNG state.")
 
     # Save 'common.json' (rank 0 only).
     if get_real_rank() == 0:

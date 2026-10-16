@@ -21,6 +21,7 @@ import re
 import json
 import time
 import shutil
+import tempfile
 from enum import Enum
 from glob import glob
 from pathlib import Path
@@ -36,6 +37,8 @@ from mindformers.tools.utils import get_real_rank, get_real_group_size
 
 
 PER_ITERATION_CKPT_DIR_PREFIX = "iteration_"
+RNG_STATE_FILE_PREFIX = "rng_state_rank_"
+RNG_STATE_FORMAT = "mindformers_rng_state_v1"
 
 MS_TYPE_TO_SIZE = {
     "Int8": 8,
@@ -53,6 +56,95 @@ MS_TYPE_TO_SIZE = {
     "BFloat16": 16,
     "Int4": 4
 }
+
+
+def save_checkpoint_rng_state(checkpoint_dir: str, rng_state) -> str:
+    """Atomically save this rank's MindSpore RNG state beside a checkpoint."""
+    rank = get_real_rank()
+    world_size = get_real_group_size()
+    state_array = rng_state.asnumpy()
+    payload = {
+        "format": RNG_STATE_FORMAT,
+        "rank": rank,
+        "world_size": world_size,
+        "dtype": str(rng_state.dtype),
+        "shape": list(state_array.shape),
+        "state": state_array.reshape(-1).tolist(),
+    }
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    state_path = os.path.join(checkpoint_dir, f"{RNG_STATE_FILE_PREFIX}{rank:08d}.json")
+    with tempfile.NamedTemporaryFile(
+            mode="w", dir=checkpoint_dir, prefix=f".{RNG_STATE_FILE_PREFIX}{rank:08d}.",
+            suffix=".tmp", delete=False, encoding="utf-8") as stream:
+        json.dump(payload, stream)
+        stream.flush()
+        os.fsync(stream.fileno())
+        temporary_path = stream.name
+    os.replace(temporary_path, state_path)
+    return state_path
+
+
+def restore_checkpoint_rng_state(checkpoint_dir: str) -> bool:
+    """Restore this rank's MindSpore RNG state, returning False for legacy checkpoints."""
+    rank = get_real_rank()
+    world_size = get_real_group_size()
+    common_path = os.path.join(checkpoint_dir, "common.json")
+    with open(common_path, "r", encoding="utf-8") as stream:
+        common_info = json.load(stream)
+
+    saved_format = common_info.get("rng_state_format")
+    saved_world_size = common_info.get("rng_world_size")
+    if saved_format is None:
+        logger.warning(
+            "Checkpoint predates RNG-state persistence; stochastic operations will restart "
+            "from the configured seed instead of continuing their saved sequence."
+        )
+        return False
+    if saved_format != RNG_STATE_FORMAT:
+        raise ValueError(f"Unsupported RNG state format in {common_path!r}: {saved_format!r}.")
+    if isinstance(saved_world_size, bool) or not isinstance(saved_world_size, int) or saved_world_size < 1:
+        raise ValueError(f"Invalid RNG world size in {common_path!r}: {saved_world_size!r}.")
+    if saved_world_size != world_size:
+        logger.warning(
+            "Checkpoint RNG state was saved with world size %s, but the current world size is %d; "
+            "skip RNG restoration and continue with the configured seed.", saved_world_size, world_size,
+        )
+        return False
+
+    state_path = os.path.join(checkpoint_dir, f"{RNG_STATE_FILE_PREFIX}{rank:08d}.json")
+    if not os.path.isfile(state_path):
+        raise FileNotFoundError(
+            f"Checkpoint declares RNG state format {saved_format!r}, but the state file "
+            f"for rank {rank} is missing: {state_path!r}."
+        )
+
+    with open(state_path, "r", encoding="utf-8") as stream:
+        payload = json.load(stream)
+    if payload.get("format") != RNG_STATE_FORMAT:
+        raise ValueError(f"Unsupported RNG state format in {state_path!r}.")
+    if payload.get("rank") != rank or payload.get("world_size") != world_size:
+        raise ValueError(
+            f"RNG state topology mismatch in {state_path!r}: saved rank/world_size="
+            f"{payload.get('rank')}/{payload.get('world_size')}, current={rank}/{world_size}."
+        )
+    if payload.get("dtype") != "UInt8":
+        raise ValueError(f"Unsupported RNG state dtype in {state_path!r}: {payload.get('dtype')!r}.")
+    shape = payload.get("shape")
+    values = payload.get("state")
+    if not isinstance(shape, list) or not isinstance(values, list) or len(values) > 4096:
+        raise ValueError(f"Invalid RNG state payload in {state_path!r}.")
+    expected_size = 1
+    for dimension in shape:
+        if not isinstance(dimension, int) or dimension < 0:
+            raise ValueError(f"Invalid RNG state shape in {state_path!r}: {shape!r}.")
+        expected_size *= dimension
+    if expected_size != len(values) or any(not isinstance(value, int) or not 0 <= value <= 255 for value in values):
+        raise ValueError(f"Invalid RNG state values in {state_path!r}.")
+
+    state = ms.Tensor(values, dtype=ms.uint8).reshape(tuple(shape))
+    ms.set_rng_state(state)
+    logger.info("Restored MindSpore RNG state for rank %d from '%s'.", rank, state_path)
+    return True
 
 
 def get_base_checkpoint_fingerprint(base_path: str) -> Optional[str]:

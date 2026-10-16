@@ -16,6 +16,8 @@
 import json
 import os
 
+from mindspore import get_rng_state
+
 from mindformers.pynative.callback.callback import TrainerCallback
 from mindformers.tools.logger import logger
 from mindformers.tools.utils import get_real_group_size, get_real_rank
@@ -27,7 +29,7 @@ from mindformers.checkpoint.utils import (
     gather_param_names_on_rank0,
 )
 from mindformers.checkpoint.sharded_tensor import get_all_sharded_tensor_on_rank0
-from mindformers.pynative.pet.utils import is_lora_param_name
+from mindformers.pynative.pet.utils import is_lora_checkpoint_param_name, is_lora_param_name
 
 
 class CheckpointCallback(TrainerCallback):
@@ -191,6 +193,9 @@ class CheckpointCallback(TrainerCallback):
 
         # CommonInfo provides metadata required by save_checkpoint.
         common_info = self._create_common_info(state)
+        # Capture before checkpoint I/O so the saved state is exactly the one the next
+        # training step would consume in an uninterrupted run.
+        rng_state = get_rng_state()
 
         if not self._sharded_tensor_metas_initialized and get_real_group_size() > 1:
             # Fetch the combined network+optimizer global ShardedTensor metadata and the
@@ -215,12 +220,12 @@ class CheckpointCallback(TrainerCallback):
 
         model_choice_func = None
         if self.save_trainable_only:
-            model_choice_func = is_lora_param_name
+            model_choice_func = is_lora_checkpoint_param_name
             model_names = set()
             model_networks = list(model) if isinstance(model, (list, tuple)) else [model]
             for net in model_networks:
                 model_names.update(net.parameters_dict().keys())
-            if not any(model_choice_func(name) for name in model_names):
+            if not any(is_lora_param_name(name) for name in model_names):
                 raise ValueError("save_trainable_only=True but no LoRA parameters exist in the model.")
 
         try:
@@ -243,7 +248,8 @@ class CheckpointCallback(TrainerCallback):
                 current_ckpt_step_list=self.current_ckpt_step_list,
                 balanced_plan_cache=self.balanced_plan_cache,
                 global_model_keys=self.global_model_keys,
-                model_choice_func=model_choice_func
+                model_choice_func=model_choice_func,
+                rng_state=rng_state,
             )
 
             if self.save_trainable_only:
