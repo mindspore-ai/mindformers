@@ -492,7 +492,12 @@ class Trainer:
                 )
 
         if not self.config.use_legacy_format:
-            self.config.checkpoint.load_path = get_checkpoint_path(self.config.checkpoint.load_path)
+            # Weights-only loading (`no_load_optim=True`) never reads the optimizer files, so
+            # they are left out of the checkpoint integrity check.
+            self.config.checkpoint.load_path = get_checkpoint_path(
+                self.config.checkpoint.load_path,
+                require_optimizer=not self.config.checkpoint.get("no_load_optim", True)
+            )
         else:
             self.config.checkpoint.load_path = self.get_load_checkpoint(self.config.checkpoint.load_path)
         self.trainer.train(
@@ -634,7 +639,12 @@ class Trainer:
                 )
 
         if not self.config.use_legacy_format:
-            self.config.checkpoint.load_path = get_checkpoint_path(self.config.checkpoint.load_path)
+            # Weights-only loading (`no_load_optim=True`) never reads the optimizer files, so
+            # they are left out of the checkpoint integrity check.
+            self.config.checkpoint.load_path = get_checkpoint_path(
+                self.config.checkpoint.load_path,
+                require_optimizer=not self.config.checkpoint.get("no_load_optim", True)
+            )
         else:
             self.config.checkpoint.load_path = self.get_load_checkpoint(self.config.checkpoint.load_path)
 
