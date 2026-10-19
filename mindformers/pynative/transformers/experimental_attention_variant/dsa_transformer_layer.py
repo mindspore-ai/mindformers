@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""DSA-specific transformer layers with a warm-up-only backward boundary."""
+"""DSA layers supporting two-stage indexer backward and a frozen warm-up trunk boundary."""
 # MindSpore ``_Function`` subclasses intentionally use model-specific signatures.
 # pylint: disable=arguments-differ,abstract-method
 from hyper_parallel.core.dtensor.dtensor import DTensor
@@ -23,6 +23,7 @@ from mindformers.parallel_core.transformer_config import TransformerConfig
 from mindformers.pynative.transformers.experimental_attention_variant.indexer import (
     DSA_WARMUP_LOSS_SINK,
     _IndexerLossAutoScaler,
+    layerwise_indexer_backward,
 )
 from mindformers.pynative.transformers.transformer_layer import (
     HyperConnectionTransformerLayer,
@@ -106,19 +107,21 @@ class _DSAWarmupLayerMixin:
         """Initialize DSA stage state after the parent layer is constructed."""
         self.layer_number = layer_number
         self.dsa_warmup = not self.config.dsa_indexer_use_sparse_loss
-        self.layerwise_warmup_backward = (
-            self.dsa_warmup and getattr(self.config, "dsa_indexer_layerwise_backward", False)
-        )
+        # One switch for both stages; every use of it below already sits inside the
+        # ``dsa_warmup`` branch, which is what makes the stage difference explicit.
+        self.layerwise_indexer_backward = layerwise_indexer_backward(self.config)
         # The frozen trunk is never worth replaying, so the full-layer wrapper is always
         # skipped in warm-up (!8692). Whether the *indexer* inside still gets wrapped is
-        # decided in ``activation_checkpoint`` from ``layerwise_warmup_backward``: with
+        # decided in ``activation_checkpoint`` from ``layerwise_indexer_backward``: with
         # per-layer backward its activations are already short-lived, without it the wrapper
         # is what stops them piling up.
         self.disable_activation_recompute = self.dsa_warmup
         # The zero-gradient wake-up chain only exists to reach the previous layer's boundary
         # during the step-end backward; per-layer backward has already driven every layer by
         # then, so the chain is dead weight.
-        self.propagate_to_previous_layer = layer_number > 0 and not self.layerwise_warmup_backward
+        self.propagate_to_previous_layer = (
+            layer_number > 0 and not (self.dsa_warmup and self.layerwise_indexer_backward)
+        )
 
     @staticmethod
     def _split_attention_result(attention_result):
@@ -143,10 +146,10 @@ class _DSAWarmupLayerMixin:
         keyword arguments and the layer would append into a copy -- see ``_DSAWarmupLossSink``.
         """
         warmup_loss_sink = (
-            DSA_WARMUP_LOSS_SINK.sink if self.layerwise_warmup_backward else None
+            DSA_WARMUP_LOSS_SINK.sink if self.layerwise_indexer_backward else None
         )
         if self.training and self.dsa_warmup:
-            if self.layerwise_warmup_backward and warmup_loss_sink is None:
+            if self.layerwise_indexer_backward and warmup_loss_sink is None:
                 # Falling back to the boundary path here would be silent data loss: nothing
                 # back-propagates it in this mode, so the indexer would stay trainable and
                 # never receive a gradient. Whoever invokes this layer has to open a
@@ -190,10 +193,10 @@ class _DSAWarmupLayerMixin:
 class DSATransformerLayer(_DSAWarmupLayerMixin, TransformerLayer):
     """Transformer layer that adds the DSA warm-up boundary to the standard path.
 
-    DSA2 follows the regular full-backward path. In dense DSA1 warm-up, only the
-    Indexer parameters are trainable. The complete TransformerLayer forward is
-    still evaluated, while ``_DSAWarmupLayerBoundary`` prevents backward and
-    recompute replay of the frozen attention/MLP trunk.
+    Both stages support layerwise indexer backward. The sparse DSA2 trunk retains
+    its regular step-end backward; dense DSA1 warm-up trains only the indexer.
+    The complete TransformerLayer forward is still evaluated in warm-up, while
+    its frozen attention/MLP trunk is kept outside backward and recompute replay.
     """
 
     def __init__(

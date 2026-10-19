@@ -43,6 +43,7 @@ from mindformers.pynative.transformers.transformer_block import (
 )
 from mindformers.pynative.transformers.experimental_attention_variant.indexer import (
     flush_warmup_indexer_backward,
+    layerwise_indexer_backward,
     warmup_indexer_loss_sink,
 )
 from mindformers.parallel_core.utils.spec_utils import ModuleSpec, build_module
@@ -353,12 +354,11 @@ class MultiTokenPredictionLayer(nn.Cell):
             if self.submodules.hc_head is not None:
                 self.hc_head = build_module(self.submodules.hc_head, config=config)
 
-    def _layerwise_backward(self):
-        """Whether this layer drives the DSA backward itself; see TransformerBlock."""
+    def _layerwise_indexer_backward(self):
+        """Whether this layer back-propagates its indexer loss itself; see TransformerBlock."""
         if not self.training:
             return False
-        return (self.config.dsa_indexer_layerwise_backward
-                and not self.config.dsa_indexer_use_sparse_loss)
+        return layerwise_indexer_backward(self.config)
 
     def construct(
             self,
@@ -407,11 +407,10 @@ class MultiTokenPredictionLayer(nn.Cell):
                 hidden_states, self.hc_num_streams, self.hc_hidden_size
             )
         # This layer is invoked outside ``TransformerBlock``'s loop, so it has to publish its
-        # own indexer-loss sink: without one the DSA layer finds none on the thread-local and
-        # falls back to the step-end boundary path, which per-layer warm-up backward never
-        # back-propagates -- the MTP indexer would stay trainable but never receive a
-        # gradient, silently. One layer is one group, so the flush is right after the call.
-        with warmup_indexer_loss_sink(self._layerwise_backward()) as warmup_sink:
+        # own indexer-loss sink when layerwise backward is enabled in either DSA stage.
+        # Without one the DSA layer raises instead of losing its indexer gradient.
+        # One MTP layer is one group, so the flush is right after the call.
+        with warmup_indexer_loss_sink(self._layerwise_indexer_backward()) as warmup_sink:
             hidden_states, _ = self.transformer_layer(
                 hidden_states=hidden_states,
                 attention_mask=attention_mask,

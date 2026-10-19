@@ -45,6 +45,15 @@ from mindformers.pynative.transformers.transformer_layer import (
 
 
 @pytest.fixture(autouse=True)
+def _restore_device_target():
+    """Restore the process device after the CPU backward-boundary tests."""
+    previous = ms.get_context("device_target")
+    yield
+    if ms.get_context("device_target") != previous:
+        ms.set_device(previous)
+
+
+@pytest.fixture(autouse=True)
 def _reset_recompute_whitelist():
     """Keep the activation-checkpoint whitelist isolated between tests."""
     activation_checkpoint._config_list = {}

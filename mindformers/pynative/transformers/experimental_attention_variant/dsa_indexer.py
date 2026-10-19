@@ -39,6 +39,17 @@ from mindformers.pynative.layers.identity_op import IdentityOp
 from mindformers.pynative.transformers.experimental_attention_variant.utils import Hadamard
 
 
+#: Return slots owned by DSAIndexer.construct. Keep this table aligned with its return list.
+#: Consumers derive the Top-K slot here instead of duplicating a cross-file magic index.
+INDEXER_OUTPUT_FIELDS = (
+    "q", "k", "weights",
+    "topk_indices", "index_scores",
+    "softmax_max_index", "softmax_sum_index",
+)
+#: Replay needs only Top-K for sparse attention; the other slots feed indexer loss.
+INDEXER_TOPK_SLOT = INDEXER_OUTPUT_FIELDS.index("topk_indices")
+
+
 class _DSAIndexerFunction(_Function):
     """
     Custom autograd function to block gradient flow from main loss to indexer inputs.
@@ -114,6 +125,12 @@ class DSAIndexerComputeSparseIndices(nn.Cell):
                 sparse_count=self.sparse_count,
                 return_value=True
             )
+            # PyNative attaches the selector's grad node to both outputs,
+            # including these integer indices. Keeping Top-K for attention or
+            # checkpoint replay would retain the indexer's saved Q/K/weights.
+            # Only floating scores can be differentiable; KL training uses the
+            # original projections returned by DSAIndexer, not this index path.
+            topk_indices = ops.stop_gradient(topk_indices)
             softmax_max_index, softmax_sum_index = None, None
         else:
             softmax_max_index, softmax_sum_index = npu_dense_lightning_indexer_softmax_lse(
@@ -306,10 +323,18 @@ class DSAIndexer(nn.Cell):
             rotary_pos_emb: Rotary position embedding.
 
         Returns:
-            Tuple containing the unfrozen indexer Q/K/weights followed by the Top-K outputs
-            and dense-stage statistics. In the dense warm-up stage the two selection outputs
-            are ``None`` (no ``ops.lightning_indexer`` call) and the softmax statistics carry
-            the indexer's own LSE instead.
+            A **list** (not a tuple) laid out as ``INDEXER_OUTPUT_FIELDS``: the unfrozen
+            indexer Q/K/weights followed by the Top-K outputs and dense-stage statistics.
+            In the dense warm-up stage the two selection outputs are ``None`` (no
+            ``ops.lightning_indexer`` call) and the softmax statistics carry the indexer's
+            own LSE instead.
+
+            The mutability is load-bearing -- do not "tidy" this back into a tuple. Under
+            ``dsa_indexer_layerwise_backward`` hp's exclusion cache holds this very object
+            until the layer's replay, and the slots that the replay does not consume are
+            nulled in place to drop their references (see
+            ``indexer.publish_excluded_indexer_outputs``). A tuple raises
+            ``TypeError: 'tuple' object does not support item assignment`` mid-forward.
         """
         q, k, weights = self.get_qk_index(x, qr, rotary_pos_emb)
         # Block gradient flow from main loss to indexer inputs via custom autograd Function.
@@ -330,8 +355,10 @@ class DSAIndexer(nn.Cell):
             actual_seq_qlen=actual_seq_qlen,
             actual_seq_klen=actual_seq_klen,
         )
-        return (
+        # The exclusion cache retains this list until replay. Mutability lets early
+        # backward clear unused slots in place; keep the order aligned with the field table.
+        return [
             q, k, weights,
             topk_indices, index_scores,
             softmax_max_index, softmax_sum_index,
-        )
+        ]

@@ -72,6 +72,9 @@ from mindformers.pynative.distributed.parallelize import parallelize_model
 from mindformers.pynative.distributed.utils import get_loss_sense
 from mindformers.pynative.pet.lora_adapter import freeze_base_params
 from mindformers.pynative.pet.utils import reinitialize_lora_parameters
+from mindformers.pynative.transformers.experimental_attention_variant.indexer import (
+    layerwise_indexer_backward,
+)
 
 from mindformers.checkpoint.checkpoint import CommonInfo, get_checkpoint_path
 from mindformers.version_control import skip_barrier_controller
@@ -307,12 +310,16 @@ class Trainer:
 
         # Create model
         self.model = self._create_model(model, self.config.model)
-        # DSA dense warm-up driving its backward per layer: the step-end backward has nothing
-        # left to do. Read once here rather than per micro-batch.
+        # Read the two-stage indexer-backward switch once rather than per micro-batch.
         model_cfg = self.config.model
-        self._dsa_indexer_layerwise_backward = bool(
-            getattr(model_cfg, "dsa_indexer_layerwise_backward", False)
-        ) and not bool(getattr(model_cfg, "dsa_indexer_use_sparse_loss", True))
+        # Per-layer indexer backward, in either DSA stage.
+        self._dsa_indexer_layerwise_backward = layerwise_indexer_backward(model_cfg)
+        # Only the dense warm-up stage loses its step-end backward with it -- there the trunk
+        # is frozen and every layer has already been back-propagated inside the forward.
+        self._dsa_frozen_trunk_layerwise = (
+            self._dsa_indexer_layerwise_backward
+            and not bool(getattr(model_cfg, "dsa_indexer_use_sparse_loss", True))
+        )
         self.parallel_dims = None
         if self.enable_parallel:
             # Apply parallelism to model
@@ -2026,13 +2033,16 @@ class Trainer:
             # 1/num_accumulation_steps) and _finalize_per_token_grads divides the whole
             # gradient buffer once by the globally reduced token count.
             numerator, denominator = loss
-            numerator.backward(sense)
+            # Warm-up already back-propagated every indexer during the forward;
+            # its frozen trunk leaves no graph on this reporting-only numerator.
+            if not self._dsa_frozen_trunk_layerwise:
+                numerator.backward(sense)
             return _to_local(numerator), _to_local(denominator)
 
         if self.num_accumulation_steps > 1:
             loss = loss / self.num_accumulation_steps
 
-        if self._dsa_indexer_layerwise_backward:
+        if self._dsa_frozen_trunk_layerwise:
             # DSA warm-up with per-layer backward has already back-propagated every layer's
             # indexer loss during this forward, and the trunk is frozen, so nothing in the
             # model is still reachable from the language-model loss -- it legitimately has no
@@ -2151,17 +2161,6 @@ class Trainer:
         for m in self.model:
             if hasattr(m, "zero_grad"):
                 m.zero_grad()
-                # FSDP's ``zero_grad`` walks its *managed* parameters only. Parameters kept
-                # out of FSDP on purpose -- the DSA warm-up indexer weights under per-layer
-                # backward -- would otherwise keep accumulating across steps, and their
-                # gradient norm grows with the step count. Key off the marker rather than
-                # ``_warmup_grad_mesh``: under pure pipeline parallelism there is no mesh to
-                # reduce over, but the gradients still have to be cleared. Only walk the
-                # parameters when that mode is on, so ordinary runs keep paying nothing.
-                if self._dsa_indexer_layerwise_backward:
-                    for param in m.trainable_params():
-                        if getattr(param, "_warmup_layerwise_grad", False):
-                            param.grad = None
             else:
                 for param in m.trainable_params():
                     param.grad = None

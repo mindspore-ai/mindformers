@@ -30,6 +30,7 @@ from mindformers.pynative.transformers.experimental_attention_variant.dsa_attent
 from mindformers.parallel_core.utils.spec_utils import ModuleSpec, build_module
 from mindformers.pynative.transformers.experimental_attention_variant.indexer import (
     flush_warmup_indexer_backward,
+    layerwise_indexer_backward,
     warmup_indexer_loss_sink,
 )
 from mindformers.pynative.transformers.transformer_layer import BaseTransformerLayer
@@ -290,12 +291,15 @@ class TransformerBlock(nn.Cell):
         else:
             self.final_layernorm = None
 
-    def _layerwise_backward(self):
-        """Whether this block drives the DSA backward per layer."""
+    def _layerwise_indexer_backward(self):
+        """Whether this block back-propagates each layer's indexer loss inside its forward.
+
+        One switch for both DSA stages (``dsa_indexer_layerwise_backward``); the layers read
+        the same sink in either. Training only: an eval forward opens no sink.
+        """
         if not self.training:
             return False
-        return (self.config.dsa_indexer_layerwise_backward
-                and not self.config.dsa_indexer_use_sparse_loss)
+        return layerwise_indexer_backward(self.config)
 
     def _is_warmup_backward_boundary(self, index):
         """Whether ``index`` ends a group whose indexer losses must be flushed together.
@@ -353,14 +357,15 @@ class TransformerBlock(nn.Cell):
         # One group object per group per block invocation, so concurrently running
         # micro-batches (dualpipe / overlap_b_f) never share sharing state.
         group = None
-        # DSA warm-up with per-layer backward: the trunk is frozen and each layer's indexer
-        # loss is independent, so a layer can be back-propagated the moment its forward ends
-        # and its activations released before the next layer runs. Peak memory then stops
-        # growing with depth. Off by default; see ``dsa_indexer_layerwise_backward``.
+        # Both DSA stages can back-propagate indexer losses during the forward, releasing
+        # each group's indexer activations before the next group runs. IndexShare layers
+        # share one indexer graph and must be flushed together. The sparse-stage trunk
+        # keeps its ordinary step-end backward; only the warm-up trunk is frozen.
+        # Off by default; see ``dsa_indexer_layerwise_backward``.
         # Published on a thread-local rather than passed down as a call argument -- the layer
         # call marshals its keyword arguments, so the layer would append into a copy; see
         # ``_DSAWarmupLossSink``.
-        with warmup_indexer_loss_sink(self._layerwise_backward()) as warmup_sink:
+        with warmup_indexer_loss_sink(self._layerwise_indexer_backward()) as warmup_sink:
             for index in range(self.layer_start, self.layer_end + 1):
                 layer = self._get_layer(index)
                 prefix_kv = prefix_keys_values[index] if prefix_keys_values is not None else None

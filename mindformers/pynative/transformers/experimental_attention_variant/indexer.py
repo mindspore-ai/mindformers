@@ -22,6 +22,7 @@
 # ============================================================================
 """DSA/CSA Lightning Indexer for pynative mode."""
 import threading
+
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Union
@@ -40,6 +41,9 @@ except ImportError:
 
 from mindformers.parallel_core.utils.spec_utils import ModuleSpec, build_module
 from mindformers.parallel_core.transformer_config import MLATransformerConfig
+from mindformers.pynative.transformers.experimental_attention_variant.dsa_indexer import (
+    INDEXER_OUTPUT_FIELDS,
+)
 from mindformers.pynative.transformers.experimental_attention_variant.utils import Hadamard
 from mindformers.pynative.base_models.common.embeddings.rope_utils import ApplyRotaryPosEmb
 from mindformers.pynative.layers.identity_op import IdentityOp
@@ -268,7 +272,7 @@ class CSAIndexer(nn.Cell):
 
 
 class _DSAWarmupLossSink(threading.local):
-    """Per-thread hand-off of the DSA warm-up indexer losses, block loop -> layer.
+    """Per-thread hand-off of indexer losses in both DSA stages, block loop -> layer.
 
     The block loop cannot simply pass the list to the layer as a call argument: the layer
     call marshals its keyword arguments, so every layer but the first receives a *copy* of
@@ -281,20 +285,131 @@ class _DSAWarmupLossSink(threading.local):
     """
 
     sink = None
+    # Output containers owned by this sink, trimmed after the group backward.
+    trims = None
+    # Nested FSDP units advanced explicitly after the group backward.
+    fsdp_units = None
 
 
 DSA_WARMUP_LOSS_SINK = _DSAWarmupLossSink()
+
+
+def publish_excluded_indexer_outputs(outputs, keep_index):
+    """Register a mutable output list for trimming after the indexer backward.
+
+    Checkpoint exclusion caches this same list until replay. Sparse attention only
+    needs Top-K then: projections and softmax statistics feed the excluded indexer
+    loss, which reuses its own cached output. After early backward releases the
+    indexer graph, unused slots can be cleared in place to release their tensors.
+    The container must remain mutable so the exclusion cache sees the cleared slots.
+    """
+    # The producer owns keep_index; validate that its field table still matches
+    # the returned container. A non-None slot alone cannot prove the order is correct.
+    if len(outputs) != len(INDEXER_OUTPUT_FIELDS):
+        raise ValueError(
+            f"publish_excluded_indexer_outputs: indexer returned {len(outputs)} slots, "
+            f"expected {len(INDEXER_OUTPUT_FIELDS)} ({', '.join(INDEXER_OUTPUT_FIELDS)}); "
+            "the return statement and INDEXER_OUTPUT_FIELDS have drifted apart."
+        )
+    if outputs[keep_index] is None:
+        raise ValueError(
+            f"publish_excluded_indexer_outputs: slot {keep_index} "
+            f"({INDEXER_OUTPUT_FIELDS[keep_index]}) is None; the indexer's return order and "
+            "INDEXER_TOPK_SLOT have drifted apart."
+        )
+    if DSA_WARMUP_LOSS_SINK.trims is None:
+        return
+    DSA_WARMUP_LOSS_SINK.trims.append((outputs, keep_index))
+
+
+def publish_indexer_fsdp_unit(module, needs_drain):
+    """Register a nested indexer unit for explicit post-backward finalization.
+
+    Detached indexer inputs bypass the usual input-side PostBackwardFunction hook.
+    Output hooks can still queue a root callback, but waiting for it may leave the
+    unit in PRE_BACKWARD after its parameters have been resharded. Explicitly drive
+    scheduler._backward_hook() so the next micro-batch can unshard normally; this
+    transition is idempotent and makes the queued callback a no-op.
+
+    needs_drain also waits for pending reductions to reach main_grad. Sparse-stage
+    trunk backward has a root callback to finish them; frozen dense warm-up has no
+    step-end backward, so it must drain before the optimizer consumes the gradients.
+    """
+    units = DSA_WARMUP_LOSS_SINK.fsdp_units
+    if units is None:
+        # No active sink means there is no early backward to finalize.
+        return
+    # FSDP manages the inner indexer, not its checkpoint exclusion wrapper.
+    # Unwrap explicitly rather than relying on wrapper attribute forwarding.
+    module = getattr(module, "_ckpt_wrapped_module", module)
+    scheduler = getattr(module, "hsdp_scheduler", None)
+    if scheduler is None:
+        if not getattr(module, "_dsa_layerwise_fsdp_managed", False):
+            return
+        # A missing unit would leave gradients unreduced on unsharded_param.grad.
+        # Fail explicitly instead of silently dropping the post-backward transition.
+        raise RuntimeError(
+            f"publish_indexer_fsdp_unit: {type(module).__name__} carries no 'hsdp_scheduler'; "
+            "the layerwise indexer backward needs the indexer to be an FSDP unit "
+            "(parallelize._shard_layer_indexer). Its gradients would otherwise stay on "
+            "unsharded_param.grad and never reach main_grad."
+        )
+    entry = (scheduler, bool(needs_drain))
+    if entry not in units:
+        units.append(entry)
+
+
+def _drive_indexer_fsdp_post_backward():
+    """Finalize each registered indexer FSDP unit once, then clear the registrations."""
+    units = DSA_WARMUP_LOSS_SINK.fsdp_units
+    if not units:
+        return
+    drain = False
+    for scheduler, needs_drain in units:
+        scheduler._backward_hook()  # pylint: disable=protected-access
+        drain = drain or needs_drain
+    if drain:
+        # Drain here only when no step-end root backward can finish the reductions.
+        units[0][0].wait_for_pending_reductions()
+    units.clear()
+
+
+def _trim_excluded_indexer_outputs():
+    """Clear every registered output slot except the one needed by replay."""
+    trims = DSA_WARMUP_LOSS_SINK.trims
+    if not trims:
+        return
+    for outputs, keep_index in trims:
+        for i, _ in enumerate(outputs):
+            if i != keep_index:
+                outputs[i] = None
+    trims.clear()
+
+
+def layerwise_indexer_backward(config):
+    """Whether this configuration back-propagates each layer's indexer loss inside the forward.
+
+    One switch for both DSA stages: the user asks for the same thing either way, and what
+    differs follows from the stage rather than from a second choice. In the dense warm-up
+    stage the frozen trunk is cut and the step-end backward disappears with it; in the sparse
+    stage the trunk keeps its ordinary backward and only the indexer's subgraph is flushed
+    early. Call sites that care about that difference read the stage
+    (``dsa_indexer_use_sparse_loss``), not another switch.
+
+    ``getattr`` with a default: this is also called with the model's HF-style config, which
+    carries only the keys the yaml actually sets.
+    """
+    return bool(getattr(config, "dsa_indexer_layerwise_backward", False))
 
 
 @contextmanager
 def warmup_indexer_loss_sink(active):
     """Publish a per-call indexer-loss sink for the layers invoked inside this block.
 
-    Every caller that invokes a DSA layer's forward has to open one: the layer looks the sink
-    up on the thread-local and, finding none, falls back to the step-end boundary path -- which
-    under per-layer backward is never back-propagated, so its indexer would silently train on
-    nothing. That is why the MTP layer, which calls its transformer layer outside
-    ``TransformerBlock``'s loop, opens its own.
+    With layerwise indexer backward enabled in either DSA stage, every caller must open
+    a sink. A layer without one raises rather than silently losing its indexer gradient.
+    The MTP layer calls its transformer layer outside ``TransformerBlock``'s loop, so it
+    opens its own sink.
 
     ``active`` False publishes ``None``, i.e. the layers keep the step-end boundary path.
     Restores the previous value on the way out so a raising forward cannot leave a stale list
@@ -302,11 +417,17 @@ def warmup_indexer_loss_sink(active):
     """
     sink = [] if active else None
     previous = DSA_WARMUP_LOSS_SINK.sink
+    previous_trims = DSA_WARMUP_LOSS_SINK.trims
+    previous_units = DSA_WARMUP_LOSS_SINK.fsdp_units
     DSA_WARMUP_LOSS_SINK.sink = sink
+    DSA_WARMUP_LOSS_SINK.trims = [] if active else None
+    DSA_WARMUP_LOSS_SINK.fsdp_units = [] if active else None
     try:
         yield sink
     finally:
         DSA_WARMUP_LOSS_SINK.sink = previous
+        DSA_WARMUP_LOSS_SINK.trims = previous_trims
+        DSA_WARMUP_LOSS_SINK.fsdp_units = previous_units
 
 
 def sum_indexer_losses(sink):
@@ -322,7 +443,7 @@ def sum_indexer_losses(sink):
 
 
 def flush_warmup_indexer_backward(sink):
-    """Back-propagate the buffered DSA warm-up indexer losses and drop their graphs.
+    """Back-propagate buffered indexer losses in either DSA stage and drop their graphs.
 
     Called at each group boundary rather than after every layer. Under DSA indexer Top-K
     sharing the Shared layers reuse the group leader's projections, so those layers share one
@@ -330,11 +451,14 @@ def flush_warmup_indexer_backward(sink):
     Summing a group's terms first keeps that graph traversed exactly once. Without sharing a
     group is a single layer, which degenerates to per-layer backward.
 
-    The running sum is safe here only because per-layer backward skips the indexer recompute
-    wrapper (see ``_wrap_dsa_warmup_indexer_recompute``): a sum produced in one checkpoint
-    region and consumed in another unpacks the same saved tensor twice.
+    The indexer graph stays outside activation recompute in both stages: warm-up skips
+    its indexer wrapper, while the sparse stage excludes the indexer from the trunk's
+    checkpoint region. This lets the grouped backward consume real saved tensors without
+    replaying the surrounding forward.
     """
     if not sink:
+        _drive_indexer_fsdp_post_backward()
+        _trim_excluded_indexer_outputs()
         return
     total = sum_indexer_losses(sink)
     if not isinstance(total, Tensor):
@@ -343,6 +467,8 @@ def flush_warmup_indexer_backward(sink):
         # second check is what keeps a future caller from turning the mistake into an
         # ``AttributeError: 'float' object has no attribute 'backward'`` mid-forward.
         sink.clear()
+        _drive_indexer_fsdp_post_backward()
+        _trim_excluded_indexer_outputs()
         return
     # ``_IndexerLossAutoScaler.backward`` does the same: the fused loss can hand back a
     # DTensor, and ``backward`` wants a plain tensor whose shape matches the seed.
@@ -355,8 +481,13 @@ def flush_warmup_indexer_backward(sink):
     # ``_DSAWarmupLayerBoundary`` gets away with the same expression only because a
     # ``_Function``'s backward return value is not shape-checked as strictly.
     scale = _IndexerLossAutoScaler.main_loss_backward_scale
+    # Isolated FSDP units keep this backward outside the outer root lifecycle.
     total.backward(mint.ones_like(total) * mint.reshape(scale, ()))
     sink.clear()
+    # Detached inputs bypass automatic post-backward; explicitly reduce into main_grad.
+    _drive_indexer_fsdp_post_backward()
+    # Trim only after backward has consumed and released the indexer graph.
+    _trim_excluded_indexer_outputs()
 
 
 class _IndexerLossAutoScaler(_Function):

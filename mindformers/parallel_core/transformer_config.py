@@ -1703,14 +1703,19 @@ class TransformerConfig:
     dsa_indexer_layerwise_backward: bool = field(
         default=False,
         metadata={
-            "description": "In the DSA dense warm-up stage, back-propagate each layer's indexer "
-                           "loss as soon as that layer's forward finishes, instead of accumulating "
-                           "every layer's loss and back-propagating once at the end of the step. "
-                           "The trunk is frozen in this stage and each layer's indexer loss is "
-                           "independent, so the two are mathematically equivalent, but the former "
-                           "lets a layer's indexer activations be released before the next layer "
-                           "runs -- peak memory stops growing with depth. Off by default; only "
-                           "meaningful when `dsa_indexer_use_sparse_loss` is False.",
+            "description": "Back-propagate each DSA layer's indexer loss as soon as that layer's "
+                           "forward finishes, instead of seeding it from the step-end backward. The "
+                           "indexer loss reaches only the indexer's own weights -- the fused loss "
+                           "operator hands back gradients for the indexer projections alone and the "
+                           "indexer's input is detached -- so the two are mathematically equivalent, "
+                           "but the former releases the operator's pre-computed gradients and the "
+                           "indexer activations before the next layer runs, so peak memory stops "
+                           "growing with depth. One switch for both DSA stages; what differs follows "
+                           "from the stage rather than from a second choice: the dense warm-up stage "
+                           "also cuts its frozen trunk and loses its step-end backward with it, while "
+                           "the sparse stage keeps both and instead moves the indexer out of the "
+                           "layer's recompute region (worth ~11% of a step, and otherwise GBs of "
+                           "resident activations). Off by default.",
             "usage": ParamUsage.TRAINING,
             "source": ParamSource.MF,
             "mode": ParamMode.COMMON
@@ -2579,12 +2584,6 @@ class TransformerConfig:
                                  "please set use_flash_attention=True.")
             if ms.get_auto_parallel_context("pipeline_scheduler") == "zero_bubble_v":
                 raise ValueError("When experimental_attention_variant == 'dsa', zero_bubble_v is not supported.")
-            if self.dsa_indexer_layerwise_backward and self.dsa_indexer_use_sparse_loss:
-                raise ValueError(
-                    "`dsa_indexer_layerwise_backward` requires the dense warm-up stage "
-                    "(`dsa_indexer_use_sparse_loss=False`): the sparse stage trains the trunk, "
-                    "so its backward cannot be driven per layer."
-                )
         elif self.dsa_indexer_layerwise_backward:
             # Inert rather than fatal, for the same reason as the sharing knobs above.
             logger.warning(

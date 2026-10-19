@@ -128,6 +128,10 @@ def test_dsa_tp_plan_uses_local_heads_and_loss_only_head_gathers(
         use_tnd=use_tnd,
         sparse_loss=sparse_loss,
         core_attention=core_attention,
+        # This test is about the head-parallel plan; the sparse stage's other option is to
+        # split the sequence over TP instead, which builds a different plan entirely
+        # (``test_dsa_context_parallel_style`` covers that one).
+        config=SimpleNamespace(dsa_tp_sequence_parallel=False),
     )
     projection_plan = {
         "self_attention.linear_qb": object(),

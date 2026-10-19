@@ -851,6 +851,16 @@ def apply_recompute(
                     "Skip activation recompute at DSA warm-up layer %s: not selected by "
                     "full_recompute_layer.", layer_id)
             continue
+        # Step 0: the DSA sparse stage's per-layer indexer backward runs inside the forward,
+        # so the indexer's graph has to be a real one right then -- inside a checkpoint region
+        # its saved tensors are placeholders whose unpack would trigger a replay mid-forward.
+        # Exclude the indexer subtree from the region; per-layer backward is what pays for it.
+        # Not just ``full_target_ids``: select recompute can wrap a module that contains the
+        # indexer too, and the wrapper is a pass-through when no region is running, so it
+        # costs nothing on a layer that ends up recomputed by neither.
+        if need_recompute:
+            _exclude_dsa_layerwise_indexer(layer, layer_id)
+
         # Step 1: exclude (must be before checkpoint_wrapper)
         if exclude_layer_to_modules:
             _set_exclude_recompute(model.layers[layer_id], layer_id, exclude_layer_to_modules)
@@ -879,7 +889,8 @@ def _wrap_dsa_warmup_indexer_recompute(layer, layer_id):
     ``early_stop=False`` because the indexer carries context-parallel collectives whose
     replay-time side effects must run to completion, matching the full-layer wrapper.
     """
-    if getattr(layer, "layerwise_warmup_backward", False):
+    layer = getattr(layer, "transformer_layer", layer)
+    if getattr(layer, "layerwise_indexer_backward", False):
         # Per-layer warm-up backward already releases each layer's indexer activations before
         # the next layer runs, so there is nothing left to trade compute for. Wrapping the
         # indexer on top would only replay it once more for no gain.
@@ -906,6 +917,55 @@ def _wrap_dsa_warmup_indexer_recompute(layer, layer_id):
         "by the layer backward boundary, so only the indexer's activations need to live.",
         layer_id,
     )
+
+
+def _exclude_dsa_layerwise_indexer(layer, layer_id):
+    """Keep a DSA sparse layer's indexer out of its own recompute region.
+
+    ``dsa_indexer_layerwise_backward`` back-propagates this layer's indexer loss while the
+    block is still running later layers' forwards. Inside a non-reentrant checkpoint region
+    the forward's saved tensors are placeholders -- unpacking one is what triggers the replay
+    -- so a backward fired mid-forward would replay the region from inside itself. The
+    exclusion wrapper runs the subtree once with its real tensors kept and reuses that output
+    during the replay, which is exactly what per-layer backward needs.
+
+    It is also the point of the feature: excluding the indexer from recompute is worth ~11%
+    of a step on its own and otherwise costs GBs of resident activations, which per-layer
+    backward releases as the forward advances. Both the indexer and the loss module are
+    excluded: the loss operator's pre-computed gradients are the largest tensors involved.
+    """
+    layer = getattr(layer, "transformer_layer", layer)
+    attention = getattr(layer, "self_attention", None)
+    if attention is None or not getattr(attention, "layerwise_indexer_backward", False):
+        return
+    if not getattr(attention, "sparse_loss", False):
+        # The warm-up stage has its own, narrower handling: the whole frozen trunk skips the
+        # wrapper and only the indexer is (optionally) replayed.
+        return
+    core_attention = getattr(attention, "core_attention", None)
+    if core_attention is None:
+        return
+    excluded = []
+    for name in ("indexer", "indexer_loss"):
+        module = getattr(core_attention, name, None)
+        if module is None:
+            # A Shared layer owns neither; it borrows its group leader's, which that layer
+            # has already excluded. The wrapper keys its cache off the running region, so
+            # being called from a Shared layer's region works the same way.
+            continue
+        if "preserve_inputs" not in inspect.signature(checkpoint_exclude_wrapper).parameters:
+            raise ValueError(
+                "DSA layerwise backward with recompute requires hyper-parallel "
+                "checkpoint_exclude_wrapper(preserve_inputs=True)."
+            )
+        setattr(core_attention, name, checkpoint_exclude_wrapper(module, preserve_inputs=True))
+        excluded.append(name)
+    if excluded:
+        logger.info(
+            "Exclude %s from activation recompute at DSA layer %s: its indexer loss is "
+            "back-propagated per layer, so its activations do not outlive the layer.",
+            ", ".join(excluded), layer_id,
+        )
 
 
 def _disables_activation_recompute(module):
