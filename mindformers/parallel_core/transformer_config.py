@@ -1440,11 +1440,131 @@ class TransformerConfig:
     experimental_attention_variant: str = field(
         default=None,
         metadata={
-            "description": "Type of attention variant to use. Currently support ['dsa', 'dsv4_hybrid']."
+            "description": "Type of attention variant to use. Currently support ['kda', 'dsa', 'dsv4_hybrid']. "
                            "Defaults: `None`, which means that no attention variant will be applied.",
             "usage": ParamUsage.TRAINING,
             "source": ParamSource.MEGATRON,
             "mode": ParamMode.COMMON
+        }
+    )
+
+    linear_conv_kernel_dim: int = field(
+        default=4,
+        metadata={
+            "description": "Kernel size of the causal depthwise convolution for a linear-attention variant.",
+            "usage": ParamUsage.TRAINING,
+            "source": ParamSource.MEGATRON,
+            "mode": ParamMode.PYNATIVE
+        }
+    )
+
+    linear_key_head_dim: Optional[int] = field(
+        default=None,
+        metadata={
+            "description": "Query/key head dimension for a linear-attention variant.",
+            "usage": ParamUsage.TRAINING,
+            "source": ParamSource.MEGATRON,
+            "mode": ParamMode.PYNATIVE
+        }
+    )
+
+    linear_value_head_dim: Optional[int] = field(
+        default=None,
+        metadata={
+            "description": "Value/output-gate head dimension for a linear-attention variant.",
+            "usage": ParamUsage.TRAINING,
+            "source": ParamSource.MEGATRON,
+            "mode": ParamMode.PYNATIVE
+        }
+    )
+
+    linear_num_key_heads: Optional[int] = field(
+        default=None,
+        metadata={
+            "description": "Number of query/key heads for a linear-attention variant.",
+            "usage": ParamUsage.TRAINING,
+            "source": ParamSource.MEGATRON,
+            "mode": ParamMode.PYNATIVE
+        }
+    )
+
+    linear_num_value_heads: Optional[int] = field(
+        default=None,
+        metadata={
+            "description": "Number of value/output-gate heads for a linear-attention variant.",
+            "usage": ParamUsage.TRAINING,
+            "source": ParamSource.MEGATRON,
+            "mode": ParamMode.PYNATIVE
+        }
+    )
+
+    linear_attention_freq: Optional[Union[int, List[int]]] = field(
+        default=1,
+        metadata={
+            "description": "Layer pattern for linear attention variants; an integer selects every Nth layer.",
+            "usage": ParamUsage.TRAINING,
+            "source": ParamSource.MEGATRON,
+            "mode": ParamMode.COMMON
+        }
+    )
+
+    kda_f_lora_rank: Optional[int] = field(
+        default=None,
+        metadata={
+            "description": "Rank of KDA's bias-free low-rank decay projection; None keeps the full-rank path.",
+            "usage": ParamUsage.TRAINING,
+            "source": ParamSource.MEGATRON,
+            "mode": ParamMode.PYNATIVE
+        }
+    )
+
+    kda_gate_lora_rank: Optional[int] = field(
+        default=None,
+        metadata={
+            "description": "Rank of KDA's bias-free low-rank output-gate projection; None keeps the full-rank path.",
+            "usage": ParamUsage.TRAINING,
+            "source": ParamSource.MEGATRON,
+            "mode": ParamMode.PYNATIVE
+        }
+    )
+
+    kda_backend: str = field(
+        default="fused",
+        metadata={
+            "description": "KDA recurrence backend; only the fused Ascend training kernel is supported.",
+            "usage": ParamUsage.TRAINING,
+            "source": ParamSource.MF,
+            "mode": ParamMode.PYNATIVE
+        }
+    )
+
+    kda_chunk_size: int = field(
+        default=64,
+        metadata={
+            "description": "KDA chunk size; the fused training backend requires 64.",
+            "usage": ParamUsage.TRAINING,
+            "source": ParamSource.MF,
+            "mode": ParamMode.PYNATIVE
+        }
+    )
+
+    kda_safe_gate: bool = field(
+        default=False,
+        metadata={
+            "description": "Whether KDA uses a bounded channel-wise decay gate.",
+            "usage": ParamUsage.TRAINING,
+            "source": ParamSource.MEGATRON,
+            "mode": ParamMode.PYNATIVE
+        }
+    )
+
+    kda_lower_bound: Optional[float] = field(
+        default=None,
+        metadata={
+            "description": "Lower bound for KDA safe-gate decay values.",
+            "usage": ParamUsage.TRAINING,
+            "source": ParamSource.MEGATRON,
+            "mode": ParamMode.PYNATIVE
         }
     )
 
@@ -2360,6 +2480,83 @@ class TransformerConfig:
 
         if self.num_query_groups is None:
             self.num_query_groups = self.num_attention_heads
+
+        if self.experimental_attention_variant == "kda":
+            if not isinstance(self.linear_attention_freq, (int, list)):
+                raise ValueError(
+                    "KDA linear_attention_freq must be an integer or a layer-pattern list, "
+                    f"got {self.linear_attention_freq!r}."
+                )
+            if isinstance(self.linear_attention_freq, int) and self.linear_attention_freq <= 0:
+                raise ValueError("KDA linear_attention_freq must be positive.")
+            if isinstance(self.linear_attention_freq, list) and (
+                    len(self.linear_attention_freq) != self.num_layers
+                    or any(item not in (0, 1) for item in self.linear_attention_freq)
+            ):
+                raise ValueError(
+                    "KDA linear_attention_freq list must contain one 0/1 entry per layer."
+                )
+            kda_dimensions = {
+                "linear_conv_kernel_dim": self.linear_conv_kernel_dim,
+                "linear_key_head_dim": self.linear_key_head_dim,
+                "linear_value_head_dim": self.linear_value_head_dim,
+                "linear_num_key_heads": self.linear_num_key_heads,
+                "linear_num_value_heads": self.linear_num_value_heads,
+            }
+            for name, value in kda_dimensions.items():
+                if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                    raise ValueError(f"KDA requires {name} to be a positive integer, got {value!r}.")
+            if self.linear_num_key_heads != self.linear_num_value_heads:
+                raise ValueError("KDA requires equal key and value head counts.")
+            if self.linear_key_head_dim != self.linear_value_head_dim:
+                raise ValueError("KDA requires equal key and value head dimensions.")
+            for name, value in {
+                    "kda_f_lora_rank": self.kda_f_lora_rank,
+                    "kda_gate_lora_rank": self.kda_gate_lora_rank,
+            }.items():
+                if value is not None and (
+                        not isinstance(value, int) or isinstance(value, bool) or value <= 0
+                ):
+                    raise ValueError(f"KDA requires {name} to be a positive integer or None, got {value!r}.")
+            if (
+                    not isinstance(self.kda_chunk_size, int)
+                    or isinstance(self.kda_chunk_size, bool)
+                    or self.kda_chunk_size <= 0
+            ):
+                raise ValueError(
+                    f"KDA requires kda_chunk_size to be a positive integer, got {self.kda_chunk_size!r}."
+                )
+            if not isinstance(self.kda_safe_gate, bool):
+                raise ValueError(
+                    f"KDA requires kda_safe_gate to be a boolean, got {self.kda_safe_gate!r}."
+                )
+            if self.kda_backend != "fused":
+                raise ValueError("KDA only supports the fused training backend.")
+            if self.linear_key_head_dim != 128 or self.linear_value_head_dim != 128:
+                raise ValueError("Fused KDA training requires linear_key_head_dim=linear_value_head_dim=128.")
+            if self.kda_chunk_size != 64:
+                raise ValueError("Fused KDA training requires kda_chunk_size=64.")
+            if self.compute_dtype not in (ms.float16, ms.bfloat16):
+                raise ValueError("Fused KDA training requires compute_dtype=float16 or bfloat16.")
+            if self.kda_safe_gate:
+                if (
+                        not isinstance(self.kda_lower_bound, (int, float))
+                        or isinstance(self.kda_lower_bound, bool)
+                        or not -5.0 <= self.kda_lower_bound < 0.0
+                ):
+                    raise ValueError(
+                        "KDA requires kda_lower_bound to be in [-5, 0) "
+                        "when kda_safe_gate=True."
+                    )
+            parallel_sizes = {
+                "tensor_model_parallel_size": self.tensor_model_parallel_size,
+                "context_parallel_size": self.context_parallel_size,
+            }
+            if any(size != 1 for size in parallel_sizes.values()):
+                raise ValueError(
+                    "The minimal KDA implementation is single-card only; expected TP/PP/CP sizes "
+                    f"to all be 1, got {parallel_sizes}."
+                )
 
         if self.context_parallel_size > 1 and not self.use_flash_attention:
             raise ValueError("context_parallel is only available for flash attention for now, "

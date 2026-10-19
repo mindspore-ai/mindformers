@@ -622,6 +622,15 @@ class GPTModel(nn.Cell):
         if labels is not None:
             label_mask = self.cast(self.not_equal(labels, self.ignore_token_id), dtype.float32)
             loss_mask = self.mul(loss_mask, label_mask)
+        # An all-KDA decoder is causal inside the recurrence. Synthesizing a
+        # dense triangular mask here sends an unsupported mask to KDA, even
+        # when the caller explicitly requests its ordinary unmasked SBH path.
+        # Preserve explicit masks so KDA can reject unsupported semantics.
+        if (attention_mask is None
+                and self.config.experimental_attention_variant == "kda"
+                and all(type(layer.self_attention).__name__ == "KimiDeltaAttention"
+                        for layer in self.decoder.layers)):
+            return labels, attention_mask, loss_mask
         if (self.use_eod_attn_mask_compression and actual_seq_len is not None and attention_mask is None
                 and getattr(self.config, "input_layout", None) == "TND") and self.dsa_indexer_use_sparse_loss:
             return labels, attention_mask, loss_mask

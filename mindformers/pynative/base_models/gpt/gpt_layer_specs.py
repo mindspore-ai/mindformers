@@ -39,6 +39,7 @@ from mindformers.pynative.transformers.experimental_attention_variant.dsa_transf
 )
 from mindformers.parallel_core.transformer_config import TransformerConfig
 from mindformers.parallel_core.utils.spec_utils import ModuleSpec
+from mindformers.pynative.base_models.gpt.kda import get_kda_module_spec
 from mindformers.pynative.base_models.gpt.moe_module_specs import get_moe_module_spec
 from mindformers.pynative.base_models.gpt.experimental_attention_variant_module_specs import (
     get_attention_variant_module_spec,
@@ -120,7 +121,9 @@ def get_gpt_layer_local_spec(
             )
         attention_variant = None
 
-    if attention_variant:
+    if attention_variant == "kda":
+        self_attention = get_kda_module_spec(qk_layernorm, fused_norm, normalization)
+    elif attention_variant:
         self_attention = get_attention_variant_module_spec(
             attention_variant,
             qk_layernorm,
