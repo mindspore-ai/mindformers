@@ -18,6 +18,7 @@
 """Transformer Config"""
 
 import enum
+import math
 import os
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional, Tuple, Union
@@ -2328,6 +2329,33 @@ class TransformerConfig:
         }
     )
 
+    mtp_enable_hyper_connections: Optional[bool] = field(
+        default=None,
+        metadata={
+            "description": "Whether the MTP layers use mHC. If unset, follow enable_hyper_connections. "
+                           "Set to False to keep mHC on the decoder while the MTP layers stay plain "
+                           "transformer layers (the layout the reference checkpoints use: mHC weights "
+                           "on every decoder layer, none under mtp.).",
+            "usage": ParamUsage.TRAINING,
+            "source": ParamSource.MF,
+            "mode": ParamMode.COMMON
+        }
+    )
+
+    mtp_enable_dsa: Optional[bool] = field(
+        default=None,
+        metadata={
+            "description": "Whether the MTP layers use DSA. If unset, follow "
+                           "experimental_attention_variant == 'dsa'. Set to False to keep DSA on the "
+                           "decoder while the MTP layers run ordinary attention, which is what the "
+                           "graph-mode implementation does unconditionally (MTP layers there never "
+                           "carry an indexer).",
+            "usage": ParamUsage.TRAINING,
+            "source": ParamSource.MF,
+            "mode": ParamMode.COMMON
+        }
+    )
+
     enable_hc_head: Optional[bool] = field(
         default=None,
         metadata={
@@ -2380,6 +2408,59 @@ class TransformerConfig:
         }
     )
 
+    hc_sinkhorn_clamp: Optional[Union[float, list, tuple]] = field(
+        default=None,
+        metadata={
+            "description": "Clamp the mHC h_res logits to [-c, +c] before Sinkhorn, matching "
+                           "graph mode's hc_sinkhorn_clamp. Accepts a scalar c or a two-element "
+                           "[min, max]. None disables clamping. **This also selects which fused "
+                           "kernel the mHC pre step calls**: set -> aclnnMhcPreClampSinkhorn "
+                           "(what graph mode uses, and what the reference checkpoints were "
+                           "trained with), unset -> aclnnMhcPreSinkhorn. The two are separate "
+                           "builds and their Sinkhorn differs once the logits are large enough "
+                           "for exp(h-max) to underflow past eps (measured: 58% apart on a "
+                           "12T-token checkpoint), so this is not only about the clamp itself.",
+            "usage": ParamUsage.TRAINING,
+            "source": ParamSource.MF,
+            "mode": ParamMode.COMMON
+        }
+    )
+
+    mhc_megatron_compatibility: bool = field(
+        default=False,
+        metadata={
+            "description": "If True, use Megatron's native mHC Sinkhorn order, residual orientation "
+                           "(h_res @ x rather than h_res^T @ x -- the graph-mode implementation and "
+                           "the checkpoints it produced use this one), and projection formula. Works "
+                           "with use_fused_mhc: the fused path transposes h_res before the kernel, "
+                           "whose Sinkhorn and projection are already Megatron's. "
+                           "False preserves the existing MindFormers implementation.",
+            "usage": ParamUsage.TRAINING,
+            "source": ParamSource.MF,
+            "mode": ParamMode.PYNATIVE
+        }
+    )
+
+    mhc_params_dtype: Optional[str] = field(
+        default=None,
+        metadata={
+            "description": "mHC trainable parameter storage dtype. None preserves the existing FP32 storage.",
+            "usage": ParamUsage.TRAINING,
+            "source": ParamSource.MF,
+            "mode": ParamMode.PYNATIVE
+        }
+    )
+
+    mhc_compute_dtype: Optional[str] = field(
+        default=None,
+        metadata={
+            "description": "mHC internal compute dtype. None preserves the existing FP32 computation.",
+            "usage": ParamUsage.TRAINING,
+            "source": ParamSource.MF,
+            "mode": ParamMode.PYNATIVE
+        }
+    )
+
     use_fused_mhc: bool = field(
         default=False,
         metadata={
@@ -2427,6 +2508,10 @@ class TransformerConfig:
 
         self.compute_dtype = convert_str_to_mstype(self.compute_dtype)
         self.layernorm_compute_dtype = convert_str_to_mstype(self.layernorm_compute_dtype)
+        if self.mhc_params_dtype is not None:
+            self.mhc_params_dtype = convert_str_to_mstype(self.mhc_params_dtype)
+        if self.mhc_compute_dtype is not None:
+            self.mhc_compute_dtype = convert_str_to_mstype(self.mhc_compute_dtype)
         self.rotary_dtype = convert_str_to_mstype(self.rotary_dtype)
         self.moe_router_dtype = convert_str_to_mstype(self.moe_router_dtype)
         self.softmax_compute_dtype = convert_str_to_mstype(self.softmax_compute_dtype)
@@ -2440,6 +2525,31 @@ class TransformerConfig:
             self.enable_hc_head = self.enable_hyper_connections
         if self.enable_hc_head and not self.enable_hyper_connections:
             raise ValueError("enable_hc_head requires enable_hyper_connections to be enabled.")
+        if self.hc_sinkhorn_clamp is not None:
+            clamp = self.hc_sinkhorn_clamp
+            if isinstance(clamp, (list, tuple)):
+                if len(clamp) != 2:
+                    raise ValueError(
+                        f"hc_sinkhorn_clamp as a list must have 2 elements, got {clamp}.")
+                lo, hi = float(clamp[0]), float(clamp[1])
+            else:
+                lo, hi = -abs(float(clamp)), abs(float(clamp))
+            if not math.isfinite(lo) or not math.isfinite(hi):
+                raise ValueError("hc_sinkhorn_clamp bounds must be finite.")
+            if lo >= hi:
+                raise ValueError(f"hc_sinkhorn_clamp min must be < max, got ({lo}, {hi}).")
+            self.hc_sinkhorn_clamp = (lo, hi)
+        if self.mtp_enable_hyper_connections is None:
+            self.mtp_enable_hyper_connections = self.enable_hyper_connections
+        if self.mtp_enable_hyper_connections and not self.enable_hyper_connections:
+            raise ValueError(
+                "mtp_enable_hyper_connections requires enable_hyper_connections to be enabled.")
+        if self.mtp_enable_dsa is None:
+            self.mtp_enable_dsa = self.experimental_attention_variant == 'dsa'
+        if self.mtp_enable_dsa and self.experimental_attention_variant != 'dsa':
+            raise ValueError(
+                "mtp_enable_dsa requires experimental_attention_variant == 'dsa', but got "
+                f"experimental_attention_variant={self.experimental_attention_variant}.")
         if self.enable_hyper_connections:
             if not isinstance(self.num_residual_streams, int) or self.num_residual_streams <= 0:
                 raise ValueError(

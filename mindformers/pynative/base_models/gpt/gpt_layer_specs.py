@@ -18,6 +18,7 @@
 # limitations under the License.
 # ============================================================================
 """GPT LayerSpec."""
+from dataclasses import replace
 from typing import Optional, Union
 
 from mindformers.pynative.layers.linear import Linear
@@ -38,6 +39,7 @@ from mindformers.pynative.transformers.experimental_attention_variant.dsa_transf
     DSATransformerLayer,
 )
 from mindformers.parallel_core.transformer_config import TransformerConfig
+from mindformers.tools import logger
 from mindformers.parallel_core.utils.spec_utils import ModuleSpec
 from mindformers.pynative.base_models.gpt.kda import get_kda_module_spec
 from mindformers.pynative.base_models.gpt.moe_module_specs import get_moe_module_spec
@@ -72,6 +74,54 @@ def get_mlp_module_spec(
         num_experts=num_experts,
         moe_grouped_gemm=moe_grouped_gemm,
     )
+
+
+def get_self_attention_module_spec(
+        qk_layernorm: bool = False,
+        multi_latent_attention: bool = False,
+        fused_norm: bool = True,
+        normalization: str = "RMSNorm",
+) -> ModuleSpec:
+    """Build the ordinary self-attention spec, i.e. the one no attention variant replaced.
+
+    Also used to walk a layer back from an attention variant to plain attention, which is
+    how the MTP layers drop DSA while the decoder keeps it (see get_gpt_mtp_block_spec).
+
+    Args:
+        qk_layernorm (bool, optional): To use layernorm for queries/keys. Defaults to False.
+        multi_latent_attention (bool, optional): To use MultiLatentAttention. Defaults to False.
+        fused_norm (bool): Whether to use fused-normalization. Defaults to True.
+        normalization (str): The type of the norm. Defaults to RMSNorm.
+
+    Returns:
+        ModuleSpec: ``MLASelfAttention`` when ``multi_latent_attention`` else ``SelfAttention``.
+    """
+    q_layernorm = get_norm_cls(normalization, fused_norm) if qk_layernorm else IdentityOp
+    k_layernorm = get_norm_cls(normalization, fused_norm) if qk_layernorm else IdentityOp
+    if multi_latent_attention:
+        return ModuleSpec(
+            module=MLASelfAttention,
+            submodules=MLASelfAttentionSubmodules(
+                linear_qkv=Linear,
+                linear_qb=Linear,
+                linear_kvb=Linear,
+                core_attention=FlashAttention,
+                linear_proj=Linear,
+                q_layernorm=q_layernorm,
+                k_layernorm=k_layernorm,
+            ),
+        )
+    return ModuleSpec(
+        module=SelfAttention,
+        submodules=SelfAttentionSubmodules(
+            linear_qkv=Linear,
+            core_attention=FlashAttention,
+            linear_proj=Linear,
+            q_layernorm=q_layernorm,
+            k_layernorm=k_layernorm,
+        ),
+    )
+
 
 def get_gpt_layer_local_spec(
         num_experts: Optional[int] = None,
@@ -130,29 +180,12 @@ def get_gpt_layer_local_spec(
             fused_norm,
             normalization,
         )
-    elif multi_latent_attention:
-        self_attention = ModuleSpec(
-            module=MLASelfAttention,
-            submodules=MLASelfAttentionSubmodules(
-                linear_qkv=Linear,
-                linear_qb=Linear,
-                linear_kvb=Linear,
-                core_attention=FlashAttention,
-                linear_proj=Linear,
-                q_layernorm=get_norm_cls(normalization, fused_norm) if qk_layernorm else IdentityOp,
-                k_layernorm=get_norm_cls(normalization, fused_norm) if qk_layernorm else IdentityOp,
-            ),
-        )
     else:
-        self_attention = ModuleSpec(
-            module=SelfAttention,
-            submodules=SelfAttentionSubmodules(
-                linear_qkv=Linear,
-                core_attention=FlashAttention,
-                linear_proj=Linear,
-                q_layernorm=get_norm_cls(normalization, fused_norm) if qk_layernorm else IdentityOp,
-                k_layernorm=get_norm_cls(normalization, fused_norm) if qk_layernorm else IdentityOp,
-            ),
+        self_attention = get_self_attention_module_spec(
+            qk_layernorm=qk_layernorm,
+            multi_latent_attention=multi_latent_attention,
+            fused_norm=fused_norm,
+            normalization=normalization,
         )
 
     return ModuleSpec(
@@ -234,6 +267,52 @@ def get_gpt_decoder_block_spec(config: TransformerConfig) -> TransformerBlockSub
     return block_spec
 
 
+# mHC layer class -> its plain counterpart, for mtp_enable_hyper_connections=False.
+_HC_TO_PLAIN_LAYER_CLS = {
+    HyperConnectionTransformerLayer: TransformerLayer,
+    DSAHyperConnectionTransformerLayer: DSATransformerLayer,
+}
+
+# DSA layer class -> its plain counterpart, for mtp_enable_dsa=False. mHC is orthogonal, so
+# each flavour maps to the one that keeps its own mHC-ness; dropping that too is the other
+# table's job, applied afterwards.
+_DSA_TO_PLAIN_LAYER_CLS = {
+    DSATransformerLayer: TransformerLayer,
+    DSAHyperConnectionTransformerLayer: HyperConnectionTransformerLayer,
+}
+
+
+def _requested_mtp_downgrades(config):
+    """Which MTP-only switches ask the MTP layers to be plainer than the decoder's.
+
+    One list for both spec shapes, so the branch that can honour them and the branch that
+    cannot agree on what was asked for.
+    """
+    downgrades = []
+    if config.experimental_attention_variant == 'dsa' and not config.mtp_enable_dsa:
+        downgrades.append("mtp_enable_dsa")
+    if config.enable_hyper_connections and not config.mtp_enable_hyper_connections:
+        downgrades.append("mtp_enable_hyper_connections")
+    return downgrades
+
+
+def _plain_layer_cls(table, layer_cls, switch_name):
+    """The plain counterpart of ``layer_cls``, or a ValueError naming the switch.
+
+    A custom decoder layer class is not in either table; without this it would surface as a
+    bare ``KeyError: <class ...>`` from a line that says nothing about which switch asked.
+    """
+    try:
+        return table[layer_cls]
+    except KeyError:
+        raise ValueError(
+            f"{switch_name}=False needs a plain counterpart for the decoder's layer class "
+            f"{layer_cls.__name__}, and none is registered. Add one to the table in "
+            f"gpt_layer_specs.py, or leave the switch unset so the MTP layers follow the "
+            f"decoder."
+        ) from None
+
+
 def get_gpt_mtp_block_spec(
         config: TransformerConfig,
         spec: Union[TransformerBlockSubmodules, ModuleSpec],
@@ -248,11 +327,57 @@ def get_gpt_mtp_block_spec(
         # get the spec for the last layer of decoder block
         transformer_layer_spec = spec.layer_specs[-1]
         hc_head = spec.hc_head
+        downgrades = _requested_mtp_downgrades(config)
+        if "mtp_enable_dsa" in downgrades:
+            # The decoder keeps DSA but the MTP layers must not, which is what graph mode does
+            # unconditionally. Two things carry DSA: the layer class (it owns the warm-up
+            # boundary) and the self-attention spec (DSASelfAttention, whose core_attention
+            # holds the indexer). Swap both back to their plain counterparts so no indexer
+            # parameter is built under ``mtp.``; the MLP and the norms are left untouched.
+            transformer_layer_spec = replace(
+                transformer_layer_spec,
+                module=_plain_layer_cls(
+                    _DSA_TO_PLAIN_LAYER_CLS, transformer_layer_spec.module, "mtp_enable_dsa"),
+                submodules=replace(
+                    transformer_layer_spec.submodules,
+                    self_attention=get_self_attention_module_spec(
+                        qk_layernorm=config.qk_layernorm,
+                        multi_latent_attention=config.multi_latent_attention,
+                        fused_norm=config.fused_norm,
+                        normalization=normalization,
+                    ),
+                ),
+            )
+        if "mtp_enable_hyper_connections" in downgrades:
+            # The decoder keeps mHC but the MTP layers must not. The two layer flavours differ
+            # only in the layer class -- ``attn_hc``/``ffn_hc`` are built inside
+            # HyperConnectionTransformerLayer itself, not declared in the spec -- so swapping
+            # the class is enough to leave no mHC parameters under ``mtp.``. The collapse head
+            # goes with it: the decoder collapses its own residual streams before the hidden
+            # states reach the MTP block, which therefore only ever sees (s, b, h).
+            transformer_layer_spec = replace(
+                transformer_layer_spec,
+                module=_plain_layer_cls(
+                    _HC_TO_PLAIN_LAYER_CLS, transformer_layer_spec.module,
+                    "mtp_enable_hyper_connections"),
+            )
+            hc_head = None
     elif (isinstance(spec, ModuleSpec)
           and isinstance(spec.module, type)
           and issubclass(spec.module, BaseTransformerLayer)):
         transformer_layer_spec = spec
         hc_head = None
+        ignored = _requested_mtp_downgrades(config)
+        if ignored:
+            # This shape is a single layer spec handed in directly, with no decoder block to
+            # walk a layer back from -- the caller already chose the MTP layer class. Honouring
+            # the switches here would mean second-guessing that choice, so they are ignored;
+            # say so, because a config that sets them would otherwise look like it took effect.
+            logger.warning(
+                "%s set but ignored: the MTP block was given an explicit layer spec (%s), which "
+                "fixes the MTP layer class regardless of the decoder's.",
+                " and ".join(ignored), spec.module.__name__,
+            )
     else:
         raise ValueError(f"Invalid spec: {spec}")
 

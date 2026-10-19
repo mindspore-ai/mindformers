@@ -35,7 +35,13 @@ def _prepare_attention_qkv(method, args, input_layout=None):
     new_args = list(args)
     query, key, value = new_args[:3]
     seq_len, batch_size = query.shape[:2]
-    if method == "colossal":
+    if (input_layout or "").upper() == "BSND":
+        # Convert SBND to BSND without merging heads. Ordinary attention in a DSA
+        # model uses this path when MTP DSA is disabled and EOD compression is off.
+        query = mint.permute(query, (1, 0, 2, 3))
+        key = mint.permute(key, (1, 0, 2, 3))
+        value = mint.permute(value, (1, 0, 2, 3))
+    elif method == "colossal":
         query = mint.reshape(query, (seq_len, batch_size, -1))
         key = mint.reshape(key, (key.shape[0], key.shape[1], -1))
         value = mint.reshape(value, (value.shape[0], value.shape[1], -1))
@@ -54,6 +60,11 @@ def _restore_attention_output(method, output, input_layout=None):
     """Convert CP FlashAttention output back to model-native SBH."""
     if (input_layout or "").upper() == "TND":
         return output
+    if (input_layout or "").upper() == "BSND":
+        # Invert the BSND input transform, then merge heads into model-native SBH.
+        output = mint.permute(output, (1, 0, 2, 3))
+        seq_len, batch_size = output.shape[:2]
+        return mint.reshape(output, (seq_len, batch_size, -1))
     if method == "colossal":
         return mint.transpose(output, 0, 1)
 
