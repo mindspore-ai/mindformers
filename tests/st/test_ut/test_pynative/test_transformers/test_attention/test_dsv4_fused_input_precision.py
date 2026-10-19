@@ -146,6 +146,9 @@ def test_fused_indexer_backward_applies_loss_coefficient(monkeypatch):
         loss_coeff=0.25,
         layer_number=1,
         num_layers=1,
+        # The fused backward reads this to decide whether to drop the local per-token
+        # normaliser; the default path keeps it, which is what this test asserts.
+        calculate_per_token_loss=False,
     )
     gradients = csa.FusedSparseFlashMlaWithIndexerLoss.backward(
         ctx, mint.ones_like(query)
