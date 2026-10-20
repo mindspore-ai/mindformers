@@ -28,7 +28,10 @@ import mindformers.pynative.distributed.ep_overlap as ep_overlap_mod
 import mindformers.pynative.distributed.expert_parallel as expert_parallel_mod
 from mindformers.pynative.distributed.activation_checkpoint import recompute_context_fn
 from mindformers.pynative.distributed.ep_overlap import OverlapExpertParallel
-from mindformers.pynative.distributed.expert_parallel import ExpertParallel
+from mindformers.pynative.distributed.expert_parallel import (
+    DispatchOverlapExpertParallel,
+    ExpertParallel,
+)
 from mindformers.parallel_core.transformer_config import TransformerConfig
 from mindformers.pynative.layers.linear import Linear
 from mindformers.pynative.pet.moe_lora_layer import GroupedMLPWithLoRA
@@ -177,7 +180,7 @@ class TestExpertParallel:
             lambda topk_indices, num_experts: local_counts)
         monkeypatch.setattr(
             self.expert_parallel, "_counts_a2a",
-            lambda counts, ep_degree: grouped_counts)
+            lambda counts, ep_degree, cell=None: grouped_counts)
 
         def fake_issue(counts):
             issue_calls.append(counts)
@@ -332,7 +335,7 @@ class TestExpertParallel:
         else:
             monkeypatch.setattr(
                 expert_parallel, "_counts_a2a",
-                lambda counts, ep_degree: calls.append("counts_a2a") or "grouped_counts")
+                lambda counts, ep_degree, cell=None: calls.append("counts_a2a") or "grouped_counts")
             monkeypatch.setattr(
                 expert_parallel, "_host_token_splits",
                 lambda counts, grouped_counts, ep_degree:
@@ -346,6 +349,119 @@ class TestExpertParallel:
     @pytest.mark.level0
     @pytest.mark.platform_x86_cpu
     @pytest.mark.env_onecard
+    @pytest.mark.parametrize("async_d2h", [False, True])
+    def test_pp_independent_overlap_launches_before_routing_map(self, monkeypatch, async_d2h):
+        """The EP-only strategy creates a real local compute window after A2A launch."""
+        expert_parallel = DispatchOverlapExpertParallel(
+            moe_permute_fusion=True, async_d2h=async_d2h)
+        calls = []
+        monkeypatch.setattr(
+            expert_parallel, "_call_prelaunched_a2a",
+            lambda *args, **kwargs:
+            calls.append("prelaunch_a2a") or ("a2a_output", "work"))
+        monkeypatch.setattr(
+            expert_parallel, "_attach_prelaunched_dispatch",
+            lambda *args, **kwargs: calls.append("finish_a2a") or "flat_out")
+        monkeypatch.setattr(
+            expert_parallel, "_build_resort_routing_map",
+            lambda *args, **kwargs: calls.append("routing_map") or "routing_map")
+        monkeypatch.setattr(
+            expert_parallel, "_compute_group_list",
+            lambda *args, **kwargs: calls.append("group_list") or "group_list")
+
+        if async_d2h:
+            monkeypatch.setattr(
+                expert_parallel, "_finish_async_d2h",
+                lambda *args: calls.append("d2h_sync") or ([1], [1], [1]))
+            result = expert_parallel._dispatch_a2a(
+                "flat_in", object(), object(), SimpleNamespace(shape=(1,)),
+                num_experts=1, ep_degree=1, block_size=4)
+        else:
+            monkeypatch.setattr(
+                expert_parallel, "_counts_a2a",
+                lambda *args, **kwargs: calls.append("counts_a2a") or SimpleNamespace(shape=(1,)))
+            monkeypatch.setattr(
+                expert_parallel, "_host_token_splits",
+                lambda *args, **kwargs: calls.append("host_splits") or ([1], [1], [1]))
+            result = expert_parallel._dispatch_comm(
+                "flat_in", "counts", ep_degree=1, block_size=4)
+
+        assert calls.index("prelaunch_a2a") < calls.index("group_list")
+        assert calls.index("prelaunch_a2a") < calls.index("routing_map")
+        assert calls.index("routing_map") < calls.index("finish_a2a")
+        assert result[-1] == "routing_map"
+
+    @pytest.mark.level0
+    @pytest.mark.platform_x86_cpu
+    @pytest.mark.env_onecard
+    def test_dispatch_overlap_prelaunch_contract(self, monkeypatch):
+        """Prelaunch fallback, wait, registration, and reverse splits stay explicit."""
+        strategy = DispatchOverlapExpertParallel()
+        calls = []
+
+        monkeypatch.setattr(
+            strategy,
+            "_prelaunch_a2a",
+            lambda *args: calls.append(("fallback", args)) or ("output", "work"),
+        )
+        result = strategy._call_prelaunched_a2a(
+            "input.alltoallsingle", "input", [1], [2], 4,
+            cell=SimpleNamespace(_comm_ops={}),
+        )
+        assert result == ("output", "work")
+        assert calls[0][0] == "fallback"
+
+        module = SimpleNamespace()
+        strategy._register_payload_comm_ops(module)
+        input_fn = module._comm_ops["input.alltoallsingle"]["fn"]
+        output_fn = module._comm_ops["output.alltoallsingle"]["fn"]
+        assert input_fn is strategy._prelaunch_a2a
+        assert output_fn is strategy._registered_sync_a2a
+
+        class Work:
+            @staticmethod
+            def wait():
+                calls.append("wait")
+
+        ctx = SimpleNamespace()
+        output = expert_parallel_mod._StandalonePrelaunchedA2A.forward(
+            ctx, "input", "output", Work(), [4], [8], "ep-group")
+        assert output == "output"
+        assert calls[-1] == "wait"
+
+        captured = {}
+
+        def _reverse(flat_grad, send_splits, recv_splits, group):
+            captured.update(
+                flat_grad=flat_grad,
+                send_splits=send_splits,
+                recv_splits=recv_splits,
+                group=group,
+            )
+            return "grad-input"
+
+        monkeypatch.setattr(
+            expert_parallel_mod._platform,
+            "differentiable_all_to_all_single_async",
+            _reverse,
+        )
+        grad_output = SimpleNamespace(reshape=lambda _: "flat-grad")
+        grad_input = expert_parallel_mod._reverse_async_a2a(
+            grad_output, [4], [8], "ep-group")
+        assert grad_input == "grad-input"
+        assert captured == {
+            "flat_grad": "flat-grad",
+            "send_splits": [8],
+            "recv_splits": [4],
+            "group": "ep-group",
+        }
+
+        with pytest.raises(ValueError, match="cannot be combined"):
+            DispatchOverlapExpertParallel(shared_experts=object())
+
+    @pytest.mark.level0
+    @pytest.mark.platform_x86_cpu
+    @pytest.mark.env_onecard
     def test_shared_expert_fc_stages_bracket_token_a2a(self, monkeypatch):
         """A2A launches before FC, while its autograd node is attached after FC."""
         calls = []
@@ -354,7 +470,8 @@ class TestExpertParallel:
             """Record split shared-expert scheduling calls."""
 
             @staticmethod
-            def wait_current_stream():
+            def wait_current_stream(ctx=None):
+                del ctx
                 calls.append("shared_wait")
 
             @staticmethod
@@ -372,7 +489,7 @@ class TestExpertParallel:
         expert_parallel = ExpertParallel(shared_experts=FakeSharedExperts())
         monkeypatch.setattr(
             expert_parallel,
-            "_shared_expert_prelaunch_a2a",
+            "_call_prelaunched_a2a",
             lambda slot, *args, **kwargs:
             calls.append("dispatch_launch" if slot.startswith("input") else "combine_launch")
             or (f"{slot}.output", f"{slot}.work"),
@@ -402,6 +519,41 @@ class TestExpertParallel:
             ("shared_fc2", shared_expert_ctx),
             "combine_attach",
         ]
+
+    @pytest.mark.level0
+    @pytest.mark.platform_x86_cpu
+    @pytest.mark.env_onecard
+    def test_main_stream_shared_overlap_uses_standalone_a2a_boundary(self, monkeypatch):
+        """Main-stream shared FC avoids cross-stream branch coupling."""
+        strategy = ExpertParallel()
+        captured = []
+        main_stream = object()
+        overlap_ctx = SimpleNamespace(
+            main_stream=main_stream,
+            shared_stream=main_stream,
+        )
+
+        monkeypatch.setattr(
+            expert_parallel_mod._StandalonePrelaunchedA2A,
+            "apply",
+            lambda *args: captured.append(args) or "routed-output",
+        )
+
+        result = strategy._finish_prelaunched_a2a(
+            "flat-input",
+            "comm-output",
+            "work",
+            [2],
+            [3],
+            4,
+            "shared-output",
+            overlap_ctx,
+        )
+
+        assert result == ("routed-output", "shared-output")
+        assert captured == [(
+            "flat-input", "comm-output", "work", [8], [12], strategy.ep_group
+        )]
 
     @pytest.mark.level0
     @pytest.mark.platform_x86_cpu
@@ -512,8 +664,11 @@ class TestExpertParallel:
             lambda grad, send, recv, group:
             calls.append(("reverse_a2a", grad.shape, send, recv, group)) or "lazy_grad",
         )
-        grad = ms.Tensor([[1.0, 2.0], [3.0, 4.0]], ms.float32)
-        shared_grad = ms.Tensor([5.0], ms.float32)
+        grad = SimpleNamespace(
+            shape=(2, 2),
+            reshape=lambda _: SimpleNamespace(shape=(4,)),
+        )
+        shared_grad = object()
 
         result = expert_parallel_mod._PrelaunchedA2A.backward(
             ctx, grad, shared_grad)

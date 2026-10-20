@@ -15,6 +15,7 @@
 """Tests for PyNative trainer loss extraction."""
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import mindspore as ms
 import numpy as np
@@ -55,6 +56,8 @@ def test_compute_loss_keeps_the_per_token_pair():
 def test_compute_pp_loss_accumulates_per_token_outputs(monkeypatch):
     """PP sums the micro-batches' loss and token count, and zeroes the count's seed."""
     trainer = Trainer.__new__(Trainer)
+    trainer.model = []
+    trainer.monitor = Mock()
     trainer.compute_loss_func = None
     trainer.calculate_per_token_loss = True
     trainer.config = SimpleNamespace(

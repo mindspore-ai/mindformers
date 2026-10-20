@@ -6,19 +6,19 @@ tqdm>=4.65.0
 pyyaml>=6.0
 jieba>=0.42.1
 rouge_chinese>=1.0.3
-nltk==3.9.1
 mindpet==1.0.4
 opencv-python-headless
-pyarrow>=23.0.1
+pyarrow==25.0.1
 tokenizers
 astunparse>=1.6.3
 numpy<2.0.0
 tiktoken
-jinja2
+jinja2>=3.1.6 # chat_template sandbox escapes CVE-2024-56326, CVE-2025-27516
 setproctitle
 safetensors
 tensorboardX
 deprecated>=1.2.0
 pybind11 # for megatron dataset
-transformers==4.57.1
-datasets>=4.0.0
+transformers>=5.3.0
+datasets>=5.0.1
+pandas==2.2.3
