@@ -208,7 +208,7 @@ def is_hybrid_model(args):
 
 def is_linear_attention_variant(experimental_attention_variant):
     """Check if the experimental attention variant is a linear attention variant."""
-    linear_attention_variants = ["gated_delta_net"]
+    linear_attention_variants = ["gated_delta_net", "kda"]
     return experimental_attention_variant in linear_attention_variants
 
 
@@ -239,8 +239,16 @@ def convert_transformer_config_to_args_for_tflops(
         'num_experts': getattr(config, 'num_moe_experts', None),
         'moe_latent_size': None,
     }
+    legacy_linear_defaults = {
+        'linear_key_head_dim',
+        'linear_value_head_dim',
+        'linear_num_key_heads',
+        'linear_num_value_heads',
+    }
     for key, value in default_args.items():
-        if not hasattr(config, key):
+        if not hasattr(config, key) or (
+                key in legacy_linear_defaults and getattr(config, key) is None
+        ):
             setattr(config, key, value)
 
     if config.num_attention_heads != config.num_query_groups and not config.multi_latent_attention:
@@ -719,6 +727,28 @@ def num_floating_point_operations(args, batch_size):
                         ## out proj
                         + args.hidden_size
                         * v_dim
+                    )
+                )
+            elif args.experimental_attention_variant == "kda":
+                qk_head_dim = args.linear_key_head_dim
+                v_head_dim = args.linear_value_head_dim
+                num_qk_heads = args.linear_num_key_heads
+                num_v_heads = args.linear_num_value_heads
+                qk_dim = qk_head_dim * num_qk_heads
+                v_dim = v_head_dim * num_v_heads
+                linear_self_attn_term = (
+                    forward_backward_expansion_factor
+                    * fma_expansion_factor
+                    * (
+                        # q/k/v, channel decay, output gate, and beta projections
+                        args.hidden_size
+                        * (2 * qk_dim + 2 * v_dim + num_v_heads * qk_head_dim + num_v_heads)
+                        # causal depthwise convolution over projected q/k/v
+                        + args.linear_conv_kernel_dim * (2 * qk_dim + v_dim)
+                        # recurrent delta-rule state update
+                        + num_v_heads * qk_head_dim * v_head_dim * 4
+                        # output projection
+                        + args.hidden_size * v_dim
                     )
                 )
             else:
