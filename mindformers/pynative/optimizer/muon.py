@@ -2313,7 +2313,6 @@ class Muon(MainParamsMixin, Optimizer):
             self.max_exp_avg_sq = None
 
         self.model = model
-        self._main_params_snapshot = None
 
     @staticmethod
     def _verify_model(model):

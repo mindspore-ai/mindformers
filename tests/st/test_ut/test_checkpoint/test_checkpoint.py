@@ -564,7 +564,8 @@ class TestLoadCheckpoint:
         # Create a new network and optimizer to load into
         new_network = SimpleNet()
         new_optimizer = nn.Adam(new_network.trainable_params(), learning_rate=0.001)
-        load_checkpoint(tmp_path, new_network, optimizer=new_optimizer)
+        loaded_optimizer_names = load_checkpoint(tmp_path, new_network, optimizer=new_optimizer)
+        assert set(original_optimizer_params) <= loaded_optimizer_names
 
         # Verify network parameters are loaded correctly
         for name, original_value in original_network_params.items():

@@ -1257,6 +1257,7 @@ class Trainer:
         self._prepare_adapter_load(checkpoint_path, models)
 
         checkpoint = self.config.checkpoint
+        loaded_optimizer_names = None if checkpoint.no_load_optim else set()
         # With `no_load_optim=True` only the model weights are read back, so the optimizer
         # files must not take part in the integrity check of the checkpoint directory.
         checkpoint_path = get_checkpoint_path(
@@ -1359,27 +1360,21 @@ class Trainer:
                 self.state.global_step = global_step
                 restore_checkpoint_rng_state(checkpoint_path)
 
-            # Save fp32 master checksums before checkpoint load so we can later
-            # detect which params were actually loaded vs freshly initialized.
-            if optimizer is not None and not checkpoint.no_load_optim:
-                optimizer.save_main_params_snapshot()
-
             for stage in models:
-                load_checkpoint(
+                stage_loaded_names = load_checkpoint(
                     checkpoint=checkpoint_path,
                     network=stage,
                     optimizer=optimizer if not checkpoint.no_load_optim else None,
                     global_step=global_step,
                     balanced_load=checkpoint.load_balanced,
                 )
+                if loaded_optimizer_names is not None:
+                    loaded_optimizer_names.update(stage_loaded_names)
 
-        # Refresh fp32 master weights after checkpoint load.
-        # reload_main_params_from_model handles both cases internally:
-        # - with a snapshot (optim state loaded): selective reload — only params
-        #   whose optimizer state was NOT found in the checkpoint
-        # - without a snapshot (no_load_optim): full reload from model params
+        # Preserve masters restored on any local PP/VPP stage. Refresh only
+        # missing masters, or all masters for weights-only loading (None).
         if optimizer is not None:
-            optimizer.reload_main_params_from_model()
+            optimizer.reload_main_params_from_model(loaded_optimizer_names)
 
     def _inner_train_loop(self):
         """
