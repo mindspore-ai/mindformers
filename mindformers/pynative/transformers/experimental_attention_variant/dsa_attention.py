@@ -137,7 +137,7 @@ class IndexShareGroup:
         """Move this group's Top-K to host memory; a later read pages it back.
 
         Called when the next group starts, so at most one group's Top-K is resident. A no-op
-        unless ``dsa_index_share_topk_offload`` is on, and unless this group actually holds a
+        unless ``dsa_indexer_share_topk_offload`` is on, and unless this group actually holds a
         device tensor (the dense warm-up stage produces no Top-K at all).
         """
         if not self._offload_topk or self._topk_device is None:
@@ -163,7 +163,7 @@ class DSASelfAttention(MLASelfAttention):
             layer_number=layer_number,
         )
         self.sparse_loss = config.dsa_indexer_use_sparse_loss
-        self.index_share_loss_mode = config.dsa_index_share_loss
+        self.index_share_loss_mode = config.dsa_indexer_share_loss
         self.index_share_group_size = dsa_layer_index_share_group_size(config, layer_number)
         # Per-layer warm-up backward runs this layer's indexer backward in the middle of the
         # block's forward, so that backward must not leave the indexer's own subgraph: any
@@ -176,7 +176,7 @@ class DSASelfAttention(MLASelfAttention):
         # being trained loses gradient by cutting them.
         self.layerwise_warmup_backward = (
             not config.dsa_indexer_use_sparse_loss
-            and config.dsa_warmup_layerwise_backward
+            and config.dsa_indexer_layerwise_backward
         )
         self.dsa_value_handoff = IdentityOp()
         self.dsa_loss_key_indexer_handoff = IdentityOp()

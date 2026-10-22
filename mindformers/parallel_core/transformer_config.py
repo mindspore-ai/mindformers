@@ -1571,7 +1571,7 @@ class TransformerConfig:
     dsa_indexer_n_heads: int = field(
         default=None,
         metadata={
-            "description": "Number of DSA indexer heads.",
+            "description": "Number of DSA indexer heads. Supports 8, 16, 32 or 64.",
             "usage": ParamUsage.TRAINING,
             "source": ParamSource.MEGATRON,
             "mode": ParamMode.COMMON
@@ -1598,20 +1598,20 @@ class TransformerConfig:
         }
     )
 
-    dsa_index_topk_freq: int = field(
+    dsa_indexer_topk_freq: int = field(
         default=1,
         metadata={
             "description": "How often a DSA layer runs its own indexer: one Full layer every "
-                           "`dsa_index_topk_freq` layers. Named after Megatron's "
-                           "`index_topk_freq`, whose semantics this matches. The Full layer owns "
-                           "the indexer; the remaining "
-                           "`dsa_index_topk_freq - 1` layers (Shared) own no indexer at all -- no "
-                           "parameters, no projections, no `ops.lightning_indexer` call -- and in "
-                           "the sparse stage they attend with the Full layer's `topk_indices`. The "
-                           "Full layer's indexer is distilled against every layer it serves and the "
-                           "terms are averaged, so the indexer-loss kernel still runs once per "
-                           "layer; what sharing saves is the Shared layers' indexer forward and "
-                           "parameters. Defaults to 1, which disables sharing and is bit-for-bit "
+                           "`dsa_indexer_topk_freq` layers. Same name and semantics as Megatron's "
+                           "`dsa_indexer_topk_freq`; GLM-5 HF configs spell it `index_topk_freq`, "
+                           "which is accepted as an alias. It is a group *size*, not a group "
+                           "count: 16 layers with 4 make four groups of four. The Full layer owns "
+                           "the indexer; the remaining layers of its group (Shared) own no indexer "
+                           "at all -- no parameters, no projections, no `ops.lightning_indexer` "
+                           "call -- and in the sparse stage they attend with the Full layer's "
+                           "`topk_indices`. `num_layers` need not be a multiple: as in Megatron, "
+                           "the last group is simply shorter (18 layers with 4 end on a group of "
+                           "two). Defaults to 1, which disables sharing and is bit-for-bit "
                            "identical to the unshared implementation.",
             "usage": ParamUsage.TRAINING,
             "source": ParamSource.MEGATRON,
@@ -1619,7 +1619,7 @@ class TransformerConfig:
         }
     )
 
-    dsa_index_share_topk_offload: bool = field(
+    dsa_indexer_share_topk_offload: bool = field(
         default=False,
         metadata={
             "description": "Keep only one sharing group's Top-K resident on device: when the next "
@@ -1629,15 +1629,16 @@ class TransformerConfig:
                            "Top-K for the whole step is the layer's checkpoint closure rather than "
                            "the sparse kernel -- every group in the stage then keeps one "
                            "[B, S, topk] tensor alive at once. Costs one D2H per group plus one "
-                           "H2D per replay. Mirrors the eviction in Megatron's "
-                           "`DSAIndexShareState`. Off by default.",
+                           "H2D per replay. Mirrors the eviction in Megatron Lite's "
+                           "`DSAIndexShareState`, where it is unconditional; Megatron's main "
+                           "path keeps every group's Top-K for the whole forward. Off by default.",
             "usage": ParamUsage.TRAINING,
             "source": ParamSource.MEGATRON,
             "mode": ParamMode.COMMON
         }
     )
 
-    dsa_index_share_loss: str = field(
+    dsa_indexer_share_loss: str = field(
         default="served",
         metadata={
             "description": "How the Full layer's indexer is supervised once it serves several "
@@ -1660,14 +1661,18 @@ class TransformerConfig:
         }
     )
 
-    dsa_index_skip_topk_offset: int = field(
+    dsa_indexer_skip_topk_offset: int = field(
         default=0,
         metadata={
-            "description": "Shifts where the Full layers land in the uniform layout: layer i is "
-                           "Full when `max(i - dsa_index_skip_topk_offset, 0) % dsa_index_topk_freq "
-                           "== 0`. Matches Megatron's `index_skip_topk_offset`. Layer 0 always "
-                           "stays Full -- a Shared layer has no preceding Full layer to inherit "
-                           "indices from. Ignored when `dsa_indexer_types` is given. "
+            "description": "Shifts where the Full layers land in the uniform layout. Same "
+                           "name, and the same value gives the same layout, as Megatron's "
+                           "`dsa_indexer_skip_topk_offset` (GLM-5 HF alias: "
+                           "`index_skip_topk_offset`): counting layers from 1, layer n is Full "
+                           "when `max(n - max(offset, 1), 0) % dsa_indexer_topk_freq == 0`, so "
+                           "0 and 1 are equivalent. Every layer up to the offset stays Full, "
+                           "which leaves a run of single-layer groups at the front (offset 3 "
+                           "with freq 4 over 12 layers: F F F S S S F S S S F S). Must be "
+                           "non-negative. Ignored when `dsa_indexer_types` is given. "
                            "Defaults to 0.",
             "usage": ParamUsage.TRAINING,
             "source": ParamSource.MEGATRON,
@@ -1680,20 +1685,22 @@ class TransformerConfig:
         metadata={
             "description": "Per-layer DSA indexer layout, one entry per global layer: 'full' for "
                            "a layer that runs its own indexer, 'shared' for one that reuses the "
-                           "nearest preceding 'full' layer's Top-K. Matches Megatron's "
-                           "`indexer_types`, including the requirement that its length equal "
-                           "`num_layers` -- a shorter list is a mistake, not a repeating unit. "
+                           "nearest preceding 'full' layer's Top-K. Matches the `indexer_types` "
+                           "field of GLM-5's HF config as validated by Megatron Lite (accepted "
+                           "here under that name too), including its requirement that the length "
+                           "equal `num_layers` -- a shorter list is a mistake, not a repeating "
+                           "unit. Megatron's main path has no per-layer layout. "
                            "The first entry must be 'full': a 'shared' layer has no preceding "
                            "'full' layer to inherit indices from. Overrides "
-                           "`dsa_index_topk_freq` / `dsa_index_skip_topk_offset`, which describe "
-                           "the uniform layout; give this only for a non-uniform one.",
+                           "`dsa_indexer_topk_freq` / `dsa_indexer_skip_topk_offset`, which "
+                           "describe the uniform layout; give this only for a non-uniform one.",
             "usage": ParamUsage.TRAINING,
             "source": ParamSource.MEGATRON,
             "mode": ParamMode.COMMON
         }
     )
 
-    dsa_warmup_layerwise_backward: bool = field(
+    dsa_indexer_layerwise_backward: bool = field(
         default=False,
         metadata={
             "description": "In the DSA dense warm-up stage, back-propagate each layer's indexer "
@@ -2400,14 +2407,16 @@ class TransformerConfig:
         if self.sequence_parallel and self.tensor_model_parallel_size <= 1:
             raise ValueError("Can not use sequence parallelism without tensor parallelism")
 
-        if ((self.dsa_index_topk_freq or 1) > 1 or self.dsa_indexer_types is not None) \
+        if ((self.dsa_indexer_topk_freq or 1) > 1 or self.dsa_indexer_types is not None) \
                 and self.experimental_attention_variant != "dsa":
-            # The full check lives in ``MLATransformerConfig._validate_dsa_index_share``; here we
-            # only make sure the knob is never silently ignored by a non-DSA model.
-            raise ValueError(
-                "DSA indexer sharing (`dsa_index_topk_freq` / `dsa_indexer_types`) is only meaningful when "
-                "`experimental_attention_variant` == 'dsa', but got "
-                f"experimental_attention_variant={self.experimental_attention_variant}."
+            # A DSA knob on a non-DSA model is inert, not fatal: yaml templates are shared
+            # across models and may carry it. Warn so the setting is not silently believed to
+            # have taken effect. The layout itself is checked in
+            # ``MLATransformerConfig._validate_dsa_index_share``.
+            logger.warning(
+                "DSA indexer sharing (`dsa_indexer_topk_freq` / `dsa_indexer_types`) is ignored "
+                "because `experimental_attention_variant` is "
+                f"{self.experimental_attention_variant!r}, not 'dsa'."
             )
 
         self.compute_dtype = convert_str_to_mstype(self.compute_dtype)
@@ -2570,16 +2579,18 @@ class TransformerConfig:
                                  "please set use_flash_attention=True.")
             if ms.get_auto_parallel_context("pipeline_scheduler") == "zero_bubble_v":
                 raise ValueError("When experimental_attention_variant == 'dsa', zero_bubble_v is not supported.")
-            if self.dsa_warmup_layerwise_backward and self.dsa_indexer_use_sparse_loss:
+            if self.dsa_indexer_layerwise_backward and self.dsa_indexer_use_sparse_loss:
                 raise ValueError(
-                    "`dsa_warmup_layerwise_backward` requires the dense warm-up stage "
+                    "`dsa_indexer_layerwise_backward` requires the dense warm-up stage "
                     "(`dsa_indexer_use_sparse_loss=False`): the sparse stage trains the trunk, "
                     "so its backward cannot be driven per layer."
                 )
-        elif self.dsa_warmup_layerwise_backward:
-            raise ValueError(
-                "`dsa_warmup_layerwise_backward` is only meaningful when "
-                "`experimental_attention_variant` is 'dsa'."
+        elif self.dsa_indexer_layerwise_backward:
+            # Inert rather than fatal, for the same reason as the sharing knobs above.
+            logger.warning(
+                "`dsa_indexer_layerwise_backward` is ignored because "
+                f"`experimental_attention_variant` is {self.experimental_attention_variant!r}, "
+                "not 'dsa'."
             )
 
         if self.use_flash_attention:
@@ -3274,11 +3285,12 @@ class MLATransformerConfig(TransformerConfig):
         """
         num_layers = self.num_layers
         indexer_types = self.dsa_indexer_types
-        share_size = self.dsa_index_topk_freq or 1
+        share_size = self.dsa_indexer_topk_freq or 1
         if indexer_types is not None:
-            # Megatron requires len(indexer_types) == num_hidden_layers exactly; a shorter
-            # list is rejected rather than tiled, so a typo cannot silently become a
-            # different layout. Uniform layouts are expressed with topk_freq/offset instead.
+            # GLM-5's HF config, as Megatron Lite validates it, requires
+            # len(indexer_types) == num_hidden_layers exactly; a shorter list is rejected
+            # rather than tiled, so a typo cannot silently become a different layout. Uniform
+            # layouts are expressed with topk_freq/offset instead.
             if not isinstance(indexer_types, (list, tuple)):
                 raise ValueError(
                     "`dsa_indexer_types` must be a list of 'full'/'shared', but got "
@@ -3304,71 +3316,87 @@ class MLATransformerConfig(TransformerConfig):
                 )
             return tuple(t == "full" for t in cleaned)
 
-        # Same shape as Megatron's ``is_dsa_skip_topk_layer``
-        # (``(max(n - offset, 0) % freq) != 0`` marks a Shared layer), evaluated on our
-        # 0-indexed layer numbers instead of its 1-indexed ones -- so our ``offset`` is
-        # theirs minus one, and ``offset=0`` keeps the layout that shipped in !8785.
-        # ``max(..., 0)`` holds every layer up to the offset Full, so layer 0 is never
-        # Shared no matter the offset.
-        offset = self.dsa_index_skip_topk_offset or 0
+        # Megatron's ``is_dsa_skip_topk_layer`` verbatim, so a value copied from a Megatron
+        # config gives the same layout: it counts layers from 1 and clamps the offset to at
+        # least 1 (``(max(n - max(offset, 1), 0) % freq) != 0`` marks a Shared layer). Our
+        # layers count from 0, hence ``n = i + 1``. With the default ``offset=0`` this is
+        # ``i % freq == 0``, the layout that shipped in !8785. ``max(..., 0)`` holds every
+        # layer up to the offset Full, so layer 0 is never Shared.
+        offset = max(self.dsa_indexer_skip_topk_offset or 0, 1)
         return tuple(
-            max(i - offset, 0) % share_size == 0 for i in range(num_layers)
+            max(i + 1 - offset, 0) % share_size == 0 for i in range(num_layers)
         )
 
     def _validate_dsa_index_share(self):
         """Validate DSA indexer Top-K sharing against the stage / MTP layer layout."""
-        if self.dsa_index_share_loss not in ("leader", "served"):
+        if self.dsa_indexer_share_loss not in ("leader", "served"):
             raise ValueError(
-                "`dsa_index_share_loss` must be 'leader' or 'served', but got "
-                f"{self.dsa_index_share_loss!r}."
+                "`dsa_indexer_share_loss` must be 'leader' or 'served', but got "
+                f"{self.dsa_indexer_share_loss!r}."
             )
-        share_size = self.dsa_index_topk_freq
+        share_size = self.dsa_indexer_topk_freq
         if share_size is None:
-            share_size = self.dsa_index_topk_freq = 1
+            share_size = self.dsa_indexer_topk_freq = 1
         if not isinstance(share_size, int) or isinstance(share_size, bool) or share_size < 1:
             raise ValueError(
-                f"`dsa_index_topk_freq` must be a positive integer, but got {share_size}."
+                f"`dsa_indexer_topk_freq` must be a positive integer, but got {share_size}."
             )
-        indexer_types = self.dsa_indexer_types
-        if indexer_types is not None:
-            # ``is not None`` rather than truthiness: an empty list is a mistake, not "no
-            # layout", and must reach ``resolve_dsa_index_share_leaders`` to be rejected
-            # there instead of silently turning sharing off. That call also raises on a
-            # malformed layout; the result is recomputed identically wherever the layout is
-            # needed, so nothing is cached here.
-            leaders = self.resolve_dsa_index_share_leaders()
-            if all(leaders):
-                return
-            self._validate_dsa_index_share_stage_alignment(leaders)
-            # An explicit layout makes groups just like ``topk_freq`` does, so it needs the same
-            # pipeline-chunk check; the longest group is what has to fit inside a chunk.
-            starts = [i for i, is_leader in enumerate(leaders) if is_leader]
-            bounds = starts[1:] + [len(leaders)]
-            share_size = max(end - start for start, end in zip(starts, bounds))
-        elif share_size == 1:
-            return
-        elif self.num_layers % share_size != 0:
+        offset = self.dsa_indexer_skip_topk_offset
+        if offset is None:
+            offset = self.dsa_indexer_skip_topk_offset = 0
+        if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
+            # Megatron rejects a negative offset too; the formula would otherwise quietly
+            # produce a different layout rather than fail.
             raise ValueError(
-                f"`num_layers` ({self.num_layers}) must be divisible by "
-                f"`dsa_index_topk_freq` ({share_size}) so that no sharing group is truncated."
+                f"`dsa_indexer_skip_topk_offset` must be a non-negative integer, but got {offset}."
             )
-        else:
-            self._validate_dsa_index_share_stage_alignment(self.resolve_dsa_index_share_leaders())
+        # ``is not None`` rather than truthiness: an empty ``dsa_indexer_types`` is a mistake,
+        # not "no layout", and must reach ``resolve_dsa_index_share_leaders`` to be rejected
+        # there instead of silently turning sharing off. That call also raises on a malformed
+        # layout; the result is recomputed identically wherever the layout is needed, so
+        # nothing is cached here.
+        if self.dsa_indexer_types is None and share_size == 1:
+            return
+        leaders = self.resolve_dsa_index_share_leaders()
+        if all(leaders):
+            return
+        # No divisibility requirement on ``num_layers``: like Megatron, a layer count that is
+        # not a multiple of the group size just ends on a shorter group, which the per-layer
+        # group-size lookup already handles.
+        self._validate_dsa_index_share_stage_alignment(leaders)
         pp_size = self.pipeline_model_parallel_size or 1
         vpp_size = self.virtual_pipeline_model_parallel_size or 1
         chunks = pp_size * vpp_size
-        if chunks > 1:
-            if self.num_layers % chunks != 0:
-                # Uneven ``offset`` layouts are checked exactly in ``TransformerBlock``,
-                # where the per-stage layer range is known.
-                return
+        if chunks > 1 and self.num_layers % chunks == 0:
+            # With an even split every chunk boundary is known here, so check it exactly: a
+            # chunk must start on a Full layer. Comparing ``layers_per_chunk`` against a group
+            # size instead would misjudge any layout whose groups differ in length (a shorter
+            # last group, the single-layer groups an offset leaves at the front, an explicit
+            # ``dsa_indexer_types``). Uneven splits are checked in ``TransformerBlock``, which
+            # knows each stage's layer range.
             layers_per_chunk = self.num_layers // chunks
-            if layers_per_chunk % share_size != 0:
-                raise ValueError(
-                    f"Each pipeline chunk holds {layers_per_chunk} layers, which is not divisible "
-                    f"by the sharing group size ({share_size}); a sharing group would then span "
-                    "two pipeline stages. Shrink the groups or rebalance the stages."
-                )
+            for boundary in range(layers_per_chunk, self.num_layers, layers_per_chunk):
+                if not leaders[boundary]:
+                    self._raise_dsa_index_share_spans_chunks(
+                        leaders, boundary, chunks, layers_per_chunk
+                    )
+
+    @staticmethod
+    def _raise_dsa_index_share_spans_chunks(leaders, boundary, chunks, layers_per_chunk):
+        """Explain a sharing group that crosses a pipeline chunk boundary."""
+        leader = max(i for i in range(boundary) if leaders[i])
+        end = next((i for i in range(boundary, len(leaders)) if leaders[i]), len(leaders))
+        num_groups = sum(leaders)
+        pattern = "".join("F" if is_leader else "S" for is_leader in leaders)
+        raise ValueError(
+            f"The DSA indexer sharing group of global layers [{leader}, {end - 1}] "
+            f"({end - leader} layers) would span two pipeline chunks: {chunks} chunks of "
+            f"{layers_per_chunk} layers each put a boundary at layer {boundary}, which is "
+            f"Shared. Layout {pattern} has {num_groups} group(s) over {len(leaders)} layers; "
+            "note `dsa_indexer_topk_freq` is the size of a group, not the number of groups. "
+            "Put a Full layer on every chunk boundary (e.g. a `dsa_indexer_topk_freq` that "
+            f"divides {layers_per_chunk}) or rebalance the stages."
+        )
 
     @staticmethod
     def _validate_dsa_index_share_stage_alignment(leaders):
@@ -3393,11 +3421,19 @@ class MLATransformerConfig(TransformerConfig):
         super().__post_init__()
 
         if self.experimental_attention_variant == 'dsa':
-            if self.kv_lora_rank != 512 or self.qk_pos_emb_head_dim != 64 or \
-                    self.dsa_indexer_head_dim != 128 or self.dsa_indexer_n_heads != 64:
-                raise ValueError("CurrentLy, when `experimental_attention_variant` == 'dsa', "
-                                 "`kv_lora_rank` only supports 512, `qk_pos_emb_head_dim` only supports 64, "
-                                 "`dsa_indexer_head_dim` only supports 128, `dsa_indexer_n_heads` only supports 64.")
+            if self.kv_lora_rank != 512 or self.qk_pos_emb_head_dim != 64:
+                raise ValueError("When `experimental_attention_variant` == 'dsa', "
+                                 "`kv_lora_rank` only supports 512, "
+                                 "`qk_pos_emb_head_dim` only supports 64, "
+                                 f"but get `kv_lora_rank`={self.kv_lora_rank}, "
+                                 f"`qk_pos_emb_head_dim`={self.qk_pos_emb_head_dim}.")
+            # The indexer head count is not fixed at 64; same set as the static-graph DSA
+            # branch (dsa_lb_stage1), whose indexer is written against the same operators.
+            if self.dsa_indexer_n_heads not in [8, 16, 32, 64] or self.dsa_indexer_head_dim != 128:
+                raise ValueError("`dsa_indexer_n_heads` only supports {8, 16, 32, 64}, "
+                                 "`dsa_indexer_head_dim` only supports 128, "
+                                 f"but get `dsa_indexer_n_heads`={self.dsa_indexer_n_heads}, "
+                                 f"`dsa_indexer_head_dim`={self.dsa_indexer_head_dim}.")
             self._validate_dsa_index_share()
 
         if self.experimental_attention_variant == 'dsv4_hybrid':
