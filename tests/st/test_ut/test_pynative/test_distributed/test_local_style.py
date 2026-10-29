@@ -17,6 +17,7 @@
 from types import SimpleNamespace
 
 import pytest
+import numpy as np
 import mindspore as ms
 from mindspore import Tensor, nn
 
@@ -36,6 +37,41 @@ from mindformers.pynative.distributed.style import (
     build_hp_cp_style,
 )
 from mindformers.pynative.layers.linear import Linear
+from mindformers.pynative.pet.lora_layer import LinearWithLoRA
+
+
+@pytest.mark.parametrize("groups", [1, 3])
+def test_grouped_linear_matches_flat_outputs_and_gradients(groups):
+    """Factoring output sections preserves linear math and exposes the correct TP axes."""
+    with ms.DeviceCtx("CPU"):
+        rng = np.random.default_rng(73)
+        flat = Linear(4, 12, "float32")
+        grouped = Linear(4, 12, "float32", output_groups=groups)
+        weight = rng.normal(size=(12, 4)).astype(np.float32)
+        bias = rng.normal(size=12).astype(np.float32)
+        for cell in (flat, grouped):
+            cell.weight.set_data(Tensor(weight.reshape(cell.weight.shape)))
+            cell.bias.set_data(Tensor(bias.reshape(cell.bias.shape)))
+        value = Tensor(rng.normal(size=(3, 2, 4)).astype(np.float32))
+        np.testing.assert_allclose(grouped(value).asnumpy(), flat(value).asnumpy(), atol=1e-6)
+        first = ms.grad(lambda x: flat(x).sum(), 0, tuple(flat.trainable_params()))(value)
+        second = ms.grad(lambda x: grouped(x).sum(), 0, tuple(grouped.trainable_params()))(value)
+        for left, right in zip((first[0], *first[1]), (second[0], *second[1])):
+            np.testing.assert_allclose(left.asnumpy().reshape(-1), right.asnumpy().reshape(-1), atol=1e-6)
+        col = ColwiseParallel()._create_weight_sharding_plan(grouped)
+        row = RowwiseParallel()._create_weight_sharding_plan(grouped)
+        assert col["weight"][0].dim == (1 if groups > 1 else 0)
+        assert col["bias"][0].dim == (1 if groups > 1 else 0)
+        assert row["weight"][0].dim == (2 if groups > 1 else 1)
+        assert row["bias"][0].is_replicate()
+        adapter = LinearWithLoRA.from_base(grouped, lora_rank=2)
+        adapter.to_empty()
+        adapter.weight.set_data(Tensor(weight.reshape(adapter.weight.shape)))
+        adapter.bias.set_data(Tensor(bias.reshape(adapter.bias.shape)))
+        adapter.lora_a.set_data(Tensor(np.zeros((2, 4), np.float32)))
+        adapter.lora_b.set_data(Tensor(np.zeros((12, 2), np.float32)))
+        assert adapter.weight is grouped.weight and adapter.output_groups == groups
+        np.testing.assert_allclose(adapter(value).asnumpy(), flat(value).asnumpy(), atol=1e-6)
 
 
 class _FakeMesh:

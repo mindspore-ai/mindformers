@@ -52,6 +52,8 @@ class Linear(nn.Cell):
         bias (bool): Whether to include bias in the linear layer. Default: True.
         skip_weight_param_allocation (bool): Whether to skip weight parameter allocation. Default: False.
         bias_init (Callable): The initialization method for bias. Default: None.
+        output_groups (int): Store equal output sections as an explicit leading
+            axis, so column parallelism shards within every section. Default: 1.
     """
 
     def __init__(self,
@@ -62,7 +64,8 @@ class Linear(nn.Cell):
                  init_method: Callable = None,
                  bias: bool = True,
                  skip_weight_param_allocation: bool = False,
-                 bias_init: Callable = None
+                 bias_init: Callable = None,
+                 output_groups: int = 1,
                  ):
         super().__init__()
 
@@ -71,6 +74,9 @@ class Linear(nn.Cell):
         self.init_method = init_method
         self.skip_weight_param_allocation = skip_weight_param_allocation
         self.has_bias = bias
+        if output_groups < 1 or output_size % output_groups:
+            raise ValueError("output_groups must be positive and divide output_size.")
+        self.output_groups = output_groups
         self.compute_dtype = convert_mstype(compute_dtype)
         self.params_dtype = (
             convert_mstype(params_dtype) if params_dtype is not None else self.compute_dtype
@@ -82,13 +88,16 @@ class Linear(nn.Cell):
         else:
             # Weight is stored as (output_size, input_size) and transposed at runtime
             weight_shape = (output_size, input_size)
+            if output_groups > 1:
+                weight_shape = (output_groups, output_size // output_groups, input_size)
             self.weight = Parameter(mint.empty(weight_shape, dtype=self.params_dtype), name='weight')
 
         if self.has_bias:
             if bias_init is None:
                 bias_init = init_method_zero(self.params_dtype)
             self.bias_init = bias_init
-            self.bias = Parameter(mint.empty((output_size,), dtype=self.params_dtype), name='bias')
+            bias_shape = (output_size,) if output_groups == 1 else (output_groups, output_size // output_groups)
+            self.bias = Parameter(mint.empty(bias_shape, dtype=self.params_dtype), name='bias')
         else:
             self.bias_init = None
             self.bias = None
@@ -123,6 +132,8 @@ class Linear(nn.Cell):
         # Weight is a sharded DTensor (TP + FSDP); compute on its local shard.
         if isinstance(weight, DTensor):
             weight = weight.to_local()
+        if self.output_groups > 1:
+            weight = weight.reshape(-1, weight.shape[-1])
         if weight.dtype != self.compute_dtype:
             weight = self.cast(weight, self.compute_dtype)
         if input_.dtype != self.compute_dtype:
@@ -136,6 +147,8 @@ class Linear(nn.Cell):
 
         if self.has_bias and not self.skip_add_bias:
             bias = self.bias.to_local() if isinstance(self.bias, DTensor) else self.bias
+            if self.output_groups > 1:
+                bias = bias.reshape(-1)
             if bias.dtype != self.compute_dtype:
                 bias = self.cast(bias, self.compute_dtype)
             output = self.add(output, bias)

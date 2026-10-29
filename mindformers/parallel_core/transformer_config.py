@@ -1499,9 +1499,10 @@ class TransformerConfig:
     )
 
     linear_attention_freq: Optional[Union[int, List[int]]] = field(
-        default=1,
+        default=None,
         metadata={
-            "description": "Layer pattern for linear attention variants; an integer selects every Nth layer.",
+            "description": "Layer pattern (1=linear, 0=full); KDA requires None or an all-ones list. "
+                           "For other variants, integer N places full attention every N layers.",
             "usage": ParamUsage.TRAINING,
             "source": ParamSource.MEGATRON,
             "mode": ParamMode.COMMON
@@ -1549,7 +1550,7 @@ class TransformerConfig:
     )
 
     kda_safe_gate: bool = field(
-        default=False,
+        default=True,
         metadata={
             "description": "Whether KDA uses a bounded channel-wise decay gate.",
             "usage": ParamUsage.TRAINING,
@@ -1559,7 +1560,7 @@ class TransformerConfig:
     )
 
     kda_lower_bound: Optional[float] = field(
-        default=None,
+        default=-5.0,
         metadata={
             "description": "Lower bound for KDA safe-gate decay values.",
             "usage": ParamUsage.TRAINING,
@@ -2497,20 +2498,14 @@ class TransformerConfig:
             self.num_query_groups = self.num_attention_heads
 
         if self.experimental_attention_variant == "kda":
-            if not isinstance(self.linear_attention_freq, (int, list)):
-                raise ValueError(
-                    "KDA linear_attention_freq must be an integer or a layer-pattern list, "
-                    f"got {self.linear_attention_freq!r}."
-                )
-            if isinstance(self.linear_attention_freq, int) and self.linear_attention_freq <= 0:
-                raise ValueError("KDA linear_attention_freq must be positive.")
-            if isinstance(self.linear_attention_freq, list) and (
-                    len(self.linear_attention_freq) != self.num_layers
-                    or any(item not in (0, 1) for item in self.linear_attention_freq)
-            ):
-                raise ValueError(
-                    "KDA linear_attention_freq list must contain one 0/1 entry per layer."
-                )
+            if self.linear_attention_freq is None:
+                self.linear_attention_freq = [1] * self.num_layers
+            if self.linear_attention_freq != [1] * self.num_layers:
+                raise ValueError("KDA requires linear_attention_freq=None or a list of ones; integers are unsupported.")
+            if self.input_layout == "TND" or self.use_eod_attn_mask_compression:
+                raise ValueError("KDA requires fixed-length, unpacked sequences; TND/EOD packing is unsupported.")
+            if self.qk_layernorm:
+                raise ValueError("KDA uses Q/K L2 normalization and does not support qk_layernorm=True.")
             kda_dimensions = {
                 "linear_conv_kernel_dim": self.linear_conv_kernel_dim,
                 "linear_key_head_dim": self.linear_key_head_dim,
@@ -2551,8 +2546,8 @@ class TransformerConfig:
                 raise ValueError("Fused KDA training requires linear_key_head_dim=linear_value_head_dim=128.")
             if self.kda_chunk_size != 64:
                 raise ValueError("Fused KDA training requires kda_chunk_size=64.")
-            if self.compute_dtype not in (ms.float16, ms.bfloat16):
-                raise ValueError("Fused KDA training requires compute_dtype=float16 or bfloat16.")
+            if self.compute_dtype != ms.bfloat16 or not self.kda_safe_gate:
+                raise ValueError("Current KDA backward requires compute_dtype=bfloat16 and kda_safe_gate=True.")
             if self.kda_safe_gate:
                 if (
                         not isinstance(self.kda_lower_bound, (int, float))
@@ -2563,17 +2558,11 @@ class TransformerConfig:
                         "KDA requires kda_lower_bound to be in [-5, 0) "
                         "when kda_safe_gate=True."
                     )
-            parallel_sizes = {
-                "tensor_model_parallel_size": self.tensor_model_parallel_size,
-                "context_parallel_size": self.context_parallel_size,
-            }
-            if any(size != 1 for size in parallel_sizes.values()):
-                raise ValueError(
-                    "The minimal KDA implementation is single-card only; expected TP/PP/CP sizes "
-                    f"to all be 1, got {parallel_sizes}."
-                )
+            if self.linear_num_key_heads % self.tensor_model_parallel_size:
+                raise ValueError("KDA key/value heads must be divisible by tensor_model_parallel_size.")
 
-        if self.context_parallel_size > 1 and not self.use_flash_attention:
+        if (self.context_parallel_size > 1 and not self.use_flash_attention
+                and self.experimental_attention_variant != "kda"):
             raise ValueError("context_parallel is only available for flash attention for now, "
                              "please set use_flash_attention=True.")
 

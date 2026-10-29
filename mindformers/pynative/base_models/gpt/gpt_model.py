@@ -36,6 +36,7 @@ from mindspore.graph.api import _no_grad
 from mindformers.tools.logger import logger
 from mindformers.pynative.loss.loss import CrossEntropyLoss, ChunkCrossEntropyLoss
 from mindformers.pynative.distributed.utils import vocab_parallel_shard_dim
+from mindformers.pynative.distributed.context_parallel import is_pure_kda
 from mindformers.parallel_core.utils.spec_utils import ModuleSpec
 from mindformers.pynative.layers.mask_generate import CausalMaskGenerate
 from mindformers.parallel_core.transformer_config import TransformerConfig
@@ -622,14 +623,17 @@ class GPTModel(nn.Cell):
         if labels is not None:
             label_mask = self.cast(self.not_equal(labels, self.ignore_token_id), dtype.float32)
             loss_mask = self.mul(loss_mask, label_mask)
+        if (attention_mask is not None
+                and any(getattr(layer.self_attention, "attention_variant", None) == "kda"
+                        for layer in self.decoder.layers)):
+            raise NotImplementedError("KDA does not support an explicit attention_mask.")
         # An all-KDA decoder is causal inside the recurrence. Synthesizing a
         # dense triangular mask here sends an unsupported mask to KDA, even
         # when the caller explicitly requests its ordinary unmasked SBH path.
-        # Preserve explicit masks so KDA can reject unsupported semantics.
-        if (attention_mask is None
-                and self.config.experimental_attention_variant == "kda"
-                and all(type(layer.self_attention).__name__ == "KimiDeltaAttention"
-                        for layer in self.decoder.layers)):
+        # Custom mixed specs generate a causal mask for their FA layers;
+        # the standard KDA decoder factory currently builds all-linear layers.
+        # Transformer layers omit that generated mask at KDA boundaries.
+        if attention_mask is None and is_pure_kda(self):
             return labels, attention_mask, loss_mask
         if (self.use_eod_attn_mask_compression and actual_seq_len is not None and attention_mask is None
                 and getattr(self.config, "input_layout", None) == "TND") and self.dsa_indexer_use_sparse_loss:
