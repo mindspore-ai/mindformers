@@ -64,6 +64,33 @@ def test_apply_moe_ep_tp_propagates_use_safe_tokens(monkeypatch, dispatcher):
 @pytest.mark.level0
 @pytest.mark.platform_x86_cpu
 @pytest.mark.env_onecard
+def test_apply_moe_ep_tp_selects_pp_independent_overlap(monkeypatch):
+    """The new flag selects dispatch overlap without a pipeline orchestrator."""
+    captured = {}
+
+    def _capture_strategy(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return object()
+
+    monkeypatch.setattr(parallelize, "DispatchOverlapExpertParallel", _capture_strategy)
+    monkeypatch.setattr(parallelize, "set_comm_ops_inplace", lambda _: None)
+    monkeypatch.setattr(parallelize, "parallelize_module", lambda **_: None)
+
+    parallelize.apply_moe_ep_tp(
+        _build_moe_model(),
+        ep_mesh=object(),
+        moe_token_dispatcher_type="alltoall",
+        expert_comm_overlap=True,
+    )
+
+    assert captured["kwargs"]["shared_experts"] is None
+    assert captured["kwargs"]["use_safe_tokens"] is True
+
+
+@pytest.mark.level0
+@pytest.mark.platform_x86_cpu
+@pytest.mark.env_onecard
 def test_apply_moe_ep_overlap_tp_propagates_use_safe_tokens(monkeypatch):
     """The overlap EP strategy receives the same safe-token config."""
     captured = {}
@@ -112,6 +139,12 @@ def test_apply_moe_ep_tp_wires_shared_expert_overlap(monkeypatch):
         return object()
 
     monkeypatch.setattr(parallelize, "ExpertParallel", _capture_strategy)
+    monkeypatch.setattr(
+        parallelize,
+        "DispatchOverlapExpertParallel",
+        lambda *args, **kwargs: pytest.fail(
+            "standalone dispatch overlap must not own shared-expert communication"),
+    )
     monkeypatch.setattr(parallelize, "set_comm_ops_inplace", lambda _: None)
     monkeypatch.setattr(parallelize, "parallelize_module", lambda **_: None)
 
@@ -119,6 +152,7 @@ def test_apply_moe_ep_tp_wires_shared_expert_overlap(monkeypatch):
         model,
         ep_mesh=object(),
         moe_token_dispatcher_type="alltoall",
+        expert_comm_overlap=True,
     )
 
     assert captured["shared_experts"] is shared_experts

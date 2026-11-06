@@ -1986,20 +1986,30 @@ class Trainer:
                     # Sum the micro-batches' unnormalised token-loss and token counts; the
                     # schedule already back-propagated each micro-batch.
                     denominator = 0.0
-                    for output in outputs:
-                        loss += _to_local(output[0])
-                        denominator += _to_local(output[1])
+                    for micro_step, output in enumerate(outputs):
+                        micro_loss, micro_denominator = _to_local(output[0]), _to_local(output[1])
+                        loss += micro_loss
+                        denominator += micro_denominator
+                        self._record_pp_local_loss(micro_loss / micro_denominator, micro_step)
                     return loss, denominator
                 else:
-                    for output in outputs:
-                        if isinstance(output[0], DTensor):
-                            loss += output[0].to_local()
-                        else:
-                            loss += output[0]
+                    for micro_step, output in enumerate(outputs):
+                        micro_loss = self._extract_model_loss(output)
+                        if isinstance(micro_loss, DTensor):
+                            micro_loss = micro_loss.to_local()
+                        loss += micro_loss
+                        self._record_pp_local_loss(micro_loss, micro_step)
                     loss /= len(outputs)
 
         # return value must be Tensor or DTensor
         return loss
+
+    def _record_pp_local_loss(self, micro_loss, micro_step: int):
+        """Record loss on stages with micro-batch outputs, matching non-PP context."""
+        self.monitor.record(
+            "local_loss", micro_loss,
+            context={"micro_step": micro_step, "model": self.model},
+        )
 
     def _forward_backward(self, model, inputs: Dict[str, Any]):
         """

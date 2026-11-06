@@ -548,6 +548,14 @@ class ParallelismConfig(BaseConfig):
     with ``pipeline_parallel_overlap_b_f``. Off by default: bit-identical but wall-clock-
     neutral unless the EP counts D2H is on the critical path (large ep_degree / multi-node)."""
 
+    expert_parallel_comm_overlap: bool = False
+    """Enable PP-independent EP communication overlap for the ``alltoall`` dispatcher.
+    The routed-token dispatch A2A is explicitly pre-launched before the local group
+    list and resort routing map are built, and its stream wait is attached afterwards. This
+    works with EP alone and does not use pipeline B/F threads or A/B/C/D rendezvous.
+    When shared-expert overlap is configured, its larger FC/A2A overlap window remains
+    authoritative.  Off by default so the existing synchronous EP path is unchanged."""
+
     expert_parallel_use_safe_tokens: bool = True
     """Prepend one zero-probability safe token per expert before EP dispatch so grouped
     GEMM never receives an empty expert group. Disable only when the grouped GEMM kernel
@@ -567,6 +575,23 @@ class ParallelismConfig(BaseConfig):
                 f"'alltoall_deredundancy', but got expert_parallel={self.expert_parallel} "
                 f"< npu_nums_per_device={self.npu_nums_per_device}."
             )
+        if self.expert_parallel_comm_overlap:
+            if self.expert_parallel <= 1:
+                raise ValueError(
+                    "expert_parallel_comm_overlap=True requires expert_parallel > 1, "
+                    f"but got expert_parallel={self.expert_parallel}."
+                )
+            if self.moe_token_dispatcher_type != "alltoall":
+                raise ValueError(
+                    "expert_parallel_comm_overlap=True only supports "
+                    "moe_token_dispatcher_type='alltoall', but got "
+                    f"'{self.moe_token_dispatcher_type}'."
+                )
+            if self.pipeline_parallel_overlap_b_f:
+                raise ValueError(
+                    "expert_parallel_comm_overlap and pipeline_parallel_overlap_b_f "
+                    "are alternative EP overlap modes; enable only one."
+                )
 
 @dataclass
 class OptimizerConfig(BaseConfig):
