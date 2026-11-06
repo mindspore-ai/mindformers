@@ -60,6 +60,11 @@ class MoELayer(nn.Cell):
                 linear_fc2=Linear
             )
             self.shared_experts = SharedExpertMLP(config, submodules)
+        # Enabled by the EP parallelizer only after the all-to-all dispatcher
+        # has taken ownership of the shared-expert split forward.  Keeping the
+        # runtime flag separate from the config makes a requested overlap fall
+        # back to the normal path when EP/all-to-all is not actually active.
+        self.shared_expert_overlap_enabled = False
 
         # Determine when to apply scores: before or after experts
         self.score_before_experts = config.moe_apply_probs_on_input
@@ -110,6 +115,12 @@ class MoELayer(nn.Cell):
         if self.shared_experts is not None and hasattr(self.shared_experts, 'reset_parameter'):
             self.shared_experts.reset_parameter()
 
+    def set_shared_expert_overlap(self, enabled: bool):
+        """Select whether the EP all-to-all dispatcher owns shared-expert execution."""
+        if enabled and self.shared_experts is None:
+            raise ValueError("Shared-expert overlap requires at least one shared expert.")
+        self.shared_expert_overlap_enabled = enabled
+
     def construct(self, hidden_states: Tensor, input_ids: Tensor = None):
         """
         Forward pass for MoELayer.
@@ -131,7 +142,7 @@ class MoELayer(nn.Cell):
         )
 
         shared_output = None
-        if self.shared_experts is not None:
+        if self.shared_experts is not None and not self.shared_expert_overlap_enabled:
             shared_output = self.shared_experts(hidden_states)
 
         out_experts = self.reshape(routed_output, (seq, batch, dim))
