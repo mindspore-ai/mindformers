@@ -145,11 +145,11 @@ class Partition:
         """split_sentence"""
         input_file_name, output_file_name = file_name
         print("Opening", input_file_name)
+        encoder = Encoder(self.args)
         with open(input_file_name, 'r', encoding='utf-8') as fin, \
                 open(output_file_name, 'w', encoding='utf-8') as fout, \
                 multiprocessing.Pool(self.workers, initializer=encoder.initializer) as pool:
 
-            encoder = Encoder(self.args)
             split_docs = pool.imap(encoder.split, fin, 32)
 
             proc_start = time.time()
@@ -164,11 +164,11 @@ class Partition:
         """Processing json file"""
         input_file_name, output_prefix = file_name
         print("Opening", input_file_name)
+        startup_start = time.time()
+        encoder = Encoder(self.args)
         with open(input_file_name, 'r', encoding='utf-8') as fin, \
                 multiprocessing.Pool(self.workers, initializer=encoder.initializer) as pool:
 
-            startup_start = time.time()
-            encoder = Encoder(self.args)
             encoded_docs = pool.imap(encoder.encode, fin, 32)
 
             level = "document"
