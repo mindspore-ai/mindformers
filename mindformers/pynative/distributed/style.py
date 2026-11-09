@@ -25,6 +25,7 @@ from mindspore.common._grad_function import _Function
 from mindspore.ops import communication as ops_comm
 
 from hyper_parallel import DTensor, DeviceMesh
+from hyper_parallel.core.activation_checkpoint import is_recomputing
 from hyper_parallel.core.context_parallel.async_context_parallel import AsyncContextParallel as HPAsyncContextParallel
 from hyper_parallel.core.context_parallel.async_dsa_context_parallel import (
     AsyncDSAIndexerContextParallel as HPAsyncDSAIndexerContextParallel,
@@ -415,12 +416,17 @@ class HPDSAContextParallelAdapter(ParallelStyle):
             attention_style: ParallelStyle,
             indexer_loss_style: Optional[HPDSAIndexerLossContextParallel] = None,
             use_sparse_loss: bool = True,
+            layerwise_indexer_backward: bool = False,
     ):
         super().__init__()
         self.indexer_style = indexer_style
         self.attention_style = attention_style
         self.indexer_loss_style = indexer_loss_style
         self.use_sparse_loss = use_sparse_loss
+        # Comes from the config, not from the module ``_apply`` is handed: that module is the
+        # *core attention* (``DSAttention``), which has no such attribute -- probing it there
+        # made this branch silently dead and cost the whole memory saving.
+        self.layerwise_indexer_backward = layerwise_indexer_backward
 
     @staticmethod
     def _maybe_get_cell(module: Optional[nn.Cell], name: str) -> Optional[nn.Cell]:
@@ -501,17 +507,32 @@ class HPDSAContextParallelAdapter(ParallelStyle):
         else:
             self.attention_style.apply(attention_boundary, device_mesh)
 
-    def _release_shared_replicate_cache_after_attention(self, attention_boundary):
-        """Free a Shared layer's replicated key/value once main attention is done.
+    def _release_shared_replicate_cache_after_attention(self, attention_boundary, replay_only=False):
+        """Free the replicated key/value once main attention is done, where nobody else will.
 
         ``DSASequenceReplicateCache`` exists so the indexer loss can reuse the key/value
-        AllGather that sparse attention already paid for, and it is emptied by the
-        indexer-loss completion hook. A Shared layer has no indexer loss, so that hook
-        never runs and the replicated tensors stay reachable until this layer's *next*
-        forward -- i.e. across the whole backward. Measured on 12 layers / share_size=4:
-        the 9 Shared layers each pinned 1 GiB that the Full-layer run released promptly.
-        Clearing here only drops the cache's own references; autograd still holds
-        whatever the backward needs.
+        AllGather that sparse attention already paid for, and it is emptied inside the
+        **indexer loss's own pre-hook** (the ``finally`` that runs right after that hook has
+        built the loss's inputs, before the loss itself computes). Two cases leave that
+        pre-hook unrun, and both end with the replicated tensors reachable until this
+        layer's *next* forward -- i.e. across the whole backward:
+
+        * A **Shared** layer has no indexer loss at all. Measured on 12 layers /
+          share_size=4: the 9 Shared layers each pinned 1 GiB that the Full-layer run
+          released promptly. (``replay_only=False``: clear on every forward.)
+        * A **Full** layer under ``dsa_indexer_layerwise_backward``, *during a replay*. The
+          loss is excluded from recompute there, so the replay pops its cached output and
+          never enters the module -- while sparse attention is not excluded and its
+          pre-hook refills the cache. One full-length KV latent per layer then survives
+          from that layer's replay to the next step. Measured at 512k / 1024 cards, 45
+          layers + MTP: peak 62.3 GB with this unfreed, 41.7 GB with it freed.
+          (``replay_only=True``: the original forward still runs the loss's pre-hook, and
+          clearing before the loss runs would throw away the very gather it is meant to
+          reuse. A Full layer whose loss is *not* excluded gets no hook at all -- see the
+          call site.)
+
+        Clearing here only drops the cache's own references; autograd still holds whatever
+        the backward needs.
         """
         cache = getattr(self.attention_style, "shared_replicate_cache", None)
         if cache is None:
@@ -519,6 +540,8 @@ class HPDSAContextParallelAdapter(ParallelStyle):
 
         def _clear_cache(hook_module, args, kwargs, outputs):
             del hook_module, args, kwargs
+            if replay_only and not is_recomputing():
+                return outputs
             cache.clear()
             return outputs
 
@@ -552,9 +575,23 @@ class HPDSAContextParallelAdapter(ParallelStyle):
         if not self.use_sparse_loss:
             self._set_dsa_dense_softmax_converter_cp_rank(core_attention, device_mesh)
         self._apply_attention_style(module, core_attention, attention_boundary, device_mesh)
+        # Registered after the style so it runs behind HP's own forward hooks. What decides
+        # whether this layer needs the hook at all is *who else would empty the cache*:
+        #
+        # * Shared layer (no indexer loss of its own): nobody, ever -> clear every forward.
+        # * Full layer whose indexer loss is excluded from recompute (only under
+        #   ``dsa_indexer_layerwise_backward``): the loss's own pre-hook empties it in the
+        #   original forward, but a replay pops the excluded output and never enters the
+        #   module -> clear on replays only.
+        # * Any other Full layer: the loss runs in the replay too and empties the cache
+        #   itself. Clearing here would land *before* it and throw away the very gather it
+        #   is meant to reuse -- it would still be correct, just one redundant full-length
+        #   AllGather per layer per replay. So this layer gets no hook at all.
         if compute_sparse_indices is None:
-            # Registered after the style so it runs behind HP's own forward hooks.
             self._release_shared_replicate_cache_after_attention(attention_boundary)
+        elif self.layerwise_indexer_backward:
+            self._release_shared_replicate_cache_after_attention(
+                attention_boundary, replay_only=True)
 
         if self.indexer_loss_style is not None and compute_indexer_loss is not None:
             if isinstance(self.indexer_loss_style, HPAsyncDSAIndexerLossContextParallel):
@@ -664,6 +701,7 @@ def build_hp_dsa_cp_style(
         input_layout: Optional[str] = None,
         async_enabled: bool = False,
         use_sparse_loss: bool = True,
+        layerwise_indexer_backward: bool = False,
 ) -> HPDSAContextParallelAdapter:
     """Build a MindFormers wrapper for Hyper-Parallel DSA CP style.
 
@@ -775,7 +813,7 @@ def build_hp_dsa_cp_style(
         attention_style,
         indexer_loss_style,
         use_sparse_loss=use_sparse_loss,
-
+        layerwise_indexer_backward=layerwise_indexer_backward,
     )
 
 def build_hp_async_cp_style(

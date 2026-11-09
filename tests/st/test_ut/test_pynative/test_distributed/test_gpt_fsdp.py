@@ -170,10 +170,9 @@ def test_apply_fsdp_wraps_each_layer_once(monkeypatch):
 
     parallelize.apply_fsdp(model, parallel_dims, parallelism)
 
+    # Per-layer indexer backward is off here, so no layer gets the nested indexer unit and
+    # the wrapped set is exactly the three ordinary ones.
     assert [module for module, _ in wrapped] == [decoder_layer, mtp_layer, model]
-    # DSA warm-up per-layer backward is off here, so no indexer weight is taken out of FSDP.
-    assert not any(getattr(p, "_warmup_layerwise_grad", False)
-                   for p in (decoder_max_logits, mtp_max_logits))
     assert mtp_layer.transformer_layer not in [module for module, _ in wrapped]
     assert all(call[1]["comm_fusion"] is False for call in wrapped)
     expected_ignored = {

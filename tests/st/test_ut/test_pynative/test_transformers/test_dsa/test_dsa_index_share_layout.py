@@ -157,3 +157,17 @@ def test_checkpoint_converter_mapping_accepts_glm5_names():
     assert mapping["index_topk_freq"] == "dsa_indexer_topk_freq"
     assert mapping["index_skip_topk_offset"] == "dsa_indexer_skip_topk_offset"
     assert mapping["indexer_types"] == "dsa_indexer_types"
+
+
+@pytest.mark.level0
+@pytest.mark.platform_x86_cpu
+@pytest.mark.parametrize("value", [None, False, True])
+def test_layerwise_switch_survives_model_and_checkpoint_conversion(value):
+    """Exercise the public model converter and the independent checkpoint mapping."""
+    from mindformers.parallel_core.transformer_config_utils import convert_to_transformer_config
+
+    knobs = {} if value is None else {"dsa_indexer_layerwise_backward": value}
+    config = DeepseekV3ConfigConverter.convert(_model_config(**knobs), is_mla_model=True)
+    assert config.dsa_indexer_layerwise_backward is (value is True)
+    converted = convert_to_transformer_config(_model_config(**knobs), is_mla_model=True)
+    assert converted.dsa_indexer_layerwise_backward is (value is True)

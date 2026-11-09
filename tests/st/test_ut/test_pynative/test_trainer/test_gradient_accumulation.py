@@ -14,7 +14,10 @@
 # ============================================================================
 """Tests for PyNative trainer gradient-accumulation communication scheduling."""
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, call
+
+import pytest
 
 from hyper_parallel.core.fully_shard.api import HSDPModule
 
@@ -67,3 +70,28 @@ def test_training_step_enables_all_reduce_only_on_last_micro_step():
     assert trainer._optimizer_update.call_count == 1
     assert loss == 10.0
     assert grad_norm == 0.0
+
+
+@pytest.mark.parametrize("frozen_trunk", [False, True])
+def test_per_token_backward_respects_early_warmup_backward(monkeypatch, frozen_trunk):
+    """Frozen warm-up already consumed the indexer graph during compute_loss."""
+    from mindformers.pynative.trainer import trainer as trainer_module
+
+    backward_calls = []
+
+    class _Loss:
+        def backward(self, seed):
+            backward_calls.append(seed)
+
+    numerator, denominator, seed = _Loss(), object(), object()
+    trainer = Trainer.__new__(Trainer)
+    trainer.compute_loss = MagicMock(return_value=(numerator, denominator))
+    trainer.enable_parallel = False
+    trainer.config = SimpleNamespace(parallelism=SimpleNamespace())
+    trainer.num_accumulation_steps = 2
+    trainer.calculate_per_token_loss = True
+    trainer._dsa_frozen_trunk_layerwise = frozen_trunk
+    monkeypatch.setattr(trainer_module, "get_loss_sense", lambda **kwargs: seed)
+
+    assert trainer._forward_backward(object(), {}) == (numerator, denominator)
+    assert backward_calls == ([] if frozen_trunk else [seed])

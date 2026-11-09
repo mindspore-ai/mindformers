@@ -18,9 +18,20 @@
 from mindspore import Tensor, mint, ops
 from mindspore.common._grad_function import _Function
 
+from hyper_parallel.core.activation_checkpoint import is_recomputing
+
 from mindformers.parallel_core.transformer_config import MLATransformerConfig
 from mindformers.pynative.layers.identity_op import IdentityOp
-from mindformers.pynative.transformers.experimental_attention_variant.indexer import _IndexerLossAutoScaler
+from mindformers.pynative.transformers.experimental_attention_variant.indexer import (
+    DSA_WARMUP_LOSS_SINK,
+    _IndexerLossAutoScaler,
+    layerwise_indexer_backward,
+    publish_excluded_indexer_outputs,
+    publish_indexer_fsdp_unit,
+)
+from mindformers.pynative.transformers.experimental_attention_variant.dsa_indexer import (
+    INDEXER_TOPK_SLOT,
+)
 from mindformers.pynative.transformers.experimental_attention_variant.dsa import (
     dsa_layer_index_share_group_size,
     dsa_layer_is_index_leader,
@@ -165,19 +176,22 @@ class DSASelfAttention(MLASelfAttention):
         self.sparse_loss = config.dsa_indexer_use_sparse_loss
         self.index_share_loss_mode = config.dsa_indexer_share_loss
         self.index_share_group_size = dsa_layer_index_share_group_size(config, layer_number)
-        # Per-layer warm-up backward runs this layer's indexer backward in the middle of the
-        # block's forward, so that backward must not leave the indexer's own subgraph: any
-        # gradient reaching an earlier layer's output tensor fires FSDP's backward pre-hook,
-        # which unshards that layer while the forward is still using it (device-side abort in
+        # Per-layer backward runs this layer's indexer backward in the middle of the block's
+        # forward, so that backward must not leave the indexer's own subgraph: any gradient
+        # reaching an earlier layer's output tensor fires FSDP's backward pre-hook, which
+        # unshards that layer while the forward is still using it (device-side abort in
         # ``alloc_unsharded_param_buffers``). ``_DSADetachFunction`` returns *zeros* rather
         # than nothing, so it does not stop that walk; and the indexer loss also reads the
-        # dense path's ``query``/``key``/softmax statistics, a second way back into the trunk.
-        # Both are cut properly below. The trunk is frozen in this stage, so nothing that is
-        # being trained loses gradient by cutting them.
-        self.layerwise_warmup_backward = (
-            not config.dsa_indexer_use_sparse_loss
-            and config.dsa_indexer_layerwise_backward
-        )
+        # attention's ``query``/``key``/softmax statistics, a second way back into the trunk.
+        # Both are cut properly below, in either stage. Nothing that is being trained loses
+        # gradient by cutting them: the warm-up stage's trunk is frozen, and in the sparse
+        # stage those two paths carry no gradient to begin with -- ``_DSADetachFunction``
+        # hands the trunk zeros, and the fused loss operator returns no gradient for
+        # ``query``/``key``/softmax (see ``_DSAIndexerGradFunction.backward``).
+        # The two stages differ only in what else per-layer backward implies (the warm-up
+        # stage also drops the trunk's step-end backward); ``layerwise_indexer_backward`` is
+        # the stage-neutral predicate.
+        self.layerwise_indexer_backward = layerwise_indexer_backward(config)
         self.dsa_value_handoff = IdentityOp()
         self.dsa_loss_key_indexer_handoff = IdentityOp()
 
@@ -219,9 +233,9 @@ class DSASelfAttention(MLASelfAttention):
             q_a = self.q_layernorm(q_a)
         q_compress = q_a
         # ``_DSADetachFunction`` returns *zeros* rather than nothing, so the autograd walk
-        # does not stop at it. Under per-layer warm-up backward that walk would reach an
+        # does not stop at it. Under per-layer indexer backward that walk would reach an
         # earlier layer's output and fire FSDP's backward pre-hook mid-forward; cut for real.
-        if self.layerwise_warmup_backward:
+        if self.layerwise_indexer_backward:
             x_detached = x.detach()
             q_compress_detached = q_compress.detach()
         else:
@@ -229,13 +243,25 @@ class DSASelfAttention(MLASelfAttention):
             q_compress_detached = _DSADetachFunction.apply(q_compress)
         is_leader = self.core_attention.is_index_leader
         if is_leader:
-            (
-                q_index, k_index, idx_weights,
-                topk_indices, _, softmax_max_index, softmax_sum_index,
-            ) = self.core_attention.indexer(
+            indexer_outputs = self.core_attention.indexer(
                 x_detached, q_compress_detached, rotary_pos_emb,
                 actual_seq_len, actual_seq_len,
             )
+            (
+                q_index, k_index, idx_weights,
+                topk_indices, _, softmax_max_index, softmax_sum_index,
+            ) = indexer_outputs
+            if self.layerwise_indexer_backward and self.training:
+                # Advance the nested indexer FSDP unit after its early backward.
+                # Warm-up has no step-end backward, so it also needs an explicit drain.
+                # The publisher unwraps any checkpoint exclusion wrapper.
+                publish_indexer_fsdp_unit(
+                    self.core_attention.indexer, needs_drain=not self.sparse_loss)
+            if (self.layerwise_indexer_backward and self.sparse_loss and self.training
+                    and index_share_group is None):
+                # Replay consumes only Top-K; the excluded loss reuses its own cache.
+                # Keep leader projections intact when IndexShare layers still need them.
+                publish_excluded_indexer_outputs(indexer_outputs, INDEXER_TOPK_SLOT)
             # Dense warm-up produces no Top-K (``dsa_indexer.py`` returns None when not
             # ``sparse_loss``); there the group shares the leader's *indexer*, not its
             # selection, so leave ``topk_indices`` unset rather than publishing a None.
@@ -319,8 +345,50 @@ class DSASelfAttention(MLASelfAttention):
                 self.layer_number + 1,
                 self.config.num_layers + (self.config.mtp_num_layers or 0),
             )
-            output = _IndexerLossAutoScaler.apply(output, indexer_loss)
+            if self.layerwise_indexer_backward and not self.sparse_loss:
+                # Dense warm-up: the layer's boundary owns the hand-off, because it also has
+                # to cut the frozen trunk (``_finish_layer``). Leave the term to it.
+                pass
+            elif self.layerwise_indexer_backward and self.training:
+                # ``self.training`` matters: the block only opens a sink while training, so an
+                # eval forward would find none and raise. The term is still computed there
+                # (the tracker reports it), it just has nobody to back-propagate it.
+                self._publish_layerwise_indexer_loss(indexer_loss)
+            else:
+                output = _IndexerLossAutoScaler.apply(output, indexer_loss)
         return output, attention_loss
+
+    @staticmethod
+    def _publish_layerwise_indexer_loss(indexer_loss):
+        """Hand this layer's indexer loss to the caller's sink instead of the step-end backward.
+
+        The sparse stage's per-layer backward differs from the warm-up stage's in what it
+        leaves alone: the trunk keeps its ordinary graph and its step-end backward, and only
+        the indexer's own subgraph is flushed early. So there is no boundary ``_Function``
+        here -- the only change is that the term is buffered for
+        ``flush_warmup_indexer_backward`` rather than seeded by ``_IndexerLossAutoScaler``
+        from the language-model loss. Doing both would back-propagate the same graph twice.
+        """
+        if is_recomputing():
+            # The trunk stays inside its checkpoint region, so this forward runs a second
+            # time while the step-end backward replays the layer. The indexer subtree is
+            # excluded from that region and hands back its cached output, but this code path
+            # still runs -- and the term it carries was flushed during the real forward. The
+            # sink is long gone by then; publishing again would be a second backward of a
+            # graph that is already consumed.
+            return
+        sink = DSA_WARMUP_LOSS_SINK.sink
+        if sink is None:
+            # Falling back to the autoscaler here would be silent: whoever called this layer
+            # opened no sink, so nothing would ever flush the term -- except the autoscaler,
+            # which the layer above has no reason to expect. Name the contract instead.
+            raise RuntimeError(
+                "DSA per-layer indexer backward is on but no indexer-loss sink is published "
+                "on this thread. The caller of this layer must wrap the call in "
+                "`warmup_indexer_loss_sink(...)`; otherwise this layer's indexer would train "
+                "on no gradient at all."
+            )
+        sink.append(indexer_loss)
 
     def _indexer_loss(self, is_leader, group,
                       query, key, q_index, k_index, idx_weights,
@@ -348,11 +416,13 @@ class DSASelfAttention(MLASelfAttention):
           produce no loss term at all. The trade is supervision coverage, and the paper's
           gradient-equivalence no longer holds.
         """
-        # The teacher is built from the dense path's own q/k/softmax statistics, which is a
-        # second way back into the frozen trunk. Under per-layer warm-up backward that walk
-        # would reach an earlier layer mid-forward and fire FSDP's backward pre-hook, so cut
-        # it. Only the teacher is cut -- the indexer's own projections must keep gradient.
-        if self.layerwise_warmup_backward:
+        # The teacher is built from the attention path's own q/k/softmax statistics, which is a
+        # second way back into the trunk. Under per-layer backward that walk would reach an
+        # earlier layer mid-forward and fire FSDP's backward pre-hook, so cut it. The fused
+        # operator returns no gradient for these anyway, in either stage, so cutting them
+        # changes nothing numerically. Only the teacher is cut -- the indexer's own
+        # projections must keep gradient.
+        if self.layerwise_indexer_backward:
             query = query.detach()
             key = key.detach()
             softmax_max = softmax_max.detach()

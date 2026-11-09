@@ -99,6 +99,9 @@ from mindformers.pynative.transformers.moe.moe_layer import MoELayer
 from mindformers.pynative.transformers.moe.moe_utils import set_moe_aux_loss_group_info
 from mindformers.pynative.transformers.experimental_attention_variant.csa import CompressedSparseAttention
 from mindformers.pynative.transformers.experimental_attention_variant.dsa import DSAttention
+from mindformers.pynative.transformers.experimental_attention_variant.indexer import (
+    layerwise_indexer_backward,
+)
 from mindformers.tools.logger import logger
 
 __all__ = ["parallelize_gptmodel"]
@@ -255,22 +258,37 @@ def is_norm_module(module):
     return False
 
 
-def _layer_inner_hsdp_modules(layer: nn.Cell) -> List[nn.Cell]:
-    """Return all FSDP-wrapped sub-modules nested inside a layer (excluding the layer itself)."""
+def _layer_inner_hsdp_modules(layer: nn.Cell, *, skip_early_indexers: bool = False) -> List[nn.Cell]:
+    """Return nested FSDP units, optionally skipping indexers consumed by early backward."""
     if not layer:
         return []
-    return [m for _, m in layer.cells_and_names() if isinstance(m, HSDPModule) and m is not layer]
+    cells = list(layer.cells_and_names())
+    early_indexers = set()
+    if skip_early_indexers:
+        # These units have already finished backward during forward. Step-end
+        # prefetch would issue all-gathers that no consumer will ever wait.
+        early_indexers = {
+            id(_layer_indexer_module(cell)) for _, cell in cells
+            if getattr(cell, "layerwise_indexer_backward", False)
+        }
+    return [
+        module for _, module in cells
+        if isinstance(module, HSDPModule) and module is not layer and id(module) not in early_indexers
+    ]
 
 
 def _setup_gpt_prefetch(
         embedding: nn.Cell,
         transformer_layers: List[nn.Cell],
         tail_modules: List[nn.Cell],
+        embedding_reused: bool = False,
 ) -> None:
     """Set up forward and backward prefetch chains for GPT FSDP modules.
 
     Each layer additionally prefetches its own inner fully_shard-wrapped MoE
     experts so their all-gathers can overlap with the layer's forward/backward.
+    ``embedding_reused`` marks the embedding shared with MTP, whose later call
+    must not re-prefetch a decoder indexer that has already finished backward.
     """
     if not transformer_layers:
         return
@@ -285,7 +303,9 @@ def _setup_gpt_prefetch(
 
     # --- Forward prefetch: embedding -> layer[0] -> ... -> [final_layernorm, output_layer] ---
     if embedding is not None and isinstance(embedding, HSDPModule):
-        targets = _layer_inner_hsdp_modules(transformer_layers[0])
+        # MTP invokes this embedding again after the decoder's early indexer
+        # backward. Do not re-prefetch that completed indexer on the shared hook.
+        targets = _layer_inner_hsdp_modules(transformer_layers[0], skip_early_indexers=embedding_reused)
         targets.append(transformer_layers[0])
         embedding.set_modules_to_forward_prefetch(targets)
 
@@ -311,7 +331,7 @@ def _setup_gpt_prefetch(
     for layer, prev_layer in zip(reversed_layers, prev_layers):
         if not isinstance(layer, HSDPModule):
             continue
-        targets = _layer_inner_hsdp_modules(prev_layer)
+        targets = _layer_inner_hsdp_modules(prev_layer, skip_early_indexers=True)
         if prev_layer is not None:
             targets.append(prev_layer)
         elif embedding is not None and isinstance(embedding, HSDPModule):
@@ -504,51 +524,6 @@ def _build_expert_fsdp_policy(experts, shard_size):
     return _build_fsdp_policy(experts, shard_size, param_rules=param_rules)
 
 
-def _tag_warmup_indexer_grad_sync(layers, mtp, grad_mesh):
-    """Mark the DSA warm-up indexer weights so their gradients regain a DTensor layout.
-
-    :func:`_collect_layer_fsdp_ignored_params` keeps these weights out of FSDP so a per-layer
-    backward fired mid-forward cannot trip the unshard/reshard lifecycle. The parameters stay
-    ``Replicate()`` DTensors on the TP mesh (``_dsa_attention_layer_plan`` puts them there),
-    but *only FSDP re-wraps a gradient as a DTensor* -- an ignored parameter's ``.grad`` comes
-    back as a bare Tensor, and the layout that says "sum me over these meshes, then I am
-    replicated" is lost. Muon then classifies it as ``local_2d`` purely because
-    ``isinstance(grad, DTensor)`` is False.
-
-    Rather than hand-rolling the reductions (an all-reduce per mesh) plus a hand-maintained
-    replica count for the grad-norm, tag the mesh the gradient must be summed over and let
-    ``_maybe_sync_warmup_indexer_grad`` restate it declaratively: the raw per-rank gradient is
-    ``Partial()`` on that mesh, and redistributing it to ``Replicate()`` is exactly the
-    reduction. ``_get_grad_factor`` then reads the replica count off the placements by itself.
-
-    Every such weight also gets ``_warmup_layerwise_grad``. That marker, not the mesh, is what
-    the trainer's ``zero_grad`` keys off: FSDP walks only its *managed* parameters, so these
-    have to be cleared by hand every step, and that is true even when there is no mesh to
-    reduce over. Under pure pipeline parallelism (dp = tp = 1) ``grad_mesh`` is ``None`` and
-    conflating the two left the gradients accumulating across steps -- the global grad norm
-    then drifted toward 2x the single-stage value by step 100.
-    """
-    all_layers = list(layers)
-    if mtp is not None:
-        all_layers.extend(mtp_layer.transformer_layer for mtp_layer in mtp.layers)
-
-    tagged = 0
-    for layer in all_layers:
-        if not getattr(layer, "layerwise_warmup_backward", False):
-            continue
-        self_attention = getattr(layer, "self_attention", None)
-        core_attention = getattr(self_attention, "core_attention", None)
-        indexer = getattr(core_attention, "indexer", None)
-        if indexer is None:
-            continue
-        for param in indexer.get_parameters():
-            param._warmup_layerwise_grad = True
-            if grad_mesh is not None and grad_mesh.size() > 1:
-                param._warmup_grad_mesh = grad_mesh
-            tagged += 1
-    return tagged
-
-
 def _collect_layer_fsdp_ignored_params(layer):
     """Collect mutable runtime state that FSDP must leave unmanaged.
 
@@ -582,18 +557,24 @@ def _collect_layer_fsdp_ignored_params(layer):
     if max_logits_val is not None:
         ignored_params.add(max_logits_val)
 
-    if getattr(layer, "layerwise_warmup_backward", False):
-        # Per-layer warm-up backward makes this layer's indexer gradients land while the block
-        # is still running later layers' forwards. For an FSDP-managed parameter that fires
-        # the owning cell's backward pre-hook, which unshards it mid-forward and aborts on
-        # device. Leaving the indexer unmanaged avoids that; the DP reduction FSDP would have
-        # done for it is issued explicitly instead (see ``_tag_warmup_indexer_grad_sync``).
-        indexer = getattr(core_attention, "indexer", None)
-        if indexer is not None:
-            for param in indexer.get_parameters():
-                ignored_params.add(param)
-
     return ignored_params
+
+
+def _layer_indexer_module(layer):
+    """Return this layer's real indexer module, or None.
+
+    AC (phase 4) runs before FSDP (phase 5) and replaces ``core_attention.indexer`` with
+    ``CheckpointExcludeWrapper``. FSDP must be applied to the *wrapped* module: during a
+    recompute replay the wrapper returns its cached output without calling the inner module,
+    so hooks registered on the inner module fire exactly once per step, while hooks on the
+    wrapper would fire again mid-backward.
+    """
+    self_attention = getattr(layer, "self_attention", None)
+    core_attention = getattr(self_attention, "core_attention", None)
+    indexer = getattr(core_attention, "indexer", None)
+    if indexer is None:
+        return None
+    return getattr(indexer, "_ckpt_wrapped_module", indexer)
 
 
 def _build_layer_fsdp_policy(layer, shard_size):
@@ -1391,6 +1372,32 @@ def _resolve_dense_fsdp_config(parallelism, base_fsdp_config, parallel_dims):
     return {**base_fsdp_config, "mesh": dense_mesh}, shard_size
 
 
+def _shard_layer_indexer(layer, fsdp_config, shard_degree):
+    """Shard an early-backward indexer independently of its outer layer.
+
+    Detached inputs bypass automatic post-backward finalization, so the loss sink
+    explicitly finalizes this unit. Keep weights unsharded between its forward
+    and immediate backward, and isolate its hooks from the outer root graph.
+    """
+    if not getattr(layer, "layerwise_indexer_backward", False):
+        return
+    indexer = _layer_indexer_module(layer)
+    if indexer is None:
+        return
+    replicate_params = _collect_module_replicate_params(indexer, shard_degree)
+    with ms.DeviceCtx("meta"):
+        fully_shard(
+            indexer,
+            **fsdp_config,
+            reshard_after_forward=False,
+            replicate_params=replicate_params,
+        )
+    indexer._dsa_layerwise_fsdp_managed = True
+    if not hasattr(indexer, "set_isolated_backward"):
+        raise ValueError("Layerwise indexer FSDP requires hyper-parallel set_isolated_backward().")
+    indexer.set_isolated_backward(True)
+
+
 def apply_fsdp(
         model: nn.Cell,
         parallel_dims: Any,
@@ -1498,28 +1505,6 @@ def apply_fsdp(
             fsdp_ignored_params.update(
                 _collect_layer_fsdp_ignored_params(mtp_layer.transformer_layer)
             )
-    # Sum over every mesh axis the (unsharded) indexer weight is replicated on: the FSDP
-    # domain and, when tp > 1, the TP axis.  The TP axis looks redundant -- the TP-paired
-    # ranks hold bit-identical indexer gradients, because ``_dsa_attention_layer_plan``
-    # all-gathers the indexer's sequence input and the loss's head-bearing inputs so every
-    # TP rank runs the same complete indexer -- but summing it and declaring the result
-    # ``Replicate()`` on the same axis is what makes ``_get_grad_factor`` divide the global
-    # grad norm by the whole domain, counting this weight exactly once.  The two halves are
-    # a pair: dropping only the sum leaves the division behind and the grad norm comes out
-    # a factor sqrt(tp) low (measured against the FSDP-managed path: 2.8e-04 -> 2.9e-01).
-    grad_mesh_dims = list(dp_mesh.mesh_dim_names or ()) if dp_mesh is not None else []
-    if parallel_dims.get_optional_mesh("tp") is not None:
-        grad_mesh_dims.append("tp")
-    grad_mesh = parallel_dims.get_optional_mesh(grad_mesh_dims) if grad_mesh_dims else None
-    tagged = _tag_warmup_indexer_grad_sync(layers, mtp, grad_mesh)
-    if tagged:
-        logger.info(
-            "DSA warm-up per-layer backward: %d indexer parameters kept outside FSDP; "
-            "the trainer clears their gradients each step, and %s.", tagged,
-            f"sums them as Partial on mesh {grad_mesh_dims} before the optimizer step"
-            if grad_mesh is not None and grad_mesh.size() > 1
-            else "no cross-rank sum is needed (the weight is replicated nowhere)",
-        )
     tail_modules = [
         m for m in [
             getattr(gpt_model.decoder, "final_layernorm", None),
@@ -1565,6 +1550,8 @@ def apply_fsdp(
                     ignored_params=fsdp_ignored_params,
                     replicate_params=expert_replicate_params,
                 )
+
+        _shard_layer_indexer(layer, fsdp_config, dense_shard_degree)
 
         layer_shard_plan, replicate_params = _build_layer_fsdp_policy(
             layer, dense_shard_degree
@@ -1631,6 +1618,8 @@ def apply_fsdp(
                         replicate_params=expert_replicate_params,
                     )
 
+            _shard_layer_indexer(layer.transformer_layer, fsdp_config, dense_shard_degree)
+
             layer_shard_plan, mtp_replicate_params = _build_mtp_fsdp_policy(
                 layer, dense_shard_degree
             )
@@ -1677,7 +1666,7 @@ def apply_fsdp(
             layers.extend(tail_modules)
         for mtp_layer in mtp.layers:
             layers.append(mtp_layer)
-        _setup_gpt_prefetch(embedding, layers, [])
+        _setup_gpt_prefetch(embedding, layers, [], True)
     else:
         _setup_gpt_prefetch(embedding, layers, tail_modules)
 
@@ -1820,6 +1809,7 @@ def apply_context_parallel_attention(
             async_enabled=async_enabled,
             attention_variant="dsa",
             dsa_use_sparse_loss=getattr(model_config, "dsa_indexer_use_sparse_loss", True),
+            dsa_indexer_layerwise_backward=layerwise_indexer_backward(model_config),
         )
 
     def _find_one_module(transformer_block, block_label, suffix):

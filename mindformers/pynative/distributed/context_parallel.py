@@ -104,7 +104,7 @@ class ContextParallelAttentionStyle(ParallelStyle):
 class DSAContextParallelAttentionStyle(ParallelStyle):
     """Attention-side CP style for PyNative DSA core-attention modules."""
     def __init__(self, method: str, cp_size: int, ulysses_degree_in_cp=None, input_layout=None,
-                 async_enabled: bool = False, use_sparse_loss: bool = True):
+                 async_enabled: bool = False, use_sparse_loss: bool = True, layerwise_indexer_backward: bool = False):
         super().__init__()
         self.method = method.lower()
         self.cp_size = cp_size
@@ -112,6 +112,7 @@ class DSAContextParallelAttentionStyle(ParallelStyle):
         self.input_layout = input_layout
         self.async_enabled = async_enabled
         self.use_sparse_loss = use_sparse_loss
+        self.layerwise_indexer_backward = layerwise_indexer_backward
 
     def _apply(self, module: nn.Cell, device_mesh: DeviceMesh) -> nn.Cell:
         hp_style = build_hp_dsa_cp_style(
@@ -121,6 +122,7 @@ class DSAContextParallelAttentionStyle(ParallelStyle):
             input_layout=self.input_layout,
             async_enabled=self.async_enabled,
             use_sparse_loss=self.use_sparse_loss,
+            layerwise_indexer_backward=self.layerwise_indexer_backward,
         )
         return hp_style._apply(module, device_mesh)
 
@@ -134,7 +136,8 @@ def build_context_parallel_attention_style(method: str,
                                            input_layout=None,
                                            async_enabled: bool = False,
                                            attention_variant=None,
-                                           dsa_use_sparse_loss: bool = True) -> ParallelStyle:
+                                           dsa_use_sparse_loss: bool = True,
+                                           dsa_indexer_layerwise_backward: bool = False) -> ParallelStyle:
     """Build the MindFormers attention-side CP style."""
     if attention_variant == "dsa":
         return DSAContextParallelAttentionStyle(
@@ -144,6 +147,7 @@ def build_context_parallel_attention_style(method: str,
             input_layout=input_layout,
             async_enabled=async_enabled,
             use_sparse_loss=dsa_use_sparse_loss,
+            layerwise_indexer_backward=dsa_indexer_layerwise_backward,
         )
     if async_enabled:
         return build_hp_async_cp_style(

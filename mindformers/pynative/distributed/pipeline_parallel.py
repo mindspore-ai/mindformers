@@ -244,9 +244,11 @@ class StageModelBuilder:
         # ``model_config`` here is the model's HF-style config, which carries a key only when
         # the yaml sets it -- read it with a default, or every pipeline run that never mentions
         # this switch (all of them, today) dies on an ``AttributeError``.
-        has_backward = has_backward and not getattr(
-            model_config, "dsa_indexer_layerwise_backward", False)
-        
+        has_backward = has_backward and not (
+            getattr(model_config, "dsa_indexer_layerwise_backward", False)
+            and not getattr(model_config, "dsa_indexer_use_sparse_loss", True)
+        )
+
         stages = []
         model_parts = []
         

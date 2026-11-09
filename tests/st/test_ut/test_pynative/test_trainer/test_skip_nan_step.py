@@ -21,11 +21,12 @@ import numpy as np
 import pytest
 
 import mindspore as ms
-from mindspore import Tensor
+from mindspore import Tensor, Parameter
 
 from mindformers.pynative.trainer import trainer as trainer_module
 from mindformers.pynative.trainer.trainer import Trainer
 from mindformers.pynative.trainer.train_state import TrainerState
+from mindformers.pynative.trainer import utils as trainer_utils
 
 
 def _build_trainer(use_skip_step_on_nan=True, max_consecutive_skipped_steps=0):
@@ -38,7 +39,7 @@ def _build_trainer(use_skip_step_on_nan=True, max_consecutive_skipped_steps=0):
     trainer.state = TrainerState()
     trainer.enable_parallel = False
     # Off by default: _optimizer_update only walks the parameters for the extra
-    # zero-grad pass when DSA warm-up per-layer backward is on.
+    # zero-grad pass when DSA per-layer indexer backward is on.
     trainer._dsa_indexer_layerwise_backward = False
     trainer.optimizer = Mock()
     trainer.optimizer.parameters = []
@@ -135,3 +136,53 @@ def test_optimizer_update_skips_optimizer_only(monkeypatch, norm_value, expect_o
     assert trainer.optimizer.called is expect_optimizer_called
     module.zero_grad.assert_called_once()
     assert np.isnan(global_norm.asnumpy()) == np.isnan(norm_value)
+
+
+def _param_with_grad(grad_values):
+    """A parameter carrying the given gradient, as the norm helper expects."""
+    parameter = Parameter(Tensor(np.ones((len(grad_values),)), ms.float32), name="weight")
+    parameter.main_grad = Tensor(np.asarray(grad_values, dtype=np.float32))
+    return parameter
+
+
+
+@pytest.mark.level0
+@pytest.mark.platform_x86_cpu
+@pytest.mark.env_onecard
+def test_missing_gradient_fails_loudly_instead_of_shifting_the_tuple():
+    """A parameter without a gradient must stop the step, not be quietly dropped.
+
+    The returned tuple is aligned to ``parameters`` **by position**: Muon indexes it with
+    ``enumerate(self.param_name_tuple)`` and AdamW zips it against ``self.fp32_params``.
+    Dropping one entry shifts every later parameter's gradient by one, and ``zip`` truncates
+    without a word -- a weight would then be updated with another weight's gradient.
+    """
+    good = _param_with_grad([3.0, 4.0])
+    bad = Parameter(Tensor(np.ones((2,)), ms.float32), name="no_grad_weight")
+    # What a real no-gradient parameter looks like: ``main_grad`` was never allocated and the
+    # backward left ``grad`` at None. ``get_grad`` reads both, and a bare Parameter has
+    # neither attribute at all, so set them explicitly rather than testing a shape that
+    # cannot occur in a run.
+    bad.main_grad = None
+    bad.grad = None
+
+    with pytest.raises(ValueError, match="no_grad_weight"):
+        trainer_utils._calculate_global_grad_norm(
+            [good, bad],
+            enable_parallel=False,
+            max_norm=1.0e9,
+        )
+
+    # The count in the message must describe the input, not a re-walked iterator: the loop
+    # above has already consumed a generator by the time the message is built.
+    with pytest.raises(ValueError, match="1 of 2 optimizer parameters"):
+        trainer_utils._calculate_global_grad_norm(
+            iter([good, bad]),
+            enable_parallel=False,
+            max_norm=1.0e9,
+        )
+
+    # No parameters at all is not the same thing and must stay allowed.
+    norm, _ = trainer_utils._calculate_global_grad_norm(
+        [], enable_parallel=False, max_norm=1.0e9)
+    np.testing.assert_allclose(norm.asnumpy(), 0.0)
