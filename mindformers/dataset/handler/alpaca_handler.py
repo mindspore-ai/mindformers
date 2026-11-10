@@ -68,7 +68,8 @@ class AlpacaInstructDataHandler(BaseInstructDataHandler):
             Dataset: Processed dataset with columns 'input_ids' and 'labels'.
         """
         columns = next(iter(dataset)).keys()
-        remove_columns = list(set(columns) - set(self.output_columns))
+        # datasets.map includes this order in the cache fingerprint.
+        remove_columns = [column for column in columns if column not in self.output_columns]
         dataset = dataset.map(self.process, remove_columns=remove_columns)
         return dataset
 
