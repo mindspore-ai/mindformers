@@ -205,15 +205,18 @@ def test_get_metadata_of_checkpoint_skips_safetensors_metadata_block(tmp_path):
     Expectation: The annotation block is skipped rather than treated as a tensor
         entry, and the real tensors are returned.
     """
-    from safetensors import serialize_file
+    from safetensors.numpy import save_file
     from mindformers.checkpoint.layout_adapter import LayoutAdapter
 
     checkpoint_dir = tmp_path / "hf_ckpt"
     checkpoint_dir.mkdir()
     weight = np.zeros((2, 3), dtype=np.float32)
-    serialize_file(
-        {"model.embed_tokens.weight": {"dtype": "float32", "shape": [2, 3],
-                                       "data": weight.tobytes()}},
+    # numpy.save_file writes the same `__metadata__` annotation block
+    # transformers' save_pretrained emits, and its (name -> array) signature
+    # is stable across safetensors releases (raw-dict serialize_file only
+    # works on < 0.5).
+    save_file(
+        {"model.embed_tokens.weight": weight},
         str(checkpoint_dir / "model.safetensors"),
         metadata={"format": "pt"},
     )

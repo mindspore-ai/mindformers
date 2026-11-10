@@ -9,7 +9,7 @@ rouge_chinese>=1.0.3
 nltk==3.10.3
 mindpet==1.0.4
 opencv-python-headless
-pyarrow>=23.0.1
+pyarrow==25.0.1
 tokenizers
 astunparse>=1.6.3
 numpy<2.0.0
@@ -22,3 +22,4 @@ deprecated>=1.2.0
 pybind11 # for megatron dataset
 transformers>=5.3.0
 datasets>=5.0.1
+pandas==2.2.3
