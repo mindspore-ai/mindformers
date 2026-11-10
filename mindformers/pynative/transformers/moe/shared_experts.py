@@ -43,7 +43,7 @@ class _BackwardUseSharedStream(_Function):
     @staticmethod
     def backward(ctx, grad_output):  # pylint: disable=arguments-differ
         overlap_ctx = ctx.overlap_ctx
-        if ctx.wait_for_output_grad:
+        if ctx.wait_for_output_grad and getattr(overlap_ctx, "use_side_stream", True):
             if overlap_ctx.backward_grad_ready_event is None:
                 raise RuntimeError("Shared-expert backward started before its output gradient was recorded.")
             overlap_ctx.shared_stream.wait_event(overlap_ctx.backward_grad_ready_event)
@@ -65,7 +65,7 @@ class _BackwardUseMainStream(_Function):
     def backward(ctx, grad_output):  # pylint: disable=arguments-differ
         overlap_ctx = ctx.overlap_ctx
         ms.runtime.set_cur_stream(overlap_ctx.main_stream)
-        if ctx.wait_for_shared:
+        if ctx.wait_for_shared and getattr(overlap_ctx, "use_side_stream", True):
             # The returned gradient is produced on the shared stream.  Insert a
             # stream wait before the autograd engine accumulates it on main.
             overlap_ctx.main_stream.wait_stream(overlap_ctx.shared_stream)
@@ -83,8 +83,9 @@ class _SharedExpertMerge(_Function):
     @staticmethod
     def backward(ctx, grad_output):  # pylint: disable=arguments-differ
         overlap_ctx = ctx.overlap_ctx
-        overlap_ctx.backward_grad_ready_event = ms.runtime.Event()
-        overlap_ctx.backward_grad_ready_event.record(overlap_ctx.main_stream)
+        if overlap_ctx.use_side_stream:
+            overlap_ctx.backward_grad_ready_event = ms.runtime.Event()
+            overlap_ctx.backward_grad_ready_event.record(overlap_ctx.main_stream)
         return grad_output, grad_output, None
 
 
@@ -106,6 +107,7 @@ class SharedExpertOverlapContext:
     main_stream: object = None
     shared_stream: object = None
     backward_grad_ready_event: object = None
+    use_side_stream: bool = True
 
 
 class SharedExpertMLP(MLP):
@@ -173,9 +175,15 @@ class SharedExpertMLP(MLP):
                 f"but got '{ctx.state}'."
             )
 
-    def wait_current_stream(self):
-        """Make the shared-expert stream wait for work queued on this thread's stream."""
-        self._get_overlap_stream().wait_stream(ms.runtime.current_stream())
+    @staticmethod
+    def wait_current_stream(ctx: Optional[SharedExpertOverlapContext] = None):
+        """Order the selected shared compute stream after the current stream."""
+        current_stream = ms.runtime.current_stream()
+        shared_stream = (
+            ctx.shared_stream if ctx is not None else SharedExpertMLP._get_overlap_stream()
+        )
+        if ctx is None or ctx.use_side_stream:
+            shared_stream.wait_stream(current_stream)
 
     def _backward_stream_anchors(self):
         """Keep stream-restore nodes live when only parameter grads are requested."""
@@ -184,60 +192,80 @@ class SharedExpertMLP(MLP):
             anchors.append(self.shared_experts_gate.weight)
         return tuple(anchor for anchor in anchors if anchor.requires_grad)
 
-    def overlap_pre_forward(self, hidden_states: Tensor) -> SharedExpertOverlapContext:
-        """Prepare one shared-expert invocation on the side stream.
+    def overlap_pre_forward(
+            self, hidden_states: Tensor, use_side_stream: bool = True
+    ) -> SharedExpertOverlapContext:
+        """Prepare one shared-expert invocation on the selected compute stream.
 
         The optional gate is deliberately launched before token permutation,
         mirroring Megatron's ``pre_forward_comm`` placement.  FC1 is deferred
-        until immediately after dispatch all-to-all is issued.
+        until immediately after dispatch all-to-all is issued.  EP-only overlap
+        may reuse the current stream because HCCL already runs independently;
+        callers that need compute/compute concurrency may request the side stream.
         """
         main_stream = ms.runtime.current_stream()
-        shared_stream = self._get_overlap_stream()
-        shared_stream.wait_stream(main_stream)
+        shared_stream = self._get_overlap_stream() if use_side_stream else main_stream
+        if use_side_stream:
+            shared_stream.wait_stream(main_stream)
         overlap_ctx = SharedExpertOverlapContext(
             hidden_states=hidden_states,
             main_stream=main_stream,
             shared_stream=shared_stream,
+            use_side_stream=use_side_stream,
         )
         with ms.runtime.StreamCtx(shared_stream):
             if self.use_shared_expert_gate:
-                gate_input = _BackwardUseMainStream.apply(
-                    hidden_states, overlap_ctx, True, *self._backward_stream_anchors())
+                gate_input = hidden_states
+                if use_side_stream:
+                    gate_input = _BackwardUseMainStream.apply(
+                        hidden_states, overlap_ctx, True, *self._backward_stream_anchors())
                 gate_input = self.cast(gate_input, self.router_dense_type)
                 gate_score = self.sigmoid(self.shared_experts_gate(gate_input))
-                overlap_ctx.gate_score = _BackwardUseSharedStream.apply(
-                    gate_score, overlap_ctx, False)
+                if use_side_stream:
+                    gate_score = _BackwardUseSharedStream.apply(
+                        gate_score, overlap_ctx, False)
+                overlap_ctx.gate_score = gate_score
         return overlap_ctx
 
     def overlap_fc1(self, ctx: SharedExpertOverlapContext):
         """Queue shared-expert FC1 and activation after dispatch A2A launch."""
         self._check_overlap_state(ctx, "prepared", "overlap_fc1")
-        with ms.runtime.StreamCtx(self._get_overlap_stream()):
-            fc1_input = _BackwardUseMainStream.apply(
-                ctx.hidden_states, ctx, True, *self._backward_stream_anchors())
+        with ms.runtime.StreamCtx(ctx.shared_stream):
+            fc1_input = ctx.hidden_states
+            if ctx.use_side_stream:
+                fc1_input = _BackwardUseMainStream.apply(
+                    fc1_input, ctx, True, *self._backward_stream_anchors())
             intermediate = self._forward_fc1_and_act(fc1_input)
-            ctx.intermediate = _BackwardUseSharedStream.apply(intermediate, ctx, False)
+            if ctx.use_side_stream:
+                intermediate = _BackwardUseSharedStream.apply(intermediate, ctx, False)
+            ctx.intermediate = intermediate
         ctx.hidden_states = None
         ctx.state = "fc1_done"
 
     def overlap_fc2(self, ctx: SharedExpertOverlapContext):
         """Queue shared-expert FC2 after combine A2A launch."""
         self._check_overlap_state(ctx, "fc1_done", "overlap_fc2")
-        with ms.runtime.StreamCtx(self._get_overlap_stream()):
-            fc2_input = _BackwardUseMainStream.apply(
-                ctx.intermediate, ctx, False, *self._backward_stream_anchors())
+        with ms.runtime.StreamCtx(ctx.shared_stream):
+            fc2_input = ctx.intermediate
+            if ctx.use_side_stream:
+                fc2_input = _BackwardUseMainStream.apply(
+                    fc2_input, ctx, False, *self._backward_stream_anchors())
             output = self._forward_fc2(fc2_input)
             if self.use_shared_expert_gate:
                 output = self.mul_shared_gate(output, self.cast(ctx.gate_score, self.compute_dtype))
-            ctx.output = _BackwardUseSharedStream.apply(output, ctx, True)
+            if ctx.use_side_stream:
+                output = _BackwardUseSharedStream.apply(output, ctx, True)
+            ctx.output = output
         ctx.intermediate = None
         ctx.gate_score = None
         ctx.state = "fc2_done"
 
     def overlap_finish(self, ctx: SharedExpertOverlapContext) -> Tensor:
-        """Join the side stream and return the completed shared-expert output."""
+        """Join the selected shared stream and return its completed output."""
         self._check_overlap_state(ctx, "fc2_done", "overlap_finish")
-        ms.runtime.current_stream().wait_stream(self._get_overlap_stream())
+        current_stream = ms.runtime.current_stream()
+        if ctx.use_side_stream:
+            current_stream.wait_stream(ctx.shared_stream)
         output = ctx.output
         ctx.output = None
         ctx.state = "finished"
@@ -250,6 +278,8 @@ class SharedExpertMLP(MLP):
             ctx: SharedExpertOverlapContext,
     ) -> Tensor:
         """Merge both branches while recording the gradient-ready point for backward."""
+        if not ctx.use_side_stream:
+            return routed_output + shared_output
         return _SharedExpertMerge.apply(routed_output, shared_output, ctx)
 
     def construct(self, hidden_states: Tensor, input_ids: Tensor = None) -> Tensor:

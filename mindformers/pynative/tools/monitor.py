@@ -21,6 +21,7 @@ import re
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional, Tuple
 
+from mindspore import mint
 from mindspore.mint.distributed import get_rank, get_world_size
 
 from mindformers.tools import logger
@@ -528,7 +529,7 @@ class TrainStateMonitor(Monitor):
         """Compute the local norm of a gradient tensor."""
         from mindformers.pynative.trainer.utils import _get_grad_factor
         local_grad = grad.to_local() if hasattr(grad, "to_local") else grad
-        return float(local_grad.pow(2).sum().sqrt().asnumpy()) / _get_grad_factor(grad)
+        return float(mint.norm(local_grad).asnumpy()) / _get_grad_factor(grad)
 
 
 class MoeMonitor(Monitor):
