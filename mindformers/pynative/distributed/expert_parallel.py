@@ -42,6 +42,12 @@ GROUP_NAME = {}
 _platform = get_platform()
 
 
+def _reverse_async_a2a(grad_output, send_splits, recv_splits, group):
+    """Route an A2A output gradient back with the forward splits reversed."""
+    return _platform.differentiable_all_to_all_single_async(
+        grad_output.reshape((-1,)), recv_splits, send_splits, group)
+
+
 class _PrelaunchedA2A(_Function):
     """Couple a pre-launched A2A and its overlapping shared-FC stage.
 
@@ -87,21 +93,48 @@ class _PrelaunchedA2A(_Function):
         # Its wait fires only when the routed branch first consumes this
         # gradient, after the side-stream FC has been dispatched.
         ms.runtime.set_cur_stream(ctx.main_stream)
-        flat_grad = grad_output.reshape((-1,))
-        grad_input = _platform.differentiable_all_to_all_single_async(
-            flat_grad,
-            ctx.recv_splits,
-            ctx.send_splits,
-            ctx.group,
-        )
+        grad_input = _reverse_async_a2a(
+            grad_output, ctx.send_splits, ctx.recv_splits, ctx.group)
         # Release this boundary's shared-FC backward stage only when main has
         # reached the reverse-A2A issue point. This prevents the shared stream
         # from running ahead into routed-expert GEMMs while the reverse A2A is
         # still queued behind them on main.
-        reverse_a2a_ready = ms.runtime.Event()
-        reverse_a2a_ready.record(ctx.main_stream)
-        ctx.shared_stream.wait_event(reverse_a2a_ready)
+        if ctx.shared_stream is not ctx.main_stream:
+            reverse_a2a_ready = ms.runtime.Event()
+            reverse_a2a_ready.record(ctx.main_stream)
+            ctx.shared_stream.wait_event(reverse_a2a_ready)
         return shared_grad_output, grad_input, None, None, None, None, None, None, None
+
+
+# This combined forward/ctx API does not require a separate setup_context override.
+class _StandalonePrelaunchedA2A(_Function):  # pylint: disable=abstract-method
+    """Attach autograd to an A2A launched before independent local work.
+
+    The collective itself is issued by :meth:`ExpertParallel._prelaunch_a2a`.
+    Applying this boundary after the local routing-map kernels have been queued
+    inserts the stream wait at their end, rather than relying on a lazy tensor
+    wrapper whose device launch can be deferred until its first consumer.
+    """
+
+    @staticmethod
+    def forward(  # pylint: disable=arguments-differ
+            ctx, input_tensor, output_tensor, work,
+            send_splits, recv_splits, group):
+        """Wait after independent work and preserve the input autograd edge."""
+        del input_tensor
+        ctx.send_splits = send_splits
+        ctx.recv_splits = recv_splits
+        ctx.group = group
+        if work is not None:
+            work.wait()
+        return output_tensor
+
+    @staticmethod
+    def backward(ctx, grad_output):  # pylint: disable=arguments-differ
+        """Reverse the dispatch using the exchanged element splits."""
+        grad_input = _reverse_async_a2a(
+            grad_output, ctx.send_splits, ctx.recv_splits, ctx.group)
+        return grad_input, None, None, None, None, None
 
 
 class ExpertParallel(ParallelStyle):
@@ -451,9 +484,9 @@ class ExpertParallel(ParallelStyle):
             work = result
         return output, work
 
-    def _shared_expert_prelaunch_a2a(
+    def _call_prelaunched_a2a(
             self, slot, flat_input, send_splits, recv_splits, block_size, cell=None):
-        """Route a shared-overlap A2A pre-launch through its registered slot."""
+        """Call a registered pre-launch slot, or fall back to the local primitive."""
         if cell is not None and hasattr(cell, '_comm_ops') and slot in cell._comm_ops:
             return _call_comm_op(
                 cell, slot, flat_input, send_splits, recv_splits, block_size)
@@ -463,6 +496,16 @@ class ExpertParallel(ParallelStyle):
             self, flat_input, output, work, send_splits, recv_splits, block_size,
             shared_tensor, shared_expert_ctx):
         """Attach both branches to one ordered forward/backward boundary."""
+        if shared_expert_ctx.shared_stream is shared_expert_ctx.main_stream:
+            routed_output = _StandalonePrelaunchedA2A.apply(
+                flat_input,
+                output,
+                work,
+                self._elem_splits(send_splits, block_size),
+                self._elem_splits(recv_splits, block_size),
+                self.ep_group,
+            )
+            return routed_output, shared_tensor
         # The shared tensor was produced on the side stream.  Applying the
         # custom Function there keeps MindSpore's identity-output bookkeeping
         # on the producing stream as well.
@@ -490,15 +533,16 @@ class ExpertParallel(ParallelStyle):
     ):
         """Launch dispatch A2A and queue shared-expert FC1 beside it.
 
-        The side stream first waits for token permutation and split preparation.
-        The main stream then issues A2A while FC1 is queued independently on the
-        side stream.  No device-wide synchronization is introduced.
+        The compute stream first finishes token permutation and split preparation,
+        then issues asynchronous A2A and queues FC1 before waiting on its handle.
+        HCCL runs on its communication stream, so a second compute stream is not
+        required to create the overlap window.
         """
         if shared_expert_ctx is None:
             return self._main_a2a(
                 flat_in, input_splits, output_splits, block_size, cell=cell)
-        self.shared_experts.wait_current_stream()
-        output, work = self._shared_expert_prelaunch_a2a(
+        self.shared_experts.wait_current_stream(shared_expert_ctx)
+        output, work = self._call_prelaunched_a2a(
             "input.alltoallsingle",
             flat_in,
             input_splits,
@@ -549,8 +593,8 @@ class ExpertParallel(ParallelStyle):
                 flat_in, send_splits, recv_splits, block_size, cell=cell)
         # Do not let shared FC2 compete with routed-expert GEMMs.  Both FC2
         # and combine A2A become ready after the current main-stream point.
-        self.shared_experts.wait_current_stream()
-        output, work = self._shared_expert_prelaunch_a2a(
+        self.shared_experts.wait_current_stream(shared_expert_ctx)
+        output, work = self._call_prelaunched_a2a(
             "output.alltoallsingle",
             flat_in,
             send_splits,
@@ -566,6 +610,41 @@ class ExpertParallel(ParallelStyle):
 
     # ---- communication segments (the part OverlapExpertParallel re-implements
     # to add A/B/C/D sync hooks and async a2a; the base class is plain sync) ----
+
+    def _dispatch_from_splits(
+            self,
+            flat_in,
+            num_tokens_per_expert_group,
+            group_counts,
+            input_splits,
+            output_splits,
+            ep_degree,
+            block_size,
+            cell=None,
+            shared_expert_ctx=None,
+    ):
+        """Build routing metadata and dispatch after host splits are available.
+
+        Subclasses may override this single seam to change when the payload A2A
+        is launched relative to independent routing work. Split preparation and
+        async-D2H staging remain owned by the base orchestrators.
+        """
+        num_tokens_per_expert = self._compute_group_list(
+            num_tokens_per_expert_group, ep_degree)
+        resort_routing_map = self._build_resort_routing_map(
+            num_tokens_per_expert_group, group_counts, ep_degree)
+        flat_out = self._dispatch_a2a_with_shared_expert(
+            flat_in,
+            input_splits,
+            output_splits,
+            block_size,
+            cell=cell,
+            shared_expert_ctx=shared_expert_ctx,
+        )
+        return (
+            flat_out, group_counts, input_splits, output_splits,
+            num_tokens_per_expert, resort_routing_map
+        )
 
     def _dispatch_comm(
             self,
@@ -588,20 +667,16 @@ class ExpertParallel(ParallelStyle):
         # Single batched D2H for all host splits; group_list stays on device.
         input_splits, output_splits, group_counts = self._host_token_splits(
             num_tokens_per_expert, num_tokens_per_expert_group, ep_degree)
-        num_tokens_per_expert = self._compute_group_list(num_tokens_per_expert_group, ep_degree)
-        resort_routing_map = self._build_resort_routing_map(
-            num_tokens_per_expert_group, group_counts, ep_degree)
-        flat_out = self._dispatch_a2a_with_shared_expert(
+        return self._dispatch_from_splits(
             flat_in,
+            num_tokens_per_expert_group,
+            group_counts,
             input_splits,
             output_splits,
+            ep_degree,
             block_size,
             cell=cell,
             shared_expert_ctx=shared_expert_ctx,
-        )
-        return (
-            flat_out, group_counts, input_splits, output_splits,
-            num_tokens_per_expert, resort_routing_map
         )
 
     # performing all-to-all dispatch on the input
@@ -621,7 +696,8 @@ class ExpertParallel(ParallelStyle):
         shared_expert_ctx = None
         if self.shared_experts is not None:
             # Use the unpadded local tokens: safe tokens belong only to routed experts.
-            shared_expert_ctx = self.shared_experts.overlap_pre_forward(tokens)
+            shared_expert_ctx = self.shared_experts.overlap_pre_forward(
+                tokens, use_side_stream=False)
         tokens = self.reshape(tokens, (-1, tokens.shape[-1]))
         ep_degree = device_mesh.mesh_shape[0]
         num_experts = num_tokens_per_expert.shape[-1]
@@ -697,20 +773,16 @@ class ExpertParallel(ParallelStyle):
         """
         input_splits, output_splits, group_counts = self._finish_async_d2h(
             host_buf, event, num_experts, ep_degree)
-        num_tokens_per_expert = self._compute_group_list(num_tokens_per_expert_group, ep_degree)
-        resort_routing_map = self._build_resort_routing_map(
-            num_tokens_per_expert_group, group_counts, ep_degree)
-        flat_out = self._dispatch_a2a_with_shared_expert(
+        return self._dispatch_from_splits(
             flat_in,
+            num_tokens_per_expert_group,
+            group_counts,
             input_splits,
             output_splits,
+            ep_degree,
             block_size,
             cell=cell,
             shared_expert_ctx=shared_expert_ctx,
-        )
-        return (
-            flat_out, group_counts, input_splits, output_splits,
-            num_tokens_per_expert, resort_routing_map
         )
 
     def _token_dispatch_async(self, device_mesh, cell, args):
@@ -731,7 +803,8 @@ class ExpertParallel(ParallelStyle):
 
         shared_expert_ctx = None
         if self.shared_experts is not None:
-            shared_expert_ctx = self.shared_experts.overlap_pre_forward(tokens)
+            shared_expert_ctx = self.shared_experts.overlap_pre_forward(
+                tokens, use_side_stream=False)
         tokens = self.reshape(tokens, (-1, tokens.shape[-1]))
         ep_degree = device_mesh.mesh_shape[0]
         num_experts = num_tokens_per_expert.shape[-1]
@@ -996,6 +1069,43 @@ class ExpertParallel(ParallelStyle):
             permutated_local_input_tokens, unsort_token_indices_experts, probs, pad_size)
         return self._merge_shared_expert_output(routed_output, shared_expert_ctx)
 
+    @staticmethod
+    def _registered_sync_a2a(output, input, output_split_sizes,  # pylint: disable=W0622
+                             input_split_sizes, group):
+        """Registered synchronous payload A2A implementation."""
+        return comm.all_to_all_single(
+            output=output,
+            input=input,
+            output_split_sizes=output_split_sizes,
+            input_split_sizes=input_split_sizes,
+            group=group,
+        )
+
+    def _register_payload_comm_ops(self, module):
+        """Register the payload collectives selected by this strategy."""
+        payload_op = (
+            self._prelaunch_a2a
+            if self.shared_experts is not None
+            else self._registered_sync_a2a
+        )
+        register_comm_op(module, "input.alltoallsingle", payload_op, "ep")
+        register_comm_op(module, "output.alltoallsingle", payload_op, "ep")
+
+    @staticmethod
+    def _registered_counts_a2a(output_tensor_list, input_tensor_list, group):
+        """Registered token-count A2A implementation."""
+        return comm.all_to_all(
+            output_tensor_list=output_tensor_list,
+            input_tensor_list=input_tensor_list,
+            group=group,
+        )
+
+    def _register_comm_ops(self, module):
+        """Register all EP collectives exactly once for this strategy."""
+        self._register_payload_comm_ops(module)
+        register_comm_op(
+            module, "expert_counts.alltoall", self._registered_counts_a2a, "ep")
+
     def _apply(self, module: nn.Cell, device_mesh: DeviceMesh) -> nn.Cell:
         # only supports GroupedMLP
         if not isinstance(module, GroupedMLP):
@@ -1018,29 +1128,93 @@ class ExpertParallel(ParallelStyle):
             input_fn=self._token_dispatch,
             output_fn=self._token_combine,
         )
-        # Register comm ops in the registry for exclude_op discovery.  Shared
-        # overlap needs a pre-launched collective; the ordinary path preserves
-        # the existing synchronous communication contract.
-        if self.shared_experts is not None:
-            def _a2as_fn(flat_input, send_splits, recv_splits, block_size):
-                return self._prelaunch_a2a(
-                    flat_input, send_splits, recv_splits, block_size)
-        else:
-            def _a2as_fn(output, input,  # pylint: disable=W0622
-                         output_split_sizes, input_split_sizes, group):
-                return comm.all_to_all_single(
-                    output=output, input=input,
-                    output_split_sizes=output_split_sizes,
-                    input_split_sizes=input_split_sizes, group=group)
-        register_comm_op(module, "input.alltoallsingle", _a2as_fn, "ep")
-        register_comm_op(module, "output.alltoallsingle", _a2as_fn, "ep")
-
-        def _a2a_fn(output_tensor_list, input_tensor_list, group):
-            return comm.all_to_all(
-                output_tensor_list=output_tensor_list,
-                input_tensor_list=input_tensor_list, group=group)
-        register_comm_op(module, "expert_counts.alltoall", _a2a_fn, "ep")
+        # Keep registry setup behind a strategy seam: subclasses select their
+        # payload implementation without registering and then overwriting slots.
+        self._register_comm_ops(module)
         return module
+
+
+class DispatchOverlapExpertParallel(ExpertParallel):
+    """PP-independent strategy that overlaps the dispatch payload A2A.
+
+    Unlike :class:`OverlapExpertParallel`, this strategy does not coordinate two
+    pipeline threads.  It launches the dispatch A2A and retains its handle before
+    constructing the local group list and fused-permute routing map.  The wait and
+    differentiable boundary are attached only after those independent kernels have
+    been queued, allowing them to cover part of the HCCL latency.
+
+    Shared-expert overlap owns a larger FC/A2A window and is therefore selected
+    as a separate strategy rather than combined with this class.
+    """
+
+    def __init__(
+            self,
+            moe_permute_fusion: bool = False,
+            async_d2h: bool = False,
+            use_safe_tokens: bool = True,
+            shared_experts=None,
+    ):
+        if shared_experts is not None:
+            raise ValueError(
+                "DispatchOverlapExpertParallel cannot be combined with shared-expert "
+                "overlap; use ExpertParallel for the shared-expert strategy.")
+        super().__init__(
+            moe_permute_fusion=moe_permute_fusion,
+            async_d2h=async_d2h,
+            use_safe_tokens=use_safe_tokens,
+        )
+
+    def _attach_prelaunched_dispatch(
+            self, flat_in, output, work, input_splits, output_splits, block_size):
+        return _StandalonePrelaunchedA2A.apply(
+            flat_in,
+            output,
+            work,
+            self._elem_splits(input_splits, block_size),
+            self._elem_splits(output_splits, block_size),
+            self.ep_group,
+        )
+
+    def _dispatch_from_splits(
+            self,
+            flat_in,
+            num_tokens_per_expert_group,
+            group_counts,
+            input_splits,
+            output_splits,
+            ep_degree,
+            block_size,
+            cell=None,
+            shared_expert_ctx=None,
+    ):
+        if shared_expert_ctx is not None:
+            raise RuntimeError(
+                "DispatchOverlapExpertParallel received a shared-expert context.")
+        output, work = self._call_prelaunched_a2a(
+            "input.alltoallsingle",
+            flat_in,
+            input_splits,
+            output_splits,
+            block_size,
+            cell=cell,
+        )
+        num_tokens_per_expert = self._compute_group_list(
+            num_tokens_per_expert_group, ep_degree)
+        resort_routing_map = self._build_resort_routing_map(
+            num_tokens_per_expert_group, group_counts, ep_degree)
+        flat_out = self._attach_prelaunched_dispatch(
+            flat_in, output, work, input_splits, output_splits, block_size)
+        return (
+            flat_out, group_counts, input_splits, output_splits,
+            num_tokens_per_expert, resort_routing_map
+        )
+
+    def _register_payload_comm_ops(self, module):
+        """Register pre-launched dispatch and synchronous combine exactly once."""
+        register_comm_op(
+            module, "input.alltoallsingle", self._prelaunch_a2a, "ep")
+        register_comm_op(
+            module, "output.alltoallsingle", self._registered_sync_a2a, "ep")
 
 
 class DeredundancyExpertParallel(ExpertParallel):

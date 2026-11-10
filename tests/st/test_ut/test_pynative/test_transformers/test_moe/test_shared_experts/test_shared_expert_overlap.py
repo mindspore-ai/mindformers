@@ -50,8 +50,9 @@ def _shared_expert_config(**overrides):
 @pytest.mark.level0
 @pytest.mark.platform_x86_cpu
 @pytest.mark.env_onecard
-def test_split_shared_expert_forward_uses_side_stream(monkeypatch):
-    """The invocation-local FC stages stay ordered and join without a global sync."""
+@pytest.mark.parametrize("use_side_stream", [False, True])
+def test_split_shared_expert_forward_selects_compute_stream(monkeypatch, use_side_stream):
+    """FC stages can reuse main for comm overlap or use a dedicated compute stream."""
     events = []
 
     class FakeStream:
@@ -95,10 +96,11 @@ def test_split_shared_expert_forward_uses_side_stream(monkeypatch):
     )
     hidden_states = ms.Tensor([[1.0, 2.0, 3.0, 4.0]], ms.float32)
 
-    ctx = shared_experts.overlap_pre_forward(hidden_states)
-    shared_experts.wait_current_stream()
+    ctx = shared_experts.overlap_pre_forward(
+        hidden_states, use_side_stream=use_side_stream)
+    shared_experts.wait_current_stream(ctx)
     shared_experts.overlap_fc1(ctx)
-    shared_experts.wait_current_stream()
+    shared_experts.wait_current_stream(ctx)
     shared_experts.overlap_fc2(ctx)
     output = shared_experts.overlap_finish(ctx)
 
@@ -107,8 +109,12 @@ def test_split_shared_expert_forward_uses_side_stream(monkeypatch):
         np.array([[4.0, 6.0, 8.0, 10.0]], dtype=np.float32),
     )
     assert ctx.state == "finished"
-    assert events.count(("shared", "wait", "main")) == 3
-    assert events[-1] == ("main", "wait", "shared")
+    if use_side_stream:
+        assert events.count(("shared", "wait", "main")) == 3
+        assert events[-1] == ("main", "wait", "shared")
+    else:
+        assert not [event for event in events if "wait" in event]
+        assert events.count(("main", "enter")) == 3
 
 
 @pytest.mark.level0

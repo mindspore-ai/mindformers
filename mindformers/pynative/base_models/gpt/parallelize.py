@@ -76,6 +76,7 @@ from mindformers.pynative.distributed.activation_checkpoint import apply_ac
 from mindformers.pynative.layers.layer_norm import FusedLayerNorm, FusedRMSNorm
 from mindformers.pynative.distributed.tensor_parallel import NoParallel
 from mindformers.pynative.distributed.expert_parallel import (
+    DispatchOverlapExpertParallel,
     ExpertParallel,
     DeredundancyExpertParallel,
 )
@@ -1145,6 +1146,7 @@ def apply_moe_ep_tp(
         moe_token_dispatcher_type: str = "all_to_all",
         npu_nums_per_device: int = 8,
         expert_async_d2h: bool = False,
+        expert_comm_overlap: bool = False,
         use_safe_tokens: bool = True,
 ):
     """
@@ -1157,7 +1159,9 @@ def apply_moe_ep_tp(
         moe_token_dispatcher_type (str): The type of token dispatcher for MoE.
         npu_nums_per_device (int): The number of NPUs per device.
         expert_async_d2h (bool): Whether to overlap dispatch counts D2H with token permutation.
-        use_safe_tokens (bool): Whether to prepend zero-probability safe tokens before dispatch.
+        expert_comm_overlap (bool): Whether to overlap the PP-independent dispatch A2A.
+        use_safe_tokens (bool): Whether to prepend zero-probability safe tokens
+            before dispatch.
 
  	MoE layer structure:
         - mlp.experts.weight1: Expert FFN first layer weights
@@ -1180,6 +1184,8 @@ def apply_moe_ep_tp(
             mtp_layer.transformer_layer for mtp_layer in model.model.mtp.layers
         )
 
+    dispatch_overlap_applied = False
+    shared_overlap_selected = False
     for transformer_block in transformer_layers:
         if not hasattr(transformer_block.mlp, 'experts'):
             continue
@@ -1197,10 +1203,20 @@ def apply_moe_ep_tp(
         set_comm_ops_inplace(False)
         # Apply TP to experts: shard along the hidden dimension
         if moe_token_dispatcher_type == "alltoall":
-            experts_plan = ExpertParallel(model.model.config.moe_permute_fusion,
-                                          async_d2h=expert_async_d2h,
-                                          use_safe_tokens=use_safe_tokens,
-                                          shared_experts=shared_experts)
+            use_dispatch_overlap = expert_comm_overlap and shared_experts is None
+            strategy_cls = (
+                DispatchOverlapExpertParallel
+                if use_dispatch_overlap
+                else ExpertParallel
+            )
+            experts_plan = strategy_cls(
+                model.model.config.moe_permute_fusion,
+                async_d2h=expert_async_d2h,
+                use_safe_tokens=use_safe_tokens,
+                shared_experts=shared_experts,
+            )
+            dispatch_overlap_applied |= use_dispatch_overlap
+            shared_overlap_selected |= shared_experts is not None
         elif moe_token_dispatcher_type == "alltoall_deredundancy":
             experts_plan = DeredundancyExpertParallel(
                 npu_nums_per_device,
@@ -1211,14 +1227,24 @@ def apply_moe_ep_tp(
                 f"Unsupported moe_token_dispatcher_type: '{moe_token_dispatcher_type}'. "
                 "Expected 'alltoall' or 'alltoall_deredundancy'."
             )
-        if hasattr(transformer_block.mlp, 'experts') and experts_mesh is not None:
-            parallelize_module(
-                module=transformer_block.mlp.experts,
-                device_mesh=experts_mesh,
-                parallelize_plan=experts_plan,
-            )
-            if shared_experts is not None:
-                transformer_block.mlp.set_shared_expert_overlap(True)
+        parallelize_module(
+            module=transformer_block.mlp.experts,
+            device_mesh=experts_mesh,
+            parallelize_plan=experts_plan,
+        )
+        if shared_experts is not None:
+            transformer_block.mlp.set_shared_expert_overlap(True)
+
+    if dispatch_overlap_applied:
+        logger.info(
+            "PP-independent EP dispatch overlap enabled: pre-launching the "
+            "routed-token all-to-all."
+        )
+    elif expert_comm_overlap and shared_overlap_selected:
+        logger.info(
+            "PP-independent EP dispatch overlap requested; shared-expert overlap "
+            "owns the dispatch/combine communication windows."
+        )
 
     return model
 
@@ -1944,6 +1970,8 @@ def _apply_spmd_parallelism(
                     moe_token_dispatcher_type=parallelism.moe_token_dispatcher_type,
                     npu_nums_per_device=parallelism.npu_nums_per_device,
                     expert_async_d2h=getattr(parallelism, "expert_parallel_async_d2h", False),
+                    expert_comm_overlap=getattr(
+                        parallelism, "expert_parallel_comm_overlap", False),
                     use_safe_tokens=use_safe_tokens,
                 )
 

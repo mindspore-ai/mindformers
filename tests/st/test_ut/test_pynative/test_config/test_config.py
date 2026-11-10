@@ -84,6 +84,30 @@ class TestConfig:
         with pytest.raises(AttributeError):
             config.non_existent_method()
 
+    def test_ep_comm_overlap_validation(self):
+        """PP-independent EP overlap is explicit and limited to all-to-all EP."""
+        config = ParallelismConfig(
+            expert_parallel=2,
+            expert_parallel_comm_overlap=True,
+        )
+        assert config.pipeline_parallel == 1
+        assert config.expert_parallel_comm_overlap is True
+
+        with pytest.raises(ValueError, match="requires expert_parallel > 1"):
+            ParallelismConfig(expert_parallel_comm_overlap=True)
+        with pytest.raises(ValueError, match="only supports.*alltoall"):
+            ParallelismConfig(
+                expert_parallel=8,
+                expert_parallel_comm_overlap=True,
+                moe_token_dispatcher_type="alltoall_deredundancy",
+            )
+        with pytest.raises(ValueError, match="alternative EP overlap modes"):
+            ParallelismConfig(
+                expert_parallel=2,
+                expert_parallel_comm_overlap=True,
+                pipeline_parallel_overlap_b_f=True,
+            )
+
     def test_base_config_repr(self):
         """Test BaseConfig string representation."""
         # Test with BaseConfig directly to use its __repr__
