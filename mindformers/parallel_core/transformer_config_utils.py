@@ -196,6 +196,19 @@ DEFAULT_WHITE_KEY.discard('pad_token_id')  # pad_token_id used in training for g
 ERROR_LOG = {}
 
 COMMON_CONFIG_MAPPING = {
+    "enable_hyper_connections": "enable_hyper_connections",
+    "enable_hc_head": "enable_hc_head",
+    "num_residual_streams": "num_residual_streams",
+    "mhc_sinkhorn_iterations": "mhc_sinkhorn_iterations",
+    "mhc_init_gating_factor": "mhc_init_gating_factor",
+    "mhc_layernorm_epsilon": "mhc_layernorm_epsilon",
+    "use_fused_mhc": "use_fused_mhc",
+    "mtp_enable_hyper_connections": "mtp_enable_hyper_connections",
+    "mtp_enable_dsa": "mtp_enable_dsa",
+    "mhc_megatron_compatibility": "mhc_megatron_compatibility",
+    "mhc_params_dtype": "mhc_params_dtype",
+    "mhc_compute_dtype": "mhc_compute_dtype",
+    "hc_sinkhorn_clamp": "hc_sinkhorn_clamp",
     #####################################################################################
     # Maps the configuration keys on the left to the TransformerConfig keys on the right.
     #

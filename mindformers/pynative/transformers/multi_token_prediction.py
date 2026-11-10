@@ -346,7 +346,24 @@ class MultiTokenPredictionLayer(nn.Cell):
         # (s, b, n*h), so the MTP layer must expand its (s, b, h) input into n
         # streams before the layer, then collapse them with the configured head
         # or the parameter-free mean fallback.
-        self.hc = config.enable_hyper_connections
+        # ``mtp_enable_hyper_connections`` defaults to ``enable_hyper_connections``; setting it
+        # to False keeps mHC on the decoder while the MTP layers stay plain, which is the
+        # layout the reference checkpoints use (mHC weights on every decoder layer, none
+        # under ``mtp.``). Read with a default, like the DSA switch below: a HF-style config
+        # carries only the keys its yaml actually wrote, so a config object that never saw
+        # this key has no attribute for it -- and the default has to be the resolved
+        # behaviour for "unset", i.e. follow the decoder.
+        self.hc = getattr(
+            config, "mtp_enable_hyper_connections", config.enable_hyper_connections)
+        # ``mtp_enable_dsa`` defaults to whether the model runs DSA at all; setting it to False
+        # keeps DSA on the decoder while this layer runs ordinary attention, so it owns no
+        # indexer and has no indexer loss to publish (see the sink in ``construct``). The
+        # ``True`` default is not "turn DSA on by default": the conjunction already requires
+        # the model to run DSA, so it only says an unset switch follows the decoder.
+        self.uses_dsa = (
+            getattr(config, "experimental_attention_variant", None) == "dsa"
+            and getattr(config, "mtp_enable_dsa", True)
+        )
         self.hc_head = None
         if self.hc:
             self.hc_num_streams = config.num_residual_streams
@@ -356,7 +373,7 @@ class MultiTokenPredictionLayer(nn.Cell):
 
     def _layerwise_indexer_backward(self):
         """Whether this layer back-propagates its indexer loss itself; see TransformerBlock."""
-        if not self.training:
+        if not self.training or not self.uses_dsa:
             return False
         return layerwise_indexer_backward(self.config)
 

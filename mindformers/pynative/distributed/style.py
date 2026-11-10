@@ -669,13 +669,14 @@ def build_hp_cp_style(
         )
         return HPContextParallelAdapter(hp_style)
 
+    # Match the kernel input: BSND keeps sequence/head on axes 1/2.
+    seq_dim, head_dim = (1, 2) if input_layout == "BSND" else (2, 1)
+
     if method == "ulysses":
         ulysses_degree = cp_size if ulysses_degree_in_cp is None else ulysses_degree_in_cp
         hp_style = HPContextParallel(
-            # Synchronous Ulysses/Hybrid feeds FlashAttention with FA-native
-            # BNSD tensors, so sequence/head are dims 2/1 respectively.
-            seq_dim=2,
-            head_dim=1,
+            seq_dim=seq_dim,
+            head_dim=head_dim,
             ulysses_degree=ulysses_degree,
             qkv_indices=(0, 1, 2),
         )
@@ -683,10 +684,8 @@ def build_hp_cp_style(
 
     if method == "hybrid":
         hp_style = HPContextParallel(
-            # Synchronous Ulysses/Hybrid feeds FlashAttention with FA-native
-            # BNSD tensors, so sequence/head are dims 2/1 respectively.
-            seq_dim=2,
-            head_dim=1,
+            seq_dim=seq_dim,
+            head_dim=head_dim,
             ulysses_degree=ulysses_degree_in_cp,
             qkv_indices=(0, 1, 2),
         )

@@ -118,6 +118,7 @@ class FlashAttention(Cell):
 
         self.bnsd_transpose = mint.permute
         self.bsh_transpose = mint.permute
+        self.bsnd_transpose = mint.permute
         self.merge_head_transpose = mint.permute
         self.reshape = mint.reshape
         self.fa_out_transpose = mint.permute
@@ -174,6 +175,9 @@ class FlashAttention(Cell):
             bsz = query.shape[0]
             q_seq_len = query.shape[2]
             kv_seq_len = key.shape[2]
+        elif self.input_layout == "BSND" and input_already_in_layout:
+            bsz, q_seq_len = query.shape[:2]
+            kv_seq_len = key.shape[1]
         else:
             q_seq_len, bsz = query.shape[:2]
             kv_seq_len = key.shape[0]
@@ -187,6 +191,14 @@ class FlashAttention(Cell):
                 query = self.bsh_transpose(query, (1, 0, 2))
                 key = self.bsh_transpose(key, (1, 0, 2))
                 value = self.bsh_transpose(value, (1, 0, 2))
+        elif self.input_layout == "BSND":
+            # Preserve separate head dimensions while moving SBND inputs to BSND.
+            # EOD compression selects TND; this branch handles ordinary attention
+            # inside an uncompressed DSA model, including MTP with DSA disabled.
+            if not input_already_in_layout:
+                query = self.bsnd_transpose(query, (1, 0, 2, 3))
+                key = self.bsnd_transpose(key, (1, 0, 2, 3))
+                value = self.bsnd_transpose(value, (1, 0, 2, 3))
         else:
             query = self.reshape(query, (q_seq_len, bsz, -1))
             key = self.reshape(key, (kv_seq_len, bsz, -1))
@@ -221,6 +233,10 @@ class FlashAttention(Cell):
         elif self.input_layout == "BSH":
             if not input_already_in_layout:
                 output = self.fa_out_transpose(output, (1, 0, 2))
+        elif self.input_layout == "BSND":
+            if not input_already_in_layout:
+                # Restore SBND; the caller merges the head dimensions afterwards.
+                output = self.fa_out_transpose(output, (1, 0, 2, 3))
         return output
 
     def _merge_heads(self, x):
