@@ -151,6 +151,7 @@ class LinearWithLoRA(Linear):
                 base.output_size,
                 compute_dtype=base.compute_dtype,
                 params_dtype=base.params_dtype,
+                output_groups=base.output_groups,
                 bias=base.has_bias,
                 skip_weight_param_allocation=base.skip_weight_param_allocation,
                 lora_rank=lora_rank,

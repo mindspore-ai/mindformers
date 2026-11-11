@@ -18,6 +18,7 @@
 """ModuleSpec registry for experimental attention variants."""
 from typing import Callable, Dict
 
+from mindformers.pynative.base_models.gpt.kda import get_kda_module_spec
 from mindformers.pynative.layers.identity_op import IdentityOp
 from mindformers.pynative.layers.layer_norm import get_norm_cls
 from mindformers.pynative.layers.linear import Linear
@@ -68,6 +69,9 @@ def register_attention_variant(name: str):
         return builder
 
     return decorator
+
+
+register_attention_variant("kda")(get_kda_module_spec)
 
 
 def get_attention_variant_module_spec(

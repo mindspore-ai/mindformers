@@ -70,6 +70,7 @@ from mindformers.pynative.distributed.mc2_style import (
 from mindformers.pynative.distributed.context_parallel import (
     apply_context_parallel_model_io,
     build_context_parallel_attention_style,
+    is_pure_kda,
 )
 from mindformers.pynative.distributed.csa_context_parallel import DSv4HybridAttentionContextParallel
 from mindformers.pynative.distributed.activation_checkpoint import apply_ac
@@ -96,6 +97,7 @@ from mindformers.pynative.transformers.experimental_attention_variant.dsa_attent
 )
 from mindformers.pynative.transformers.multi_latent_attention import MLASelfAttention
 from mindformers.pynative.transformers.mlp import MLP
+from mindformers.pynative.transformers.kda import KimiDeltaAttention
 from mindformers.pynative.transformers.moe.moe_layer import MoELayer
 from mindformers.pynative.transformers.moe.moe_utils import set_moe_aux_loss_group_info
 from mindformers.pynative.transformers.experimental_attention_variant.csa import CompressedSparseAttention
@@ -110,6 +112,10 @@ __all__ = ["parallelize_gptmodel"]
 _DTYPE_MAP = {"float16": ms.float16, "float32": ms.float32, "bfloat16": ms.bfloat16}
 
 _LAYER_FSDP_PARAM_RULES = {
+    # KDA keeps the fused section axis intact; shard channels inside each section.
+    "self_attention.in_proj.weight": {"shard_dim": 1},
+    "self_attention.in_proj.bias": {"shard_dim": 1},
+    "self_attention.conv1d.weight": {"shard_dim": 1},
     "attn_hc.mapping_proj.weight": {"shard_dim": 1},
     "attn_hc.alpha_pre": {"replicate": True},
     "attn_hc.alpha_post": {"replicate": True},
@@ -810,6 +816,38 @@ def _gqa_attention_layer_plan(self_attn, tp_mesh, enable_mc2=False):
     return plan
 
 
+def _kda_attention_layer_plan(self_attn, tp_mesh):
+    """Shard complete KDA heads, preserving each fused projection's group axis."""
+    world = tp_mesh.size()
+    if self_attn.num_key_heads % world or self_attn.num_value_heads % world:
+        raise ValueError("KDA key/value heads must be divisible by tensor_parallel.")
+    plan = {
+        "self_attention.in_proj": ColwiseParallel(gather_input=True),
+        "self_attention.beta_proj": ColwiseParallel(gather_input=True),
+        "self_attention.out_norm": SequenceParallel(sequence_dim=0),
+        "self_attention.out_proj": RowwiseParallel(),
+    }
+    params = [[self_attn, "A_log", (Shard(0),)],
+              [self_attn, "dt_bias", (Shard(0),)],
+              [self_attn.conv1d, "weight", (Shard(1),)]]
+    if not self_attn.use_legacy_fused_projections:
+        for prefix, rank in (("f", self_attn.config.kda_f_lora_rank),
+                             ("g", self_attn.config.kda_gate_lora_rank)):
+            if rank is None:
+                plan[f"self_attention.{prefix}_proj"] = ColwiseParallel(gather_input=True)
+            else:
+                # Compress on the SP shard; gather only the low-rank activation.
+                plan[f"self_attention.{prefix}_a_proj"] = SequenceParallel(sequence_dim=0)
+                plan[f"self_attention.{prefix}_b_proj"] = ColwiseParallel(gather_input=True)
+    self_attn.num_key_heads //= world
+    self_attn.num_value_heads //= world
+    for name in ("qk_dim", "v_dim", "gate_dim", "conv_dim"):
+        setattr(self_attn, name, getattr(self_attn, name) // world)
+    self_attn.in_proj_split_sections = tuple(size // world for size in self_attn.in_proj_split_sections)
+    self_attn.conv1d.channels = self_attn.conv_dim
+    return plan, params
+
+
 class _DSv4QUpParallel(ParallelStyle):
     """Column-shard Q-up while reducing its replicated input gradient."""
 
@@ -985,12 +1023,13 @@ def _apply_layers_tp(
     is_dsv4 = isinstance(self_attn, DSv4HybridSelfAttention)
     is_mla = isinstance(self_attn, MLASelfAttention)
     is_dsa = isinstance(self_attn, DSASelfAttention)
+    is_kda = isinstance(self_attn, KimiDeltaAttention)
     if is_mla and self_attn.config.q_lora_rank is None:
         # Without q compression, q comes straight out of linear_qkv (sequence-sharded, not
         # head-sharded) with no colwise up-projection to all-gather it, so SP-native MLA
         # cannot form the full-sequence query.
         raise NotImplementedError("Local sequence-parallel MLA requires q_lora_rank (q compression).")
-    if not is_mla and not is_dsv4:
+    if not is_mla and not is_dsv4 and not is_kda:
         # Standard GQA/MHA: the fused QKV is colwise-sharded along the group-interleaved
         # output dim, so each rank must own whole query-groups.
         num_kv_groups = self_attn.kv_num_heads
@@ -1012,7 +1051,11 @@ def _apply_layers_tp(
             "ffn_hc": SequenceParallel(sequence_dim=0),
         })
     distribute_param_plan = []
-    if is_dsv4:
+    if is_kda:
+        kda_plan, kda_params = _kda_attention_layer_plan(self_attn, tp_mesh)
+        layer_plan.update(kda_plan)
+        distribute_param_plan.extend(kda_params)
+    elif is_dsv4:
         dsv4_plan, dsv4_params = _dsv4_attention_layer_plan(self_attn, tp_mesh)
         layer_plan.update(dsv4_plan)
         distribute_param_plan.extend(dsv4_params)
@@ -1729,6 +1772,7 @@ def _uses_ulysses_head_sharding(gpt_model):
     blocks.extend(list(getattr(mtp, "layers", ()) or ()))
     return any(
         name.endswith("core_attention") and not isinstance(cell, CompressedSparseAttention)
+        and getattr(cell, "attention_variant", None) != "kda"
         for block in blocks
         for name, cell in block.cells_and_names()
     )
@@ -1759,6 +1803,10 @@ def apply_context_parallel_attention(
     if decoder_layers is None:
         raise ValueError("Unable to locate GPT decoder layers for context parallel application.")
     uses_dsa_cp_kernel = _uses_dsa_cp_kernel(gpt_model)
+    kda_layers = [cell for _, cell in gpt_model.cells_and_names() if isinstance(cell, KimiDeltaAttention)]
+    pure_kda = is_pure_kda(gpt_model)
+    if kda_layers and async_enabled:
+        raise ValueError("KDA CP requires synchronous execution.")
     uses_ulysses_head_sharding = _uses_ulysses_head_sharding(gpt_model)
     if async_enabled and method == "colossal" and not uses_dsa_cp_kernel:
         raise NotImplementedError(
@@ -1780,13 +1828,22 @@ def apply_context_parallel_attention(
     else:
         ulysses_degree = requested_ulysses_degree
 
+    if kda_layers:
+        degree = 1 if method == "colossal" else ulysses_degree
+        if degree is None or degree < 1 or cp_size % degree:
+            raise ValueError("KDA CP requires a valid Ulysses degree dividing context_parallel.")
+        for attention in kda_layers:
+            if attention.num_key_heads % degree:
+                raise ValueError("KDA heads per TP rank must be divisible by the Ulysses degree.")
+
     if model_config is not None:
         setattr(model_config, "_mf_runtime_context_parallel_method", method)
         setattr(model_config, "_mf_runtime_context_parallel_async", async_enabled)
         setattr(model_config, "_mf_runtime_ulysses_degree_in_cp", ulysses_degree)
         setattr(model_config, "_mf_runtime_cp_rank_list", tuple(cp_mesh.rank_list))
         rotary_pos_emb = getattr(gpt_model, "rotary_pos_emb", None)
-        if rotary_pos_emb is not None and hasattr(rotary_pos_emb, "use_rotary_position_ids"):
+        if (not pure_kda and rotary_pos_emb is not None
+                and hasattr(rotary_pos_emb, "use_rotary_position_ids")):
             gpt_model.set_use_rotary_position_ids(True)
             # Context parallel forces explicit position_ids, so the rotary cos/sin carries a
             # per-batch dimension. The fused interleaved RoPE op (apply_rope_fusion) does not
@@ -1851,6 +1908,18 @@ def apply_context_parallel_attention(
         return matches[0]
 
     def _apply_cp_to_block(transformer_block, block_label):
+        kda_matches = [cell for _, cell in transformer_block.cells_and_names()
+                       if isinstance(cell, KimiDeltaAttention)]
+        if kda_matches:
+            if len(kda_matches) != 1:
+                raise ValueError(f"Expected one KDA attention in {block_label}.")
+            attention = kda_matches[0]
+            build_context_parallel_attention_style(
+                method=method, cp_size=cp_size, attention_variant="kda",
+                ulysses_degree_in_cp=ulysses_degree,
+            )._apply(attention.core_attention, cp_mesh)
+            logger.info("Applied KDA %s context parallel to %s", method, block_label)
+            return
         cp_module_path, cp_module = _find_one_module(transformer_block, block_label, "core_attention")
         if isinstance(cp_module, CompressedSparseAttention):
             attention_path, attention_module = _find_one_module(transformer_block, block_label, "self_attention")

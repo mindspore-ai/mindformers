@@ -18,6 +18,7 @@ from mindspore import mint, nn, ops
 from mindspore.common import dtype as mstype
 
 from hyper_parallel import DeviceMesh
+from hyper_parallel.core.context_parallel import ContextParallel as HPContextParallel
 
 from mindformers.tools.logger import logger
 from mindformers.pynative.distributed.style import (
@@ -25,6 +26,7 @@ from mindformers.pynative.distributed.style import (
     build_hp_async_cp_style,
     build_hp_cp_style,
     build_hp_dsa_cp_style,
+    HPContextParallelAdapter,
 )
 
 
@@ -150,6 +152,14 @@ def build_context_parallel_attention_style(method: str,
                                            dsa_use_sparse_loss: bool = True,
                                            dsa_indexer_layerwise_backward: bool = False) -> ParallelStyle:
     """Build the MindFormers attention-side CP style."""
+    if attention_variant == "kda":
+        if async_enabled:
+            raise ValueError("KDA CP requires synchronous execution.")
+        degree = _validate_cp_method(method, cp_size, ulysses_degree_in_cp)
+        return HPContextParallelAdapter(HPContextParallel(
+            seq_dim=1, head_dim=2, ulysses_degree=degree, state_parallel=True,
+            qkv_indices=(0, 1, 2, 3, 4), use_local_output=True,
+        ))
     if attention_variant == "dsa":
         return DSAContextParallelAttentionStyle(
             method=method,
@@ -191,7 +201,8 @@ class ContextParallelModelIOStyle(ParallelStyle):
     def __init__(self, cp_mesh, cp_method: str = "colossal",
                  ulysses_degree_in_cp: int = None, mask_type: str = "causal",
                  build_attention_mask: bool = True,
-                 require_actual_seq_len: bool = False):
+                 require_actual_seq_len: bool = False,
+                 require_position_ids: bool = True):
         super().__init__()
         self.cp_mesh = cp_mesh
         self.cp_method = cp_method
@@ -199,6 +210,7 @@ class ContextParallelModelIOStyle(ParallelStyle):
         self.mask_type = mask_type
         self.build_attention_mask = build_attention_mask
         self.require_actual_seq_len = require_actual_seq_len
+        self.require_position_ids = require_position_ids
 
     def _prepare_inputs(self, module, args, kwargs):
         """Prepare root-model inputs for CP."""
@@ -223,6 +235,7 @@ class ContextParallelModelIOStyle(ParallelStyle):
             ulysses_degree_in_cp=self.ulysses_degree_in_cp,
             mask_type=self.mask_type,
             build_attention_mask=self.build_attention_mask,
+            require_position_ids=self.require_position_ids,
         )
 
         new_args = list(args)
@@ -265,7 +278,8 @@ def apply_context_parallel_model_io(
         getattr(model_config, "use_attn_mask_compression", False)
         or getattr(model_config, "use_eod_attn_mask_compression", False)
     )
-    if not uses_dsa_cp_kernel and not attn_mask_compressed:
+    pure_kda = is_pure_kda(model)
+    if not uses_dsa_cp_kernel and not attn_mask_compressed and not pure_kda:
         raise ValueError(
             "Context parallel (context_parallel > 1) requires a compressed attention mask. "
             "Please enable use_attn_mask_compression for non-eod data, or "
@@ -285,11 +299,26 @@ def apply_context_parallel_model_io(
         ulysses_degree_in_cp=getattr(parallelism, "ulysses_degree_in_cp", None),
         mask_type=getattr(parallelism, "context_parallel_mask_type", "causal"),
         build_attention_mask=uses_dsa_cp_kernel and not attn_mask_compressed,
+        require_position_ids=(not pure_kda
+                              or getattr(model_config, "position_embedding_type", None) == "learned_absolute"
+                              or bool(getattr(model_config, "use_rotary_position_ids", False))),
         require_actual_seq_len=(
             uses_dsa_cp_kernel
             and bool(getattr(model_config, "use_eod_attn_mask_compression", False))
         ),
     )._apply(model)
+
+
+def is_pure_kda(model):
+    """Classify actual attention cells, including transparent wrappers and custom specs."""
+    attentions = _decoder_attentions(model)
+    return bool(attentions) and all(getattr(cell, "attention_variant", None) == "kda" for cell in attentions)
+
+
+def _decoder_attentions(model):
+    """Find decoder attention cells without relying on concrete wrapper class names."""
+    return [cell for name, cell in model.cells_and_names()
+            if name.endswith("self_attention")]
 
 
 def attach_context_parallel_runtime_hints(model_config, parallelism_config):
@@ -356,7 +385,8 @@ def prepare_context_parallel_input(inputs: dict,
                                    cp_method: str = "colossal",
                                    ulysses_degree_in_cp: int = None,
                                    mask_type: str = "causal",
-                                   build_attention_mask: bool = True) -> dict:
+                                   build_attention_mask: bool = True,
+                                   require_position_ids: bool = True) -> dict:
     """Slice sequence inputs for context parallel training and build the CP causal mask.
 
     ``build_attention_mask`` injects a per-rank causal mask sized
@@ -444,6 +474,10 @@ def prepare_context_parallel_input(inputs: dict,
     for key, value in inputs.items():
         if key in {"input_ids", "labels", "loss_mask"}:
             sharded[key] = _slice_tnd_flattened(value) if use_tnd_actual_seq else _slice_seq_dim1(value)
+        elif key == "decoder_input" and value is not None:
+            # Decoder embeddings use SBH; token fields above use BSH.
+            start, end = _get_chunk_bounds(value.shape[0])
+            sharded[key] = value[start:end]
         elif key == "position_ids":
             sharded[key] = _slice_tnd_flattened(value) if use_tnd_actual_seq else _slice_position_ids(value)
         elif key == "attention_mask":
@@ -457,7 +491,7 @@ def prepare_context_parallel_input(inputs: dict,
         else:
             sharded[key] = value
 
-    if sharded.get("position_ids", None) is None:
+    if require_position_ids and sharded.get("position_ids", None) is None:
         raise ValueError("Context parallel requires position_ids from dataset inputs.")
 
     if use_tnd_actual_seq or not build_attention_mask:

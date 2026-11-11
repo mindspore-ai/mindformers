@@ -241,7 +241,8 @@ class TransformerLayer(nn.Cell, BaseTransformerLayer):
         # Self-Attention
         attn_result = self.self_attention(
             input_layernorm_output,
-            attention_mask=attention_mask,
+            attention_mask=(None if getattr(self.self_attention, "attention_variant", None) == "kda"
+                            else attention_mask),
             rotary_pos_emb=rotary_pos_emb,
             prefix_keys_values=prefix_keys_values,
             actual_seq_len=actual_seq_len,
@@ -332,7 +333,8 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         input_layernorm_output = self.input_layernorm(aggregated_attn)
         attn_result = self.self_attention(
             input_layernorm_output,
-            attention_mask=attention_mask,
+            attention_mask=(None if getattr(self.self_attention, "attention_variant", None) == "kda"
+                            else attention_mask),
             rotary_pos_emb=rotary_pos_emb,
             prefix_keys_values=prefix_keys_values,
             actual_seq_len=actual_seq_len,

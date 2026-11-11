@@ -29,7 +29,8 @@ def get_kda_module_spec(
         normalization: str = "RMSNorm",
 ) -> ModuleSpec:
     """Build the minimal single-card KDA training ModuleSpec."""
-    del qk_layernorm
+    if qk_layernorm:
+        raise NotImplementedError("KDA uses Q/K L2 normalization; qk_layernorm=True is unsupported.")
     return ModuleSpec(
         module=KimiDeltaAttention,
         submodules=KimiDeltaAttentionSubmodules(

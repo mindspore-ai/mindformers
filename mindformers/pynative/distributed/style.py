@@ -871,10 +871,11 @@ class ColwiseParallel(ParallelStyle):
         """Create weight sharding plan for column-wise parallelism."""
         sharding_plan = {}
         if isinstance(module, Linear):
+            output_dim = 1 if module.output_groups > 1 else 0
             if getattr(module, "weight", None) is not None:
-                sharding_plan.update({"weight": (Shard(0),)})
+                sharding_plan.update({"weight": (Shard(output_dim),)})
             if getattr(module, "bias", None) is not None:
-                sharding_plan.update({"bias": (Shard(0),)})
+                sharding_plan.update({"bias": (Shard(output_dim),)})
         elif isinstance(module, VocabEmbedding):
             sharding_plan = {"weight": (Shard(1),)}
         else:
@@ -962,7 +963,8 @@ class RowwiseParallel(ParallelStyle):
         sharding_plan = {}
         if isinstance(module, Linear):
             if getattr(module, "weight", None) is not None:
-                sharding_plan.update({"weight": (Shard(1),)})
+                input_dim = 2 if module.output_groups > 1 else 1
+                sharding_plan.update({"weight": (Shard(input_dim),)})
             if getattr(module, "bias", None) is not None:
                 sharding_plan.update({"bias": (Replicate(),)})
         elif isinstance(module, VocabEmbedding):
@@ -1025,6 +1027,8 @@ class RowwiseParallel(ParallelStyle):
                 out = _call_comm_op(cell, "output.allreduce", out)
             if getattr(cell, "has_bias", False) and getattr(cell, "skip_add_bias", False):
                 bias = cell.bias.to_local() if isinstance(cell.bias, DTensor) else cell.bias
+                if cell.output_groups > 1:
+                    bias = bias.reshape(-1)
                 out = out + cell.cast(bias, out.dtype)
             return out
 
