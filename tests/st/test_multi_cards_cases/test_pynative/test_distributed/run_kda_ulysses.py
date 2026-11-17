@@ -12,7 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Manual KDA TP/CP regression; pending HP state APIs keep this worker outside CI."""
+"""Manual KDA TP/CP regression; pending HP state APIs keep this worker outside CI.
+
+On four ranks, --tp 4 selects TP4/CP1 and exercises the local fused forward/backward
+without installing a CP adapter. --tp 2 selects TP2/CP2 on the same four ranks.
+"""
 
 import argparse
 
@@ -23,7 +27,7 @@ from mindspore.communication import init, get_rank, get_group_size
 from mindspore.graph.api import _no_grad
 from mindspore.ops.communication import all_reduce
 
-from hyper_parallel import DeviceMesh, SkipDTensorDispatch
+from hyper_parallel import DTensor, DeviceMesh, SkipDTensorDispatch
 from hyper_parallel.core.dtensor.layout import _get_slice_tensor_by_layout
 from hyper_parallel.core.fully_shard.api import fully_shard, MixedPrecisionPolicy
 from hyper_parallel.platform.mindspore.autograd_compat import enable_mindspore_backward_compat
@@ -50,21 +54,32 @@ def assert_close(actual, expected, atol, rtol, name="tensor"):
     np.testing.assert_allclose(actual, expected, atol=atol, rtol=rtol, err_msg=name)
 
 
-def check_convolution_layout(core, tokens, heads):
+def check_convolution_layout(core, tokens, heads, cp_enabled=True):
     """Require the intended local sequence/head layout at convolution entry."""
-    original = core._convolve
+    adapter = getattr(core, "_kda_parallel", None)
+    if not cp_enabled:
+        return
+    assert adapter is not None, "CP style did not attach _kda_parallel"
+    original = adapter.convolve
 
-    def checked(query, key, value, weight):
-        """Reject a regression that moves convolution ahead of CP redistribution."""
-        assert query.shape[1:3] == key.shape[1:3] == value.shape[1:3] == (tokens, heads), query.shape
-        assert weight.shape[1] == heads * query.shape[-1], weight.shape
-        return original(query, key, value, weight)
+    def checked(query, key, value, weight, compute, kernel_size):
+        """Check distributed operands before the local convolution boundary."""
+        assert all(isinstance(tensor, DTensor) for tensor in (query, key, value))
+        for tensor in (query, key, value):
+            assert tensor.to_local().shape[1:3] == (tokens, heads), tensor
 
-    core._convolve = checked
+        def checked_compute(projected, local_weight, size):
+            # HP selects Ulysses heads inside convolve, after this wrapper's entry.
+            assert local_weight.shape == (3, heads * query.shape[-1], 1, size), local_weight.shape
+            return compute(projected, local_weight, size)
+
+        return original(query, key, value, weight, checked_compute, kernel_size)
+
+    adapter.convolve = checked
 
 
 def check_tensor_parallel(tp_mesh, cp_mesh, lora=False, bias=False, fsdp=False,
-                          method="ulysses", degree=None, heads=4, tokens=64, batch=2, future_only=False):
+                          method="ulysses", degree=None, heads=4, tokens=64, batch=2, future_only=False, layers=1):
     """Exercise production TP setup and compare local shards with two serial SGD steps."""
     config = TransformerConfig(
         hidden_size=8, num_layers=1, num_attention_heads=heads,
@@ -73,68 +88,94 @@ def check_tensor_parallel(tp_mesh, cp_mesh, lora=False, bias=False, fsdp=False,
         compute_dtype="bfloat16", params_dtype="float32", add_bias_linear=bias,
         kda_f_lora_rank=3 if lora else None, kda_gate_lora_rank=5 if lora else None,
     )
-    with ms.DeviceCtx("meta"):
-        parallel = build_module(get_kda_module_spec(), config=config)
-    base = build_module(get_kda_module_spec(), config=config)
-    rng = np.random.default_rng(142)
-    block = nn.Cell()
-    block.self_attention = parallel
-    block.input_layernorm, block.pre_mlp_layernorm, block.mlp = nn.Identity(), nn.Identity(), nn.Identity()
-    with ms.DeviceCtx("meta"):
-        _apply_layers_tp(block, tp_mesh, enable_ep=False)
-    if cp_mesh.size() > 1:
-        build_context_parallel_attention_style(
-            method=method, cp_size=cp_mesh.size(), attention_variant="kda", ulysses_degree_in_cp=degree,
-        )._apply(parallel.core_attention, cp_mesh)
-    if fsdp:
-        enable_mindspore_backward_compat()
-        shard_plan, replicas = _build_layer_fsdp_policy(block, cp_mesh.size())
-        for param in (parallel.in_proj.weight, parallel.conv1d.weight):
-            assert shard_plan(param).dim == 1 and all(id(param) != id(replica) for replica in replicas)
+    def build_pair():
         with ms.DeviceCtx("meta"):
-            fully_shard(parallel, mesh=cp_mesh, reshard_after_forward=False,
-                        shard_placement_fn=shard_plan, replicate_params=replicas,
-                        mp_policy=MixedPrecisionPolicy(param_dtype=ms.float32, reduce_dtype=ms.float32,
-                                                       output_dtype=ms.float32, cast_forward_inputs=False))
-        parallel.set_reduce_op_type("sum")
-    class InitModel(nn.Cell, TrainModelMixin):
-        """Use the same materialization/reset entry points as Trainer."""
-        def __init__(self):
-            super().__init__()
-            self.model = parallel
+            parallel = build_module(get_kda_module_spec(), config=config)
+        base = build_module(get_kda_module_spec(), config=config)
+        block = nn.Cell()
+        block.self_attention = parallel
+        block.input_layernorm, block.pre_mlp_layernorm, block.mlp = nn.Identity(), nn.Identity(), nn.Identity()
+        with ms.DeviceCtx("meta"):
+            _apply_layers_tp(block, tp_mesh, enable_ep=False)
+        if cp_mesh.size() > 1:
+            build_context_parallel_attention_style(
+                method=method, cp_size=cp_mesh.size(), attention_variant="kda", ulysses_degree_in_cp=degree,
+            )._apply(parallel.core_attention, cp_mesh)
+        if fsdp:
+            enable_mindspore_backward_compat()
+            shard_plan, replicas = _build_layer_fsdp_policy(block, cp_mesh.size())
+            for param in (parallel.in_proj.weight, parallel.conv1d.weight):
+                assert shard_plan(param).dim == 1 and all(id(param) != id(replica) for replica in replicas)
+            with ms.DeviceCtx("meta"):
+                fully_shard(parallel, mesh=cp_mesh, reshard_after_forward=False,
+                            shard_placement_fn=shard_plan, replicate_params=replicas,
+                            mp_policy=MixedPrecisionPolicy(param_dtype=ms.float32, reduce_dtype=ms.float32,
+                                                           output_dtype=ms.float32, cast_forward_inputs=False))
+            parallel.set_reduce_op_type("sum")
+        class InitModel(nn.Cell, TrainModelMixin):
+            """Use the same materialization/reset entry points as Trainer."""
+            def __init__(self):
+                super().__init__()
+                self.model = parallel
 
-    initializer = InitModel()
-    initializer.to_empty()
-    initialized = {}
-    for _ in range(2):
-        ms.set_seed(142)
-        ms.manual_seed(142)
-        with _no_grad():
-            initializer.init_states()
-        for name in ("A_log", "dt_bias"):
-            value = getattr(parallel, name).full_tensor()
-            mean, _ = all_reduce(value / get_group_size())
-            assert_close(value, mean, 1e-6, 1e-6, name + " replicas")
-            if name in initialized:
-                assert_close(value, initialized[name], 0, 0, name + " reseed")
-            initialized[name] = value.copy()
-            sample = value.asnumpy()
-            if name == "dt_bias":
-                assert np.unique(sample, axis=0).shape[0] == sample.shape[0], name + " repeated shards"
-    step = mint.nn.functional.softplus(initialized["dt_bias"]).asnumpy()
-    assert (step >= .001 - 1e-7).all() and (step <= .1 + 1e-7).all()
-    assert not initialized["A_log"].asnumpy().any()
-    for (_, source), (_, target) in zip(base.parameters_and_names(), parallel.parameters_and_names()):
-        source.set_data(target.full_tensor())
-    # Independent pre-TP flat parameter layout for numerical/gradient comparison.
-    base.in_proj.weight = ms.Parameter(base.in_proj.weight.reshape(-1, config.hidden_size), name="weight")
-    if base.in_proj.bias is not None:
-        base.in_proj.bias = ms.Parameter(base.in_proj.bias.reshape(-1), name="bias")
-    base.in_proj.output_groups = 1
-    base.conv1d.weight = ms.Parameter(base.conv1d.weight.reshape(-1, 1, 4), name="weight")
-    head_degree = cp_mesh.size() if method == "ulysses" else (1 if method == "colossal" else degree)
-    check_convolution_layout(parallel.core_attention, tokens // (cp_mesh.size() // head_degree),
-                             heads // tp_mesh.size() // head_degree)
+        initializer = InitModel()
+        initializer.to_empty()
+        initialized = {}
+        for _ in range(2):
+            ms.set_seed(142)
+            ms.manual_seed(142)
+            with _no_grad():
+                initializer.init_states()
+            for name in ("A_log", "dt_bias"):
+                value = getattr(parallel, name).full_tensor()
+                mean, _ = all_reduce(value / get_group_size())
+                assert_close(value, mean, 1e-6, 1e-6, name + " replicas")
+                if name in initialized:
+                    assert_close(value, initialized[name], 0, 0, name + " reseed")
+                initialized[name] = value.copy()
+                sample = value.asnumpy()
+                if name == "dt_bias":
+                    assert np.unique(sample, axis=0).shape[0] == sample.shape[0], name + " repeated shards"
+        step = mint.nn.functional.softplus(initialized["dt_bias"]).asnumpy()
+        assert (step >= .001 - 1e-7).all() and (step <= .1 + 1e-7).all()
+        assert not initialized["A_log"].asnumpy().any()
+        for (_, source), (_, target) in zip(base.parameters_and_names(), parallel.parameters_and_names()):
+            source.set_data(target.full_tensor())
+        # Independent pre-TP flat parameter layout for numerical/gradient comparison.
+        base.in_proj.weight = ms.Parameter(base.in_proj.weight.reshape(-1, config.hidden_size), name="weight")
+        if base.in_proj.bias is not None:
+            base.in_proj.bias = ms.Parameter(base.in_proj.bias.reshape(-1), name="bias")
+        base.in_proj.output_groups = 1
+        base.conv1d.weight = ms.Parameter(base.conv1d.weight.reshape(-1, 1, 4), name="weight")
+        head_degree = cp_mesh.size() if method == "ulysses" else (1 if method == "colossal" else degree)
+        check_convolution_layout(parallel.core_attention, tokens // (cp_mesh.size() // head_degree),
+                                 heads // tp_mesh.size() // head_degree, cp_enabled=cp_mesh.size() > 1)
+        return base, parallel
+
+    pairs = [build_pair() for _ in range(layers)]
+
+    class ResidualStack(nn.Cell):
+        """Compose independently parameterized KDA layers for chained backward checks."""
+        def __init__(self, cells):
+            super().__init__()
+            self.layers = nn.CellList(cells)
+
+        def construct(self, hidden):
+            for layer in self.layers:
+                hidden = hidden + layer(hidden).astype(hidden.dtype)
+            return hidden
+
+        def zero_grad(self):
+            """Reset gradients through each independently sharded FSDP layer."""
+            for layer in self.layers:
+                layer.zero_grad()
+
+    if layers == 1:
+        base, parallel = pairs[0]
+    else:
+        base = ResidualStack([pair[0] for pair in pairs])
+        parallel = ResidualStack([pair[1] for pair in pairs])
+    rng = np.random.default_rng(142)
     original_params, parallel_params = tuple(base.trainable_params()), tuple(parallel.trainable_params())
     cp_tokens = tokens // cp_mesh.size()
     local_tokens = cp_tokens // tp_mesh.size()
@@ -194,6 +235,7 @@ if __name__ == "__main__":
     parser.add_argument("--tokens", type=int, default=64)
     parser.add_argument("--batch", type=int, default=2)
     parser.add_argument("--future-only", action="store_true")
+    parser.add_argument("--layers", type=int, default=1)
     for option in ("fsdp", "lora", "bias"):
         parser.add_argument("--" + option, action="store_true")
     cli_options = parser.parse_args()
@@ -204,5 +246,5 @@ if __name__ == "__main__":
     check_tensor_parallel(
         full_mesh["tp"], full_mesh["cp"], cli_options.lora,
         cli_options.bias, cli_options.fsdp, cli_options.method, cli_options.degree,
-        cli_options.heads, cli_options.tokens, cli_options.batch, cli_options.future_only)
+        cli_options.heads, cli_options.tokens, cli_options.batch, cli_options.future_only, cli_options.layers)
     print("KDA TP/CP INIT AND TWO STEPS PASS", get_rank(), flush=True)

@@ -14,6 +14,9 @@
 # ============================================================================
 """Unit tests for local-tensor parallel styles."""
 
+import os
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -38,6 +41,133 @@ from mindformers.pynative.distributed.style import (
 )
 from mindformers.pynative.layers.linear import Linear
 from mindformers.pynative.pet.lora_layer import LinearWithLoRA
+
+
+def test_non_kda_cp_import_without_optional_kda_style():
+    """Check a fresh import without replacing class objects in the test process."""
+    code = """
+import sys
+import hyper_parallel as hp
+from hyper_parallel.core import context_parallel as hp_cp
+for package in (hp, hp_cp):
+    if hasattr(package, "KDAContextParallel"):
+        delattr(package, "KDAContextParallel")
+assert "mindformers.pynative.distributed.context_parallel" not in sys.modules
+from mindformers.pynative.distributed import context_parallel as mf_cp
+assert mf_cp.build_context_parallel_attention_style("ulysses", 2) is not None
+try:
+    mf_cp.build_context_parallel_attention_style("colossal", 2, attention_variant="kda")
+except ImportError as error:
+    assert "KDA CP requires" in str(error)
+else:
+    raise AssertionError("Missing optional KDA dependency must fail explicitly.")
+"""
+    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
+                            env={**os.environ, "HYPER_PARALLEL_PLATFORM": "mindspore"}, timeout=120, check=False)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("extra,exception,match", [
+    ({"async_enabled": True}, ValueError, "synchronous"),
+    ({"method": "invalid"}, NotImplementedError, "Unsupported context_parallel_method"),
+])
+def test_kda_cp_validates_before_optional_import(monkeypatch, extra, exception, match):
+    """Invalid options remain diagnosable even when HP has no KDA CP interface."""
+    from hyper_parallel.core import context_parallel as hp_cp
+    from mindformers.pynative.distributed.context_parallel import build_context_parallel_attention_style
+    monkeypatch.delattr(hp_cp, "KDAContextParallel", raising=False)
+    kwargs = {"method": "colossal", "cp_size": 2, "attention_variant": "kda", **extra}
+    with pytest.raises(exception, match=match):
+        build_context_parallel_attention_style(**kwargs)
+
+
+@pytest.mark.parametrize("cp_rank", [0, 1])
+def test_pipeline_cp_preserves_received_activation(monkeypatch, cp_rank):
+    """A non-first PP stage receives an activation already sliced by the sender's CP."""
+    from mindformers.pynative.distributed import context_parallel as cp_module
+    model = nn.Cell()
+    model.model = nn.Cell()
+    model.model.pre_process = False
+    mesh = SimpleNamespace(size=lambda: 2, get_local_rank=lambda: cp_rank)
+    dims = SimpleNamespace(cp_enabled=True, pp_enabled=True, get_mesh=lambda _: mesh)
+    styles = []
+    monkeypatch.setattr(cp_module, "is_pure_kda", lambda _: True)
+    monkeypatch.setattr(cp_module.ContextParallelModelIOStyle, "_apply",
+                        lambda style, cell: styles.append(style) or cell)
+    cp_module.apply_context_parallel_model_io(
+        model, dims, SimpleNamespace(), SimpleNamespace(), stage_pre_process=False)
+    tokens = np.arange(8).reshape(1, 8)
+    hidden = np.arange(32).reshape(4, 1, 8)
+    _, result = styles[0]._prepare_inputs(model, (), {
+        "decoder_input": hidden, "input_ids": tokens, "labels": tokens, "loss_mask": np.ones((1, 8))})
+    assert result["decoder_input"] is hidden
+    np.testing.assert_array_equal(result["labels"], tokens[:, cp_rank * 4:(cp_rank + 1) * 4])
+
+
+@pytest.mark.parametrize("world", [2, 4])
+@pytest.mark.parametrize("projection_name", [
+    "in_proj", "out_proj", "beta_proj", "f_proj", "g_proj",
+    "f_a_proj", "f_b_proj", "g_a_proj", "g_b_proj",
+])
+def test_kda_grouped_peft_rejects_unsupported_tp(world, projection_name):
+    """Reject PEFT before sharding fused sections or mutating KDA head metadata."""
+    from mindformers.pynative.base_models.gpt.parallelize import _kda_attention_layer_plan
+    attention = nn.Cell()
+    with ms.DeviceCtx("meta"):
+        attention.in_proj = Linear(4, 12, "float32", output_groups=3)
+        target = attention.in_proj if projection_name == "in_proj" else Linear(4, 12, "float32")
+        setattr(attention, projection_name, LinearWithLoRA.from_base(target, lora_rank=2))
+    for name, value in {
+            "num_key_heads": 4, "num_value_heads": 4, "qk_dim": 4, "v_dim": 4,
+            "gate_dim": 4, "conv_dim": 12, "in_proj_split_sections": (4, 4, 4),
+            "conv1d": SimpleNamespace(channels=12), "use_legacy_fused_projections": True,
+    }.items():
+        setattr(attention, name, value)
+    with pytest.raises(NotImplementedError, match="PEFT LoRA"):
+        _kda_attention_layer_plan(attention, SimpleNamespace(size=lambda: world))
+    assert attention.num_key_heads == attention.num_value_heads == 4
+
+
+@pytest.mark.parametrize("already_sharded", [False, True])
+def test_cp_does_not_inject_absent_decoder_input(already_sharded):
+    """Optional decoder_input must not become an unsolicited keyword argument."""
+    from mindformers.pynative.distributed.context_parallel import ContextParallelModelIOStyle
+    mesh = SimpleNamespace(size=lambda: 2, get_local_rank=lambda: 0)
+    style = ContextParallelModelIOStyle(mesh, build_attention_mask=False, require_position_ids=False,
+                                        decoder_input_is_cp_sharded=already_sharded)
+    _, kwargs = style._prepare_inputs(None, (), {"input_ids": np.ones((1, 8)), "labels": np.ones((1, 8))})
+    assert "decoder_input" not in kwargs
+
+
+def test_pipeline_cp_requires_explicit_stage_metadata(monkeypatch):
+    """Unknown PP wrapper metadata must not silently select the first-stage path."""
+    from mindformers.pynative.distributed import context_parallel as cp_module
+    monkeypatch.setattr(cp_module, "is_pure_kda", lambda _: True)
+    dims = SimpleNamespace(cp_enabled=True, pp_enabled=True, get_mesh=lambda _: None)
+    with pytest.raises(ValueError, match="stage_pre_process"):
+        cp_module.apply_context_parallel_model_io(nn.Cell(), dims, SimpleNamespace(), SimpleNamespace())
+
+
+def test_pipeline_cp_uses_unwrapped_stage_metadata(monkeypatch):
+    """The caller resolves the real GPT stage beneath multiple wrappers."""
+    from mindformers.pynative.base_models.gpt.parallelize import _unwrap_gptmodel
+    from mindformers.pynative.base_models.gpt.gpt_model import GPTModel
+    from mindformers.pynative.distributed import context_parallel as cp_module
+    # Only the Cell shell and GPT type are needed to exercise wrapper traversal.
+    stage = nn.Cell.__new__(GPTModel)
+    nn.Cell.__init__(stage)
+    stage.pre_process = False
+    model = nn.Cell()
+    model.wrapper = nn.Cell()
+    model.wrapper.stage = stage
+    resolved = _unwrap_gptmodel(model)
+    assert resolved is stage
+    monkeypatch.setattr(cp_module, "is_pure_kda", lambda _: True)
+    monkeypatch.setattr(cp_module.ContextParallelModelIOStyle, "_apply", lambda style, cell: style)
+    dims = SimpleNamespace(cp_enabled=True, pp_enabled=True, get_mesh=lambda _: None)
+    style = cp_module.apply_context_parallel_model_io(
+        model, dims, SimpleNamespace(), SimpleNamespace(), stage_pre_process=resolved.pre_process)
+    assert style.decoder_input_is_cp_sharded
 
 
 @pytest.mark.parametrize("groups", [1, 3])

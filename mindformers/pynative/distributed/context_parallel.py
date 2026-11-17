@@ -18,7 +18,6 @@ from mindspore import mint, nn, ops
 from mindspore.common import dtype as mstype
 
 from hyper_parallel import DeviceMesh
-from hyper_parallel.core.context_parallel import ContextParallel as HPContextParallel
 
 from mindformers.tools.logger import logger
 from mindformers.pynative.distributed.style import (
@@ -156,10 +155,12 @@ def build_context_parallel_attention_style(method: str,
         if async_enabled:
             raise ValueError("KDA CP requires synchronous execution.")
         degree = _validate_cp_method(method, cp_size, ulysses_degree_in_cp)
-        return HPContextParallelAdapter(HPContextParallel(
-            seq_dim=1, head_dim=2, ulysses_degree=degree, state_parallel=True,
-            qkv_indices=(0, 1, 2, 3, 4), use_local_output=True,
-        ))
+        # Optional HP interface: ordinary attention must work with older HP packages.
+        try:
+            from hyper_parallel.core.context_parallel import KDAContextParallel
+        except ImportError as error:
+            raise ImportError("KDA CP requires HyperParallel KDAContextParallel (HP #1555).") from error
+        return HPContextParallelAdapter(KDAContextParallel(ulysses_degree=degree))
     if attention_variant == "dsa":
         return DSAContextParallelAttentionStyle(
             method=method,
@@ -186,7 +187,11 @@ def build_context_parallel_attention_style(method: str,
 
 
 class ContextParallelModelIOStyle(ParallelStyle):
-    """Apply CP input slicing to the root model."""
+    """Slice token fields while preserving received CP-local pipeline activations.
+
+    Positional arguments follow the supported PP wrapper contract: decoder_input
+    first. Ordinary keyword calls are mapped by name.
+    """
 
     _INPUT_NAMES = (
         "decoder_input",
@@ -202,7 +207,8 @@ class ContextParallelModelIOStyle(ParallelStyle):
                  ulysses_degree_in_cp: int = None, mask_type: str = "causal",
                  build_attention_mask: bool = True,
                  require_actual_seq_len: bool = False,
-                 require_position_ids: bool = True):
+                 require_position_ids: bool = True,
+                 decoder_input_is_cp_sharded: bool = False):
         super().__init__()
         self.cp_mesh = cp_mesh
         self.cp_method = cp_method
@@ -211,6 +217,7 @@ class ContextParallelModelIOStyle(ParallelStyle):
         self.build_attention_mask = build_attention_mask
         self.require_actual_seq_len = require_actual_seq_len
         self.require_position_ids = require_position_ids
+        self.decoder_input_is_cp_sharded = decoder_input_is_cp_sharded
 
     def _prepare_inputs(self, module, args, kwargs):
         """Prepare root-model inputs for CP."""
@@ -222,12 +229,18 @@ class ContextParallelModelIOStyle(ParallelStyle):
             else:
                 inputs[name] = kwargs.get(name)
 
+        decoder_input_provided = bool(args) or "decoder_input" in kwargs
+        if not decoder_input_provided:
+            inputs.pop("decoder_input", None)
+
         if self.require_actual_seq_len and inputs.get("actual_seq_len") is None:
             raise ValueError(
                 "TND DSA context parallel requires actual_seq_len from the dataset. "
                 "Enable create_compressed_eod_mask and include actual_seq_len in column_names."
             )
 
+        # Non-first PP stages receive activations already sliced by the sender's CP.
+        decoder_input = inputs.pop("decoder_input", None) if self.decoder_input_is_cp_sharded else None
         sharded_inputs = prepare_context_parallel_input(
             inputs,
             self.cp_mesh,
@@ -237,6 +250,9 @@ class ContextParallelModelIOStyle(ParallelStyle):
             build_attention_mask=self.build_attention_mask,
             require_position_ids=self.require_position_ids,
         )
+
+        if self.decoder_input_is_cp_sharded and decoder_input_provided:
+            sharded_inputs["decoder_input"] = decoder_input
 
         new_args = list(args)
         new_kwargs = dict(kwargs)
@@ -265,10 +281,14 @@ def apply_context_parallel_model_io(
         parallelism,
         model_config,
         uses_dsa_cp_kernel: bool = False,
+        stage_pre_process: bool | None = None,
 ) -> nn.Cell:
-    """Apply root-model CP input slicing hooks."""
+    """Apply CP input hooks using stage metadata resolved by the GPT caller."""
     if not getattr(parallel_dims, "cp_enabled", False):
         return model
+    pp_enabled = bool(getattr(parallel_dims, "pp_enabled", False))
+    if pp_enabled and not isinstance(stage_pre_process, bool):
+        raise ValueError("PP+CP requires boolean stage_pre_process from the unwrapped GPT stage.")
     # Context parallel relies on the model's compressed attention mask. Without it CP
     # has to materialize a rank-offset dense causal mask. DSA BSND can use the same
     # 2048x2048 compressed left-up mask as ordinary FlashAttention: HP keeps pure
@@ -293,8 +313,10 @@ def apply_context_parallel_model_io(
             "create_compressed_eod_mask with actual_seq_len for TND long sequences.",
             cp_method,
         )
+    received_cp_activation = pp_enabled and not stage_pre_process
     return ContextParallelModelIOStyle(
         cp_mesh=parallel_dims.get_mesh("cp"),
+        decoder_input_is_cp_sharded=received_cp_activation,
         cp_method=cp_method,
         ulysses_degree_in_cp=getattr(parallelism, "ulysses_degree_in_cp", None),
         mask_type=getattr(parallelism, "context_parallel_mask_type", "causal"),

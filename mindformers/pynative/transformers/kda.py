@@ -20,8 +20,7 @@ from typing import Union
 import mindspore as ms
 from mindspore import Parameter, Tensor, mint, nn, ops
 from hyper_parallel import DTensor
-from hyper_parallel.core.dtensor.dtensor import distribute_tensor
-from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
+from hyper_parallel.core.dtensor.placement_types import Replicate
 
 try:
     from hyper_parallel.custom_ops.experimental import npu_chunk_kda
@@ -108,7 +107,12 @@ class ShortConv(nn.Cell):
 
 
 class KimiDeltaCoreAttention(nn.Cell):
-    """Local convolution/normalization/recurrence boundary inside context parallel."""
+    """Coordinate convolution, MF Q/K normalization and the fused KDA recurrence.
+
+    With CP, the HP adapter owns redistribution, convolution halos and recurrent
+    state propagation; MF normalizes Q/K between its convolve/attention calls.
+    Without CP, local convolution and the fused operator consume TP-local tensors.
+    """
 
     attention_variant = "kda"
 
@@ -122,27 +126,26 @@ class KimiDeltaCoreAttention(nn.Cell):
     @staticmethod
     def _l2_normalize(x):
         """Normalize each query/key head in FP32."""
+        if isinstance(x, DTensor):
+            x = x.float()
+            return x / mint.sqrt(mint.sum(x * x, dim=-1, keepdim=True) + 1e-6)
         x = ops.cast(x, ms.float32)
         return x * ops.rsqrt(ops.sum(x * x, dim=-1, keepdim=True) + Tensor(1e-6, ms.float32))
 
     def construct(self, query, key, value, decay, beta, conv_weight, a_log, dt_bias):
         """Run local convolution and recurrence after CP redistribution."""
-        layout = (query.device_mesh, query.placements) if isinstance(query, DTensor) else None
-        query, key, value, decay, beta = (
+        parallel = getattr(self, "_kda_parallel", None)
+        if parallel is not None:
+            query, key, value = parallel.convolve(query, key, value, conv_weight,
+                                                  ShortConv.compute, self.conv_kernel_size)
+            query, key = self._l2_normalize(query), self._l2_normalize(key)
+            return parallel.attention(
+                query.to(value.dtype), key.to(value.dtype), value,
+                decay, beta, a_log, dt_bias, self.scale, self.chunk_size, self.lower_bound)
+        # Without CP all operands are local; TP/FSDP parameter views are localized here.
+        conv_weight, a_log, dt_bias = (
             tensor.to_local() if isinstance(tensor, DTensor) else tensor
-            for tensor in (query, key, value, decay, beta)
-        )
-        conv_weight = conv_weight.to_local() if isinstance(conv_weight, DTensor) else conv_weight
-        a_log = a_log.to_local() if isinstance(a_log, DTensor) else a_log
-        dt_bias = dt_bias.to_local() if isinstance(dt_bias, DTensor) else dt_bias
-        conv_weight = conv_weight.reshape(3, -1, 1, self.conv_kernel_size)
-        state_context = getattr(self, "_context_parallel_state", None)
-        head_mesh = state_context.head_mesh if state_context is not None else (layout[0] if layout else None)
-        if head_mesh is not None:
-            # FSDP has gathered this TP rank's weights; select only Ulysses-local heads.
-            conv_weight = distribute_tensor(conv_weight, head_mesh, (Shard(1),)).to_local()
-            a_log = distribute_tensor(a_log, head_mesh, (Shard(0),)).to_local()
-            dt_bias = distribute_tensor(dt_bias, head_mesh, (Shard(0),)).to_local()
+            for tensor in (conv_weight, a_log, dt_bias))
         query, key, value = self._convolve(query, key, value, conv_weight)
         output, _ = npu_chunk_kda(
             ops.cast(query, value.dtype), ops.cast(key, value.dtype), value,
@@ -151,21 +154,15 @@ class KimiDeltaCoreAttention(nn.Cell):
             safe_gate=self.safe_gate, lower_bound=self.lower_bound,
             a_log=a_log, dt_bias=dt_bias,
             disable_recompute=True, state_v_first=False,
-            context_parallel=state_context,
         )
-        return DTensor.from_local(output, *layout) if layout is not None else output
+        return output
 
     def _convolve(self, query, key, value, conv_weight):
         """Convolve local inputs with causal context and normalize Q/K."""
         batch, tokens, heads, dim = query.shape
         widths = (heads * dim, heads * dim, heads * value.shape[-1])
         projected = ops.concat(tuple(tensor.reshape(batch, tokens, -1) for tensor in (query, key, value)), axis=-1)
-        state_context = getattr(self, "_context_parallel_state", None)
-        if state_context is not None:
-            projected = state_context.sequence_halo(projected, self.conv_kernel_size - 1)
         convolved = ShortConv.compute(projected, conv_weight, self.conv_kernel_size)
-        if state_context is not None:
-            convolved = convolved[:, self.conv_kernel_size - 1:]
         query, key, value = mint.split(convolved, widths, dim=-1)
         query = self._l2_normalize(query.reshape(batch, tokens, heads, dim))
         key = self._l2_normalize(key.reshape(batch, tokens, heads, dim))
@@ -174,15 +171,17 @@ class KimiDeltaCoreAttention(nn.Cell):
 
 
 class KimiDeltaAttention(nn.Cell):
-    """Direct-projection KDA module for fixed-length training.
+    """KDA projections, gate preparation and core attention for fixed-length training.
 
-    This implementation includes the native MindSpore ShortConv fallback and
-    intentionally excludes packed sequences and inference state/cache handling.
-    Head-wise TP keeps complete local heads. Ulysses gathers complete sequences
-    before convolution and normalization, then restores local sequences after the
-    fused recurrence. State CP exchanges summaries and causal halos. The recurrence requires
-    Hyper-Parallel's differentiable Chunk KDA and the FLA-NPU OPP, with
-    128-dimensional heads, 64-token chunks, and BF16 safe-gate computation.
+    MF prepares projections and FP32 beta sigmoid. Its core applies Q/K L2
+    normalization; an installed HP KDAContextParallel adapter owns Ulysses,
+    Colossal or Hybrid redistribution, causal halos and recurrent state exchange.
+    Distributed layouts remain intact until HP's native computation boundaries.
+    The non-CP path uses local ShortConv and differentiable Chunk KDA directly.
+    The fused backend requires the matching HP extension and FLA-NPU OPP with
+    head128, chunk64 and BF16 safe gates. Packed inputs and inference caches are
+    not supported. PEFT adapters on KDA projections currently require TP1;
+    the built-in low-rank projection paths have separate TP support.
     """
 
     attention_variant = "kda"
@@ -432,7 +431,7 @@ class KimiDeltaAttention(nn.Cell):
         )
 
         decay = ops.cast(raw_gate, ms.float32)
-        # Ulysses encloses convolution, Q/K normalization and fused raw-gate processing.
+        # MF prepares beta and normalizes Q/K; HP manages CP layout, halos and state exchange.
         output = self.core_attention(
             q, k, v, decay, beta, self.conv1d.weight, self.A_log, self.dt_bias
         )

@@ -819,6 +819,11 @@ def _gqa_attention_layer_plan(self_attn, tp_mesh, enable_mc2=False):
 def _kda_attention_layer_plan(self_attn, tp_mesh):
     """Shard complete KDA heads, preserving each fused projection's group axis."""
     world = tp_mesh.size()
+    if world > 1:
+        adapters = [name for name, cell in self_attn.cells_and_names() if hasattr(cell, "lora_a")]
+        if adapters:
+            raise NotImplementedError(
+                f"PEFT LoRA on KDA projections {adapters} does not support TP>1; use TP1.")
     if self_attn.num_key_heads % world or self_attn.num_value_heads % world:
         raise ValueError("KDA key/value heads must be divisible by tensor_parallel.")
     plan = {
@@ -1918,6 +1923,10 @@ def apply_context_parallel_attention(
                 method=method, cp_size=cp_size, attention_variant="kda",
                 ulysses_degree_in_cp=ulysses_degree,
             )._apply(attention.core_attention, cp_mesh)
+            adapter = getattr(attention.core_attention, "_kda_parallel", None)
+            if adapter is None or not all(callable(getattr(adapter, name, None))
+                                          for name in ("convolve", "attention")):
+                raise RuntimeError("KDA CP style did not install the required _kda_parallel adapter.")
             logger.info("Applied KDA %s context parallel to %s", method, block_label)
             return
         cp_module_path, cp_module = _find_one_module(transformer_block, block_label, "core_attention")
@@ -2148,6 +2157,7 @@ def _apply_spmd_parallelism(
             parallelism,
             gptmodel.config,
             uses_dsa_cp_kernel=_uses_dsa_cp_kernel(gptmodel),
+            stage_pre_process=gptmodel.pre_process,
         )
 
     # Configure this even when DP and CP are both size one. Pure PP must skip

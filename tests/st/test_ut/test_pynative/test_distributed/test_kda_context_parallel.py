@@ -15,6 +15,7 @@
 """KDA CP configuration and production GPT parallelization entry points."""
 
 import os
+from unittest.mock import patch
 from types import SimpleNamespace
 
 import pytest
@@ -70,6 +71,20 @@ class Model(nn.Cell):
         self.decoder.layers[0].self_attention = build_module(get_kda_module_spec(), config=config)
 
 
+def test_cp_setup_rejects_missing_adapter(monkeypatch):
+    """A changed HP hook contract must fail before training starts."""
+    with ms.DeviceCtx("meta"):
+        model = Model(make_config(context_parallel_size=2))
+    monkeypatch.setattr(parallelize, "_unwrap_gptmodel", lambda value: value)
+    monkeypatch.setattr(parallelize, "build_context_parallel_attention_style",
+                        lambda **kwargs: SimpleNamespace(_apply=lambda cell, mesh: cell))
+    dims = SimpleNamespace(cp=2, tp_enabled=False, cp_enabled=True, get_mesh=lambda _: FakeMesh())
+    parallelism = SimpleNamespace(context_parallel_method="ulysses", context_parallel_async=False,
+                                  ulysses_degree_in_cp=None)
+    with pytest.raises(RuntimeError, match="_kda_parallel"):
+        parallelize.apply_context_parallel_attention(model, FakeMesh(), dims, parallelism)
+
+
 def test_kda_cp_config_and_tp_boundary():
     """Only TP and the Ulysses subgroup divide heads, not the state CP group."""
     assert make_config(context_parallel_size=2, use_flash_attention=False).context_parallel_size == 2
@@ -79,7 +94,18 @@ def test_kda_cp_config_and_tp_boundary():
     assert make_config(tensor_model_parallel_size=2, context_parallel_size=4).context_parallel_size == 4
     make_config(tensor_model_parallel_size=4, context_parallel_size=16, hidden_size=3584,
                 num_attention_heads=32, linear_num_key_heads=32, linear_num_value_heads=32)
-    assert build_context_parallel_attention_style("hybrid", 16, 4, attention_variant="kda").hp_style.state_parallel
+    assert build_context_parallel_attention_style("hybrid", 16, 4, attention_variant="kda").hp_style.ulysses_degree == 4
+
+
+def test_kda_builtin_low_rank_remains_tp_compatible():
+    """Built-in factorized projections are distinct from PEFT adapters."""
+    with ms.DeviceCtx("meta"):
+        attention = build_module(get_kda_module_spec(), config=make_config(
+            kda_f_lora_rank=3, kda_gate_lora_rank=5))
+    plan, _ = parallelize._kda_attention_layer_plan(attention, FakeMesh())
+    assert attention.num_key_heads == attention.num_value_heads == 2
+    assert all(f"self_attention.{name}" in plan for name in (
+        "f_a_proj", "f_b_proj", "g_a_proj", "g_b_proj"))
 
 
 @pytest.mark.parametrize("low_rank", [None, 3])
@@ -141,15 +167,19 @@ def test_production_setup_preserves_parameter_names_and_maskless_io(
     parallelize.apply_context_parallel_attention(model, FakeMesh(), dims, parallelism)
     attention = model.decoder.layers[0].self_attention
     assert attention.core_attention._forward_pre_hook
+    assert attention.core_attention._kda_parallel is not None
     assert not attention.conv1d._forward_pre_hook
     assert before == tuple(name for name, _ in model.parameters_and_names())
     assert model.rotary_pos_emb.use_rotary_position_ids is False
     original = ContextParallelModelIOStyle._apply
+    captured = []
     def capture(style, module):
+        captured.append(style)
         assert style.require_position_ids == requires_positions
         return original(style, module)
     monkeypatch.setattr(ContextParallelModelIOStyle, "_apply", capture)
     assert apply_context_parallel_model_io(model, dims, parallelism, config) is model
+    assert len(captured) == 1
     assert model._forward_pre_hook
 
 
@@ -186,3 +216,28 @@ def test_gpt_mask_generation_respects_kda_and_fa_layers(mixed):
     assert result[1] == ("causal-mask" if mixed else None)
     with pytest.raises(NotImplementedError, match="explicit attention_mask"):
         GPTModel._preprocess_input_labels_and_masks(model, "tokens", attention_mask="custom", loss_mask="loss-mask")
+
+
+def test_cp_convolution_and_normalization_keep_dtensors():
+    """MindSpore must retain placements across the convolution/normalization boundary."""
+    from hyper_parallel import DTensor, init_device_mesh
+    from hyper_parallel.core.context_parallel import KDAContextParallel
+    from hyper_parallel.core.dtensor.placement_types import Replicate
+    from mindformers.pynative.transformers.kda import KimiDeltaCoreAttention
+    with patch("hyper_parallel.core.dtensor.device_mesh.platform") as platform:
+        platform.get_rank.return_value = 0
+        platform.get_world_size.return_value = 1
+        platform.tensor_to_numpy.side_effect = lambda value: value.asnumpy()
+        mesh = init_device_mesh("cpu", (1,), mesh_dim_names=("kda_test",), init_backend=False)
+    with ms.DeviceCtx("CPU"):
+        inputs = tuple(DTensor.from_local(ms.Tensor(np.ones((1, 3, 2, 4)), ms.float32),
+                                         mesh, (Replicate(),)) for _ in range(3))
+        weight = ms.Tensor(np.ones((3, 8, 1, 4)), ms.float32)
+        outputs = KDAContextParallel(ulysses_degree=1).convolve(
+            *inputs, weight, lambda value, conv_weight, size: value, 4)
+        for value in outputs:
+            assert isinstance(value, DTensor)
+            normalized = KimiDeltaCoreAttention._l2_normalize(value).to(ms.float32)
+            assert isinstance(normalized, DTensor)
+            assert normalized.placements == (Replicate(),)
+            np.testing.assert_allclose(normalized.to_local().asnumpy(), .5, atol=1e-6)
