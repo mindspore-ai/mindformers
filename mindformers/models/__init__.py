@@ -96,6 +96,10 @@ from .telechat3 import (
     TeleChat3PreTrainedModel,
     TeleChat3ForCausalLM,
 )
+from .telechat4_moe import (
+    TeleChatV4Config,
+    TeleChatV4ForCausalLM,
+)
 from .tokenization_utils import (
     PreTrainedTokenizer,
     PreTrainedTokenizerBase
