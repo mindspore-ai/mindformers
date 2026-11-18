@@ -19,7 +19,6 @@
    ../../research/internlm/internlm
    ../../research/ziya/ziya
    gpt2
-   pangualpha
    bilip2
    clip
    sam

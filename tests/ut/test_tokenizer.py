@@ -33,7 +33,7 @@ def test_all_tokenizers():
     #     os.mkdir(path_name)
 
     tokenizer_list = ["gpt2", "bert_base_uncased", "llama_7b", "bloom_560m",
-                      "pangualpha_2_6b", "clip_vit_b_32", "glm_6b", "t5_small"]
+                      "clip_vit_b_32", "glm_6b", "t5_small"]
     string_list = ["I love Beijing.", "我爱北京。"]
     return_tensors_sig = ["", "ms", "np"]
 
@@ -46,8 +46,6 @@ def test_all_tokenizers():
         [31822, 233, 139, 148, 234, 139, 180, 232, 143, 154, 231, 189, 175, 230, 131, 133],   # llama chinese
         [44, 19134, 61335, 17],    # bloom english
         [164830, 11385, 420],   # bloom chinese
-        [2787, 13, 4, 13, 28420, 13, 4, 37472, 34],    # pangualpha english
-        [21, 453, 263, 12],   # pangualpha chinese
         [328, 793, 11796, 269],    # clip english
         [162, 230, 239, 163, 230, 109, 161, 234, 245, 21078, 361, 38000],     # clip chinese
         [115, 703, 8994, 7],    # glm english
