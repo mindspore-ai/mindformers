@@ -31,19 +31,28 @@ MindSpore Transformers套件基于MindSpore内置的多维混合并行技术和�
 
 ### 模型列表
 
-当前MindSpore Transformers全量的模型列表如下：
+当前MindSpore Transformers 动态图（PyNative） 的模型列表如下：
 
 | 模型名                                                                                                               | 支持规格                          |   模型类型   |     模型架构     |   最新支持版本   |
 |:------------------------------------------------------------------------------------------------------------------|:------------------------------|:--------:|:------------:|:----------:|
-| [TeleChat3](https://atomgit.com/mindspore/mindformers/blob/r1.9.0/configs/telechat3) `🔥HOT`                      | 36B                           |  稠密LLM   |    Mcore     | 1.9.0、在研版本 |
-| [TeleChat3-MoE](https://atomgit.com/mindspore/mindformers/blob/r1.9.0/configs/telechat3_moe) `🔥HOT`              | 105B-A4.7B                    |  稀疏LLM   |    Mcore     | 1.9.0、在研版本 |
-| [Qwen3](https://atomgit.com/mindspore/mindformers/blob/r1.9.0/configs/qwen3) `🔥HOT`                              | 0.6B/1.7B/4B/8B/14B/32B       |  稠密LLM   |    Mcore     | 1.9.0、在研版本 |
-| [Qwen3-MoE](https://atomgit.com/mindspore/mindformers/blob/r1.9.0/configs/qwen3_moe) `🔥HOT`                      | 30B-A3B/235B-A22B             |  稀疏LLM   |    Mcore     | 1.9.0、在研版本 |
-| [DeepSeek-V3](https://atomgit.com/mindspore/mindformers/blob/r1.9.0/research/deepseek3) `🔥HOT`                   | 671B                          |  稀疏LLM   | Mcore/Legacy | 1.9.0、在研版本 |
-| [GLM4.5](https://atomgit.com/mindspore/mindformers/blob/r1.9.0/configs/glm4_moe) `🔥HOT`                          | 106B-A12B/355B-A32B           |  稀疏LLM   |    Mcore     | 1.9.0、在研版本 |
-| [GLM4](https://atomgit.com/mindspore/mindformers/blob/r1.9.0/configs/glm4) `🔥HOT`                                | 9B                            |  稠密LLM   | Mcore/Legacy | 1.9.0、在研版本 |
-| [Qwen2.5](https://atomgit.com/mindspore/mindformers/blob/r1.9.0/research/qwen2_5) `🔥HOT`                         | 0.5B/1.5B/7B/14B/32B/72B      |  稠密LLM   |    Legacy    | 1.9.0、在研版本 |
-| [TeleChat2](https://atomgit.com/mindspore/mindformers/blob/r1.9.0/research/telechat2) `🔥HOT`                     | 7B/35B/115B                   |  稠密LLM   | Mcore/Legacy | 1.9.0、在研版本 |
+| [DeepSeek-V3](https://atomgit.com/mindspore/mindformers/tree/r2.1.0/configs/deepseek3) `🔥HOT`                           | 671B                         |  稀疏LLM   |    Mcore     | 2.1.0、在研版本 |
+| [DeepSeek-V4-Pro](https://atomgit.com/mindspore/mindformers/tree/r2.1.0/configs/deepseek4) `🔥HOT`                       | 1.6T（激活49B）                  |  稀疏LLM   |    Mcore     | 2.1.0、在研版本 |
+| [DeepSeek-V4-Flash](https://atomgit.com/mindspore/mindformers/tree/r2.1.0/configs/deepseek4) `🔥HOT`                     | 284B（激活13B）                  |  稀疏LLM   |    Mcore     | 2.1.0、在研版本 |
+| [Qwen3](https://atomgit.com/mindspore/mindformers/tree/r2.1.0/configs/qwen3) `🔥HOT`                                   | 0.6B/1.7B/4B/8B/14B/32B      |  稠密LLM   |    Mcore     | 2.1.0、在研版本 |
+
+以下为历史静态图模型列表，不代表当前动态图入口的支持范围。需要使用静态图模型时，请切换到对应的历史版本，并使用该版本的入口和配套环境：
+
+| 模型名                                                                                                               | 支持规格                          |   模型类型   |     模型架构     |   最新支持版本   |
+|:------------------------------------------------------------------------------------------------------------------|:------------------------------|:--------:|:------------:|:----------:|
+| [TeleChat3](https://atomgit.com/mindspore/mindformers/blob/r2.1.0/configs/telechat3)                      | 36B                           |  稠密LLM   |    Mcore     | 2.1.0 |
+| [TeleChat3-MoE](https://atomgit.com/mindspore/mindformers/blob/r2.1.0/configs/telechat3_moe)              | 105B-A4.7B                    |  稀疏LLM   |    Mcore     | 2.1.0 |
+| [Qwen3](https://atomgit.com/mindspore/mindformers/blob/r2.1.0/configs/qwen3)                              | 0.6B/1.7B/4B/8B/14B/32B       |  稠密LLM   |    Mcore     | 2.1.0 |
+| [Qwen3-MoE](https://atomgit.com/mindspore/mindformers/blob/r2.1.0/configs/qwen3_moe)                      | 30B-A3B/235B-A22B             |  稀疏LLM   |    Mcore     | 2.1.0 |
+| [DeepSeek-V3](https://atomgit.com/mindspore/mindformers/blob/r2.1.0/research/deepseek3)                   | 671B                          |  稀疏LLM   | Mcore/Legacy | 2.1.0 |
+| [GLM4.5](https://atomgit.com/mindspore/mindformers/blob/r2.1.0/configs/glm4_moe)                          | 106B-A12B/355B-A32B           |  稀疏LLM   |    Mcore     | 2.1.0 |
+| [GLM4](https://atomgit.com/mindspore/mindformers/blob/r2.1.0/configs/glm4)                                | 9B                            |  稠密LLM   | Mcore/Legacy | 2.1.0 |
+| [Qwen2.5](https://atomgit.com/mindspore/mindformers/blob/r2.1.0/research/qwen2_5)                         | 0.5B/1.5B/7B/14B/32B/72B      |  稠密LLM   |    Legacy    | 2.1.0 |
+| [TeleChat2](https://atomgit.com/mindspore/mindformers/blob/r2.1.0/research/telechat2)                     | 7B/35B/115B                   |  稠密LLM   | Mcore/Legacy | 2.1.0 |
 | [Llama3.1](https://atomgit.com/mindspore/mindformers/blob/r1.7.0/research/llama3_1) `⚠️EOL`                       | 8B/70B                        |  稠密LLM   |    Legacy    |   1.7.0    |
 | [Mixtral](https://atomgit.com/mindspore/mindformers/blob/r1.7.0/research/mixtral) `⚠️EOL`                         | 8x7B                          |  稀疏LLM   |    Legacy    |   1.7.0    |
 | [CodeLlama](https://atomgit.com/mindspore/mindformers/blob/r1.5.0/docs/model_cards/codellama.md) `⚠️EOL`          | 34B                           |  稠密LLM   |    Legacy    |   1.5.0    |
@@ -124,14 +133,19 @@ Mcore架构模型按照训练和推理各分为5个级别，分别代表该模�
 
 当前套件建议使用的Python版本为3.11.4。
 
-| MindSpore Transformers | MindSpore | CANN | 固件与驱动 |
-|:----------------------:|:---------:|:----:|:-----:|
-|          在研版本          |   在研版本    | 在研版本 | 在研版本  |
+当前版本仅支持动态图，需配套使用对应的 MindSpore、CANN、固件与驱动在研版本，以及与当前源码配套的 HyperParallel。下方历史版本配套关系仅用于对应历史版本，不能作为当前版本的兼容性保证；使用静态图功能时，请同时切换 MindSpore Transformers 和整套依赖。
+
+| MindSpore Transformers | MindSpore | CANN | 固件与驱动 | HyperParallel |
+|:----------------------:|:---------:|:----:|:----------:|:-------------:|
+| 在研版本 | 在研版本 | 在研版本 | 在研版本 | 在研版本 |
 
 历史版本配套关系：
 
 | MindSpore Transformers |                   MindSpore                   |                                                      CANN                                                      |                                                      固件与驱动                                                      |
 |:----------------------:|:---------------------------------------------:|:--------------------------------------------------------------------------------------------------------------:|:---------------------------------------------------------------------------------------------------------------:|
+|         2.1.0          |   [2.11.0](https://www.mindspore.cn/install)    |   [9.2.0](https://www.hiascend.com/document/detail/zh/canncommercial/920/softwareinst/instg/instg_0000.html)   | [26.2.RC1](https://www.hiascend.com/document/detail/zh/canncommercial/latest/softwareinst/instg/instg_0107.html?OS=openEuler&InstallType=netyum) |
+|         2.0.0          |   [2.10.0](https://www.mindspore.cn/install)    |   [9.1.0](https://www.hiascend.com/document/detail/zh/canncommercial/910/softwareinst/instg/instg_0000.html)   | [26.1.0](https://www.hiascend.com/document/detail/zh/canncommercial/latest/softwareinst/instg/instg_0107.html?OS=openEuler&InstallType=netyum) |
+|         1.9.0          |   [2.9.0](https://www.mindspore.cn/install)    |   [9.0.0](https://www.hiascend.com/document/detail/zh/canncommercial/900/softwareinst/instg/instg_0000.html)   | [26.0.0](https://www.hiascend.com/document/detail/zh/canncommercial/latest/softwareinst/instg/instg_0107.html?OS=openEuler&InstallType=netyum) |
 |         1.8.0          |   [2.7.2](https://www.mindspore.cn/install)   |   [8.5.0](https://www.hiascend.com/document/detail/zh/canncommercial/850/softwareinst/instg/instg_0000.html)   |   [25.5.0](https://www.hiascend.com/document/detail/zh/canncommercial/850/softwareinst/instg/instg_0000.html)   |
 |         1.7.0          |   [2.7.1](https://www.mindspore.cn/install)   | [8.3.RC1](https://www.hiascend.com/document/detail/zh/canncommercial/83RC1/softwareinst/instg/instg_0000.html) | [25.3.RC1](https://www.hiascend.com/document/detail/zh/canncommercial/83RC1/softwareinst/instg/instg_0000.html) |
 |         1.6.0          |   [2.7.0](https://www.mindspore.cn/install)   | [8.2.RC1](https://www.hiascend.com/document/detail/zh/canncommercial/82RC1/softwareinst/instg/instg_0000.html) |  [25.2.0](https://www.hiascend.com/document/detail/zh/canncommercial/82RC1/softwareinst/instg/instg_0000.html)  |
@@ -151,6 +165,23 @@ bash build.sh
 ```
 
 ## 三、使用指南
+
+### 启动训练
+
+当前版本的 `run_mindformer.py` 已弃用静态图（GRAPH_MODE），默认直接使用动态图 Trainer。请使用动态图 YAML，例如：
+
+```shell
+bash scripts/msrun_launcher.sh "run_mindformer.py --config configs/deepseek3/pretrain_deepseek3_1b_8p_pynative.yaml" 8
+```
+
+运行前请准备数据集并修改 YAML 中的数据路径、模型和并行配置；上面的命令在单机启动八卡任务。
+
+- 不指定 `--mode`：直接进入动态图 Trainer。
+- `--mode 1`：兼容旧命令，输出弃用提示后进入动态图 Trainer。
+- `--mode 0`：直接报错，提示静态图已弃用及动态图启动方式。
+- YAML 中的 `mode: 0` 或 `context.mode: 0`：直接报错。请迁移到动态图 YAML。
+
+入口仅接受 `--config`、`--mode` 和 `--register_path`。训练、推理、设备及数据等运行选项请在动态图 YAML 中配置；历史命令行覆盖参数和未知参数会直接报错。
 
 MindSpore Transformers支持一键启动大模型的分布式[预训练](https://www.mindspore.cn/mindformers/docs/zh-CN/master/guide/pre_training.html)、[SFT 微调](https://www.mindspore.cn/mindformers/docs/zh-CN/master/guide/supervised_fine_tuning.html)、[推理](https://www.mindspore.cn/mindformers/docs/zh-CN/master/guide/inference.html)任务，可点击[模型列表](#模型列表)中各模型的链接查看对应使用文档。
 
