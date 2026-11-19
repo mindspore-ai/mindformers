@@ -14,21 +14,17 @@
 # ============================================================================
 """APIs of checkpoint utils."""
 
-import datetime
 import hashlib
 import os
 import re
 import json
-import time
 import shutil
 import tempfile
 from enum import Enum
 from glob import glob
-from pathlib import Path
 from typing import Optional, List
 
 import mindspore as ms
-from mindspore import context
 from mindspore.mint.distributed import gather_object
 
 from mindformers.tools import get_output_root_path
@@ -600,88 +596,6 @@ def verify_ckpt_valid(checkpoint_dir: str, require_optimizer: bool = True) -> Op
                     f"checkpoint directory '{checkpoint_dir}'. Full expected path: '{file_path}'."
                 )
     return None
-
-
-def compile_model(model, dataset, mode, sink_mode, epoch=1, sink_size=1, do_eval=False, do_predict=False):
-    """
-    Compiles the MindSpore model, generates parallel strategy files (if applicable), and validates runtime context.
-
-    This function ensures the model is built with the correct parallel strategy for distributed training or inference.
-
-    Args:
-        model: MindSpore Model object to compile.
-        dataset: Input dataset for model compilation.
-        mode: MindSpore runtime mode (either `ms.GRAPH_MODE` or `ms.PYNATIVE_MODE`). Strategy files are only
-            generated in `GRAPH_MODE`.
-        sink_mode: Whether to enable data sinking.
-        epoch: Number of training epochs for model compilation (used in `model.build()`). Defaults to 1.
-        sink_size: Batch size for data sinking (controls how many batches are sunk at once). Defaults to 1.
-        do_eval: Whether to compile the model for evaluation (uses `infer_predict_layout()`). Defaults to `False`.
-        do_predict: Whether to compile the model for prediction (uses `infer_predict_layout()`). Defaults to `False`.
-
-    Returns:
-        None.
-
-    Raises:
-        ValueError: If `sink_mode` is `False`.
-        RuntimeError: If `dataset` is `None`.
-        AttributeError: If `model` lacks required methods (`build()` or `infer_predict_layout()`).
-    """
-    # Validate mutually exclusive flags (eval and predict cannot both be True)
-    if do_eval and do_predict:
-        raise ValueError("'do_eval' and 'do_predict' cannot both be True; choose one or neither.")
-
-    # Get current parallel mode from MindSpore context
-    parallel_mode = context.get_auto_parallel_context('parallel_mode')
-    supported_parallel_modes = ('semi_auto_parallel', 'auto_parallel', 'hybrid_parallel')
-
-    # Skip compilation if in PyNative mode (no strategy files generated)
-    if mode == ms.PYNATIVE_MODE:
-        logger.warning(
-            "Current runtime mode is PyNative. The `compile_model` function will not generate strategy files."
-        )
-        return
-
-    # Skip compilation if parallel mode is unsupported (no strategy files generated)
-    if parallel_mode not in supported_parallel_modes:
-        logger.warning(
-            f"Current parallel mode '{parallel_mode}' is unsupported. "
-            f"Strategy files are only generated for: {supported_parallel_modes}. Compilation skipped."
-        )
-        return
-
-    # Enforce sink_mode=True for distributed sliced weight loading
-    if not sink_mode:
-        raise ValueError(
-            "When loading distributed sliced weights, 'sink_mode' must be set to True. "
-            "Please enable sink_mode and retry."
-        )
-
-    # Validate dataset exists for compilation
-    if not dataset:
-        raise RuntimeError("Dataset cannot be None when compiling.")
-
-    # Compile model and measure build time
-    build_time_start = time.time()
-    try:
-        logger.info(".........Compiling model.........")
-        if do_eval or do_predict:
-            # Compile for evaluation/prediction (infer layout)
-            model.infer_predict_layout(*dataset)  # Unpack dataset if it's a tuple (e.g., (data, label))
-        else:
-            # Compile for training (build model with dataset/epoch/sink settings)
-            model.build(train_dataset=dataset, epoch=epoch, sink_size=sink_size)
-    except AttributeError as e:
-        raise AttributeError(
-            f"Model is missing a required method: {str(e)}. "
-            "Ensure the model has 'build()' (for training) and 'infer_predict_layout()' (for eval/predict)."
-        ) from e
-    except Exception as e:
-        raise RuntimeError(f"Failed to compile model: {str(e)}") from e
-
-    build_time_end = time.time()
-    build_duration = build_time_end - build_time_start
-    logger.info(f"Time spent compiling the model: {build_duration:.2f} seconds")
 
 
 def is_hf_checkpoint(checkpoint_path: str) -> bool:

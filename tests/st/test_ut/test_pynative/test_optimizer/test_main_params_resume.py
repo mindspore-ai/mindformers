@@ -48,7 +48,6 @@ _split._muon_schema = ()
 def create_resume_optimizer(request, monkeypatch):
     """Exercise the shared resume code through both production optimizers."""
     ms.set_context(mode=ms.PYNATIVE_MODE, device_target="CPU")
-    monkeypatch.setattr(checkpoint_module.LayoutAdapter, "is_pynative_mode", lambda: True)
     net = ResumeNet()
     if request.param == "muon":
         monkeypatch.setattr(muon_module.core_context, "is_legacy_model", lambda: False)

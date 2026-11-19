@@ -28,7 +28,6 @@ import numpy as np
 
 from mindspore import Parameter, Tensor
 from mindspore import load_checkpoint as ms_load_checkpoint
-from mindformers.checkpoint.layout_adapter import LayoutAdapter
 from mindformers.checkpoint.safetensors_utils import load_safetensors_file
 
 from mindformers.tools.logger import logger
@@ -1111,7 +1110,7 @@ class ReshardLoader:
             # using the source parameter names when reading from the weight file.
             src_names = list(set(info[0] for info in param_infos))  # `src_name` is the first character in the tuple.
 
-            if is_hf_checkpoint(self.checkpoint_dir) and LayoutAdapter.is_pynative_mode():
+            if is_hf_checkpoint(self.checkpoint_dir):
                 # Lazy loading with custom reader that handles F8_E8M0, BF16, etc.
                 state_dict_from_file = load_safetensors_file(
                     file_path,

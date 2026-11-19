@@ -15,38 +15,16 @@
 """broadcast params across redundant rank groups."""
 import numpy as np
 
-from mindspore import context, Tensor
-from mindspore.nn import Cell
-from mindspore.ops import operations as P
+from mindspore import Tensor
 from mindspore.communication import create_group, destroy_group
+from mindspore.ops import ReduceOp
 from mindspore.communication._comm_helper import _get_group_map, _remove_group_info
 from mindspore.runtime import synchronize
 from mindspore.mint.distributed import all_gather_object
+from mindspore.ops.communication import all_reduce
 
 from mindformers.tools.utils import get_real_rank, get_real_group_size
 from mindformers.tools.logger import logger
-
-
-class SingleCommunicator(Cell):
-    """
-    Used to broadcast single parameter.
-    """
-
-    def __init__(self, group_name):
-        super().__init__()
-        self.allreduce = P.AllReduce(group=group_name)
-        self.add_flags(skip_auto_parallel_compile=True)
-
-    def construct(self, loaded_param):
-        result = self.allreduce(loaded_param)
-        return result
-
-
-def _change_parallel_context(origin_dataset_strategy):
-    """Change the original parallel state."""
-    context.set_auto_parallel_context(parallel_mode="hybrid_parallel")
-    if origin_dataset_strategy != "data_parallel":
-        context.set_auto_parallel_context(dataset_strategy="data_parallel")
 
 
 def _get_sorted_group_map():
@@ -110,46 +88,42 @@ def _get_group_name(group_map, group):
 
 def _communicate_allreduce(allreduce_input, group_map, group):
     """Communicate allreduce input."""
-    if not allreduce_input:
+    if not allreduce_input or len(group) == 1:
         return
     group_name, is_manual_communication_group = _get_group_name(group_map, group)
     if is_manual_communication_group:
         create_group(group_name, list(group))
-    communicator = SingleCommunicator(group_name)
-    for real_param in allreduce_input:
-        real_param.set_data(communicator(Tensor(real_param)), real_param.sliced)
-    if is_manual_communication_group:
-        destroy_group(group_name)
-        _remove_group_info(group_name)
-
-
-def _restore_parallel_context(origin_parallel_mode, origin_dataset_strategy):
-    """Restore the original parallel state."""
-    context.set_auto_parallel_context(parallel_mode=origin_parallel_mode)
-    if origin_dataset_strategy != "data_parallel":
-        if origin_dataset_strategy is not None and isinstance(origin_dataset_strategy, list):
-            origin_dataset_strategy = tuple(tuple(ds_item) for ds_item in origin_dataset_strategy)
-        context.set_auto_parallel_context(dataset_strategy=origin_dataset_strategy)
+    try:
+        for real_param in allreduce_input:
+            value = real_param.to_local() if hasattr(real_param, 'to_local') else real_param
+            data = Tensor(value)
+            reduced, _ = all_reduce(data, op=ReduceOp.SUM, group=group_name)
+            real_param.set_data(reduced, real_param.sliced)
+    finally:
+        if is_manual_communication_group:
+            synchronize()
+            destroy_group(group_name)
+            _remove_group_info(group_name)
 
 
 def single_parameter_broadcast(net, param_redundancy, param_not_load, param_loaded):
     """
     Broadcasts unique parameter values across redundant rank groups to eliminate duplicate parameter storage.
 
-    This function coordinates parameter sharing among ranks that hold redundant copies of the same parameters 
-    (identified by `param_redundancy`). It temporarily adjusts parallel execution contexts, synchronizes the 
-    loading status of parameters across all ranks, and performs allreduce communication within redundant groups 
+    This function coordinates parameter sharing among ranks that hold redundant copies of the same parameters
+    (identified by `param_redundancy`). It synchronizes the
+    loading status of parameters across all ranks, and performs allreduce communication within redundant groups
     to ensure all ranks in a group access the same parameter values—thus removing redundant parameter storage.
 
     Core workflow:
-    1. Capture the current rank ID and original parallel context configurations (to restore later).
-    2. Retrieve the network's parameter dictionary and adjust parallel context settings for communication.
+    1. Capture the current rank ID.
+    2. Retrieve the network's parameter dictionary.
     3. Track the current rank's parameter loading status and synchronize this status across all ranks via allgather.
     4. For each group of ranks with redundant parameters:
         a. Filter parameters to only those present in the network's parameter dictionary.
         b. Create input data for allreduce communication, including valid parameter values from loaded ranks.
         c. Execute allreduce to broadcast consistent parameter values to all ranks in the group.
-    5. Restore the original parallel context settings and synchronize all ranks to complete the process.
+    5. Synchronize all ranks to complete the process.
 
     Args:
         net: MindSpore Network instance containing the parameters to be broadcasted and synchronized.
@@ -159,12 +133,10 @@ def single_parameter_broadcast(net, param_redundancy, param_not_load, param_load
         param_loaded (set): Set tracking rank IDs that have successfully loaded their assigned parameters.
             Updated to include the current rank before synchronizing loading status.
     """
+    if get_real_group_size() == 1:
+        return
     cur_rank = get_real_rank()
-    origin_parallel_mode = context.get_auto_parallel_context("parallel_mode")
-    origin_dataset_strategy = context.get_auto_parallel_context("dataset_strategy")
-
     net_param_dict = net.parameters_dict()
-    _change_parallel_context(origin_dataset_strategy)
     param_loaded.add(cur_rank)
     total_num = get_real_group_size()
     total_param_loaded = [None] * total_num
@@ -172,13 +144,15 @@ def single_parameter_broadcast(net, param_redundancy, param_not_load, param_load
     all_gather_object(total_param_loaded, param_loaded)
 
     group_map = _get_sorted_group_map()
-    for group, params in param_redundancy.items():
+    for group in sorted(param_redundancy):
+        if cur_rank not in group:
+            continue
+        params = param_redundancy[group]
         logger.debug(f"Rank group: {group}")
         logger.debug(f"AllReduce params: {params}")
-        params = [param for param in params if param in set(net_param_dict.keys())]
+        params = sorted(param for param in params if param in net_param_dict)
         allreduce_input = _create_allreduce_input(
             params, group, net_param_dict, total_param_loaded, param_not_load, cur_rank)
         _communicate_allreduce(allreduce_input, group_map, group)
-    _restore_parallel_context(origin_parallel_mode, origin_dataset_strategy)
     synchronize()
     logger.info("End loading the parameter broadcast for removing redundant parameters.")
