@@ -42,6 +42,12 @@ from collections import defaultdict
 from dataclasses import replace
 from glob import glob
 
+# Select this checkout before importing MindFormers when invoked as a script.
+# pylint: disable=wrong-import-position
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
 import numpy as np
 import safetensors
 import yaml
@@ -57,6 +63,7 @@ from mindformers.checkpoint.converter.template import WeightTemplate
 from mindformers.checkpoint.safetensors_utils import read_safetensors_header
 from mindformers.checkpoint.utils import get_sharded_tensor_shard_id
 from mindformers.tools.check_rules import check_yaml_depth_before_loading
+# pylint: enable=wrong-import-position
 
 ms.set_device(device_target='CPU')
 cpu_cast = Cast().set_device('CPU')
@@ -99,19 +106,27 @@ def discover_model_converters():
     """Populate MODEL_CONVERTERS from the models that declare weight_converters."""
     if MODEL_CONVERTERS:
         return MODEL_CONVERTERS
-    models_dir = os.path.join(os.path.dirname(os.path.dirname(
-        os.path.dirname(os.path.abspath(__file__)))), 'mindformers', 'models')
-    for name in sorted(os.listdir(models_dir)):
-        if not os.path.isfile(os.path.join(models_dir, name, 'utils.py')):
-            continue
+    models_dir = os.path.join(_REPO_ROOT, 'mindformers', 'models')
+    modules = [f'mindformers.models.{name}.utils' for name in sorted(os.listdir(models_dir))
+               if os.path.isfile(os.path.join(models_dir, name, 'utils.py'))]
+    adapter_dir = os.path.dirname(os.path.abspath(__file__))
+    modules.extend(f'toolkit.weight_convert.{name}.export_adapter' for name in sorted(os.listdir(adapter_dir))
+                   if os.path.isfile(os.path.join(adapter_dir, name, 'export_adapter.py')))
+    for module_name in modules:
         try:
-            module = importlib.import_module(f'mindformers.models.{name}.utils')
+            module = importlib.import_module(module_name)
         except ImportError as exc:            # optional deps, unrelated models
-            logger.debug(f"Skipping mindformers.models.{name}.utils: {exc}")
+            if module_name.startswith('toolkit.'):
+                logger.warning(f'Cannot load weight-conversion adapter {module_name}: {exc}')
+            else:
+                logger.debug(f"Skipping {module_name}: {exc}")
             continue
         for obj in vars(module).values():
-            if not (inspect.isclass(obj) and getattr(obj, 'weight_converters', None)):
+            if not (inspect.isclass(obj) and (getattr(obj, 'weight_converters', None)
+                                             or callable(getattr(obj, 'build_weight_template', None)))):
                 continue
+            for model_type in getattr(obj, 'export_model_types', ()):
+                MODEL_CONVERTERS.setdefault(model_type, obj)
             model_type = getattr(getattr(obj, 'config_class', None), 'model_type', None)
             if model_type and model_type not in MODEL_CONVERTERS:
                 MODEL_CONVERTERS[model_type] = obj
@@ -132,6 +147,7 @@ OPTIMIZER_PREFIXES = frozenset({'adam_m', 'adam_v', 'muon_m', 'muon_v',
 FP32_HF_SUFFIXES = (
     '.attn_sink', '.compressor.ape',   # the latter covers .indexer.compressor.ape
     '.ffn.gate.bias',
+    '.e_score_correction_bias',
     '.hc_attn_base', '.hc_attn_fn', '.hc_attn_scale',
     '.hc_ffn_base', '.hc_ffn_fn', '.hc_ffn_scale',
     'hc_head_base', 'hc_head_fn', 'hc_head_scale',
@@ -245,6 +261,10 @@ def build_template(model_type, config):
     model_cls = MODEL_CONVERTERS.get(model_type)
     if model_cls is None:
         raise ValueError(f"No weight_converters registered for model type '{model_type}'.")
+
+    factory = getattr(model_cls, 'build_weight_template', None)
+    if callable(factory):
+        return factory(config)
 
     hidden_size = config.get('hidden_size')
     converters = [_configure_op(op, config, hidden_size)
@@ -591,34 +611,47 @@ class ShardedCheckpointReader:
     def read(self, name):
         """Return the whole parameter as (numpy array, MF dtype)."""
         entry = self._meta[name]
-        fragments = entry.get('axis_fragmentations') or []
-        split_axes = [i for i, n in enumerate(fragments) if n and n > 1]
-        if len(split_axes) > 1:
-            raise ValueError(
-                f"{name} is split along more than one axis ({fragments}); this tool "
-                f"only reassembles single-axis sharding.")
-        axis = split_axes[0] if split_axes else None    # None: replicated
-
-        pieces = []
-        for chunk in sorted(entry['chunk'], key=lambda c: c['global_offset'][0]):
+        expected = tuple(entry['global_shape'])
+        fragments = tuple(entry.get('axis_fragmentations') or (1,) * len(expected))
+        if len(fragments) != len(expected) or any(n < 1 or size % n for size, n in zip(expected, fragments)):
+            raise ValueError(f'{name} has invalid axis fragmentations: {fragments} for {expected}')
+        tile_shape = tuple(size // n for size, n in zip(expected, fragments))
+        # In 1-D the complete offset set distinguishes element offsets from MF shard indices.
+        element_offsets_1d = len(expected) == 1 and {
+            tuple(chunk['global_offset']) for chunk in entry['chunk']
+        } == {(index * tile_shape[0],) for index in range(fragments[0])}
+        seen = set()
+        merged, source_dtype = None, None
+        for chunk in entry['chunk']:
+            offset = tuple(chunk['global_offset'])
+            # MF stores a flattened shard index, rather than an element offset.
+            if len(offset) == 1 and not element_offsets_1d:
+                if not 0 <= offset[0] < int(np.prod(fragments)):
+                    raise ValueError(f'{name} has an invalid shard index: {offset}')
+                grid = np.unravel_index(offset[0], fragments) if fragments else ()
+                offset = tuple(index * width for index, width in zip(grid, tile_shape))
+            if (len(offset) != len(expected) or offset in seen
+                    or any(start < 0 or start >= size or start % width
+                           for start, size, width in zip(offset, expected, tile_shape))):
+                raise ValueError(f'{name} has an invalid or duplicate chunk offset: {offset}')
             locations = self._storage[
                 get_sharded_tensor_shard_id(name, chunk['global_offset'])]
             shard_file = locations[0]['file_name']
             header, data_start = self._header(shard_file)
             array, ms_dtype = read_one_tensor(
                 os.path.join(self.file_path, shard_file), header, data_start, name)
-            if axis is None:                      # replicated: any copy will do
-                return array, ms_dtype
-            pieces.append(array)
-
-        merged = np.concatenate(pieces, axis=axis) if len(pieces) > 1 else pieces[0]
-        expected = tuple(entry['global_shape'])
-        if merged.shape != expected:
-            raise ValueError(
-                f"{name} reassembled to {merged.shape} but metadata.json declares "
-                f"{expected}; the checkpoint's shard layout is not what this tool "
-                f"expects.")
-        return merged, ms_dtype
+            if array.shape != tile_shape:
+                raise ValueError(f'{name} chunk {offset} has shape {array.shape}, expected {tile_shape}')
+            if merged is None:
+                merged = np.empty(expected, dtype=array.dtype)
+                source_dtype = ms_dtype
+            elif ms_dtype != source_dtype:
+                raise ValueError(f'{name} chunks have different dtypes')
+            merged[tuple(slice(start, start + width) for start, width in zip(offset, tile_shape))] = array
+            seen.add(offset)
+        if len(seen) != int(np.prod(fragments)):
+            raise ValueError(f'{name} has {len(seen)} chunks, expected {int(np.prod(fragments))}')
+        return merged, source_dtype
 
     def read_layer(self, prefixes, extra_names=()):
         """Read every parameter under any of ``prefixes``, plus ``extra_names``."""
@@ -909,11 +942,29 @@ def hf_config_fields(model_type):
     return fields
 
 
-def save_hf_config(output_path, config, model_type):
+def save_hf_config(output_path, config, model_type, reference_path=None):
     """Write a config.json holding only fields the HF config class declares."""
     model_section = dict(config.get('_raw_model_section') or {})
     if not model_section:
         return
+    exporter = getattr(MODEL_CONVERTERS[model_type], 'export_hf_config', None)
+    if callable(exporter):
+        hf_config = exporter(config)
+        if reference_path:
+            with open(reference_path, encoding='utf-8') as source:
+                reference = json.load(source)
+            if reference.get('model_type') != hf_config['model_type']:
+                raise ValueError('Reference HF config belongs to a different model type.')
+            reference.update(hf_config)
+            hf_config = reference
+        dtype = str(model_section.get('params_dtype', 'bfloat16')).lower()
+        hf_config['torch_dtype'] = {'bf16': 'bfloat16', 'fp16': 'float16', 'fp32': 'float32'}.get(dtype, dtype)
+        with open(os.path.join(output_path, 'config.json'), 'w', encoding='utf-8') as target:
+            json.dump(hf_config, target, indent=2)
+        logger.info(f"Saved native HF config: {hf_config['model_type']}")
+        return
+    if reference_path:
+        raise ValueError('--hf_config_path requires a model with an HF config exporter.')
     fields = hf_config_fields(model_type)
     if fields is None:
         logger.warning(f"{model_type} declares no config_class; writing the YAML "
@@ -977,6 +1028,8 @@ def main():
                              'sink, APE and HyperConnection params stay fp32, as published.')
     parser.add_argument('--no_config_json', action='store_true',
                         help='Do not write config.json into the output directory.')
+    parser.add_argument('--hf_config_path', type=str, default=None,
+                        help='Original HF config.json; preserves remote-code metadata on export.')
     parser.add_argument('--max_worker', type=int, default=16,
                         help='Processes converting layers in parallel; 1 is serial. Peak '
                              'memory scales with it (one layer per worker). '
@@ -999,6 +1052,13 @@ def main():
                      f"this tool exports {list(MODEL_CONVERTERS)}.")
         sys.exit(1)
 
+    config['model_type'] = model_key
+    model_cls = MODEL_CONVERTERS[model_key]
+    if callable(getattr(model_cls, 'build_weight_template', None)):
+        resolved = model_cls.config_class.from_dict(config['_raw_model_section'] | {'model_type': model_key})
+        config.update(resolved.to_dict())
+        config['num_layers'] = resolved.num_hidden_layers
+
     if not os.path.exists(args.input_path):
         logger.error(f"Input path not found: {args.input_path}")
         sys.exit(1)
@@ -1012,7 +1072,7 @@ def main():
     policy = DtypePolicy(resolve_dtype(config, args.dtype), uniform=args.uniform_dtype)
     convert_model(args.input_path, args.output_path, config, policy, workers=args.max_worker)
     if not args.no_config_json:
-        save_hf_config(args.output_path, config, model_key)
+        save_hf_config(args.output_path, config, model_key, args.hf_config_path)
 
 
 if __name__ == '__main__':
