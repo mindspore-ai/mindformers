@@ -698,34 +698,40 @@ class GPTModel(nn.Cell):
             metric_group_size: Size of ``metric_group`` (skip all-reduce when
                 ``<= 1``).
         """
-        cache = self._get_expert_bias_modules()
-        if not cache:
+        freeze_keywords = getattr(self, "_freeze_keywords", ())
+        active_modules = []
+        with _no_grad():
+            for module in self._get_expert_bias_modules():
+                if module.load_balance_coeff == 0 or any(
+                        keyword in module.expert_bias.name for keyword in freeze_keywords):
+                    module.tokens_per_expert = mint.zeros_like(module.tokens_per_expert)
+                else:
+                    active_modules.append(module)
+        if not active_modules:
             return
 
-        # NOTE: Currently this sync is blocking (thus exposed) and happens on the
-        # default compute stream. Need to assess if this is OK performance-wise.
-        tokens_per_expert_list = [module.tokens_per_expert for module in cache]
-        tokens_per_expert_by_layer = ops.vstack(tokens_per_expert_list)
+        # Decoder and MTP counters contain local histograms but can have different layouts.
+        local_counts = []
+        for module in active_modules:
+            counter = module.tokens_per_expert
+            local_counts.append(counter.to_local() if isinstance(counter, DTensor) else counter)
+        tokens_per_expert_by_layer = ops.vstack(local_counts)
 
         # All-reduce the per-rank token counts over the dp x cp domain so the
         # bias delta is computed from global-batch statistics, matching the
         # single-card path (which has no group to reduce over).
         if metric_group is not None and (
                 metric_group_size is None or metric_group_size > 1):
-            if DTensor is not None and isinstance(tokens_per_expert_by_layer, DTensor):
-                tokens_per_expert_by_layer = tokens_per_expert_by_layer.to_local()
             all_reduce(tokens_per_expert_by_layer, group=metric_group)
 
-        router = getattr(cache[0], "router", None)
+        router = getattr(active_modules[0], "router", None)
         tp_group = getattr(router, "_tp_group", None)
         tp_size = getattr(router, "_tp_size", 1)
         if tp_group is not None and tp_size > 1:
-            if DTensor is not None and isinstance(tokens_per_expert_by_layer, DTensor):
-                tokens_per_expert_by_layer = tokens_per_expert_by_layer.to_local()
             all_reduce(tokens_per_expert_by_layer, group=tp_group)
 
         with _no_grad():
-            for moe_layer_idx, module in enumerate(cache):
+            for moe_layer_idx, module in enumerate(active_modules):
                 tokens_per_expert = tokens_per_expert_by_layer[moe_layer_idx].float()
 
                 # update the expert bias

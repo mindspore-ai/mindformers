@@ -710,9 +710,13 @@ def load_hf_checkpoint(
         network: Cell,
         balanced_load: bool = False,
         reshard_worker_num: int = 1,
+        strict_load: bool = False,
 ) -> None:
     """
     Load HuggingFace format weights.
+
+    Missing converter targets warn by default. ``strict_load=True`` requests
+    an error when the model template provides a completeness validator.
 
     Uses a two-step processing approach:
         1. Reshard: Uses ReshardLoader to handle distributed slicing;
@@ -814,6 +818,9 @@ def load_hf_checkpoint(
 
         # Flush any remaining cached (unconverted) weights.
         template.release()
+        validate_loaded_weights = getattr(template, "validate_loaded_weights", None)
+        if callable(validate_loaded_weights):
+            validate_loaded_weights(state_dict, strict_load=strict_load)
         del reshard_output
 
     # 6. Load into network

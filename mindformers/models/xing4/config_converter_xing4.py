@@ -12,14 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""TeleChatV4 config converter."""
-from mindformers.parallel_core.config_converter import ConfigConverter
+"""Xing4 config converter."""
+from mindformers.parallel_core.config_converter import ConfigConverter, ConversionContext
 from mindformers.parallel_core.transformer_config_utils import is_float_32, get_drop_policy
 
 
-class TeleChatV4ConfigConverter(ConfigConverter):
+class Xing4ConfigConverter(ConfigConverter):
     """
-    TeleChatV4ConfigConverter
+    Xing4ConfigConverter
     """
     CONFIG_MAPPING = {
         # Mixed-Precision
@@ -51,8 +51,27 @@ class TeleChatV4ConfigConverter(ConfigConverter):
         "qk_nope_head_dim": "qk_head_dim",
         "qk_rope_head_dim": "qk_pos_emb_head_dim",
 
+        # DSA
+        "index_n_heads": "dsa_indexer_n_heads",
+        "index_head_dim": "dsa_indexer_head_dim",
+        "index_topk": "dsa_indexer_topk",
+
         # MHC
         "hc_eps": "mhc_layernorm_epsilon",
         "hc_mult": "num_residual_streams",
         "hc_sinkhorn_iters": "mhc_sinkhorn_iterations",
     }
+
+    @classmethod
+    def _pre_process(cls, model_config: dict, ctx: ConversionContext):
+        """Combine HF clamp bounds into the framework's optional pair."""
+        super()._pre_process(model_config, ctx)
+        if not {"mhc_h_res_clamp_min", "mhc_h_res_clamp_max"}.intersection(model_config):
+            return
+        lower = model_config.pop("mhc_h_res_clamp_min", None)
+        upper = model_config.pop("mhc_h_res_clamp_max", None)
+        if (lower is None) != (upper is None):
+            raise ValueError("Both mHC clamp bounds must be provided, or both must be None.")
+        if lower is not None and lower > upper:
+            raise ValueError("mHC clamp minimum must not exceed its maximum.")
+        ctx.result["hc_sinkhorn_clamp"] = None if lower is None else (lower, upper)
