@@ -107,6 +107,16 @@ class CommonInfo:
     rng_world_size: int = None
     """World size whose per-rank RNG streams are stored in this checkpoint."""
 
+    skipped_steps: int = None
+    """Total number of optimizer updates skipped because the loss or global gradient norm was
+    NaN/Inf (pynative ``training.use_skip_step_on_nan``) — persisted so the cumulative
+    count survives a resume."""
+
+    consecutive_skipped_steps: int = None
+    """Number of steps skipped in a row at save time — persisted so the
+    ``training.max_consecutive_skipped_steps`` guard keeps counting across a resume
+    instead of restarting from zero."""
+
     def save_common(self, common_filename: str):
         """
         Save common info to 'common.json'.

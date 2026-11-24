@@ -41,8 +41,12 @@ class TrainerState:
         num_accumulation_steps (int):
             Number of steps to accumulate gradients before performing an optimizer step.
         skipped_steps (int):
-            Number of optimizer updates skipped so far because the global gradient norm
+            Number of optimizer updates skipped so far because the loss or global gradient norm
             was NaN/Inf (only non-zero when ``training.use_skip_step_on_nan`` is enabled).
+        consecutive_skipped_steps (int):
+            Number of steps skipped in a row up to now; reset by the first finite step.
+            Drives the ``training.max_consecutive_skipped_steps`` guard. Both counters are
+            persisted to ``common.json`` and restored on resume.
         loss_scale (float):
             Current loss scale. PyNative training defaults to 1.0.
         total_flops (float):
@@ -67,6 +71,7 @@ class TrainerState:
     num_accumulation_steps: int = 1
     consumed_samples: int = 0
     skipped_steps: int = 0
+    consecutive_skipped_steps: int = 0
     loss_scale: float = 1.0
     total_flops: float = 0.0
     best_metric: Optional[float] = None
@@ -97,6 +102,7 @@ class TrainerState:
             "num_accumulation_steps": self.num_accumulation_steps,
             "consumed_samples": self.consumed_samples,
             "skipped_steps": self.skipped_steps,
+            "consecutive_skipped_steps": self.consecutive_skipped_steps,
             "loss_scale": self.loss_scale,
             "total_flops": self.total_flops,
             "best_metric": self.best_metric,
