@@ -12,33 +12,35 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""TeleChat-V4 Model for training."""
+"""Shared PyNative model entry for Xing4 29B and 285B."""
 from mindspore import Tensor
 
 from mindformers.tools.register import MindFormerRegister, MindFormerModuleType
 
-from mindformers.models.telechat4_moe.utils import TeleChatV4PreTrainedModel, TeleChatV4WeightTemplate
+from mindformers.models.xing4.utils import Xing4PreTrainedModel, Xing4WeightTemplate
 from mindformers.pynative.base_models.gpt.gpt_model import GPTModel
 from mindformers.pynative.base_models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
 from mindformers.pynative.base_models.gpt.parallelize import parallelize_gptmodel
 from mindformers.pynative.distributed.parallelize import register_parallelize
 from mindformers.parallel_core.utils.model_mixin import TrainModelMixin
 
-from .configuration_telechat_v4 import TeleChatV4Config
+from .configuration_xing4 import Xing4Config
 
 
 @MindFormerRegister.register(MindFormerModuleType.MODELS, legacy=False)
 @register_parallelize(parallelize_gptmodel)
-class TeleChatV4ForCausalLM(TrainModelMixin, TeleChatV4PreTrainedModel):
-    """TeleChatV4 model for training"""
+class Xing4ForCausalLM(TrainModelMixin, Xing4PreTrainedModel):
+    """Xing4 model for training"""
 
-    def __init__(self, config: TeleChatV4Config, **kwargs):
+    def __init__(self, config: Xing4Config, **kwargs):
+        if isinstance(config, dict):
+            config = Xing4Config.from_dict(config)
         super().__init__(config, auto_prefix=False)
         transformer_config = self.convert_to_transformer_config(config, is_mla_model=True)
         if transformer_config.num_moe_experts:
             transformer_layer_spec = get_gpt_decoder_block_spec(transformer_config)
         else:
-            raise ValueError("Only MoE model is supported in TeleChatV4ForCausalLM.")
+            raise ValueError("Only MoE model is supported in Xing4ForCausalLM.")
         self.model = GPTModel(
             config=transformer_config,
             transformer_layer_spec=transformer_layer_spec,
@@ -54,7 +56,7 @@ class TeleChatV4ForCausalLM(TrainModelMixin, TeleChatV4PreTrainedModel):
             vp_size=kwargs.get("vp_size", 1),
         )
 
-        self.template = TeleChatV4WeightTemplate(transformer_config)
+        self.template = Xing4WeightTemplate(transformer_config)
 
     # pylint: disable=W0221
     def convert_weight_dict(self, source_dict, **kwargs):
@@ -76,7 +78,7 @@ class TeleChatV4ForCausalLM(TrainModelMixin, TeleChatV4PreTrainedModel):
             position_ids: Tensor = None,
             actual_seq_len=None
     ):
-        """TeleChatV4 construct for training"""
+        """Xing4 construct for training"""
         return self.model(
             input_ids=input_ids,
             position_ids=position_ids,

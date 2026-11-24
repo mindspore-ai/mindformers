@@ -39,18 +39,9 @@ lr_scheduler:
   learning_rate: 3.0e-5
   warmup_lr_init: 0
   warmup_steps: 0
-  total_steps: 165000
+  total_steps: 4000
 
-callbacks:
-  - type: MFLossMonitor
-    per_print_times: 1
-    wandb_config:
-      key: null
-      host: null
-      project: null
-      name: null
-      id: null
-      resume: null
+callbacks: []
 
 parallelism:
 
@@ -59,7 +50,7 @@ parallelism:
 
   tensor_parallel: 1
   context_parallel: 4
-  context_parallel_method: ulysses
+  context_parallel_method: colossal
   pipeline_parallel: 1
   pipeline_parallel_schedule: "1f1b"
   pipeline_parallel_microbatch_size: 1
@@ -76,10 +67,7 @@ recompute:
 train_dataset:
   dataloader:
     type: OrderedIndexDataLoader
-    config:
-      create_compressed_eod_mask: True
-      compressed_eod_mask_length: 128
-    data_path: "/path/to/telechat4_dataset"
+    data_path: "/path/to/xing4_29b_dataset"
     shuffle: False
     sequence_length: 4096
     reset_position_ids: False
@@ -103,14 +91,14 @@ train_dataset:
 model:
   chunk_loss_num: 8
   calculate_per_token_loss: false
-  model_type: telechat_v4
-  architectures: TeleChatV4ForCausalLM
+  model_type: xing4_v4
+  architectures: Xing4ForCausalLM
   vocab_size: 131072
   seq_length: 4096
   hidden_size: 3584
   intermediate_size: 9216
   num_hidden_layers: 40
-  max_position_embeddings: 262144
+  max_position_embeddings: 32768
   hidden_act: silu
   num_attention_heads: 32
   num_key_value_heads: 32
@@ -144,35 +132,43 @@ model:
   num_nextn_predict_layers: 1
   mtp_loss_scaling_factor: 0.1
   mtp_enable_hyper_connections: false
+  mtp_enable_dsa: false
   position_embedding_type: yarn
-  rotary_scaling_factor: 64
+  rotary_scaling_factor: 8
   beta_fast: 32
   beta_slow: 1
   mscale: 1
   mscale_all_dim: 1
-  rope_theta: 10000.0
+  rope_theta: 100000.0
   rope_scaling:
     type: yarn
-    factor: 64.0
-    original_max_position_embeddings: 4096
+    factor: 8.0
+    original_max_position_embeddings: 32768
     beta_fast: 32
     beta_slow: 1
     mscale: 1.0
     mscale_all_dim: 1.0
   apply_rope_fusion: true
   bias_swiglu_fusion: false
-  experimental_attention_variant: null
+  experimental_attention_variant: dsa
+  index_n_heads: 16
+  index_head_dim: 128
+  index_topk: 2048
+  dsa_indexer_topk_freq: 1
+  dsa_indexer_loss_coeff: 1.0
+  dsa_indexer_use_sparse_loss: true
+  dsa_indexer_layerwise_backward: true
   enable_hyper_connections: true
   mhc_compute_dtype: bfloat16
   enable_hc_head: false
-  num_residual_streams: 4
-  mhc_sinkhorn_iterations: 20
+  hc_eps: 1.0e-06
+  hc_mult: 4
+  hc_sinkhorn_iters: 20
   mhc_init_gating_factor: 0.01
   use_fused_mhc: true
   mhc_megatron_compatibility: true
-  hc_sinkhorn_clamp:
-  - -30
-  - 30
+  mhc_h_res_clamp_min: -30
+  mhc_h_res_clamp_max: 30
   gated_linear_unit: true
   moe_intermediate_size: 1024
   routed_scaling_factor: 2.0

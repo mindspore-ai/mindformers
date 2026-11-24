@@ -12,15 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""The export function for telechat4"""
+"""Xing4 model and configuration exports."""
 
 from mindformers.tools.logger import logger
 
-from .configuration_telechat_v4 import TeleChatV4Config
+from .configuration_xing4 import Xing4Config, Xing4V4Config, Xing4V41Config
 try:
-    from .modeling_telechat_v4 import TeleChatV4ForCausalLM
+    from .modeling_xing4 import Xing4ForCausalLM
 except ImportError as exc:
-    TeleChatV4ForCausalLM = None
-    logger.warning(f"Import TeleChatV4ForCausalLM failed: {exc}.")
+    Xing4ForCausalLM = None
+    logger.warning(f"Import Xing4ForCausalLM failed: {exc}.")
 
-__all__ = ['TeleChatV4Config', 'TeleChatV4ForCausalLM']
+__all__ = ['Xing4Config', 'Xing4V4Config', 'Xing4V41Config', 'Xing4ForCausalLM']

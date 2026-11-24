@@ -12,28 +12,30 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Conversion rules for the public TeleChat4 29B HF checkpoint."""
+"""Shared MLA, DSA, MoE, mHC and MTP weight rules for Xing4 models."""
 from copy import copy
 
 import numpy as np
+from mindspore import float32
 
 from mindformers.checkpoint.converter.convert_op import ConcatConvertOp, ExpertsConvertOp, RenameConvertOp, ScaleSplitConvertOp
 from mindformers.checkpoint.converter.template import WeightTemplate
 from mindformers.models.modeling_utils import PreTrainedModel
 from mindformers.parallel_core.utils.model_mixin import ModelMixin
-from .configuration_telechat_v4 import TeleChatV4Config
+from mindformers.tools.logger import logger
+from .configuration_xing4 import Xing4Config
 
 
 def _transformer_config(config):
     """Accept model configuration objects at the model/export boundary."""
     if isinstance(config, dict):
-        config = TeleChatV4Config(**config)
-    if isinstance(config, TeleChatV4Config):
+        config = Xing4Config.from_dict(config)
+    if isinstance(config, Xing4Config):
         return config.convert_to_transformer_config()
     return config
 
 
-def _layer_converters(config, source, target, moe, hyper_connections):
+def _layer_converters(config, source, target, moe, hyper_connections, dsa=False):
     """Use concrete layer prefixes so MTP never matches a decoder-layer rule."""
     renames = [
         ("self_attn.q_b_proj.weight", "self_attention.linear_qb.weight"),
@@ -47,6 +49,14 @@ def _layer_converters(config, source, target, moe, hyper_connections):
         renames.append(("self_attn.q_a_layernorm.weight", "self_attention.q_layernorm.weight"))
     else:
         renames = [(hf, mf) for hf, mf in renames if "q_b_proj" not in hf]
+    if dsa:
+        renames.extend(("self_attn.indexer." + hf, "self_attention.core_attention.indexer." + mf)
+                       for hf, mf in (
+                           ("wq_b.weight", "linear_wq_b.weight"),
+                           ("wk.weight", "linear_wk.weight"),
+                           ("weights_proj.weight", "linear_weights_proj.weight"),
+                           ("k_norm.weight", "k_norm.gamma"),
+                           ("k_norm.bias", "k_norm.beta")))
     ops = [RenameConvertOp(source + hf, target + mf) for hf, mf in renames]
     query = "q_a_proj" if config.q_lora_rank is not None else "q_proj"
     query_rows = (config.q_lora_rank if config.q_lora_rank is not None
@@ -90,7 +100,8 @@ def _weight_converters(config):
     ]
     for layer, moe in enumerate(config.moe_layer_freq):
         ops.extend(_layer_converters(config, f"model.layers.{layer}.", f"decoder.layers.{layer}.",
-                                     bool(moe), config.enable_hyper_connections))
+                                     bool(moe), config.enable_hyper_connections,
+                                     config.experimental_attention_variant == "dsa"))
     for layer in range(config.mtp_num_layers or 0):
         source = f"model.layers.{config.num_layers + layer}."
         target = f"mtp.layers.{layer}."
@@ -98,11 +109,12 @@ def _weight_converters(config):
             ("enorm.weight", "enorm.weight"), ("hnorm.weight", "hnorm.weight"),
             ("eh_proj.weight", "eh_proj.weight"), ("shared_head.norm.weight", "final_layernorm.weight")))
         ops.extend(_layer_converters(config, source, target + "transformer_layer.",
-                                     bool(config.moe_layer_freq[-1]), config.mtp_enable_hyper_connections))
+                                     bool(config.moe_layer_freq[-1]), config.mtp_enable_hyper_connections,
+                                     config.experimental_attention_variant == "dsa" and config.mtp_enable_dsa))
     return ops
 
 
-class TeleChatV4WeightTemplate(WeightTemplate):
+class Xing4WeightTemplate(WeightTemplate):
     """One HF schema for runtime loading and legacy NumPy conversion callbacks."""
 
     def __init__(self, config):
@@ -125,10 +137,24 @@ class TeleChatV4WeightTemplate(WeightTemplate):
         return super().get_mf_name(hf_name)
 
     def _cast_weight_to_dtype(self, mf_name, weight):
-        # The public checkpoint's learned router corrections are FP32 buffers.
-        if mf_name.endswith(".expert_bias"):
+        # Preserve learned router corrections and FP32 target normalization parameters.
+        target = self.network_tensor_info.get(mf_name)
+        if mf_name.endswith(".expert_bias") or (target is not None and target.dtype == float32):
             return weight
         return super()._cast_weight_to_dtype(mf_name, weight)
+
+    def validate_loaded_weights(self, loaded_names, strict_load=False):
+        """Check declared converter targets on this rank; auxiliary/adapter state is excluded."""
+        expected = {name for op in self.weight_converters for name in op.mf_names}
+        missing = (expected & self.network_tensor_info.keys()) - set(loaded_names)
+        if missing:
+            message = (f"Missing Xing4 checkpoint weights: {sorted(missing)[:10]}. "
+                       "Check that the model type and DSA/MTP settings match the checkpoint; "
+                       "missing parameters retain their initialized values.")
+            if strict_load:
+                raise ValueError(message)
+            logger.warning(message)
+        return missing
 
     def _find_expert_converter(self, dst_name):
         op = self.get_convert_op(dst_name, self.mf_name_to_converter)
@@ -181,7 +207,7 @@ class TeleChatV4WeightTemplate(WeightTemplate):
                 groups.append((op, required, present))
         unknown = source.keys() - known
         if unknown:
-            raise ValueError(f"Unrecognized public TeleChat4 HF weights: {sorted(unknown)[:5]}")
+            raise ValueError(f"Unrecognized Xing4 HF weights: {sorted(unknown)[:5]}")
         return groups
 
     def numpy_name_map(self, source):
@@ -239,11 +265,11 @@ class TeleChatV4WeightTemplate(WeightTemplate):
         return {op.mf_names[0]: value.reshape(len(expert_ids), first_dim, width)}
 
 
-class TeleChatV4PreTrainedModel(PreTrainedModel, ModelMixin):
-    """TeleChat4 model metadata and a single public HF conversion schema."""
+class Xing4PreTrainedModel(PreTrainedModel, ModelMixin):
+    """Shared Xing4 model metadata and HF conversion schema."""
 
-    config_class = TeleChatV4Config
-    base_model_prefix = "TeleChatv4"
+    config_class = Xing4Config
+    base_model_prefix = "Xing4"
 
     @staticmethod
     def select_weight_converters(config):

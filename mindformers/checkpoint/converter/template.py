@@ -112,7 +112,7 @@ class WeightTemplate:
         """Release cached weights"""
         if len(self.name_to_weight) > 0:
             weights_not_converted = [
-                (name, weight.size())
+                (name, weight.shape)
                 for name, weight in self.name_to_weight.items()
             ]
             logger.warning(f"weights not converted {len(weights_not_converted)} {weights_not_converted}")
