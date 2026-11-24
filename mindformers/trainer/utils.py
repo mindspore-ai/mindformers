@@ -35,8 +35,7 @@ from mindspore.common.file_system import mindio_preload, set_mindio_server_info
 from mindformers.checkpoint.utils import is_hf_checkpoint
 from mindformers.tools.logger import logger
 from mindformers.tools.utils import get_real_rank
-from mindformers.utils.load_checkpoint_utils import \
-    CkptFormat, load_checkpoint_with_safetensors, compile_model, get_last_checkpoint
+from mindformers.utils.load_checkpoint_utils import CkptFormat, load_checkpoint_with_safetensors, get_last_checkpoint
 from mindformers.tools.register import MindFormerConfig
 from mindformers.tools.utils import (
     replace_rank_id_in_ckpt_name,
@@ -503,15 +502,6 @@ def transform_and_load_checkpoint(config, model, network, dataset, optimizer=Non
     if context.get_auto_parallel_context('parallel_mode') in ['semi_auto_parallel', 'auto_parallel',
                                                               'hybrid_parallel']:
         # build net if parallel mode is auto_parallel
-        compile_model(
-            model=model,
-            dataset=dataset,
-            mode=config.context.mode,
-            sink_mode=config.runner_config.sink_mode,
-            epoch=config.runner_config.epochs,
-            sink_size=config.runner_config.sink_size,
-            do_eval=do_eval, do_predict=do_predict
-        )
 
         if config.only_save_strategy:
             logger.info("Only_save_strategy is True, model.compile() finished, system exit! ")

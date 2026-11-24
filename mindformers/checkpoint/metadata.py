@@ -25,7 +25,6 @@ from mindspore.communication.management import get_group_size
 from mindspore.common.dtype import all_types
 from mindspore.parallel import Layout
 
-from mindformers.checkpoint.layout_adapter import LayoutAdapter
 from mindformers.tools.logger import logger
 from mindformers.tools.utils import set_safe_mode_for_file_or_dir
 from mindformers.checkpoint.sharded_tensor import build_sharded_tensor
@@ -319,7 +318,7 @@ def generate_default_metadata_from_checkpoint(checkpoint_dir: str) -> tuple[dict
         file_basename = os.path.basename(safetensor_file)
         logger.info(f"Extracting metadata from: {file_basename}")
 
-        if is_hf_checkpoint(checkpoint_dir) and LayoutAdapter.is_pynative_mode():
+        if is_hf_checkpoint(checkpoint_dir):
             # Read the safetensors JSON header directly to avoid MindSpore dtype
             # compatibility issues (e.g. F8_E8M0, BF16 not recognised by ms_load_checkpoint).
             header, _ = read_safetensors_header(safetensor_file)

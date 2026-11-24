@@ -25,19 +25,18 @@ from mindspore import Parameter
 
 from mindformers.tools.register import MindFormerConfig
 
-from mindformers.checkpoint.utils import compile_model, check_checkpoints_dir_max_num, get_checkpoint_iter_dir, \
+from mindformers.checkpoint.utils import check_checkpoints_dir_max_num, get_checkpoint_iter_dir, \
     get_checkpoint_tracker_filename, get_common_filename, get_metadata_filename, \
     get_latest_iteration_from_tracker, get_checkpoint_name, get_sharded_tensor_shard_id, \
     sharded_tensor_shard_id, _reverse_sharded_tensor_shard_id, _get_shard_size, verify_ckpt_valid, \
     FileType, is_optimizer_ckpt_file
-from mindformers.models.modeling_utils import PreTrainedModel
 from mindformers.utils.load_checkpoint_utils import (
     CkptFormat, _get_checkpoint_mode, CheckpointFileMode, _check_checkpoint_path,
     extract_suffix, get_last_checkpoint, validate_config_with_file_mode,
-    update_global_step, unify_safetensors, _revise_remove_redundancy_with_file,
+    update_global_step, unify_safetensors,
     _get_origin_network, get_load_path_after_hf_convert, _get_src_strategy,
     _get_src_file_suffix, _get_src_file, load_safetensors_checkpoint,
-    process_hf_checkpoint, validate_qkv_concat, get_merged_src_strategy_path,
+    process_hf_checkpoint, get_merged_src_strategy_path,
     get_merged_dst_strategy_path, process_for_stand_alone_mode,
     load_checkpoint_with_safetensors
 )
@@ -96,14 +95,6 @@ def mock_model():
     mock_mod.config = MagicMock()
     mock_mod.config.model_type = "test_model"
     return mock_mod
-
-
-@pytest.fixture
-def mock_file():
-    """Create a mock file"""
-    mock_f = MagicMock()
-    mock_f.metadata.return_value = None
-    return mock_f
 
 
 class TestCommonCheckpointMethod:
@@ -295,30 +286,6 @@ class TestCommonCheckpointMethod:
             mock_barrier.reset_mock()
             unify_safetensors("/src/checkpoint", "/src/strategy", "/dst/unified", False, "-10_200", False)
             mock_barrier.assert_not_called()
-
-    @pytest.mark.level0
-    @pytest.mark.platform_x86_cpu
-    @pytest.mark.env_onecard
-    @pytest.mark.parametrize(
-        "config_remove_redundancy, metadata, expected_result",
-        [
-            # test with metadata remove_redundancy=True and config remove_redundancy=False
-            (False, {"remove_redundancy": "True"}, True),
-            # test with metadata remove_redundancy=False and config remove_redundancy=True
-            (True, {"remove_redundancy": "False"}, False),
-            # test with matching metadata and config
-            (True, {"remove_redundancy": "True"}, True),
-            # test with no metadata
-            (True, None, True),
-            # test with metadata but no remove_redundancy key
-            (True, {"other_key": "value"}, True)
-        ]
-    )
-    def test__revise_remove_redundancy_with_file(self, config_remove_redundancy, metadata, expected_result, mock_file):
-        """test _revise_remove_redundancy_with_file function"""
-        mock_file.metadata.return_value = metadata
-        result = _revise_remove_redundancy_with_file(config_remove_redundancy, mock_file)
-        assert result == expected_result
 
     @pytest.mark.level0
     @pytest.mark.platform_x86_cpu
@@ -519,21 +486,17 @@ class TestCommonCheckpointMethod:
     @pytest.mark.level0
     @pytest.mark.platform_x86_cpu
     @pytest.mark.env_onecard
-    def test_load_safetensors_checkpoint(self, mock_config, mock_network, mock_file):
+    def test_load_safetensors_checkpoint(self, mock_config, mock_network):
         """test load_safetensors_checkpoint function"""
         # Setup mocks using context managers
         with patch('mindformers.utils.load_checkpoint_utils._get_origin_network') as mock_get_origin_network, \
                 patch('mindformers.utils.load_checkpoint_utils.ms') as mock_ms, \
                 patch('mindformers.utils.load_checkpoint_utils.logger'), \
-                patch('mindformers.utils.load_checkpoint_utils.safe_open') as mock_safe_open, \
                 patch('mindformers.utils.load_checkpoint_utils.is_hf_safetensors_dir') as mock_is_hf_safetensors_dir:
             # Setup mock return values
             mock_get_origin_network.return_value = (MagicMock(), False)
             mock_ms.load_checkpoint.return_value = {"param1": MagicMock()}
             mock_is_hf_safetensors_dir.return_value = False
-
-            # Mock the safe_open context manager
-            mock_safe_open.return_value.__enter__.return_value = mock_file
 
             strategy_path = "/path/to/strategy"
             load_ckpt_path = "/path/to/checkpoint"
@@ -592,52 +555,6 @@ class TestCommonCheckpointMethod:
             mock_is_main_rank.return_value = False
             process_hf_checkpoint(mock_model, str(output_dir), str(input_checkpoint))
             mock_process_instance.start.assert_not_called()
-
-    @pytest.mark.level0
-    @pytest.mark.platform_x86_cpu
-    @pytest.mark.env_onecard
-    @pytest.mark.parametrize(
-        "model, qkv_concat_config, check_safetensors_key_return, "
-        "has_concat_keys, expected_exception, should_log_warning",
-        [
-            # test with non-PreTrainedModel
-            ("not_a_model", False, False, False, None, True),
-            # test with PreTrainedModel but no concat keys
-            (MagicMock(spec=PreTrainedModel), False, False, False, None, False),
-            # Test case where check_safetensors_key returns True and qkv_concat_config is True
-            (MagicMock(spec=PreTrainedModel), True, True, True, None, False),
-            # Test case where check_safetensors_key returns False and qkv_concat_config is True
-            (MagicMock(spec=PreTrainedModel), True, False, True, ValueError, False),
-            # Test case where check_safetensors_key returns True and qkv_concat_config is False
-            (MagicMock(spec=PreTrainedModel), False, True, True, ValueError, False)
-        ]
-    )
-    def test_validate_qkv_concat(self, model, qkv_concat_config,
-                                 check_safetensors_key_return, has_concat_keys, expected_exception, should_log_warning):
-        """test validate_qkv_concat function"""
-        # Setup mocks using context managers
-        with patch('mindformers.utils.load_checkpoint_utils.logger') as mock_logger, \
-                patch('mindformers.utils.load_checkpoint_utils.check_safetensors_key') as mock_check_safetensors_key:
-
-            # Setup mock behavior
-            mock_check_safetensors_key.return_value = check_safetensors_key_return
-
-            # If it's a PreTrainedModel, set up obtain_qkv_ffn_concat_keys
-            if hasattr(model, 'obtain_qkv_ffn_concat_keys'):
-                model.obtain_qkv_ffn_concat_keys.return_value = ["qkv_concat_key"] if has_concat_keys else None
-
-            # Run the test and check results
-            if expected_exception:
-                with pytest.raises(expected_exception, match="The qkv concat check failed!"):
-                    validate_qkv_concat(model, qkv_concat_config, "/path/to/checkpoint")
-            else:
-                validate_qkv_concat(model, qkv_concat_config, "/path/to/checkpoint")
-
-            # Check if warning was logged when expected
-            if should_log_warning:
-                mock_logger.warning.assert_called_once()
-            else:
-                mock_logger.warning.assert_not_called()
 
     @pytest.mark.level0
     @pytest.mark.platform_x86_cpu
@@ -764,8 +681,6 @@ class TestCommonCheckpointMethod:
                 patch('mindformers.utils.load_checkpoint_utils._get_checkpoint_mode') as mock_get_checkpoint_mode, \
                 patch('mindformers.utils.load_checkpoint_utils.'
                       'validate_config_with_file_mode') as mock_validate_config_with_file_mode, \
-                patch('mindformers.utils.load_checkpoint_utils.compile_model') as mock_compile_model, \
-                patch('mindformers.utils.load_checkpoint_utils.validate_qkv_concat'), \
                 patch('mindformers.utils.load_checkpoint_utils.process_for_stand_alone_mode'), \
                 patch('mindformers.utils.load_checkpoint_utils.'
                       'get_merged_dst_strategy_path') as mock_get_merged_dst_strategy_path, \
@@ -801,11 +716,9 @@ class TestCommonCheckpointMethod:
             # test with use_parallel=True
             mock_config.use_parallel = True
             mock_load_safetensors_checkpoint.reset_mock()
-            mock_compile_model.reset_mock()
             load_checkpoint_with_safetensors(mock_config, mock_model, mock_network, input_data, do_eval=False,
                                              do_predict=False,
                                              optimizer=optimizer)
-            mock_compile_model.assert_called_once()
             mock_load_safetensors_checkpoint.assert_called_once()
 
             # test with resume_training=True
@@ -820,80 +733,6 @@ class TestCommonCheckpointMethod:
             mock_load_safetensors_checkpoint.assert_called_once()
 
 
-class TestBuildModel:
-    """A test class for testing build_model"""
-    runner_config = {'sink_mode': True, 'epochs': 1, 'sink_size': 1}
-    config = {
-        'runner_config': runner_config,
-        'context': {'mode': 0}  # 0 is typically ms.GRAPH_MODE, 1 is ms.PYNATIVE_MODE
-    }
-    model = MagicMock()
-    dataset = MagicMock()
-
-    @patch('mindspore.context.get_auto_parallel_context')
-    def test_build_model_sink_mode_value_error(self, mock_get_auto_parallel_context):
-        """test build model sink mode value error"""
-        mock_get_auto_parallel_context.return_value = 'auto_parallel'
-        config = MindFormerConfig(**self.config)
-        config.runner_config.sink_mode = False
-        with pytest.raises(ValueError):
-            compile_model(
-                model=None,
-                dataset=None,
-                mode=config.context.mode,
-                sink_mode=config.runner_config.sink_mode,
-                epoch=config.runner_config.epochs,
-                sink_size=config.runner_config.sink_size,
-                do_eval=False, do_predict=False
-            )
-
-    @patch('mindspore.context.get_auto_parallel_context')
-    def test_build_model_infer_predict_layout_when_do_eval_is_true(self, mock_get_auto_parallel_context):
-        """test build model infer predict layout when do eval is true"""
-        mock_get_auto_parallel_context.return_value = 'auto_parallel'
-        config = MindFormerConfig(**self.config)
-        compile_model(
-            model=self.model,
-            dataset=self.dataset,
-            mode=config.context.mode,
-            sink_mode=config.runner_config.sink_mode,
-            epoch=config.runner_config.epochs,
-            sink_size=config.runner_config.sink_size,
-            do_eval=True, do_predict=False
-        )
-        self.model.infer_predict_layout.assert_called_once_with(*self.dataset)
-
-    @patch('mindspore.context.get_auto_parallel_context')
-    def test_build_model_infer_predict_layout_when_do_predict_is_true(self, mock_get_auto_parallel_context):
-        """test build model infer predict layout when do predict is true"""
-        mock_get_auto_parallel_context.return_value = 'auto_parallel'
-        config = MindFormerConfig(**self.config)
-        compile_model(
-            model=self.model,
-            dataset=self.dataset,
-            mode=config.context.mode,
-            sink_mode=config.runner_config.sink_mode,
-            epoch=config.runner_config.epochs,
-            sink_size=config.runner_config.sink_size,
-            do_eval=False, do_predict=True
-        )
-        self.model.infer_predict_layout.assert_called_once_with(*self.dataset)
-
-    @patch('mindspore.context.get_auto_parallel_context')
-    def test_build_model_model_build(self, mock_get_auto_parallel_context):
-        """test build model build"""
-        mock_get_auto_parallel_context.return_value = 'auto_parallel'
-        config = MindFormerConfig(**self.config)
-        compile_model(
-            model=self.model,
-            dataset=self.dataset,
-            mode=config.context.mode,
-            sink_mode=config.runner_config.sink_mode,
-            epoch=config.runner_config.epochs,
-            sink_size=config.runner_config.sink_size,
-            do_eval=False, do_predict=False
-        )
-        self.model.build.assert_called_once_with(train_dataset=self.dataset, epoch=1, sink_size=1)
 
 
 class TestGetCheckpointMode:

@@ -70,7 +70,6 @@ from mindformers.checkpoint.metadata import (
 from mindformers.checkpoint.sharded_tensor import (
     get_sharded_tensor_from_cell,
     get_cur_sharded_tensor,
-    complete_optimizer_sharded_tensor
 )
 from mindformers.checkpoint.broadcast import single_parameter_broadcast
 
@@ -331,8 +330,7 @@ def save_checkpoint(iteration: int, network: Union[Cell, List[Cell]], optimizer:
             (None on all other ranks). Mandatory on rank 0 in PyNative multi-rank scenarios,
             where it distinguishes model shards from optimizer shards. It should be fetched
             and cached once by the caller via `gather_param_names_on_rank0` before saving.
-            In Graph mode (or single-rank jobs) it is derived locally and this argument is
-            ignored.
+            In single-rank jobs it is derived locally and this argument is ignored.
         model_choice_func: Optional predicate for selecting model parameters to save. When
             omitted, every model parameter is saved.
         rng_state: MindSpore RNG state captured at the checkpoint boundary. When provided,
@@ -340,7 +338,6 @@ def save_checkpoint(iteration: int, network: Union[Cell, List[Cell]], optimizer:
     """
     logger.info('...... Start to save checkpoint ......')
     start_save_ckpt_time = time()
-    is_pynative_mode = LayoutAdapter.is_pynative_mode()
 
     if remove_redundancy and get_real_group_size() == 1:
         remove_redundancy = False
@@ -416,7 +413,7 @@ def save_checkpoint(iteration: int, network: Union[Cell, List[Cell]], optimizer:
     model_keys = set()
     for net in network:
         model_keys.update(net.parameters_dict().keys())
-    if is_pynative_mode and get_real_group_size() > 1:
+    if get_real_group_size() > 1:
         if get_real_rank() == 0 and global_model_keys is None:
             raise ValueError(
                 "In PyNative multi-rank scenarios, `global_model_keys` (the global union of "
@@ -424,8 +421,7 @@ def save_checkpoint(iteration: int, network: Union[Cell, List[Cell]], optimizer:
                 "via `gather_param_names_on_rank0` before calling `save_checkpoint`."
             )
     else:
-        # Graph mode (or single-rank jobs): the full network is defined on every rank,
-        # so the local parameter names are already the global ones.
+        # In single-rank jobs the local parameter names are already global.
         global_model_keys = model_keys
 
     model_sharded_tensor_metas = None
@@ -455,7 +451,7 @@ def save_checkpoint(iteration: int, network: Union[Cell, List[Cell]], optimizer:
     def save_network(net, file_type, side_sharded_tensor_metas, filter_func, choice_func=None):
         """Save one side (model or optimizer) of the checkpoint.
 
-        Returns `(BalancedShardPlan, written_params)` when saving with redundancy removal,
+        Returns `(BalancedShardPlan, None)` when saving with redundancy removal,
         otherwise `(None, None)`.
         """
         if remove_redundancy:
@@ -644,21 +640,11 @@ def load_checkpoint(
     else:
         dst_sharded_tensor_metas = get_cur_sharded_tensor(network, filter_func) \
             if get_real_group_size() > 1 else get_sharded_tensor_from_cell(network, optimizer)
-        if optimizer and LayoutAdapter.is_pynative_mode() and get_real_group_size() > 1:
+        if optimizer and get_real_group_size() > 1:
             dst_sharded_tensor_metas_opt = get_cur_sharded_tensor(optimizer, filter_func)
             for key, value in dst_sharded_tensor_metas_opt.items():
                 if key not in dst_sharded_tensor_metas:
                     dst_sharded_tensor_metas[key] = value
-        if optimizer and not LayoutAdapter.is_pynative_mode() and get_real_group_size() > 1:
-            # Graph mode only: the strategy metadata does not report every optimizer state (Muon's
-            # `muon_m.*` is absent on stages holding no MTP layer), and a state that is not asked
-            # for is never read back: resume then silently continues from a zeroed momentum.
-            # PyNative already takes every optimizer state from the optimizer itself (above).
-            # The balanced-load branch above takes no optimizer state at all and is left as is.
-            dst_sharded_tensor_metas = complete_optimizer_sharded_tensor(
-                dst_sharded_tensor_metas, optimizer, filter_func
-            )
-
     # Load using ReshardLoader
     # Self-trained weights do not require a template;
     #   the parameter names are directly the same as `dst_sharded_tensor_metas`.
@@ -961,12 +947,9 @@ def load_parameters(
     loaded_optimizer_names = set()
     # A rank with no local optimizer state must still receive balanced broadcasts.
     if optimizer is not None:
-        if LayoutAdapter.is_pynative_mode():
-            state_dict_opt.update(state_dict)
+        state_dict_opt.update(state_dict)
         logger.debug(f"Optimizer state_dict keys: {list(state_dict_opt.keys())}")
-        strict_load = True
-        if LayoutAdapter.is_pynative_mode():
-            strict_load = False
+        strict_load = False
         param_not_load_opt, ckpt_not_load_opt = load_param_into_net(optimizer, state_dict_opt, strict_load)
         if balanced_load:
             param_loaded_opt = {param_name for param_name in state_dict_opt if param_name not in ckpt_not_load_opt}

@@ -20,7 +20,6 @@ import time
 from enum import Enum
 from glob import glob
 from multiprocessing import Process
-from safetensors import safe_open
 
 import mindspore as ms
 from mindspore import Parameter
@@ -30,11 +29,9 @@ from mindspore.mint.distributed import barrier
 from mindformers.tools.logger import logger
 from mindformers.tools.utils import is_main_rank, get_real_rank
 from mindformers.utils.parallel_utils import barrier_world
-from mindformers.utils import convert_hf_safetensors_multiprocess, check_safetensors_key, is_hf_safetensors_dir
+from mindformers.utils import convert_hf_safetensors_multiprocess, is_hf_safetensors_dir
 from mindformers.utils.safetensors.convert_safetensors import _convert_index_json
-from mindformers.checkpoint.utils import compile_model
 from mindformers.version_control import check_safetensors_addition_param_support
-from mindformers.models.modeling_utils import PreTrainedModel
 from mindformers.parallel_core.inference.utils import generate_state_dict, save_strategy_file
 from ..version_control import check_tft_valid
 
@@ -262,7 +259,7 @@ def _get_src_file(checkpoint_dir, checkpoint_name=None, ckpt_format='ckpt'):
     return ckpt_path
 
 
-def load_checkpoint_with_safetensors(config, model, network, input_data, do_eval=False,
+def load_checkpoint_with_safetensors(config, model, network, input_data, do_eval=False,  # pylint: disable=unused-argument
                                      do_predict=False, optimizer=None):
     """load different format checkpoint interface."""
     logger.info(f"......Start load checkpoint from {config.load_ckpt_format}......")
@@ -330,24 +327,7 @@ def load_checkpoint_with_safetensors(config, model, network, input_data, do_eval
         network = model._train_network
     # build model
     if config.use_parallel:
-        compile_model(
-            model=model,
-            dataset=input_data,
-            mode=config.context.mode,
-            sink_mode=config.runner_config.sink_mode,
-            epoch=config.runner_config.epochs,
-            sink_size=config.runner_config.sink_size,
-            do_eval=do_eval, do_predict=do_predict
-        )
         # wait generate all rank strategy files
-        barrier()
-
-    # only execute qkv concat check on the main rank in predict mode
-    if do_predict and is_main_rank(ignore_check_modelarts=True):
-        qkv_concat_config = config.model.model_config.get("qkv_concat", False)
-        validate_qkv_concat(network, qkv_concat_config, load_checkpoint)
-    # wait for the main rank to complete qkv check
-    if config.use_parallel:
         barrier()
 
     process_for_stand_alone_mode(config, network, strategy_path)
@@ -475,8 +455,6 @@ def load_safetensors_checkpoint(config, load_checkpoint_files, network, strategy
         remove_redundancy = config.get('remove_redundancy', False)
         for checkpoint_file in load_checkpoint_files:
             logger.info(f"load checkpoint file: {checkpoint_file}")
-            with safe_open(checkpoint_file, framework='np') as f:
-                remove_redundancy = _revise_remove_redundancy_with_file(remove_redundancy, f)
             params_dict.update(ms.load_checkpoint(
                 ckpt_file_name=checkpoint_file,
                 format=config.load_ckpt_format
@@ -565,50 +543,6 @@ def get_last_checkpoint(checkpoint_dir, ckpt_format='ckpt'):
     return os.path.join(checkpoint_dir, output_checkpoint_path[-1])
 
 
-def validate_qkv_concat(model_cls_or_instance, qkv_concat_config, load_checkpoint):
-    """
-    Check whether qkv_concat configuration and qkv concat weight convert are the same.
-    Currently only safetensors format is supported.
-    """
-    # check the type of model_cls_or_instance
-    if not (
-            isinstance(model_cls_or_instance, PreTrainedModel) or
-            (isinstance(model_cls_or_instance, type) and issubclass(model_cls_or_instance, PreTrainedModel))
-    ):
-        logger.warning(f"Cur model_cls_or_instance: {model_cls_or_instance} is not "
-                       f"a subclass or an instance of PreTrainedModel, "
-                       f"will not execute qkv concat check.")
-        return
-
-    concat_key_list = model_cls_or_instance.obtain_qkv_ffn_concat_keys()
-    if concat_key_list is None:
-        return
-
-    logger.info(".........Starting qkv concat check.........")
-    is_qkv_concat = True
-    for concat_key in concat_key_list:
-        is_qkv_concat = check_safetensors_key(load_checkpoint, concat_key) and is_qkv_concat
-        if not is_qkv_concat:
-            break
-
-    if is_qkv_concat and not qkv_concat_config:
-        err_msg = ("The qkv concat check failed! The qkv in the model weights has been concatenated, "
-                   "but qkv_concat is set to false.")
-        logger.error(err_msg)
-        raise ValueError(err_msg)
-    if not is_qkv_concat and qkv_concat_config:
-        err_msg = ("The qkv concat check failed! The qkv in the model weights has been not concatenated, "
-                   "but qkv_concat is set to true.")
-        logger.error(err_msg)
-        raise ValueError(err_msg)
-    if is_qkv_concat and qkv_concat_config:
-        logger.info("The qkv concat check succeed! The qkv in the model weights has been concatenated and "
-                    "qkv_concat is set to true.")
-    if not is_qkv_concat and not qkv_concat_config:
-        logger.info("The qkv concat check succeed! The qkv in the model weights has been not concatenated and "
-                    "qkv_concat is set to false.")
-
-
 def get_merged_src_strategy_path(config):
     """prepare for src strategy."""
     # prepare merged strategy directory
@@ -652,18 +586,3 @@ def get_merged_dst_strategy_path(config, strategy_path):
         logger.info("merge dst strategy finished.")
         strategy_path = dst_strategy_path[1]
     return strategy_path
-
-
-def _revise_remove_redundancy_with_file(remove_redundancy, f):
-    """Check whether remove_redundancy is consistent with the safetensors file."""
-    if f.metadata() is not None and "remove_redundancy" in f.metadata().keys():
-        if f.metadata()["remove_redundancy"] == "True" and not remove_redundancy:
-            logger.warning("For 'load_checkpoint', the safetensors file is without redundancy "
-                           "but remove_redundancy in yaml is False and it will revise to True.")
-            return True
-        if f.metadata()["remove_redundancy"] == "False" and remove_redundancy:
-            logger.warning("For 'load_checkpoint', the safetensors file is with redundancy, "
-                           "but remove_redundancy is set to True and it will revise to False.")
-            return False
-    logger.warning("no metadata info in file.Please make sure remove_redundancy is consistent in file and config. ")
-    return remove_redundancy

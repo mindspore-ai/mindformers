@@ -19,9 +19,7 @@ import mindspore as ms
 from mindspore import Parameter
 from mindspore.nn.cell import Cell
 from mindspore.mint.distributed import gather_object
-from mindspore.parallel.strategy import get_strategy_metadata
 
-from mindformers.core.context.build_context import get_context
 from mindformers.tools.logger import logger
 
 try:
@@ -40,27 +38,14 @@ class LayoutAdapter:
     """
     Adapter class for extracting and managing distributed parallel layout information from MindSpore networks.
 
-    This class provides unified interfaces to retrieve sharding strategy metadata across different
-    parallel modes (PyNative and Graph mode), supporting both single-rank and multi-rank scenarios.
+    Retrieves PyNative layout metadata for single-rank and multi-rank checkpoint operations.
     """
-
-    @staticmethod
-    def is_pynative_mode() -> bool:
-        """
-        Check if the current execution mode is PyNative mode.
-
-        Returns:
-            bool: True if running in PyNative mode, False if in Graph mode.
-        """
-        return get_context("mode") == ms.context.PYNATIVE_MODE
-
     @staticmethod
     def get_all_layouts(network: Union[Cell, List[Cell]]) -> Dict[int, Dict[str, list]]:
         """
         Retrieve distributed parallel layout information for all ranks in the network.
 
-        This method automatically detects the execution mode and delegates to the appropriate
-        backend implementation to collect layout metadata across all participating ranks.
+        Collect layout metadata from the PyNative network across all participating ranks.
 
         Args:
             network (Cell): The MindSpore network cell containing distributed parameters
@@ -73,10 +58,7 @@ class LayoutAdapter:
                     [ms.Layout object, parameter type, full shape].
                 Returns empty dict if no layout information is available.
         """
-        if LayoutAdapter.is_pynative_mode():
-            return LayoutAdapter._get_layout_from_pynative(network)
-        return LayoutAdapter._get_layout_from_graph(network)
-
+        return LayoutAdapter._get_layout_from_pynative(network)
 
     @staticmethod
     def get_current_layout(network: Union[Cell, List[Cell]]) -> Dict[str, list]:
@@ -100,11 +82,7 @@ class LayoutAdapter:
                 lists containing [ms.Layout object, parameter type, full shape] for the
                 current rank. Returns empty dict if no layout information is available.
         """
-        rank_id = get_real_rank()
-        if LayoutAdapter.is_pynative_mode():
-            return LayoutAdapter._get_current_layout_from_pynative(network)
-        return LayoutAdapter._get_layout_from_graph(network)[rank_id]
-
+        return LayoutAdapter._get_current_layout_from_pynative(network)
     @staticmethod
     def get_all_layouts_on_rank0(
             network: Union[Cell, List[Cell]]
@@ -121,17 +99,13 @@ class LayoutAdapter:
         every rank that owns the parameter, and the offsets it yields already cover all ranks. One
         copy per parameter is therefore enough to rebuild the layout of every rank.
 
-        In PyNative mode, each rank sends only its parameter names plus the layouts it owns
-        (the lowest rank of the parameter's rank list is chosen as the owner, decided locally
-        without communication). In Graph mode, the strategy metadata is produced locally by the
-        compiler on every rank, so rank 0 simply builds the index from its local view. Either
-        way the payload and rank 0's work are linear in the world size.
+        Each rank sends its parameter names plus the layouts it owns (the lowest rank of
+        each parameter's rank list is chosen as the owner, decided locally). The payload
+        and rank 0's work are linear in the world size.
 
         Note:
-            All ranks must call this interface. In PyNative multi-rank scenarios it performs a
-            ``gather_object`` towards rank 0 (non-zero ranks take part in the gather and simply
-            get None). In Graph mode only rank 0 builds the result locally, without any
-            communication.
+            All ranks must call this interface. Multi-rank jobs perform a ``gather_object``
+            towards rank 0; non-zero ranks participate and return None.
 
         Args:
             network (Cell): The MindSpore network cell containing distributed parameters
@@ -149,13 +123,6 @@ class LayoutAdapter:
             RuntimeError: On rank 0, if a rank reported a parameter whose layout no rank claimed
                 ownership of, which would silently drop that parameter from 'metadata.json'.
         """
-        if not LayoutAdapter.is_pynative_mode():
-            # Graph mode strategy metadata is produced locally by the compiler on every
-            # rank without any communication, so only rank 0 needs to build the index.
-            if get_real_rank() != 0:
-                return None
-            return LayoutAdapter._build_layout_index_from_graph(network)
-
         if get_current_layout is None:
             raise ImportError("hyper_parallel is required for PyNative mode. Please install it.")
 
@@ -172,27 +139,6 @@ class LayoutAdapter:
         gathered = [None] * get_real_group_size()
         gather_object(contribution, gathered, dst=0)
         return LayoutAdapter._merge_layout_contributions(gathered)
-
-    @staticmethod
-    def _build_layout_index_from_graph(
-            network: Union[Cell, List[Cell]]
-    ) -> Tuple[Dict[str, list], Dict[int, List[str]]]:
-        """
-        Build the deduplicated layout index from Graph-mode strategy metadata (rank 0 only).
-
-        The compiler produces the full strategy metadata locally on every rank, so the index
-        is extracted from the local view without any communication. A parameter's layout is
-        identical on every rank that owns it, so the first occurrence is kept.
-        """
-        graph_layout = LayoutAdapter._get_layout_from_graph(network)
-        param_layouts = {}
-        rank_param_names = {}
-        for rank_id, params in graph_layout.items():
-            rank_param_names[int(rank_id)] = list(params.keys())
-            for param_name, param_info in params.items():
-                if param_name not in param_layouts:
-                    param_layouts[param_name] = param_info
-        return param_layouts, rank_param_names
 
     @staticmethod
     def _build_local_layout_contribution(
@@ -224,7 +170,6 @@ class LayoutAdapter:
                 if rank_list is None or min(rank_list) == cur_rank:
                     owned_layouts[param_name] = param_info
         return rank_param_names, owned_layouts
-
     @staticmethod
     def _merge_layout_contributions(
             contributions: List[Tuple[Dict[int, List[str]], Dict[str, dict]]]
@@ -273,7 +218,6 @@ class LayoutAdapter:
 
         # Each parameter's ms.Layout is built once here and shared by every rank that owns it.
         return LayoutAdapter._convert_rank_layout_dict(raw_layouts), rank_param_names
-
     @staticmethod
     def _get_raw_current_layout_from_pynative(network: Union[Cell, List[Cell]]) -> Dict[str, Dict[str, dict]]:
         """
@@ -303,7 +247,6 @@ class LayoutAdapter:
                 else:
                     local_layout_dict[rank_id] = metas
         return local_layout_dict
-
     @staticmethod
     def _get_current_layout_from_pynative(network: Union[Cell, List[Cell]]) -> Dict[str, list]:
         """
@@ -316,7 +259,6 @@ class LayoutAdapter:
             return {}
         result = LayoutAdapter._convert_global_layout_dict(local_layout_dict)
         return result.get(get_real_rank(), {})
-
     @staticmethod
     def _convert_rank_layout_dict(current_layout_dict: Dict[str, dict]) -> Dict[str, list]:
         """
@@ -344,7 +286,6 @@ class LayoutAdapter:
                 layout_info._tensor_map = tuple(param_info['tensor_map'])
                 rank_layout[param_name] = [layout_info, param_info['type'], param_info['full_shape']]
         return rank_layout
-
     @staticmethod
     def _convert_global_layout_dict(global_layout_dict: Dict) -> Dict[int, Dict[str, list]]:
         """
@@ -362,7 +303,6 @@ class LayoutAdapter:
         for rank_id, current_layout_dict in global_layout_dict.items():
             result[int(rank_id)] = LayoutAdapter._convert_rank_layout_dict(current_layout_dict)
         return result
-
     @staticmethod
     def _get_layout_from_pynative(network: Cell) -> Dict[int, Dict[str, list]]:
         """
@@ -402,26 +342,6 @@ class LayoutAdapter:
         return LayoutAdapter._convert_global_layout_dict(global_layout_dict)
 
     @staticmethod
-    def _get_layout_from_graph(network: Cell) -> Dict[int, Dict[str, list]]:
-        """
-        Extract distributed parallel layout information from Graph mode execution.
-
-        This method retrieves strategy metadata that was generated during graph compilation,
-        which contains the optimized sharding decisions made by MindSpore's parallel compiler.
-
-        Args:
-            network (Cell): The MindSpore network cell containing distributed parameters
-                and their compiled sharding strategies in Graph mode.
-
-        Returns:
-            Dict[int, Dict[str, list]]: A nested dictionary where:
-                - Outer keys are rank IDs (int).
-                - Inner dictionaries map parameter names (str) to layout information lists
-                  obtained from the compiled strategy metadata.
-        """
-        return get_strategy_metadata(network)
-
-    @staticmethod
     def preprocess_params(network: Cell):
         """
         Preprocess network parameters by converting DTensor types to Parameter in PyNative mode.
@@ -434,18 +354,9 @@ class LayoutAdapter:
             network (Cell): MindSpore neural network cell object containing parameters to be processed
 
         Returns:
-            state_dict (Dict[str, Parameter]): Returns the original network object if not in PyNative mode;
-                                If in PyNative mode, returns a dictionary where keys are parameter names
-                                and values are processed parameter objects (DTensor converted to Parameter)
+            Dict[str, Parameter]: Parameters indexed by name, with DTensor values converted
+                to local Parameters.
         """
-        if not LayoutAdapter.is_pynative_mode():
-            # `save_checkpoint` takes a Cell or a list of Parameters, not a list of Cells. A single
-            # Cell is passed through as is, so MindSpore's own Graph-mode save handling applies.
-            if isinstance(network, (list, tuple)):
-                if len(network) == 1:
-                    return network[0]
-                return [param for net in network for param in net.get_parameters()]
-            return network
         if DTensor is None:
             raise ImportError("DTensor is required for PyNative mode. Please install it.")
         state_dict = {}

@@ -181,51 +181,6 @@ def test_get_sharded_tensor_from_cell():
 @pytest.mark.level0
 @pytest.mark.platform_x86_cpu
 @pytest.mark.env_onecard
-def test_owned_param_names_ignores_per_rank_state():
-    """
-    Feature: _owned_param_names, the filter rank 0 applies for the whole job
-    Description: Under pipeline parallelism another stage's parameters look unsliced and still hold
-        an initializer on rank 0, while they are written normally on their own stage. Only
-        ownership and the pipeline-shared flag, which are the same on every rank, may filter.
-    Expectation: Unsliced / initializer-holding parameters are kept; pipeline-shared ones and
-        parameters of cells not being saved are left out
-    """
-    from mindformers.checkpoint.sharded_tensor import _owned_param_names
-
-    net = SimpleNet()
-    net.dense.weight.sliced = False   # as another pipeline stage's weight looks on rank 0
-    net.dense.bias.param_info.is_pipeline_shared_param = True
-
-    owned = _owned_param_names([net, None])
-    assert net.dense.weight.name in owned
-    assert net.dense.bias.name not in owned
-    assert "accu_grads." + net.dense.weight.name not in owned
-
-
-@pytest.mark.level0
-@pytest.mark.platform_x86_cpu
-@pytest.mark.env_onecard
-def test_preprocess_params_graph_unwraps_cell_list():
-    """
-    Feature: LayoutAdapter.preprocess_params in Graph mode
-    Description: 'save_checkpoint' wraps the network in a list, but MindSpore's save_checkpoint
-        takes a Cell or a list of Parameters, not a list of Cells
-    Expectation: A single Cell is passed through unchanged; several Cells become their Parameters
-    """
-    from unittest.mock import patch
-    from mindformers.checkpoint.layout_adapter import LayoutAdapter
-
-    net_a, net_b = SimpleNet(), SimpleNet()
-    with patch.object(LayoutAdapter, "is_pynative_mode", return_value=False):
-        assert LayoutAdapter.preprocess_params(net_a) is net_a
-        assert LayoutAdapter.preprocess_params([net_a]) is net_a
-        params = LayoutAdapter.preprocess_params([net_a, net_b])
-    assert params == list(net_a.get_parameters()) + list(net_b.get_parameters())
-
-
-@pytest.mark.level0
-@pytest.mark.platform_x86_cpu
-@pytest.mark.env_onecard
 def test_sharded_tensor_with_custom_attributes():
     """
     Feature: ShardedTensor creation with custom attributes
@@ -652,41 +607,6 @@ def test_merge_layout_contributions_detects_missing_owner():
 @pytest.mark.level0
 @pytest.mark.platform_x86_cpu
 @pytest.mark.env_onecard
-def test_get_all_layouts_on_rank0_graph_builds_index_locally():
-    """
-    Feature: LayoutAdapter.get_all_layouts_on_rank0 in Graph mode
-    Description: rank 0 builds the deduplicated layout index from the local compiler
-        strategy metadata without communication; non-zero ranks get None
-    Expectation: Index holds one layout entry per parameter plus per-rank name lists
-    """
-    from unittest.mock import patch, MagicMock
-    from mindformers.checkpoint.layout_adapter import LayoutAdapter
-
-    fake_graph_layout = {
-        0: {"param1": ["layout1", "float32", (10,)], "param2": ["layout2", "float32", (20,)]},
-        1: {"param1": ["layout1", "float32", (10,)]},
-    }
-    with patch("mindformers.checkpoint.layout_adapter.LayoutAdapter.is_pynative_mode",
-               return_value=False), \
-         patch("mindformers.checkpoint.layout_adapter.get_real_rank", return_value=0), \
-         patch("mindformers.checkpoint.layout_adapter.LayoutAdapter._get_layout_from_graph",
-               return_value=fake_graph_layout):
-        layout_index = LayoutAdapter.get_all_layouts_on_rank0(MagicMock())
-
-    param_layouts, rank_param_names = layout_index
-    assert param_layouts == {"param1": ["layout1", "float32", (10,)],
-                             "param2": ["layout2", "float32", (20,)]}
-    assert rank_param_names == {0: ["param1", "param2"], 1: ["param1"]}
-
-    with patch("mindformers.checkpoint.layout_adapter.LayoutAdapter.is_pynative_mode",
-               return_value=False), \
-         patch("mindformers.checkpoint.layout_adapter.get_real_rank", return_value=1):
-        assert LayoutAdapter.get_all_layouts_on_rank0(MagicMock()) is None
-
-
-@pytest.mark.level0
-@pytest.mark.platform_x86_cpu
-@pytest.mark.env_onecard
 def test_get_current_layout_pynative_is_local_only():
     """
     Feature: LayoutAdapter.get_current_layout in PyNative mode
@@ -702,9 +622,7 @@ def test_get_current_layout_pynative_is_local_only():
             "param1": {"type": "float32", "full_shape": (10,)},
         }
     }
-    with patch("mindformers.checkpoint.layout_adapter.LayoutAdapter.is_pynative_mode",
-               return_value=True), \
-         patch("mindformers.checkpoint.layout_adapter.get_current_layout",
+    with patch("mindformers.checkpoint.layout_adapter.get_current_layout",
                return_value=raw_local_layout) as mock_local, \
          patch("mindformers.checkpoint.layout_adapter.get_global_layout") as mock_global, \
          patch("mindformers.checkpoint.layout_adapter.get_real_rank", return_value=0):

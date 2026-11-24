@@ -73,7 +73,7 @@ from mindformers.core.callback.callback import (
 from mindformers.modules.seq_pipe import SequenceSplit
 from mindformers.utils.load_checkpoint_utils import get_load_path_after_hf_convert
 from mindformers.checkpoint.checkpoint import load_checkpoint, CommonInfo, load_hf_checkpoint, get_checkpoint_path
-from mindformers.checkpoint.utils import compile_model, is_hf_checkpoint, get_healthy_checkpoint_path
+from mindformers.checkpoint.utils import is_hf_checkpoint, get_healthy_checkpoint_path
 from mindformers.dataset.dataloader.hf_dataloader import _resume_hf_iterable_dataset
 from ..core.config_args import ConfigArguments
 from .training_args import TrainingArguments
@@ -1533,9 +1533,6 @@ class BaseTrainer:
 
         # resume checkpoint
         if not config.use_legacy_format and config.checkpoint.load_path:
-            if config.use_parallel:
-                compile_model(model, dataset, mode=config.context.mode, sink_mode=config.runner_config.sink_mode,
-                              epoch=config.runner_config.epochs, sink_size=config.runner_config.sink_size)
 
             if not config.checkpoint.no_load_optim:
                 if is_hf_checkpoint(config.checkpoint.load_path):

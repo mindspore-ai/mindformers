@@ -206,7 +206,6 @@ def test_get_metadata_of_checkpoint_skips_safetensors_metadata_block(tmp_path):
         entry, and the real tensors are returned.
     """
     from safetensors.numpy import save_file
-    from mindformers.checkpoint.layout_adapter import LayoutAdapter
 
     checkpoint_dir = tmp_path / "hf_ckpt"
     checkpoint_dir.mkdir()
@@ -216,9 +215,6 @@ def test_get_metadata_of_checkpoint_skips_safetensors_metadata_block(tmp_path):
         str(checkpoint_dir / "model.safetensors"),
         metadata={"format": "pt"},
     )
-
-    if not LayoutAdapter.is_pynative_mode():
-        pytest.skip("the HF header path is only taken in pynative mode")
 
     sharded_tensor_metas, _ = get_metadata_of_checkpoint(str(checkpoint_dir))
     assert "__metadata__" not in sharded_tensor_metas
