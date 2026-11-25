@@ -1,6 +1,6 @@
 # Xing4 权重转换
 
-29B 和 285B 的离线转换复用 `mindformers/models/xing4` 的权重模板，覆盖 MLA、DSA、MoE、mHC 和追加的 MTP 层。转换使用 CPU，不需要 PyTorch。模型 YAML 与权重应使用相同型号及结构；285B Xing4.1-Preview 的 MTP 层数为 0。
+29B 和 285B 的离线转换复用 `mindformers/models/xing4` 的权重模板，覆盖 MLA、DSA、MoE、mHC 和追加的 MTP 层。转换使用 CPU，不需要 PyTorch。模型 YAML 与权重应使用相同型号及结构；285B 的默认结构与 [Xing4.1-Preview-MindSpore](https://huggingface.co/XingChen-AGI/Xing4.1-Preview-MindSpore) 对齐，包含一层启用 DSA 的 MTP；转换旧权重时应以实际权重对应的 YAML 为准。
 
 在仓库根目录执行以下命令。
 
@@ -33,7 +33,7 @@ python -m toolkit.weight_convert.convert_mf_to_hf \
   --max_worker 1
 ```
 
-输入既可以是完整 MF 权重，也可以是包含 `metadata.json` 及其引用分片的分布式 checkpoint。工具按元数据恢复各轴的规则切分，忽略优化器状态，并输出 HF safetensors、索引和原生 `config.json`。29B 使用 `xing4_0` 身份，285B 使用 `deepseek_v32` 身份；MTP 的共享 embedding/head 也会恢复对应的 HF 权重条目。
+输入既可以是完整 MF 权重，也可以是包含 `metadata.json` 及其引用分片的分布式 checkpoint。工具按元数据恢复各轴的规则切分，忽略优化器状态，并输出 HF safetensors、索引和原生 `config.json`。29B 使用 `xing4_0` 身份，285B 使用 `Xing4.1-Preview` 身份；MTP 的共享 embedding/head 也会恢复对应的 HF 权重条目。
 
 `--dtype source` 保留微调后的各参数精度。`--hf_config_path` 用于保留 `auto_map` 等原始元数据，模型结构字段以 YAML 及型号默认值为准。Tokenizer 文件和 `auto_map` 引用的自定义 Python 文件应从原 HF 目录复制到输出目录。
 
