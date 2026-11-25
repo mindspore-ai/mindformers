@@ -33,7 +33,7 @@ class Xing4ExportAdapter:
     """Model-specific configuration and offline template factory."""
 
     config_class = Xing4Config
-    export_model_types = ("xing4_v4", "xing4_v41")
+    export_model_types = ("xing4_v4", "xing4_v41", "Xing4.1-Preview")
 
     @staticmethod
     def build_weight_template(config):
@@ -52,7 +52,7 @@ class Xing4ExportAdapter:
         result = {name: getattr(config, name) for name in config._HF_DEFAULTS}
         is_v41 = config.model_type == "xing4_v41"
         result.update(
-            model_type="deepseek_v32" if is_v41 else "xing4_0",
+            model_type="Xing4.1-Preview" if is_v41 else "xing4_0",
             architectures=["DeepseekV32ForCausalLM" if is_v41 else "Xing4_0ForCausalLM"],
             scoring_func=config.moe_router_score_function,
             moe_layer_freq=1, ep_size=1, use_cache=True,

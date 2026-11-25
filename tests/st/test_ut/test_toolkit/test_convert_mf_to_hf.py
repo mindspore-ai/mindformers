@@ -89,7 +89,8 @@ def test_parse_yaml_config_reads_model_section(tmp_path):
 
 @pytest.mark.level0
 @pytest.mark.platform_x86_cpu
-@pytest.mark.parametrize("model_type,layers,mtp", [("xing4_v4", 40, 1), ("xing4_v41", 45, 0)])
+@pytest.mark.parametrize("model_type,layers,mtp", [
+    ("xing4_v4", 40, 1), ("xing4_v41", 45, 1), ("Xing4.1-Preview", 45, 1)])
 def test_xing4_dynamic_export_schema(tmp_path, model_type, layers, mtp):
     """
     Feature: Xing4 offline export.
@@ -107,7 +108,9 @@ def test_xing4_dynamic_export_schema(tmp_path, model_type, layers, mtp):
     converter.save_hf_config(str(tmp_path), config, model_type)
     hf = json.loads((tmp_path / 'config.json').read_text())
     assert hf['num_hidden_layers'] == layers and hf['num_nextn_predict_layers'] == mtp
-    assert hf['model_type'] == ('xing4_0' if mtp else 'deepseek_v32')
+    assert hf['model_type'] == ('xing4_0' if model_type == 'xing4_v4' else 'Xing4.1-Preview')
+    mtp_indexer = 'mtp.layers.0.transformer_layer.self_attention.core_attention.indexer.linear_wk.weight'
+    assert (mtp_indexer in template.mf_name_to_converter) == (model_type != 'xing4_v4')
     assert hf['scoring_func'] == 'sigmoid'
     assert 'architectures' in hf and 'params_dtype' not in hf
 
@@ -135,7 +138,7 @@ def test_xing4_export_preserves_reference_metadata_and_mtp_aliases(tmp_path):
     assert exported['num_hidden_layers'] == 40 and exported['auto_map']['AutoConfig'].endswith('Xing4_0Config')
     policy = converter.DtypePolicy(converter.ms.bfloat16)
     assert policy.for_name('model.layers.3.mlp.gate.e_score_correction_bias') == converter.ms.float32
-    reference.write_text(json.dumps({'model_type': 'deepseek_v32'}))
+    reference.write_text(json.dumps({'model_type': 'Xing4.1-Preview'}))
     with pytest.raises(ValueError, match='different model type'):
         converter.save_hf_config(str(tmp_path), config, 'xing4_v4', str(reference))
 
@@ -258,7 +261,26 @@ def test_xing4_optional_hf_fields(monkeypatch, missing, overrides):
     defaults.pop(missing)
     monkeypatch.setattr(Xing4Config, '_HF_DEFAULTS', defaults)
     result = Xing4ExportAdapter.export_hf_config({'model_type': 'xing4_v41', **overrides})
-    assert result['model_type'] == 'deepseek_v32' and missing not in result
+    assert result['model_type'] == 'Xing4.1-Preview' and missing not in result
+
+
+@pytest.mark.level0
+@pytest.mark.platform_x86_cpu
+def test_xing41_export_preserves_native_reference(tmp_path):
+    """Native reference metadata survives while explicit MTP settings take precedence."""
+    converter = _load_converter()
+    converter.discover_model_converters()
+    config = {'model_type': 'xing4_v41', '_raw_model_section': {
+        'model_type': 'xing4_v41', 'num_nextn_predict_layers': 0, 'mtp_enable_dsa': False}}
+    reference = tmp_path / 'reference.json'
+    auto_map = {'AutoConfig': 'configuration_deepseek.DeepseekV3Config'}
+    reference.write_text(json.dumps({'model_type': 'Xing4.1-Preview', 'auto_map': auto_map,
+                                     'num_nextn_predict_layers': 1}))
+    converter.save_hf_config(str(tmp_path), config, 'xing4_v41', str(reference))
+    result = json.loads((tmp_path / 'config.json').read_text())
+    assert result['model_type'] == 'Xing4.1-Preview' and result['auto_map'] == auto_map
+    assert result['architectures'] == ['DeepseekV32ForCausalLM']
+    assert result['num_nextn_predict_layers'] == 0
 
 
 @pytest.mark.level0

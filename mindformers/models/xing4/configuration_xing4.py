@@ -105,7 +105,6 @@ class Xing4Config(PretrainedConfig):
         experimental_attention_variant="dsa",
         dsa_indexer_use_sparse_loss=True,
         mtp_loss_scaling_factor=0.1,
-        mtp_enable_dsa=False,
         mtp_enable_hyper_connections=False,
         enable_hc_head=False,
     )
@@ -158,14 +157,14 @@ class Xing4Config(PretrainedConfig):
     def _config_class(cls, config_dict):
         """Resolve model identity without inferring it from parameter dimensions."""
         model_type = config_dict.get("model_type")
-        aliases = {"xing4_0": Xing4V4Config, "deepseek_v32": Xing4V41Config}
+        aliases = {"xing4_0": Xing4V4Config, "Xing4.1-Preview": Xing4V41Config}
         if model_type in aliases:
             return aliases[model_type]
         for config_class in (Xing4V4Config, Xing4V41Config):
             if model_type == config_class.model_type or config_dict.get("type") == config_class.__name__:
                 return config_class
         raise ValueError(f"Unknown Xing4 model_type {model_type!r}; expected xing4_v4/xing4_0 "
-                         "(29B) or xing4_v41/deepseek_v32 (285B).")
+                         "(29B) or Xing4.1-Preview/xing4_v41 (285B).")
 
     @classmethod
     def from_dict(cls, config_dict, **kwargs):
@@ -214,11 +213,13 @@ class Xing4V4Config(Xing4Config):
         "enable_hyper_connections": True, "mhc_compute_dtype": "bf16",
         "mhc_megatron_compatibility": True,
         "mhc_h_res_clamp_min": -30, "mhc_h_res_clamp_max": 30,
+        "mtp_enable_dsa": False,
         "bos_token_id": 1, "eos_token_id": 2, "pad_token_id": None,
     }
 
 
-@MindFormerRegister.register(MindFormerModuleType.CONFIG, legacy=False, search_names=["xing4_v41"])
+@MindFormerRegister.register(MindFormerModuleType.CONFIG, legacy=False,
+                            search_names=["xing4_v41", "Xing4.1-Preview"])
 class Xing4V41Config(Xing4Config):
     """Xing4.1-Preview 285B configuration with independent DSA indexers."""
 
@@ -231,7 +232,7 @@ class Xing4V41Config(Xing4Config):
         "q_lora_rank": 1536, "index_n_heads": 64,
         "rms_norm_eps": 1e-5, "initializer_range": 0.0048,
         "enable_hyper_connections": False,
-        "num_nextn_predict_layers": 0, "max_position_embeddings": 1048576,
+        "mtp_enable_dsa": True, "max_position_embeddings": 1048576,
         "rope_scaling": {
             "type": "yarn", "factor": 32.0, "original_max_position_embeddings": 32768,
             "beta_fast": 32, "beta_slow": 1, "mscale": 1.0, "mscale_all_dim": 1.0,

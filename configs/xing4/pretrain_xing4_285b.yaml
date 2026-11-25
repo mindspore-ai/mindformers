@@ -88,7 +88,7 @@ train_dataset:
 model:
   chunk_loss_num: 8
   calculate_per_token_loss: false
-  model_type: xing4_v41
+  model_type: Xing4.1-Preview
   architectures: Xing4ForCausalLM
   vocab_size: 131072
   seq_length: 4096
@@ -126,7 +126,7 @@ model:
   rotary_dtype: float32
   fp32_residual_connection: true
   initializer_range: 0.0048
-  num_nextn_predict_layers: 0
+  num_nextn_predict_layers: 1
   mtp_loss_scaling_factor: 0.1
   mtp_enable_hyper_connections: false
   position_embedding_type: yarn
@@ -181,7 +181,7 @@ model:
   dsa_indexer_loss_coeff: 1.0
   dsa_indexer_use_sparse_loss: true
   dsa_indexer_layerwise_backward: true
-  mtp_enable_dsa: false
+  mtp_enable_dsa: true
 context:
   mode: 1
   device_target: Ascend
