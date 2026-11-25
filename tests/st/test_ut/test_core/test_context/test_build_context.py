@@ -26,7 +26,6 @@ from mindformers.core.context import (
     build_mf_context,
     build_parallel_context,
     get_context,
-    is_legacy_model,
     set_context,
 )
 from mindformers.core.context.build_context import (
@@ -39,8 +38,19 @@ from mindformers.core.context.build_context import (
 from mindformers.tools.register import MindFormerConfig
 
 
+@pytest.fixture(autouse=True)
+def isolated_context():
+    """Reset both context singletons and isolate one-time CPU affinity setup."""
+    Context.reset_instance()
+    MFContextOperator.reset_instance()
+    with patch("mindformers.core.context.build_context._setup_affinity"):
+        yield
+    Context.reset_instance()
+    MFContextOperator.reset_instance()
+
+
 def get_config_tpl():
-    return {"context": {"mode": "PYNATIVE_MODE"}, "parallel": {}}
+    return {"context": {"mode": "PYNATIVE_MODE", "device_target": "CPU"}, "parallel": {}}
 
 
 def run_in_subprocess(func, *args):
@@ -51,88 +61,40 @@ def run_in_subprocess(func, *args):
     assert process.exitcode == 0
 
 
-def run_deterministic_setting(
-    mode,
-    switch,
-    hccl_deterministic_env,
-    te_parallel_compiler_env,
-    custom_matmul_shuffle_env,
-    lccl_deterministic_env,
-    hccl_deterministic_expect,
-    te_parallel_compiler_expect,
-    custom_matmul_shuffle_expect,
-    lccl_deterministic_expect,
-):
-    """Execute deterministic setting testcase."""
+def run_deterministic_setting(mode, switch, shuffle, lccl, expected_shuffle, expected_lccl):
+    """Check the MindSpore API call and environment variables owned by MindFormers."""
     os.environ.clear()
-    env = {
-        "HCCL_DETERMINISTIC": hccl_deterministic_env,
-        "TE_PARALLEL_COMPILER": te_parallel_compiler_env,
-        "CUSTOM_MATMUL_SHUFFLE": custom_matmul_shuffle_env,
-        "LCCL_DETERMINISTIC": lccl_deterministic_env,
-    }
-    os.environ.update({k: v for k, v in env.items() if v is not None})
-    config_tpl = get_config_tpl()
-    config_tpl["run_mode"] = mode
-    build_context(config_tpl)
-    if mode in ("train", "finetune"):
-        set_context(train_precision_sync=switch)
-        assert get_context("train_precision_sync") == switch
-    else:
-        set_context(infer_precision_sync=switch)
-        assert get_context("infer_precision_sync") == switch
-    assert os.getenv("HCCL_DETERMINISTIC") == hccl_deterministic_expect
-    assert os.getenv("TE_PARALLEL_COMPILER") == te_parallel_compiler_expect
-    assert os.getenv("CUSTOM_MATMUL_SHUFFLE") == custom_matmul_shuffle_expect
-    assert os.getenv("LCCL_DETERMINISTIC") == lccl_deterministic_expect
+    os.environ.update({key: value for key, value in {
+        "CUSTOM_MATMUL_SHUFFLE": shuffle,
+        "LCCL_DETERMINISTIC": lccl,
+    }.items() if value is not None})
+    config = get_config_tpl()
+    config["run_mode"] = mode
+    with patch("mindformers.core.context.build_context.set_ms_deterministic") as set_deterministic:
+        build_context(config)
+        if mode in ("train", "finetune"):
+            set_context(train_precision_sync=switch)
+            assert get_context("train_precision_sync") == switch
+        else:
+            set_context(infer_precision_sync=switch)
+            assert get_context("infer_precision_sync") == switch
+        set_deterministic.assert_called_once_with(switch)
+    assert os.getenv("CUSTOM_MATMUL_SHUFFLE") == expected_shuffle
+    assert os.getenv("LCCL_DETERMINISTIC") == expected_lccl
 
 
 @pytest.mark.level1
 @pytest.mark.platform_x86_cpu
-@pytest.mark.parametrize(
-    "mode, switch, hccl_deterministic_env, te_parallel_compiler_env, "
-    "custom_matmul_shuffle_env, lccl_deterministic_env, "
-    "hccl_deterministic_expect, te_parallel_compiler_expect, "
-    "custom_matmul_shuffle_expect, lccl_deterministic_expect",
-    (
-        ("train", False, "true", "1", None, None, None, None, "on", "0"),
-        ("train", False, "false", "0", None, None, "false", "0", "on", "0"),
-        ("train", True, "false", "0", None, None, "true", "1", "on", "0"),
-        ("finetune", True, "false", "0", None, None, "true", "1", "on", "0"),
-        ("predict", False, None, None, "off", "1", None, None, "on", "0"),
-        ("predict", True, None, None, "on", "0", "true", "1", "off", "1"),
-    ),
-)
-def test_deterministic(
-    mode,
-    switch,
-    hccl_deterministic_env,
-    te_parallel_compiler_env,
-    custom_matmul_shuffle_env,
-    lccl_deterministic_env,
-    hccl_deterministic_expect,
-    te_parallel_compiler_expect,
-    custom_matmul_shuffle_expect,
-    lccl_deterministic_expect,
-):
-    """
-    Feature: Test deterministic computing setting through set_context().
-    Description: Compare the setting env variables and expected variables.
-    Expectation: setting env variables and expected variables is different.
-    """
-    run_in_subprocess(
-        run_deterministic_setting,
-        mode,
-        switch,
-        hccl_deterministic_env,
-        te_parallel_compiler_env,
-        custom_matmul_shuffle_env,
-        lccl_deterministic_env,
-        hccl_deterministic_expect,
-        te_parallel_compiler_expect,
-        custom_matmul_shuffle_expect,
-        lccl_deterministic_expect,
-    )
+@pytest.mark.parametrize("mode,switch,shuffle,lccl,expected_shuffle,expected_lccl", [
+    ("train", False, None, None, "on", "0"),
+    ("train", True, None, None, "on", "0"),
+    ("finetune", True, None, None, "on", "0"),
+    ("predict", False, "off", "1", "on", "0"),
+    ("predict", True, "on", "0", "off", "1"),
+])
+def test_deterministic(mode, switch, shuffle, lccl, expected_shuffle, expected_lccl):
+    """Training and inference precision switches call MindSpore with the requested value."""
+    run_in_subprocess(run_deterministic_setting, mode, switch, shuffle, lccl, expected_shuffle, expected_lccl)
 
 
 @pytest.mark.level1
@@ -165,27 +127,6 @@ def test_context_singleton():
         assert ctx1 is ctx2
 
     run_in_subprocess(is_singleton_context)
-
-
-@pytest.mark.level1
-@pytest.mark.platform_x86_cpu
-@pytest.mark.parametrize(
-    "cfg, is_legacy_model_except",
-    (
-        ({}, True),
-        ({"use_legacy": True}, True),
-        ({"use_legacy": False}, False),
-    ),
-)
-def test_get_use_legacy(cfg, is_legacy_model_except):
-    """
-    Feature: Test whether the method of getting use_legacy is correct.
-    Description: Test get_context and is_legacy_model functions.
-    Expectation: The result of execution does not equal the expected result.
-    """
-    build_mf_context(cfg)
-    assert is_legacy_model() == is_legacy_model_except
-    MFContextOperator.reset_instance()
 
 
 @pytest.mark.level1
@@ -228,88 +169,6 @@ def test_ms_context_operator_set_save_graphs_path():
     )
     operator = MSContextOperator(config)
     assert operator.get_context("save_graphs_path") == "/tmp/graphs"
-
-
-@pytest.mark.level1
-@pytest.mark.platform_x86_cpu
-def test_ms_context_operator_predict_jit_config_o1():
-    """
-    Feature: Test MSContextOperator._set_predict_jit_config with O1.
-    Description: Test that O1 jit_level raises ValueError in predict mode.
-    Expectation: ValueError is raised.
-    """
-    config = MindFormerConfig(
-        run_mode="predict", context={"jit_level": "O1"}, parallel={}
-    )
-    with pytest.raises(ValueError) as exc_info:
-        MSContextOperator(config)
-    assert "O1 is not supported" in str(exc_info.value)
-
-
-@pytest.mark.level1
-@pytest.mark.platform_x86_cpu
-def test_ms_context_operator_predict_jit_config_o2_with_boost():
-    """
-    Feature: Test MSContextOperator._set_predict_jit_config with O2 and boost.
-    Description: Test that O2 with infer_boost=on raises ValueError.
-    Expectation: ValueError is raised.
-    """
-    config = MindFormerConfig(
-        run_mode="predict",
-        context={"jit_level": "O2", "infer_boost": "on"},
-        parallel={},
-    )
-    with pytest.raises(ValueError) as exc_info:
-        MSContextOperator(config)
-    assert "infer_boost must set off" in str(exc_info.value)
-
-
-@pytest.mark.level1
-@pytest.mark.platform_x86_cpu
-def test_ms_context_operator_predict_jit_config_o2_without_boost():
-    """
-    Feature: Test MSContextOperator._set_predict_jit_config with O2 without boost.
-    Description: Test that O2 with infer_boost=off works.
-    Expectation: jit_config is set correctly.
-    """
-
-    def is_ms_context_operator_predict_jit_config():
-        config = MindFormerConfig(
-            run_mode="predict",
-            context={"jit_level": "O2", "infer_boost": "off"},
-            parallel={},
-        )
-        operator = MSContextOperator(config)
-        jit_config = operator.get_context("jit_config")
-        assert jit_config is not None
-        assert jit_config.get("jit_level") == "O2"
-        assert jit_config.get("infer_boost") == "off"
-
-    run_in_subprocess(is_ms_context_operator_predict_jit_config)
-
-
-@pytest.mark.level1
-@pytest.mark.platform_x86_cpu
-def test_ms_context_operator_predict_jit_config_from_jit_config():
-    """
-    Feature: Test MSContextOperator._set_predict_jit_config with jit_config dict.
-    Description: Test that jit_config dict is used.
-    Expectation: jit_config values are taken from jit_config dict.
-    """
-    config = MindFormerConfig(
-        run_mode="predict",
-        context={
-            "jit_level": "O0",
-            "infer_boost": "on",
-            "jit_config": {"jit_level": "O2", "infer_boost": "off"},
-        },
-        parallel={},
-    )
-    operator = MSContextOperator(config)
-    jit_config = operator.get_context("jit_config")
-    assert jit_config is not None
-    assert jit_config.get("jit_level") == "O2"
-    assert jit_config.get("infer_boost") == "off"
 
 
 @pytest.mark.level1

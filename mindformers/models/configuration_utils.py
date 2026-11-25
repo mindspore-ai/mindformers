@@ -32,7 +32,7 @@ from mindformers.tools.generic import experimental_mode_func_checker, is_experim
 from mindformers.tools.logger import logger
 from mindformers.tools.check_rules import check_yaml_depth_before_loading
 from mindformers.tools.utils import FILE_PERMISSION
-from mindformers.models.build_config import build_model_config, get_model_config
+from mindformers.models.build_config import get_model_config
 from mindformers.models.utils import CONFIG_NAME, ms_type_to_str, DEFAULT_CHECKPOINT_SAVE_FOLDER
 from mindformers.models.auto.utils import set_default_yaml_file
 from mindformers.modules.transformer.transformer import default_transformer_config
@@ -442,13 +442,8 @@ class PretrainedConfig(PushToHubMixin):
             set_default_yaml_file(yaml_name, yaml_file)
 
             config_args = MindFormerConfig(yaml_file)
-        use_legacy = config_args.get_value("use_legacy", True)
         config_args.model.model_config.update(**kwargs)
-        if not use_legacy:
-            config = get_model_config(config_args.model)
-        else:
-            config = build_model_config(config_args.model.model_config)
-            MindFormerBook.set_model_config_to_name(id(config), config_args.model.arch.type)
+        config = get_model_config(config_args.model)
 
         return config
 

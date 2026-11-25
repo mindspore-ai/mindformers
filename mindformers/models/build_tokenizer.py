@@ -48,8 +48,8 @@ def check_and_add_vocab_file_path(config, **kwargs):
 
 
 def build_tokenizer(
-        config: dict = None, default_args: dict = None, module_type: str = 'tokenizer',
-        class_name: str = None, use_legacy: bool = True, **kwargs):
+        config: dict = None, default_args: dict = None, module_type: str = 'tokenizer',  # pylint: disable=unused-argument
+        class_name: str = None, **kwargs):  # pylint: disable=unused-argument
     r"""Build tokenizer For MindFormer.
     Instantiate the tokenizer from MindFormerRegister's registry.
 
@@ -58,7 +58,6 @@ def build_tokenizer(
         default_args (dict): The default argument of tokenizer API. Default: None.
         module_type (str): The module type of MindFormerModuleType. Default: 'tokenizer'.
         class_name (str): The class name of tokenizer API. Default: None.
-        use_legacy (bool): Distinguish whether to use hf-tokenizer or not. Default: True.
 
     Return:
         The function instance of tokenizer API.
@@ -69,33 +68,19 @@ def build_tokenizer(
         >>> config = MindFormerConfig('configs/clip/run_clip_vit_b_32_pretrain_flickr8k.yaml')
         >>> tokenizer_from_config = build_tokenizer(config.processor.tokenizer)
     """
-    if not use_legacy:
-        from transformers import AutoTokenizer
-        pretrained_model_dir = kwargs.get("pretrained_model_dir", None)
-        if not pretrained_model_dir:
-            pretrained_model_dir = get_context('pretrained_model_dir')
-        if not pretrained_model_dir:
-            raise ValueError("The current interface supports passing a local folder path, "
-                             "but the provided path is empty or None.")
-        pretrained_model_dir = os.path.realpath(pretrained_model_dir)
-        if not os.path.isdir(pretrained_model_dir):
-            raise ValueError(f"The current interface supports passing a local folder path, "
-                             f"but the provided path '{pretrained_model_dir}' is not a valid directory.")
+    from transformers import AutoTokenizer
+    pretrained_model_dir = kwargs.get("pretrained_model_dir", None)
+    if not pretrained_model_dir:
+        pretrained_model_dir = get_context('pretrained_model_dir')
+    if not pretrained_model_dir:
+        raise ValueError("The current interface supports passing a local folder path, "
+                         "but the provided path is empty or None.")
+    pretrained_model_dir = os.path.realpath(pretrained_model_dir)
+    if not os.path.isdir(pretrained_model_dir):
+        raise ValueError(f"The current interface supports passing a local folder path, "
+                         f"but the provided path '{pretrained_model_dir}' is not a valid directory.")
 
-        trust_remote_code = kwargs.get("trust_remote_code", False)
-        tokenizer = AutoTokenizer.from_pretrained(pretrained_model_name_or_path=pretrained_model_dir,
-                                                  trust_remote_code=trust_remote_code)
-        return tokenizer
-
-    if config is None and class_name is None:
-        return None
-    if config is not None:
-        if isinstance(config, dict) and not isinstance(config, MindFormerConfig):
-            config = MindFormerConfig(**config)
-        if 'auto_register' in config:
-            MindFormerRegister.auto_register(class_reference=config.pop('auto_register'), module_type=module_type)
-        check_and_add_vocab_file_path(config, **kwargs)
-        return MindFormerRegister.get_instance_from_cfg(
-            config, MindFormerModuleType.TOKENIZER, default_args=default_args)
-
-    return MindFormerRegister.get_instance(module_type, class_name, **kwargs)
+    trust_remote_code = kwargs.get("trust_remote_code", False)
+    tokenizer = AutoTokenizer.from_pretrained(pretrained_model_name_or_path=pretrained_model_dir,
+                                              trust_remote_code=trust_remote_code)
+    return tokenizer

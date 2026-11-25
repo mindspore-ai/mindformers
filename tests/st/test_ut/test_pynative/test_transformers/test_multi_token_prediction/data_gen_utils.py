@@ -73,3 +73,14 @@ def get_golden_datas():
 def get_gpu_datas():
     """Generate gpu data for test."""
     return np.array([2.2798521519], dtype=np.float16)
+
+
+# Parallel MTP baselines shared by the PyNative distributed cases.
+GOLDEN_DATA = {
+    "single_card_baseline": np.array([2.293926239013672]),
+    "pe_rope": np.array([2.3010616302490234]),
+}
+GPU_DATA = {
+    "single_card_baseline": np.array([2.2938010692596436]),
+    "pe_rope": np.array([2.3010997772216797]),
+}

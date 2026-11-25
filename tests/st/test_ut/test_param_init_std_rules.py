@@ -118,8 +118,8 @@ def test_param_init_std_rules():
     Description: Test get_optimizer_grouped_parameters function
     Expectation: No exception.
     """
-    build_context({'context': {'device_target': 'CPU'}, "use_legacy": False})
-    ms.set_context(mode=1)  # GRAPH_MODE is typical for MindSpore model execution
+    build_context({'context': {'device_target': 'CPU'}})
+    ms.set_context(mode=ms.PYNATIVE_MODE)
     ms.set_seed(42)
     np.random.seed(42)
     net = GPTModelNet()

@@ -35,7 +35,7 @@ from mindformers.models.model_config_utils import (
 )
 
 
-@MindFormerRegister.register(MindFormerModuleType.CONFIG, legacy=False, search_names=["telechat3"])
+@MindFormerRegister.register(MindFormerModuleType.CONFIG, search_names=["telechat3"])
 class TeleChat3Config(PretrainedConfig):
     """
     This is the configuration class to store the configuration of a [`TeleChat3Model`].

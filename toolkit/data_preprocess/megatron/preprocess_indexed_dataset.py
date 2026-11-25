@@ -205,8 +205,7 @@ class Partition:
 def get_tokenizer(args):
     """Get tokenizer according to args."""
     if args.tokenizer_type == 'HuggingFaceTokenizer':
-        return build_tokenizer(use_legacy=False,
-                               pretrained_model_dir=args.tokenizer_dir,
+        return build_tokenizer(pretrained_model_dir=args.tokenizer_dir,
                                trust_remote_code=args.trust_remote_code)
     if args.tokenizer_type == 'AutoRegister':
         tokenizer_config = {

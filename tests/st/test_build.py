@@ -17,7 +17,6 @@ Test module for testing the interface used for mindformers.
 How to run this:
 python tests/ut/test_build.py
 """
-import os
 from dataclasses import dataclass
 from typing import Callable
 from mindspore.nn import AdamWeightDecay, CosineDecayLR, Accuracy,\
@@ -26,19 +25,13 @@ from mindspore.train.callback import LossMonitor, TimeMonitor
 from mindspore import Parameter, Tensor
 
 from mindformers.tools.logger import logger
-from mindformers.tools import MindFormerConfig, MindFormerRegister, MindFormerModuleType
+from mindformers.tools import MindFormerRegister, MindFormerModuleType
 from mindformers.core import build_lr, build_optim, build_loss, build_metric
-from mindformers.trainer import build_trainer
-from mindformers.models import build_model, build_processor, build_network
+from mindformers.models import build_model, build_processor
 from mindformers.models import PretrainedConfig, PreTrainedModel
-from mindformers.dataset import build_dataset, check_dataset_config
+from mindformers.dataset import build_dataset
 from mindformers.pipeline import build_pipeline
 from mindformers.wrapper import build_wrapper
-
-path = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-yaml_path = os.path.join(path, 'tests', 'st', 'test_build.yaml')
-all_config = MindFormerConfig(yaml_path)
 
 
 @MindFormerRegister.register(MindFormerModuleType.DATASET_LOADER)
@@ -204,63 +197,6 @@ class TestProcessor:
     """Test Processor API For Register."""
     def __init__(self):
         pass
-
-
-def test_build_from_config():
-    """
-    Feature: Build API from config
-    Description: Test build function to instance API from config
-    Expectation: TypeError
-    """
-    # build dataset
-    check_dataset_config(all_config)
-    build_dataset(all_config.train_dataset_task)
-
-    logger.info("Test Build Dataset Success")
-
-    # build model
-    model = build_model(all_config.model)
-    logger.info("Test Build Model Success")
-
-    # build network
-    model = build_network(all_config.model)
-    logger.info("Test Build Network Success")
-
-    # build lr
-    lr = build_lr(all_config.lr_schedule)
-    logger.info("Test Build LR Success")
-
-    # build optimizer
-    if lr is not None:
-        optimizer = build_optim(all_config.optimizer,
-                                default_args={"params": model.trainable_params(),
-                                              "learning_rate": lr})
-    else:
-        optimizer = build_optim(all_config.optimizer,
-                                default_args={"params": model.trainable_params()})
-    logger.info("Test Build Optimizer Success")
-
-    # build wrapper
-    build_wrapper(all_config.runner_wrapper,
-                  default_args={"network": model, "optimizer": optimizer})
-    logger.info("Test Build Wrapper Success")
-
-    build_loss(all_config.loss)
-    logger.info("Test Build Loss Success")
-
-    build_metric(all_config.metric)
-    logger.info("Test Build Metric Success")
-
-    build_processor(all_config.processor)
-    logger.info("Test Build Processor Success")
-
-    # build trainer
-    build_trainer(all_config.trainer)
-    logger.info("Test Build Trainer Success")
-
-    # build pipeline
-    build_pipeline(all_config.pipeline)
-    logger.info("Test Build Pipeline Success")
 
 
 def test_build_from_class_name():

@@ -33,14 +33,12 @@ from mindspore.dataset import GeneratorDataset
 from mindspore.dataset.engine.datasets import Dataset
 from mindspore.train.metrics import get_metrics
 from mindspore.nn.wrap.cell_wrapper import _VirtualDatasetCell
-from mindspore.nn import Optimizer, Cell, PipelineCell, MicroBatchInterleaved
-from mindspore.nn.wrap.cell_wrapper import GradAccumulationCell
+from mindspore.nn import Optimizer, Cell
 from mindspore.nn.utils import no_init_parameters
 from mindformers.mindformer_book import MindFormerBook
 from mindformers.core import build_lr, build_optim, build_callback, build_metric
 from mindformers.core.context.build_context import (
     get_context as mf_get_context,
-    is_legacy_model,
     set_context as mf_set_context,
 )
 from mindformers.core.parallel_config import build_parallel_config
@@ -49,8 +47,7 @@ from mindformers.models import build_network, build_processor, build_tokenizer, 
     PreTrainedModel, PreTrainedTokenizerBase, BaseImageProcessor
 from mindformers.pipeline import pipeline
 from mindformers.wrapper import build_wrapper
-from mindformers.wrapper.wrapper import GradAccumulationCellWithTwoOutput, GradAccumulationCellWithMultiOutputs, \
-    PipelineCellWithTwoOutput, PipelineCellWithMultiOutputs
+from mindformers.wrapper.wrapper import GradAccumulationCellWithMultiOutputs, PipelineCellWithMultiOutputs
 from mindformers.tools.register import MindFormerConfig
 from mindformers.wrapper.wrapper import DataOrderWrapperCell
 from mindformers.tools.logger import logger
@@ -70,7 +67,6 @@ from mindformers.core.callback.callback import (
     ColdHotExpertMonitor,
     TopkBiasBalanceCallback
 )
-from mindformers.modules.seq_pipe import SequenceSplit
 from mindformers.utils.load_checkpoint_utils import get_load_path_after_hf_convert
 from mindformers.checkpoint.checkpoint import load_checkpoint, CommonInfo, load_hf_checkpoint, get_checkpoint_path
 from mindformers.checkpoint.utils import is_hf_checkpoint, get_healthy_checkpoint_path
@@ -499,43 +495,6 @@ class BaseTrainer:
         """For passing parameters in lexicographical order."""
         return DataOrderWrapperCell(construct_args_key, network)
 
-    def _wrap_network_with_tool_cells_legacy(self, network):
-        """For training process, warp the network with some tool cells."""
-        micro_batch_interleave_num = self.config.micro_batch_interleave_num
-        gradient_accumulation_steps = self.config.runner_config.gradient_accumulation_steps
-        parallel_mode = ms.context.get_auto_parallel_context("parallel_mode")
-        pp = self.get_pipeline_stages()
-        if micro_batch_interleave_num > 1:
-            logger.info("micro_batch_interleave_num > 1, the double copy parallel feature is turned on.")
-            network = MicroBatchInterleaved(network, micro_batch_interleave_num)
-        if gradient_accumulation_steps > 1 and not pp > 1:
-            logger.info("gradient_accumulation_steps > 1, GradAccumulationCell is wrapped on network. "
-                        "It is suggested to use `Lazy Inline` feature to save compiling time.")
-            if self.config.runner_wrapper.calculate_per_token_loss:
-                network = GradAccumulationCellWithTwoOutput(network, gradient_accumulation_steps)
-            else:
-                network = GradAccumulationCell(network, gradient_accumulation_steps)
-        if pp > 1:
-            micro_batch_num = self.config.parallel_config.micro_batch_num
-            seq_split_num = self.config.parallel_config.seq_split_num
-            if seq_split_num > 1:
-                if self.config.recompute_config.recompute:
-                    raise ValueError("When using seq pipe, cannot apply full recompute.")
-                network = SequenceSplit(network, split_num=seq_split_num)
-            if self.config.runner_wrapper.calculate_per_token_loss:
-                if seq_split_num > 1:
-                    raise ValueError("When using seq pipe, cannot apply calculate_per_token_loss.")
-                network = PipelineCellWithTwoOutput(network, micro_size=micro_batch_num)
-            else:
-                network = PipelineCell(network, micro_size=micro_batch_num)
-        if parallel_mode in ["semi_auto_parallel", "auto_parallel"] and mf_get_context('mode') == 0:
-            network = _VirtualDatasetCell(network)
-            ds_broadcast_level = mf_get_context("dataset_broadcast_opt_level")
-            if ds_broadcast_level > 0:
-                # pylint: disable=W0212
-                network._virtual_dataset.add_prim_attr("repeat_dim_direct", "right")
-        return network
-
     def _wrap_network_with_tool_cells(self, network):
         """For training process, warp the network with some tool cells."""
         micro_batch_interleave_num = self.config.micro_batch_interleave_num
@@ -543,7 +502,7 @@ class BaseTrainer:
         parallel_mode = ms.context.get_auto_parallel_context("parallel_mode")
         pp = self.get_pipeline_stages()
         if micro_batch_interleave_num > 1:
-            raise ValueError("micro_batch_interleave_num > 1, is not supported when use_legacy=False.")
+            raise ValueError("micro_batch_interleave_num > 1, is not supported for non-legacy models.")
 
         if not pp > 1:
             if gradient_accumulation_steps > 1:
@@ -556,10 +515,7 @@ class BaseTrainer:
             if seq_split_num > 1:
                 if self.config.recompute_config.recompute:
                     raise ValueError("When using seq pipe, cannot apply full recompute.")
-                raise ValueError("seq_split_num > 1, is not supported when use_legacy=False.")
-            if self.config.runner_wrapper.calculate_per_token_loss:
-                if seq_split_num > 1:
-                    raise ValueError("When using seq pipe, cannot apply calculate_per_token_loss.")
+                raise ValueError("seq_split_num > 1, is not supported for non-legacy models.")
             network = PipelineCellWithMultiOutputs(network, micro_size=micro_batch_num)
         if parallel_mode in ["semi_auto_parallel", "auto_parallel"] and mf_get_context('mode') == 0:
             network = _VirtualDatasetCell(network)
@@ -571,8 +527,6 @@ class BaseTrainer:
 
     def wrap_network_with_tool_cells(self, network):
         """For training process, warp the network with some tool cells."""
-        if is_legacy_model():
-            return self._wrap_network_with_tool_cells_legacy(network)
         return self._wrap_network_with_tool_cells(network)
 
     @staticmethod
@@ -890,7 +844,7 @@ class BaseTrainer:
     def _check_input_sliced_sig(config, usage_info='special'):
         """Check input_sliced_sig in model config."""
         input_sliced_sig = config.model.model_config.get("input_sliced_sig")
-        if not input_sliced_sig and is_legacy_model():
+        if not input_sliced_sig:
             raise ValueError(
                 f"In this {usage_info} configuration, input_sliced_sig in model_config should be set 'True'")
 
@@ -1292,10 +1246,9 @@ class BaseTrainer:
         is_moe_model = False
         is_mtp_model = False
         transformer_config = None
-        if not is_legacy_model():
-            is_moe_model = network.is_moe_model()
-            is_mtp_model = network.is_mtp_model()
-            transformer_config = network.get_gpt_transformer_config()
+        is_moe_model = network.is_moe_model()
+        is_mtp_model = network.is_mtp_model()
+        transformer_config = network.get_gpt_transformer_config()
 
         if config.get('use_legacy_format', True):
             config.checkpoint.load_path = get_load_path_after_hf_convert(config, network)
@@ -1416,9 +1369,9 @@ class BaseTrainer:
                         "async_save": config.checkpoint.async_save,
                         "prefix": config.checkpoint.prefix
                     })
-                if not config.get("use_legacy", True) and default_args.get("checkpoint_format") == "ckpt":
+                if default_args.get("checkpoint_format") == "ckpt":
                     logger.warning(
-                        "When use_legacy=False, it's not supported to save 'ckpt' files and switch to 'safetensors'.")
+                        "Non-legacy models do not support saving 'ckpt' files; switching to 'safetensors'.")
                     default_args["checkpoint_format"] = "safetensors"
                 if default_args.get("remove_redundancy") and default_args.get("checkpoint_format") == "ckpt":
                     raise ValueError("The format of checkpoint is ckpt which is not support remove redundancy.")
@@ -1811,7 +1764,6 @@ class BaseTrainer:
                 pretrained_model_dir = config.get("pretrained_model_dir", None)
                 trust_remote_code = config.get("trust_remote_code", False)
                 tokenizer = build_tokenizer(tokenizer_config,
-                                            use_legacy=config.get("use_legacy", True),
                                             pretrained_model_dir=pretrained_model_dir,
                                             trust_remote_code=trust_remote_code)
 
@@ -1823,7 +1775,7 @@ class BaseTrainer:
 
             model = Model(network)
 
-            if not config.use_legacy and config.checkpoint.load_path and config.run_mode != "predict_with_train_model":
+            if config.checkpoint.load_path and config.run_mode != "predict_with_train_model":
                 if self.config.load_ckpt_format == 'safetensors':
                     network.load_weights(config.checkpoint.load_path)
                 else:
@@ -1833,7 +1785,7 @@ class BaseTrainer:
                     if ms.context.get_auto_parallel_context('parallel_mode') in \
                             ['semi_auto_parallel', 'auto_parallel', 'hybrid_parallel']:
                         if network.config:
-                            src_config = network.config if config.use_legacy else network.transformer_config
+                            src_config = network.transformer_config
                             batch_size = src_config.batch_size
                             seq_length = src_config.seq_length
                         else:

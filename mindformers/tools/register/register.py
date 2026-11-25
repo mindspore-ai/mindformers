@@ -17,11 +17,7 @@
 import inspect
 import os
 
-from mindformers.core.context import is_legacy_model
 from mindformers.tools.hub.dynamic_module_utils import get_class_from_dynamic_module
-
-
-NEW_CLASS_PREFIX = "mcore_"
 
 
 class MindFormerModuleType:
@@ -163,7 +159,7 @@ class MindFormerRegister:
     search_names_map = {}
 
     @classmethod
-    def register(cls, module_type=MindFormerModuleType.TOOLS, alias=None, legacy=True, search_names=None):
+    def register(cls, module_type=MindFormerModuleType.TOOLS, alias=None, search_names=None):
         """
         A decorator that registers the class in the registry.
 
@@ -171,7 +167,6 @@ class MindFormerRegister:
             module_type (MindFormerModuleType, optional): Module type name of MindFormers.
                 Default: ``MindFormerModuleType.TOOLS``.
             alias (str, optional): Alias for the class. Default: ``None``.
-            legacy (bool, optional): Legacy Class or not. Default: ``True``.
             search_names (Union[str, tuple, list, set], optional): mapping search_names to a class_name.
                 Default: ``None``.
         Returns:
@@ -188,7 +183,6 @@ class MindFormerRegister:
                 wrapper of register_class
             """
             class_name = alias if alias is not None else register_class.__name__
-            class_name = cls._add_class_name_prefix(module_type, class_name, legacy)
             if module_type not in cls.registry:
                 cls.registry[module_type] = {class_name: register_class}
             else:
@@ -201,7 +195,6 @@ class MindFormerRegister:
                     names.update(search_names)
             names.add(class_name)
             for search_name in names:
-                search_name = cls._add_class_name_prefix(module_type, search_name, legacy)
                 cls.search_names_map[(module_type, search_name)] = class_name
             return register_class
 
@@ -210,7 +203,7 @@ class MindFormerRegister:
     @classmethod
     def register_cls(
             cls, register_class, module_type=MindFormerModuleType.TOOLS,
-            alias=None, legacy=True, search_names=None
+            alias=None, search_names=None
     ):
         """
         A method that registers a class into the registry.
@@ -220,7 +213,6 @@ class MindFormerRegister:
             module_type (MindFormerModuleType, optional): Module type name of MindFormers.
                 Default: ``MindFormerModuleType.TOOLS``.
             alias (str, optional): Alias for the class. Default: ``None``.
-            legacy (bool, optional): Legacy Class or not. Default: ``True``.
             search_names (Union[str, tuple, list, set], optional): mapping search_names to a class_name.
                 Default: ``None``.
 
@@ -228,7 +220,6 @@ class MindFormerRegister:
             Class, the registered class itself.
         """
         class_name = alias if alias is not None else register_class.__name__
-        class_name = cls._add_class_name_prefix(module_type, class_name, legacy)
         if module_type not in cls.registry:
             cls.registry[module_type] = {class_name: register_class}
         else:
@@ -241,7 +232,6 @@ class MindFormerRegister:
                 names.update(search_names)
         names.add(class_name)
         for search_name in names:
-            search_name = cls._add_class_name_prefix(module_type, search_name, legacy)
             cls.search_names_map[(module_type, search_name)] = class_name
         return register_class
 
@@ -260,7 +250,6 @@ class MindFormerRegister:
         """
         if not class_name:
             return module_type in cls.registry
-        class_name = cls._add_class_name_prefix(module_type, class_name, is_legacy_model())
         if (module_type, class_name) in cls.search_names_map:
             class_name = cls.search_names_map[(module_type, class_name)]
             return module_type in cls.registry and class_name in cls.registry.get(module_type)
@@ -284,17 +273,14 @@ class MindFormerRegister:
             ValueError: Can't find type `module_type` in the registry.
         """
         if not cls.is_exist(module_type, class_name):
-            raise ValueError(f"Can't find class type {module_type} class name {class_name} in class registry "
-                             f"when use_legacy={is_legacy_model()}")
+            raise ValueError(f"Can't find class type {module_type} class name {class_name} in class registry")
 
         if not class_name:
             raise ValueError(f"Can't find class. class type = {class_name}")
-        class_name = cls._add_class_name_prefix(module_type, class_name, is_legacy_model())
         if (module_type, class_name) in cls.search_names_map:
             class_name = cls.search_names_map[(module_type, class_name)]
         if not (module_type in cls.registry and class_name in cls.registry.get(module_type)):
-            raise ValueError(f"Can't find class type {module_type} class name {class_name} in class registry "
-                             f"when use_legacy={is_legacy_model()}")
+            raise ValueError(f"Can't find class type {module_type} class name {class_name} in class registry")
         register_class = cls.registry.get(module_type).get(class_name)
         return register_class
 
@@ -361,8 +347,7 @@ class MindFormerRegister:
         if 'auto_register' in cfg:
             cls.auto_register(class_reference=cfg.pop('auto_register'), module_type=module_type)
 
-        use_legacy = is_legacy_model()
-        if use_legacy or module_type not in [MindFormerModuleType.CONFIG, MindFormerModuleType.MODELS]:
+        if module_type not in [MindFormerModuleType.CONFIG, MindFormerModuleType.MODELS]:
             if 'type' not in cfg:
                 raise KeyError(
                     '`cfg` or `default_args` must contain the key "type",'
@@ -380,10 +365,7 @@ class MindFormerRegister:
                 else:
                     args[k] = v
 
-        if use_legacy:
-            obj_type = args.pop('type')
-        else:
-            obj_type = cls.get_instance_type_from_cfg(args, module_type)
+        obj_type = cls.get_instance_type_from_cfg(args, module_type)
 
         if isinstance(obj_type, str):
             obj_cls = cls.get_cls(module_type, obj_type)
@@ -393,7 +375,7 @@ class MindFormerRegister:
             raise ValueError(f"Can't find class type {type} class name {obj_type} in class registry")
 
         try:
-            if not use_legacy and module_type == MindFormerModuleType.MODELS:
+            if module_type == MindFormerModuleType.MODELS:
                 return obj_cls(default_args['config'])
             return obj_cls(**args)
         except Exception as e:
@@ -463,10 +445,4 @@ class MindFormerRegister:
         register_path = os.path.realpath(os.getenv("REGISTER_PATH"))
         module_class = get_class_from_dynamic_module(
             class_reference=class_reference, pretrained_model_name_or_path=register_path)
-        _ = cls.register_cls(module_class, module_type=module_type, legacy=is_legacy_model())
-
-    @classmethod
-    def _add_class_name_prefix(cls, module_type, class_name, legacy=True):
-        if not legacy and module_type in [MindFormerModuleType.MODELS, MindFormerModuleType.CONFIG]:
-            class_name = NEW_CLASS_PREFIX + class_name
-        return class_name
+        _ = cls.register_cls(module_class, module_type=module_type)

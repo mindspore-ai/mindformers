@@ -64,8 +64,6 @@ from mindformers.pynative.callback import (
     ensure_max_logits_reset_callback,
 )
 from mindformers.pynative.tools.profiler import Profiler
-import mindformers.tools.register.register as register_module
-import mindformers.dataset.handler.base_handler as handler_module
 from mindformers.pynative.distributed.parallel_dims import ParallelDims
 from mindformers.pynative.distributed.parallelize import parallelize_model
 from mindformers.pynative.distributed.utils import get_loss_sense
@@ -102,19 +100,6 @@ from .inference import (
     normalize_input,
     PipelineInferenceContext,
 )
-
-
-def patch_legacy_model_inference():
-    """Patch legacy model inference."""
-    return False
-
-
-def patch_pynative_modules():
-    """Patch is_legacy_model for pynative trainer."""
-    register_module.is_legacy_model = patch_legacy_model_inference
-    handler_module.is_legacy_model = patch_legacy_model_inference
-    from mindformers.core import context as core_context
-    core_context.is_legacy_model = patch_legacy_model_inference
 
 
 class TrainMode(enum.Enum):
@@ -215,9 +200,6 @@ class Trainer:
                 "When config is a yaml file, (model, dataset, optimizer, lr_scheduler, callbacks) "
                 "instances should not be provided. They will be built from config."
             )
-
-        # patch legacy model inference for pynative mode
-        patch_pynative_modules()
 
         # apply backward compat for `loss.backward()`
         enable_mindspore_backward_compat()

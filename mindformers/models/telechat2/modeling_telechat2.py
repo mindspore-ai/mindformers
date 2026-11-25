@@ -24,7 +24,7 @@ from .utils import Telechat2PreTrainedModel
 from .modeling_telechat2_infer import InferenceTelechat2ForCausalLM
 
 
-@MindFormerRegister.register(MindFormerModuleType.MODELS, legacy=False)
+@MindFormerRegister.register(MindFormerModuleType.MODELS)
 class TeleChat2ForCausalLM(Telechat2PreTrainedModel):
     r"""
     Provide Telechat2 Model for training and inference.

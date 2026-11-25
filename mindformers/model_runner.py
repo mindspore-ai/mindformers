@@ -32,7 +32,6 @@ from mindspore.nn.utils import no_init_parameters
 from mindformers import models, MindFormerRegister, MindFormerModuleType
 from mindformers import build_context, build_parallel_config, GenerationConfig
 from mindformers import AutoModel, AutoConfig, AutoTokenizer
-from mindformers.core.context import is_legacy_model
 from mindformers.models.utils import convert_mstype, str_to_ms_type
 from mindformers.utils import contains_safetensors_files
 
@@ -265,7 +264,6 @@ class MindIEModelRunner:
 
         build_context(self.config)
         logger.info("Build context finished.")
-        self.use_legacy = is_legacy_model()
 
         if self.is_multi_modal_model:
             if isinstance(self.model_config.llm_model, PretrainedConfig):
@@ -298,8 +296,7 @@ class MindIEModelRunner:
 
         self.load_checkpoint()
 
-        if not self.use_legacy or self.model_config.is_dynamic:
-            self.model.set_dynamic_inputs()
+        self.model.set_dynamic_inputs()
 
         cpu_kv_shape = (self.cpu_num_blocks, block_size, self.num_kv_heads, self.head_size)
         self.key_host = [ms.Parameter(ms.Tensor(shape=cpu_kv_shape, dtype=self.dtype, init=Zero()),
@@ -312,13 +309,7 @@ class MindIEModelRunner:
     def load_checkpoint(self):
         """load checkpoint into model"""
         ms_model = ms.Model(self.model)
-        batch_size = self.model_config.batch_size
-        seq_length = self.model_config.seq_length
-        input_ids = np.ones(shape=tuple([batch_size, seq_length]))
-        if self.use_legacy:
-            inputs = self.model.prepare_inputs_for_predict_layout(input_ids)
-        else:
-            inputs = None
+        inputs = None
         convert_checkpoint_config(self.config)
         self.config.checkpoint.load_path = get_load_path_after_hf_convert(self.config, self.model)
         if self.config.checkpoint.load_path:
@@ -344,19 +335,11 @@ class MindIEModelRunner:
 
     def update_llm_config(self, config, world_size, npu_mem_size, cpu_mem_size, block_size):
         """update llm model config"""
-        if self.use_legacy:
-            self.num_layers = config.num_layers
-            self.num_kv_heads = config.num_heads if config.n_kv_heads is None \
-                else config.n_kv_heads
-            # check the divisibility in model initialization.
-            self.num_kv_heads = self.num_kv_heads // world_size
-            self.head_size = config.hidden_size // config.num_heads
-        else:
-            self.num_layers = config.num_hidden_layers
-            self.num_kv_heads = config.num_attention_heads if config.num_key_value_heads is None \
-                else config.num_key_value_heads
-            self.num_kv_heads = self.num_kv_heads // world_size
-            self.head_size = config.hidden_size // config.num_attention_heads
+        self.num_layers = config.num_hidden_layers
+        self.num_kv_heads = config.num_attention_heads if config.num_key_value_heads is None \
+            else config.num_key_value_heads
+        self.num_kv_heads = self.num_kv_heads // world_size
+        self.head_size = config.hidden_size // config.num_attention_heads
 
         kvcache_dtype = config.compute_dtype
         if hasattr(self.model_config, "quantization_config") and \
@@ -434,40 +417,22 @@ class MindIEModelRunner:
                 decode_args.pop("position_ids", None)
                 model_args.update(decode_args)
 
-        if self.use_legacy:
-            res, current_idx = self.model.forward(input_ids=input_ids,
-                                                  valid_length_each_example=valid_length_each_example,
-                                                  block_tables=block_tables,
-                                                  slot_mapping=slot_mapping,
-                                                  prefill=prefill,
-                                                  use_past=True,
-                                                  position_ids=position_ids,
-                                                  spec_mask=spec_mask,
-                                                  q_seq_lens=q_seq_lens,
-                                                  adapter_ids=adapter_ids,
-                                                  prefill_head_indices=prefill_head_indices,
-                                                  key_cache=key_cache,
-                                                  value_cache=value_cache,
-                                                  **model_args)
-        else:
-            res, current_idx = self.model.forward_mcore(input_ids=input_ids,
-                                                        valid_length_each_example=valid_length_each_example,
-                                                        block_tables=block_tables,
-                                                        slot_mapping=slot_mapping,
-                                                        prefill=prefill,
-                                                        position_ids=position_ids,
-                                                        spec_mask=spec_mask,
-                                                        q_seq_lens=q_seq_lens,
-                                                        adapter_ids=adapter_ids,
-                                                        prefill_head_indices=prefill_head_indices,
-                                                        key_cache=key_cache,
-                                                        value_cache=value_cache,
-                                                        **model_args)
+        res, _ = self.model.forward_mcore(input_ids=input_ids,
+                                          valid_length_each_example=valid_length_each_example,
+                                          block_tables=block_tables,
+                                          slot_mapping=slot_mapping,
+                                          prefill=prefill,
+                                          position_ids=position_ids,
+                                          spec_mask=spec_mask,
+                                          q_seq_lens=q_seq_lens,
+                                          adapter_ids=adapter_ids,
+                                          prefill_head_indices=prefill_head_indices,
+                                          key_cache=key_cache,
+                                          value_cache=value_cache,
+                                          **model_args)
         logits = res[0] if isinstance(res, tuple) else res
         if hasattr(self, 'model_config') and parallel_decoding_control(self.model_config):
             return logits
-        if self.use_legacy and prefill and logits.shape[0] > len(current_idx):
-            logits = logits[Tensor(current_idx)]
 
         if self.warmup_step > 0:
             self.warmup_step -= 1

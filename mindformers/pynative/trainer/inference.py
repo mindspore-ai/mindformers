@@ -103,7 +103,7 @@ def build_inference_tokenizer(config):
             f"tokenizer_config.json) into that directory before inference."
         )
     tokenizer = _graph_build_tokenizer(
-        use_legacy=False, pretrained_model_dir=tokenizer_dir
+        pretrained_model_dir=tokenizer_dir
     )
     config.model.pad_token_id = _resolve_pad_token_id(tokenizer)
     return tokenizer

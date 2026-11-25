@@ -34,9 +34,8 @@ from mindformers.models.configuration_utils import PretrainedConfig
 class DummyMindFormerConfig(dict):
     """Stub MindFormerConfig for unit tests."""
 
-    def __init__(self, use_legacy=True, has_pretrained=False, has_generation=False):
+    def __init__(self, has_pretrained=False, has_generation=False):
         super().__init__()
-        self._use_legacy = use_legacy
         self.model = SimpleNamespace(
             model_config={"type": "DemoConfig"},
             arch=SimpleNamespace(type="demo_arch"),
@@ -51,12 +50,6 @@ class DummyMindFormerConfig(dict):
             self.generation_config = {"gen": True}
         else:
             self.generation_config = None
-
-    def get_value(self, key, default=None):
-        """Get value from config."""
-        if key == "use_legacy":
-            return self._use_legacy
-        return default
 
 
 @pytest.fixture(autouse=True)
@@ -181,32 +174,28 @@ class TestConfigurationAuto:
 
     @pytest.mark.level1
     @pytest.mark.platform_x86_cpu
-    def test_get_config_origin_mode_legacy_flow(self, monkeypatch, tmp_path):
-        """Legacy pathway should build configs and update auxiliary fields."""
-        dummy = DummyMindFormerConfig(use_legacy=True, has_pretrained=True, has_generation=True)
+    def test_get_config_origin_mode_auxiliary_fields(self, monkeypatch, tmp_path):
+        """Config loading should preserve auxiliary fields without a legacy flag."""
+        dummy = DummyMindFormerConfig(has_pretrained=True, has_generation=True)
         monkeypatch.setattr(auto_cfg, "MindFormerConfig", lambda *_: dummy)
         built = {}
-        monkeypatch.setattr(auto_cfg, "build_model_config",
-                            lambda cfg: built.setdefault("config", cfg) or "legacy")
-        monkeypatch.setattr(auto_cfg.MindFormerBook, "set_model_config_to_name",
-                            lambda *args, **kwargs: built.setdefault("mark", args))
+        monkeypatch.setattr(auto_cfg, "get_model_config",
+                            lambda model: built.setdefault("model", model))
         yaml_file = tmp_path / "model.yaml"
         yaml_file.write_text("model: {}", encoding="utf-8")
         AutoConfig.get_config_origin_mode(str(yaml_file), hidden_size=128)
         assert dummy.model.model_config["hidden_size"] == 128
         assert dummy.model.pretrained_model_dir == "pretrained_dir"
         assert dummy.model.generation_config == {"gen": True}
-        assert built["config"] == dummy.model.model_config
+        assert built["model"] is dummy.model
 
     @pytest.mark.level1
     @pytest.mark.platform_x86_cpu
     def test_get_config_origin_mode_nonlegacy_flow(self, monkeypatch, tmp_path):
-        """Non-legacy pathway should use get_model_config without calling builder."""
-        dummy = DummyMindFormerConfig(use_legacy=False)
+        """Config loading should use get_model_config without a legacy flag."""
+        dummy = DummyMindFormerConfig()
         monkeypatch.setattr(auto_cfg, "MindFormerConfig", lambda *_: dummy)
         marker = {}
-        monkeypatch.setattr(auto_cfg, "build_model_config",
-                            lambda *_: marker.setdefault("should_not_call", True))
         monkeypatch.setattr(auto_cfg, "get_model_config",
                             lambda model: marker.setdefault("model", model) or "new_config")
         yaml_file = tmp_path / "model.yaml"
@@ -214,7 +203,6 @@ class TestConfigurationAuto:
         AutoConfig.get_config_origin_mode(str(yaml_file), dropout=0.1)
         assert dummy.model.model_config["dropout"] == 0.1
         assert marker["model"] == dummy.model
-        assert "should_not_call" not in marker
 
     @pytest.mark.level1
     @pytest.mark.platform_x86_cpu

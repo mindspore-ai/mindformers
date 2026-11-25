@@ -127,11 +127,11 @@ from .base_processor import (
 )
 from .build_tokenizer import build_tokenizer
 from .build_processor import build_processor
+from .build_config import build_model_config
 from .build_model import (
     build_encoder,
     build_head,
     build_model,
-    build_model_config,
     build_network
 )
 from .utils import (

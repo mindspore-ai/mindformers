@@ -480,7 +480,6 @@ class MFContextConfig(BaseArgsConfig):
         'balanced_load',
         'reshard_worker_num',
         'run_mode',
-        'use_legacy',
         'exclude_cann_cpu',
         'train_precision_sync',
         'infer_precision_sync',

@@ -34,14 +34,12 @@ from mindspore.ops.auto_generate import SumExt
 from mindspore.ops._grad_experimental.grad_comm_ops import get_squared_device_local_norm_param
 
 from mindformers.core.clip_grad import ClipGradNorm
-from mindformers.core.context.build_context import is_legacy_model
 from mindformers.tools.register import MindFormerRegister, MindFormerModuleType
 from mindformers.tools.utils import get_real_rank
 from mindformers.utils.parameter_register import parameter_register
 from mindformers.version_control import get_identity
 
-__all__ = ['MFTrainOneStepCell', 'MFPipelineWithLossScaleCell', 'PipelineCellWithTwoOutput',
-           'GradAccumulationCellWithTwoOutput']
+__all__ = ['MFTrainOneStepCell', 'MFPipelineWithLossScaleCell']
 
 _grad_scale = C.MultitypeFuncGraph("grad_scale")
 reciprocal = P.Reciprocal()
@@ -275,11 +273,10 @@ class MFTrainOneStepCell(nn.TrainOneStepWithLossScaleCell):
         self.use_skip_data_by_global_norm = use_skip_data_by_global_norm
 
         # loss
-        self.use_legacy = is_legacy_model()
-        self.print_separate_loss = bool(print_separate_loss and not self.use_legacy)
+        self.print_separate_loss = bool(print_separate_loss)
 
         real_network = get_real_models(self.network)
-        transformer_config = real_network.get_gpt_transformer_config() if not self.use_legacy else None
+        transformer_config = real_network.get_gpt_transformer_config()
 
         if self.print_separate_loss:
             self.indexer_loss_parameter = parameter_register.register("indexer_loss", Tensor([0], mstype.float32))
@@ -314,10 +311,7 @@ class MFTrainOneStepCell(nn.TrainOneStepWithLossScaleCell):
             _ = F.assign(self.squared_device_local_norm, Tensor(0.0, mstype.float32))
             scaling_sens = F.depend(self.scale_sense, _)
 
-        if self.use_legacy:
-            loss, grads, grad_scale_factor = self.grads_for_legacy(scaling_sens, *inputs)
-        else:
-            loss, grads, grad_scale_factor = self.grads_for_mcore(scaling_sens, *inputs)
+        loss, grads, grad_scale_factor = self.grads_for_mcore(scaling_sens, *inputs)
 
         status, scaling_sens = self.start_overflow_check(loss, scaling_sens)
         grads = self.hyper_map(F.partial(_grad_scale, scaling_sens * grad_scale_factor), grads)
@@ -476,58 +470,6 @@ def tensor_shard_grad_scale_pipeline(scale, grad_scale_factor, grad, accu_grad):
     return new_grad
 
 
-class GradAccumulationCellWithTwoOutput(nn.Cell):
-    """
-        Wrap the network with Micro Batch to enable the grad accumulation in semi_auto_parallel/auto_parallel mode.
-
-        Note:
-            micro_size must be greater or equal to pipeline stages.
-
-        Args:
-            network (Cell): The target network to wrap.
-            micro_size (int): MicroBatch size.
-
-        Supported Platforms:
-            ``Ascend`` ``GPU``
-    """
-
-    def __init__(self, network, micro_size):
-        super().__init__(auto_prefix=False)
-        self.network = network
-        self.micro_inputs = nn.CellList()
-        self.micro_size = micro_size
-        self.add_list = []
-        _check_network_with_micro_size('GradAccumulationCellWithTwoOutput', network, micro_size)
-        for i in range(micro_size):
-            micro_input = _MicroBatch(micro_size)
-            micro_input.strided_slice.add_prim_attr("grad_accu_num", micro_size)
-            self.micro_inputs.append(micro_input)
-            self.add = P.Add().add_prim_attr("forward_end", i)
-            self.add_list.append(self.add)
-        self._get_attr_from_cell(network)
-
-    def construct(self, *inputs):
-        """Construct function for pipeline with multiple outputs."""
-        ret = None
-        ret2 = None
-        for i in range(self.micro_size):
-            micro_input = self.micro_inputs[i](i, *inputs)
-            output1, output2 = self.network(*micro_input)
-
-            if ret is not None:
-                ret = self.add_list[i](ret, output1)
-            else:
-                ret = output1
-
-            if ret2 is not None:
-                ret2 = self.add_list[i](ret2, output2)
-            else:
-                ret2 = output2
-
-        loss = ret, ret2
-        return loss
-
-
 class GradAccumulationCellWithMultiOutputs(nn.Cell):
     """
         Wrap the network with Micro Batch to enable the grad accumulation in semi_auto_parallel/auto_parallel mode.
@@ -643,63 +585,6 @@ def _get_pipeline_group():
     rank_str_list = [str(local_stage_rank_id + x * per_stage_device_nums) for x in group]
     rank_list_str = "-".join(rank_str_list)
     return rank_list, rank_list_str
-
-
-class PipelineCellWithTwoOutput(nn.Cell):
-    """
-        Slice MiniBatch into finer-grained MicroBatch for use in pipeline-parallel training.
-
-        Note:
-            micro_size must be greater or equal to pipeline stages.
-
-        Args:
-            network (Cell): The target network to wrap.
-            micro_size (int): MicroBatch size.
-
-        Supported Platforms:
-            ``Ascend`` ``GPU``
-    """
-    def __init__(self, network, micro_size):
-        super().__init__(auto_prefix=False)
-        self.network = network
-        self.micro_inputs = nn.CellList()
-        self.micro_size = micro_size
-        self.add_list = []
-        _check_network_with_micro_size('PipelineCellWithTwoOutput', network, micro_size)
-        for i in range(micro_size):
-            micro_input = _MicroBatch(micro_size)
-            self.micro_inputs.append(micro_input)
-            self.add = P.Add().add_prim_attr("pipeline_end", i)
-            self.add_list.append(self.add)
-        self._get_attr_from_cell(network)
-
-    def construct(self, *inputs):
-        """
-        Construct function for pipeline with multiple input
-        Args:
-            *inputs:
-
-        Returns:
-
-        """
-        ret = None
-        ret2 = None
-        for i in range(self.micro_size):
-            micro_input = self.micro_inputs[i](i, *inputs)
-            output1, output2 = self.network(*micro_input)
-
-            if ret is not None:
-                ret = self.add_list[i](ret, output1)
-            else:
-                ret = output1
-
-            if ret2 is not None:
-                ret2 = self.add_list[i](ret2, output2)
-            else:
-                ret2 = output2
-
-        loss = ret, ret2
-        return loss
 
 
 class PipelineCellWithMultiOutputs(nn.Cell):
@@ -925,14 +810,13 @@ class MFPipelineWithLossScaleCell(nn.TrainOneStepWithLossScaleCell):
         self.global_norm_spike_threshold = global_norm_spike_threshold
         self.use_skip_data_by_global_norm = use_skip_data_by_global_norm
 
-        self.use_legacy = is_legacy_model()
         real_network = get_real_models(self.network)
-        transformer_config = real_network.get_gpt_transformer_config() if not self.use_legacy else None
+        transformer_config = real_network.get_gpt_transformer_config()
         self.is_zbv = get_auto_parallel_context("pipeline_scheduler") == "zero_bubble_v"
         self.is_dsa = getattr(transformer_config, "experimental_attention_variant", None) == "dsa"
 
         # loss
-        self.print_separate_loss = bool(print_separate_loss and not self.use_legacy)
+        self.print_separate_loss = bool(print_separate_loss)
         if self.print_separate_loss:
             self.indexer_loss_parameter = parameter_register.register("indexer_loss", Tensor([0], mstype.float32))
             self.aux_loss_parameter = parameter_register.register("aux_loss", Tensor([0], mstype.float32))
@@ -968,10 +852,7 @@ class MFPipelineWithLossScaleCell(nn.TrainOneStepWithLossScaleCell):
             _ = F.assign(self.squared_device_local_norm, Tensor(0.0, mstype.float32))
             scaling_sens = F.depend(self.scale_sense, _)
 
-        if self.use_legacy:
-            loss, grads, grad_scale_factor = self.grads_for_legacy(scaling_sens, *inputs)
-        else:
-            loss, grads, grad_scale_factor = self.grads_for_mcore(scaling_sens, *inputs)
+        loss, grads, grad_scale_factor = self.grads_for_mcore(scaling_sens, *inputs)
 
         if self.local_norm:
             local_norm, size = self.localnorm(grads)

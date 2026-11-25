@@ -44,15 +44,8 @@ def convert_hf_safetensors_multiprocess(src_dir, dst_dir, model_cls_or_instance,
 
 def _check_valid_input(src_dir, dst_dir, model_cls_or_instance, model_config):
     """check whether the input arguments are valid"""
-    from mindformers.core.context.build_context import is_legacy_model
-    use_legacy = is_legacy_model()
-
-    if use_legacy:
-        num_heads = model_config.num_heads or model_config.num_attention_heads
-        n_kv_heads = model_config.n_kv_heads or model_config.multi_query_group_num
-    else:
-        num_heads = model_config.num_attention_heads
-        n_kv_heads = model_config.num_key_value_heads
+    num_heads = model_config.num_attention_heads
+    n_kv_heads = model_config.num_key_value_heads
 
     hidden_size = model_config.hidden_size
     qkv_concat = model_config.qkv_concat
@@ -69,7 +62,7 @@ def _check_valid_input(src_dir, dst_dir, model_cls_or_instance, model_config):
         raise ValueError(f"model_cls_or_instance must be a subclass or an instance of PreTrainedModel,"
                          f"but got {model_cls_or_instance}.")
     if not is_hf_safetensors_dir(src_dir, model_cls_or_instance):
-        raise ValueError(f"src_dir is not a valid HuggingFace safetensors directory.")
+        raise ValueError("src_dir is not a valid HuggingFace safetensors directory.")
     if not isinstance(num_heads, int):
         raise ValueError(f"num_attention_heads must be an int value, but got {num_heads}.")
     if n_kv_heads and not isinstance(n_kv_heads, int):
@@ -121,7 +114,7 @@ def _convert_index_json(load_checkpoint, converted_dir, convert_map_dict, is_qkv
     """convert mapping file if exists"""
     index_path = os.path.join(load_checkpoint, 'model.safetensors.index.json')
     if not os.path.exists(index_path):
-        logger.warning(f"The given path contains no 'model.safetensors.index.json' file.")
+        logger.warning("The given path contains no 'model.safetensors.index.json' file.")
         return
     with open(index_path, 'r') as f:
         data = json.load(f)
@@ -130,7 +123,7 @@ def _convert_index_json(load_checkpoint, converted_dir, convert_map_dict, is_qkv
     flags_ = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
     with os.fdopen(os.open(os.path.join(converted_dir, 'param_name_map.json'), flags_, FILE_PERMISSION), 'w') as f:
         json.dump(new_weight_map, f, indent=2)
-        logger.info(f"Converted file param_name_map.json")
+        logger.info("Converted file param_name_map.json")
 
 
 def _convert_process(src_dir, dst_dir, convert_weight_dict, model_config, qkv_dict=None, condition=None):

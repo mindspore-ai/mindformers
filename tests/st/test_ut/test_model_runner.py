@@ -209,14 +209,12 @@ class MockRunnerFactory:
     def create_runner_mock(
         num_layers=2,
         warmup_step=2,
-        is_multi_modal=False,
-        use_legacy=True
+        is_multi_modal=False
     ):
         """Create a mock MindIEModelRunner instance"""
         runner = MagicMock(spec=MindIEModelRunner)
         runner.num_layers = num_layers
         runner.model = MagicMock()
-        runner.use_legacy = use_legacy
         runner.warmup_step = warmup_step
         runner.is_multi_modal_model = is_multi_modal
         runner.model_config = MagicMock()
@@ -521,7 +519,7 @@ class TestModel:
     """
     Test Model.
     """
-    def forward(self, input_ids, valid_length_each_example, block_tables, slot_mapping, prefill, use_past,
+    def forward_mcore(self, input_ids, valid_length_each_example, block_tables, slot_mapping, prefill,
                 position_ids=None, spec_mask=None, q_seq_lens=None, adapter_ids=None, prefill_head_indices=None,
                 mindie_warm_up=False, key_cache=None, value_cache=None):
         """
@@ -533,7 +531,6 @@ class TestModel:
             block_tables (np.ndarray): rank is 2, and data type is int32.
             slot_mapping (np.ndarray): rank is 1, and data type is int32.
             prefill (bool).
-            use_past (bool).
             position_ids (Union[np.ndarray, list]): rank is 1, and data type is int32.
             spec_mask (np.ndarray): rank is 2 or 3, and data type is float16.
             q_seq_lens (Union[np.ndarray, list]): rank is 1, and data type is int32.
@@ -554,7 +551,6 @@ class TestModel:
         assert isinstance(block_tables, np.ndarray) and block_tables.ndim == 2 and block_tables.dtype == np.int32
         assert isinstance(slot_mapping, np.ndarray) and slot_mapping.ndim == 1 and slot_mapping.dtype == np.int32
         assert isinstance(prefill, bool)
-        assert isinstance(use_past, bool)
         assert isinstance(mindie_warm_up, bool)
         assert isinstance(key_cache, type(None))
         assert isinstance(value_cache, type(None))
@@ -729,7 +725,6 @@ class TestMindIEModelRunnerInit:
             'auto_tokenizer': patch('mindformers.model_runner.AutoTokenizer'),
             'auto_config': patch('mindformers.model_runner.AutoConfig'),
             'build_context': patch('mindformers.model_runner.build_context'),
-            'is_legacy': patch('mindformers.model_runner.is_legacy_model'),
             'config_cls': patch('mindformers.model_runner.MindFormerConfig'),
             'gen_config': patch('mindformers.model_runner.GenerationConfig'),
             'get_load_path': patch('mindformers.model_runner.get_load_path_after_hf_convert'),
@@ -755,69 +750,12 @@ class TestMindIEModelRunnerInit:
                 )
             assert 'plugin params should be str type' in str(exc_info.value)
 
-    @patch('mindspore.Model')
-    @patch('mindformers.model_runner.AutoModel')
-    @patch('mindformers.model_runner.AutoTokenizer')
-    @patch('mindformers.model_runner.AutoConfig')
-    @patch('mindformers.model_runner.build_context')
-    @patch('mindformers.model_runner.is_legacy_model')
-    @patch('mindformers.model_runner.MindFormerConfig')
-    @patch('mindformers.model_runner.GenerationConfig')
-    @patch('mindformers.model_runner.get_load_path_after_hf_convert')
-    @patch('mindformers.model_runner.no_init_parameters')
-    @patch('mindformers.model_runner.register_auto_class')
-    @pytest.mark.level1
-    @pytest.mark.platform_x86_cpu
-    @pytest.mark.env_onecard
-    def test_init_single_modal_legacy(self, mock_register, mock_no_init, mock_get_load_path,
-                                       mock_gen_config, mock_config_cls, mock_is_legacy,
-                                       mock_build_ctx, mock_auto_config, mock_tokenizer,
-                                       mock_auto_model, mock_ms_model):
-        """Test initialization for single modal model with legacy mode"""
-        mock_config = MockConfigFactory.create_mindformer_config()
-        mock_config_cls.return_value = mock_config
-
-        mock_model_config = MockConfigFactory.create_model_config()
-        mock_auto_config.from_pretrained.return_value = mock_model_config
-
-        mock_is_legacy.return_value = True
-
-        mock_model = MagicMock()
-        mock_model.__class__.__name__ = 'TestModel'
-        mock_model.kvcache.return_value = (MagicMock(), MagicMock())
-        mock_auto_model.from_config.return_value = mock_model
-
-        mock_tok = MagicMock()
-        mock_tokenizer.from_pretrained.return_value = mock_tok
-
-        mock_get_load_path.return_value = None
-        mock_gen_config.from_model_config.return_value = MagicMock()
-
-        ctx_mgr = MagicMock()
-        ctx_mgr.__enter__ = Mock(return_value=None)
-        ctx_mgr.__exit__ = Mock(return_value=False)
-        mock_no_init.return_value = ctx_mgr
-
-        runner = MindIEModelRunner(
-            model_path=self.test_dir,
-            config_path=self.yaml_file,
-            npu_mem_size=1,
-            cpu_mem_size=1,
-            block_size=128
-        )
-
-        assert runner.num_layers == 2
-        assert runner.warmup_step == 2
-        assert runner.is_multi_modal_model is False
-        mock_register.assert_called()
-        assert mock_register.call_count == 3
 
     @patch('mindspore.Model')
     @patch('mindformers.model_runner.AutoModel')
     @patch('mindformers.model_runner.AutoTokenizer')
     @patch('mindformers.model_runner.AutoConfig')
     @patch('mindformers.model_runner.build_context')
-    @patch('mindformers.model_runner.is_legacy_model')
     @patch('mindformers.model_runner.MindFormerConfig')
     @patch('mindformers.model_runner.GenerationConfig')
     @patch('mindformers.model_runner.get_load_path_after_hf_convert')
@@ -827,7 +765,7 @@ class TestMindIEModelRunnerInit:
     @pytest.mark.platform_x86_cpu
     @pytest.mark.env_onecard
     def test_init_with_npu_device_ids_error(self, mock_register, mock_no_init, mock_get_load_path,
-                                             mock_gen_config, mock_config_cls, mock_is_legacy,
+                                             mock_gen_config, mock_config_cls,
                                              mock_build_ctx, mock_auto_config, mock_tokenizer,
                                              mock_auto_model, mock_ms_model):
         """Test initialization with multiple npu_device_ids in non-parallel mode"""
@@ -850,7 +788,6 @@ class TestMindIEModelRunnerInit:
     @patch('mindformers.model_runner.AutoTokenizer')
     @patch('mindformers.model_runner.AutoConfig')
     @patch('mindformers.model_runner.build_context')
-    @patch('mindformers.model_runner.is_legacy_model')
     @patch('mindformers.model_runner.MindFormerConfig')
     @patch('mindformers.model_runner.GenerationConfig')
     @patch('mindformers.model_runner.get_load_path_after_hf_convert')
@@ -860,7 +797,7 @@ class TestMindIEModelRunnerInit:
     @pytest.mark.platform_x86_cpu
     @pytest.mark.env_onecard
     def test_init_dynamic_kv_cache_error(self, mock_register, mock_no_init, mock_get_load_path,
-                                          mock_gen_config, mock_config_cls, mock_is_legacy,
+                                          mock_gen_config, mock_config_cls,
                                           mock_build_ctx, mock_auto_config, mock_tokenizer,
                                           mock_auto_model, mock_ms_model):
         """Test initialization with npu_mem_size=-1 for unsupported model"""
@@ -870,7 +807,6 @@ class TestMindIEModelRunnerInit:
         mock_model_config = MockConfigFactory.create_model_config()
         mock_auto_config.from_pretrained.return_value = mock_model_config
 
-        mock_is_legacy.return_value = True
 
         mock_model = MagicMock()
         mock_model.__class__.__name__ = 'UnsupportedModel'  # Not in whitelist
@@ -899,7 +835,6 @@ class TestMindIEModelRunnerInit:
     @patch('mindformers.model_runner.AutoTokenizer')
     @patch('mindformers.model_runner.AutoConfig')
     @patch('mindformers.model_runner.build_context')
-    @patch('mindformers.model_runner.is_legacy_model')
     @patch('mindformers.model_runner.MindFormerConfig')
     @patch('mindformers.model_runner.GenerationConfig')
     @patch('mindformers.model_runner.get_load_path_after_hf_convert')
@@ -910,7 +845,7 @@ class TestMindIEModelRunnerInit:
     @pytest.mark.env_onecard
     def test_update_model_config_with_plugin_params(self, mock_register, mock_no_init,
                                                      mock_get_load_path, mock_gen_config,
-                                                     mock_config_cls, mock_is_legacy,
+                                                     mock_config_cls,
                                                      mock_build_ctx, mock_auto_config,
                                                      mock_tokenizer, mock_auto_model, mock_ms_model):
         """Test update_model_config with plugin parameters"""
@@ -920,7 +855,6 @@ class TestMindIEModelRunnerInit:
         mock_model_config = MockConfigFactory.create_model_config()
         mock_auto_config.from_pretrained.return_value = mock_model_config
 
-        mock_is_legacy.return_value = True
 
         mock_model = MagicMock()
         mock_model.__class__.__name__ = 'TestModel'
@@ -953,7 +887,6 @@ class TestMindIEModelRunnerInit:
     @patch('mindformers.model_runner.AutoConfig')
     @patch('mindformers.model_runner.build_context')
     @patch('mindformers.model_runner.build_parallel_config')
-    @patch('mindformers.model_runner.is_legacy_model')
     @patch('mindformers.model_runner.MindFormerConfig')
     @patch('mindformers.model_runner.GenerationConfig')
     @patch('mindformers.model_runner.get_load_path_after_hf_convert')
@@ -963,7 +896,7 @@ class TestMindIEModelRunnerInit:
     @pytest.mark.platform_x86_cpu
     @pytest.mark.env_onecard
     def test_init_with_moe_config(self, mock_register, mock_no_init, mock_get_load_path,
-                                   mock_gen_config, mock_config_cls, mock_is_legacy,
+                                   mock_gen_config, mock_config_cls,
                                    mock_build_parallel, mock_build_ctx, mock_auto_config,
                                    mock_tokenizer, mock_auto_model, mock_ms_model):
         """Test initialization with MoE config"""
@@ -977,7 +910,6 @@ class TestMindIEModelRunnerInit:
         mock_model_config = MockConfigFactory.create_model_config()
         mock_auto_config.from_pretrained.return_value = mock_model_config
 
-        mock_is_legacy.return_value = False
 
         mock_model = MagicMock()
         mock_model.__class__.__name__ = 'TestModel'
@@ -1015,14 +947,14 @@ class TestMindIEModelRunnerMethods:
     @pytest.mark.level1
     @pytest.mark.platform_x86_cpu
     @pytest.mark.env_onecard
-    def test_forward_legacy_prefill(self):
-        """Test forward method in legacy mode with prefill"""
+    def test_forward_pynative_prefill(self):
+        """Test forward method in PyNative mode with prefill"""
         input_ids = [[1, 2, 3, 4]]
         valid_length = [4]
 
         mock_logits = Tensor(np.random.randn(1, 4, 1000).astype(np.float32))
         current_idx = [0]
-        self.runner.model.forward.return_value = (mock_logits, current_idx)
+        self.runner.model.forward_mcore.return_value = (mock_logits, current_idx)
 
         result = MindIEModelRunner.forward(
             self.runner,
@@ -1031,7 +963,7 @@ class TestMindIEModelRunnerMethods:
             prefill=True
         )
 
-        self.runner.model.forward.assert_called_once()
+        self.runner.model.forward_mcore.assert_called_once()
         assert self.runner.warmup_step == 1
 
     @pytest.mark.level1
@@ -1039,7 +971,6 @@ class TestMindIEModelRunnerMethods:
     @pytest.mark.env_onecard
     def test_forward_non_legacy_decode(self):
         """Test forward method in non-legacy mode with decode"""
-        self.runner.use_legacy = False
         self.runner.warmup_step = 0
 
         input_ids = [[1]]
@@ -1070,7 +1001,7 @@ class TestMindIEModelRunnerMethods:
         valid_length = [2]
 
         mock_logits = Tensor(np.random.randn(1, 2, 1000).astype(np.float32))
-        self.runner.model.forward.return_value = (mock_logits, [])
+        self.runner.model.forward_mcore.return_value = (mock_logits, [])
 
         result = MindIEModelRunner.forward(
             self.runner,
@@ -1171,22 +1102,6 @@ class TestMindIEModelRunnerMethods:
 
             self.runner.model.init_parameters_data.assert_called_once()
 
-    @patch('mindformers.model_runner.get_load_path_after_hf_convert')
-    @pytest.mark.level1
-    @pytest.mark.platform_x86_cpu
-    @pytest.mark.env_onecard
-    def test_load_checkpoint_legacy(self, mock_get_load):
-        """Test load_checkpoint in legacy mode"""
-        self.runner.model_config.batch_size = 1
-        self.runner.model_config.seq_length = 512
-        self.runner.use_legacy = True
-        self.runner.model.prepare_inputs_for_predict_layout.return_value = MagicMock()
-        mock_get_load.return_value = None
-
-        with patch('mindspore.Model'):
-            MindIEModelRunner.load_checkpoint(self.runner)
-
-            self.runner.model.prepare_inputs_for_predict_layout.assert_called_once()
 
     @pytest.mark.level1
     @pytest.mark.platform_x86_cpu
@@ -1220,10 +1135,9 @@ class TestMindIEModelRunnerMethods:
     @pytest.mark.level1
     @pytest.mark.platform_x86_cpu
     @pytest.mark.env_onecard
-    def test_update_llm_config_legacy_with_nz(self, mock_need_nz):
-        """Test update_llm_config in legacy mode with NZ"""
+    def test_update_llm_config_pynative_with_nz(self, mock_need_nz):
+        """Test update_llm_config in PyNative mode with NZ"""
         mock_need_nz.return_value = True
-        self.runner.use_legacy = True
 
         config = MockConfigFactory.create_model_config(
             num_layers=4,
@@ -1252,7 +1166,6 @@ class TestMindIEModelRunnerMethods:
     @pytest.mark.env_onecard
     def test_update_llm_config_non_legacy(self):
         """Test update_llm_config in non-legacy mode"""
-        self.runner.use_legacy = False
         self.runner.model_config.quantization_config = None
 
         config = MockConfigFactory.create_model_config(
@@ -1284,7 +1197,6 @@ class TestMindIEModelRunnerMethods:
     @pytest.mark.env_onecard
     def test_update_llm_config_with_quantization(self):
         """Test update_llm_config with quantization config"""
-        self.runner.use_legacy = False
         self.runner.model_config.quantization_config = MagicMock()
         self.runner.model_config.quantization_config.kvcache_dtype = 'int8'
 
@@ -1307,7 +1219,6 @@ class TestMindIEModelRunnerMethods:
     @pytest.mark.env_onecard
     def test_update_llm_config_no_max_position_embedding(self):
         """Test update_llm_config when max_position_embedding is not set"""
-        self.runner.use_legacy = False
 
         config = MockConfigFactory.create_model_config()
         config.max_position_embedding = None
@@ -1636,7 +1547,6 @@ def test_model_runner():
     model_runner = ModelRunner(model_path=model_path, npu_mem_size=npu_mem_size, cpu_mem_size=cpu_mem_size,
                                block_size=block_size, rank_id=rank_id, world_size=world_size,
                                npu_device_ids=npu_device_ids)
-    model_runner.use_legacy = True
     input_ids = np.arange(32 * 256).reshape(32, 256).astype(np.int32)
     valid_length_each_example = np.arange(32).astype(np.int32)
     block_tables = np.arange(32 * 256).reshape(32, 256).astype(np.int32)
@@ -1646,12 +1556,11 @@ def test_model_runner():
     logits = model_runner.forward(input_ids=input_ids, valid_length_each_example=valid_length_each_example,
                                   block_tables=block_tables, slot_mapping=slot_mapping, prefill=prefill)
     assert logits.shape == (2, 16000)
-    # Given that `prefill` is True,
-    # the shape of `logits` should be the same as that of `res[current_index]` in model.forward
+    # PyNative prefill returns the model logits without legacy index slicing.
     prefill = True
     logits = model_runner.forward(input_ids=input_ids, valid_length_each_example=valid_length_each_example,
                                   block_tables=block_tables, slot_mapping=slot_mapping, prefill=prefill)
-    assert logits.shape == (1, 16000)
+    assert logits.shape == (2, 16000)
 
 
 if __name__ == '__main__':

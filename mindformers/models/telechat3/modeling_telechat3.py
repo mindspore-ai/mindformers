@@ -22,7 +22,7 @@ from .modeling_telechat3_train import TrainingTeleChat3ForCausalLM
 from .modeling_telechat3_infer import InferenceTelechat3ForCausalLM
 
 
-@MindFormerRegister.register(MindFormerModuleType.MODELS, legacy=False)
+@MindFormerRegister.register(MindFormerModuleType.MODELS)
 class TeleChat3ForCausalLM:
     r"""
     Provide TeleChat3 Model for training and inference.
@@ -33,7 +33,7 @@ class TeleChat3ForCausalLM:
         Tensor, the loss or logits of the network.
     """
 
-    def __new__(cls, config: TeleChat3Config, *args, **kwargs):
+    def __new__(cls, config: TeleChat3Config, *_args, **_kwargs):
         # get run mode to init different model.
         # we can use train mode to do train task.
         if os.environ.get("RUN_MODE") == "predict":

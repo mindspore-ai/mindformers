@@ -77,7 +77,7 @@ class TestGeneralConfig:
         config = GeneralConfig.apply(self.correct_input)
         for key in GeneralConfig.keys():
             assert key in config
-            if key in self.correct_input.keys():
+            if key in self.correct_input:
                 assert config[key] == self.correct_input[key]
             else:
                 assert config[key] == getattr(GeneralConfig, key)
@@ -110,7 +110,7 @@ class TestParallelConfig:
         config = ParallelConfig.apply(self.correct_input)
         for key in ParallelConfig.keys():
             assert key in config
-            if key in self.correct_input.keys():
+            if key in self.correct_input:
                 assert config[key] == self.correct_input[key]
             else:
                 assert config[key] == getattr(ParallelConfig, key)
@@ -155,7 +155,7 @@ class TestRecomputeConfig:
         config = RecomputeConfig.apply(self.correct_input)
         for key in RecomputeConfig.keys():
             assert key in config
-            if key in self.correct_input.keys():
+            if key in self.correct_input:
                 assert config[key] == self.correct_input[key]
             else:
                 assert config[key] == getattr(RecomputeConfig, key)
@@ -197,7 +197,7 @@ class TestSwapConfig:
         config = SwapConfig.apply(self.correct_input)
         for key in SwapConfig.keys():
             assert key in config
-            if key in self.correct_input.keys():
+            if key in self.correct_input:
                 assert config[key] == self.correct_input[key]
             else:
                 assert config[key] == getattr(SwapConfig, key)
@@ -239,7 +239,7 @@ class TestMoEConfig:
         config = MoEConfig.apply(self.correct_input)
         for key in MoEConfig.keys():
             assert key in config
-            if key in self.correct_input.keys():
+            if key in self.correct_input:
                 assert config[key] == self.correct_input[key]
             else:
                 assert config[key] == getattr(MoEConfig, key)
@@ -281,7 +281,7 @@ class TestRunnerConfig:
         config = RunnerConfig.apply(self.correct_input)
         for key in RunnerConfig.keys():
             assert key in config
-            if key in self.correct_input.keys():
+            if key in self.correct_input:
                 assert config[key] == self.correct_input[key]
             else:
                 assert config[key] == getattr(RunnerConfig, key)
@@ -317,7 +317,7 @@ class TestMsParallelConfig:
         config = MsParallelConfig.apply(self.correct_input)
         for key in MsParallelConfig.keys():
             assert key in config
-            if key in self.correct_input.keys():
+            if key in self.correct_input:
                 assert config[key] == self.correct_input[key]
             else:
                 assert config[key] == getattr(MsParallelConfig, key)
@@ -352,7 +352,7 @@ class TestContextConfig:
         config = ContextConfig.apply(self.correct_input)
         for key in ContextConfig.keys():
             assert key in config
-            if key in self.correct_input.keys():
+            if key in self.correct_input:
                 assert config[key] == self.correct_input[key]
             else:
                 assert config[key] == getattr(ContextConfig, key)
@@ -649,7 +649,6 @@ class TestCallbackConfig:
         for config in configs:
             assert len(config) == 1
             assert config[0]["type"] == "MFLossMonitor"
-            assert config[1]["type"] == "MFLossMonitor"
 
     def test_missing_required_input(self):
         with pytest.raises(KeyError, match="required"):
@@ -661,9 +660,9 @@ class TestCallbackConfig:
             if callback["type"] == "MFLossMonitor":
                 assert callback["aaa"] == 1
 
-        assert len(config) == 3
-        assert config[2]["type"] == "type"
-        assert config[2]["aaa"] == 1
+        assert len(config) == 2
+        assert config[1]["type"] == "type"
+        assert config[1]["aaa"] == 1
 
 
 TRAIN_DEFAULT_CONFIGS = [
@@ -678,8 +677,7 @@ DEFAULT_CONFIGS = [
     "parallel_config",
     "parallel",
     "runner_config",
-    "context",
-    "moe_config"
+    "context"
 ]
 
 callbacks = [
@@ -824,13 +822,6 @@ class TestTemplate:
         config = MindFormerConfig(run_mode="train",
                                   trainer={"a": 1})
         with pytest.raises(KeyError, match="missing a required key: type"):
-            ConfigTemplate.apply_template(config)
-
-    def test_model_missing_key_1(self):
-        config = MindFormerConfig(run_mode="train",
-                                  trainer={"type": 1},
-                                  model={"model_config": 1})
-        with pytest.raises(KeyError, match="missing a required key: arch"):
             ConfigTemplate.apply_template(config)
 
     def test_model_missing_key_2(self):

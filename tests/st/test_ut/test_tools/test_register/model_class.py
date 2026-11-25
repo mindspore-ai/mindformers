@@ -12,11 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Dummpy Legacy Model Class"""
+"""Dummy model and tool classes"""
 
 from mindformers.tools.register.register import MindFormerRegister, MindFormerModuleType
 
 
-@MindFormerRegister.register(MindFormerModuleType.MODELS, legacy=True)
+@MindFormerRegister.register(MindFormerModuleType.MODELS)
 class MyModel:
+    pass
+
+
+@MindFormerRegister.register(MindFormerModuleType.TOOLS)
+class MyTool:
     pass

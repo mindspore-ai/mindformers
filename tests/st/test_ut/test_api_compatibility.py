@@ -33,8 +33,6 @@ CUR_DIR_PATH = os.path.dirname(os.path.realpath(__file__))
 
 def special_case_process(api_str, signature, obj):
     """process special cases"""
-    if "MindFormerRegister._add_class_name_prefix" in api_str:
-        signature = signature.replace("module_type, ", "")
     if re.search("AdamW$", api_str):
         signature = inspect.getsource(obj.__new__)
         signature = re.sub("\n", "", signature)

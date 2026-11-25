@@ -25,7 +25,7 @@ from mindformers.models.model_config_utils import (
 from mindformers.tools.register import MindFormerRegister, MindFormerModuleType
 
 
-@MindFormerRegister.register(MindFormerModuleType.CONFIG, legacy=False, search_names='glm4_moe')
+@MindFormerRegister.register(MindFormerModuleType.CONFIG, search_names='glm4_moe')
 class Glm4MoeConfig(PretrainedConfig):
     r"""
     This is the configuration class to store the configuration of a [`Glm4MoeModel`]. It is used to instantiate a

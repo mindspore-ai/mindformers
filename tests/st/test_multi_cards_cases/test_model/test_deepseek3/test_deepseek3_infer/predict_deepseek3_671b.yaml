@@ -3,7 +3,6 @@ output_dir: './output' # path to save checkpoint/strategy
 load_checkpoint: ''
 use_parallel: True
 run_mode: 'predict'
-use_legacy: False
 load_ckpt_format: "safetensors"
 
 trainer:

@@ -25,7 +25,7 @@ from mindformers.models.telechat2.config_converter_telechat2 import Telechat2Con
 from mindformers.tools.register import MindFormerRegister, MindFormerModuleType
 
 
-@MindFormerRegister.register(MindFormerModuleType.CONFIG, legacy=False, search_names='telechat')
+@MindFormerRegister.register(MindFormerModuleType.CONFIG, search_names='telechat')
 class Telechat2Config(PretrainedConfig):
     """
     Args:

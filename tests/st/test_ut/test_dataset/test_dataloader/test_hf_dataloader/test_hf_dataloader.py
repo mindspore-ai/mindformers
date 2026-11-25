@@ -25,7 +25,7 @@ import mindspore as ms
 from mindformers.tools.register.config import MindFormerConfig
 from mindformers.dataset.dataloader.hf_dataloader import HFDataLoader
 
-ms.set_context(mode=0)
+ms.set_context(mode=ms.PYNATIVE_MODE)
 
 WORK_DIR = os.path.dirname(os.path.abspath(__file__))
 JSON_DATASET_PATH = os.path.join(WORK_DIR, 'alpaca.json')
@@ -104,7 +104,8 @@ def test_load_alpaca_json(mock_tokenizer):
 
     sample = dataloader.source.dataset[0]
     assert list(sample.keys()) == ['input_ids', 'labels']
-    assert len(dataloader.source.dataset[0]['input_ids']) == 1025  # legacy seq_length
+    assert len(sample['input_ids']) == 1024
+    assert len(sample['labels']) == 1024
 
 
 @patch('mindformers.dataset.handler.base_handler.BaseInstructDataHandler.build_tokenizer',

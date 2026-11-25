@@ -46,7 +46,6 @@ from hyper_parallel.core.dtensor.placement_types import Replicate
 from hyper_parallel.core.dtensor.redistribute_infer import DevMat, RedistributionOperatorInfer
 from hyper_parallel.platform import get_platform
 
-from mindformers.core import context as core_context
 from mindformers.tools.logger import get_logger, logger
 from mindformers.pynative.optimizer.adamw import _run_adamw_opt, _run_fused_adamw_opt
 from mindformers.pynative.dtensor_compat import inplace_copy
@@ -2319,9 +2318,6 @@ class Muon(MainParamsMixin, Optimizer):
         """Verify if the model is compatible with Muon optimizer."""
         if model is None:
             raise ValueError("Model must be provided for Muon optimizer.")
-
-        if core_context.is_legacy_model():
-            raise ValueError("Muon does not support Legacy Model.")
 
         config = model.get_gpt_transformer_config()
 

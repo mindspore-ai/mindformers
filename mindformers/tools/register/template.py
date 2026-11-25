@@ -249,7 +249,6 @@ class GeneralConfig(Config):
     src_strategy_path_or_dir = ""
     only_save_strategy = False
     load_ckpt_async = False
-    use_legacy = True
     use_legacy_format = True
     pretrained_model_dir = ""
     balanced_load = False
@@ -667,7 +666,6 @@ class ConfigTemplate:
         Returns:
             dict: A new dict with the applied template.
         """
-        cls.use_legacy = config.get('use_legacy', True)
         run_mode = config.get('run_mode', None)
         if run_mode not in cls._run_modes:
             logger.warning(f"The specified run_mode '{run_mode}' is invalid. Expected one of {cls._run_modes}.")
@@ -698,7 +696,7 @@ class ConfigTemplate:
         new_config = {}
         for sub_config in template:
             class_ = CONFIG_NAME_TO_CLASS[sub_config]
-            if sub_config == "moe_config" and not cls.use_legacy:
+            if sub_config == "moe_config":
                 continue
             new_config[sub_config] = class_.apply(config.pop(sub_config, None))
 
