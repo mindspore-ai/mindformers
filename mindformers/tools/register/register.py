@@ -40,8 +40,6 @@ class MindFormerModuleType:
           - 'dataset'
         * - DATASET_LOADER
           - 'dataset_loader'
-        * - DATASET_SAMPLER
-          - 'dataset_sampler'
         * - DATA_HANDLER
           - 'data_handler'
         * - ENCODER
@@ -92,7 +90,6 @@ class MindFormerModuleType:
     DATASET = 'dataset'
     MASK_POLICY = 'mask_policy'
     DATASET_LOADER = 'dataset_loader'
-    DATASET_SAMPLER = 'dataset_sampler'
     TRANSFORMS = 'transforms'
     ENCODER = 'encoder'
     MODELS = 'models'

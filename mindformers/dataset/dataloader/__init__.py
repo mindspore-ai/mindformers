@@ -15,13 +15,7 @@
 """MindFormers DataLoader."""
 from .build_dataloader import build_dataset_loader
 from .hf_dataloader import HFDataLoader
-from .common_dataloader import CommonDataLoader
-from .multi_source_dataloader import MultiSourceDataLoader
-from .adgen_dataloader import ADGenDataLoader
-from .sft_dataloader import SFTDataLoader
-from .training_dataloader import TrainingDataLoader
-from .toolaplaca_dataloader import ToolAlpacaDataLoader
-from .multi_modal_dataloader import BaseMultiModalDataLoader
 from .blended_megatron_dataloader import BlendedMegatronDatasetDataLoader
+from .ordered_index_dataloader import OrderedIndexDataLoader
 
 __all__ = ['BlendedMegatronDatasetDataLoader']

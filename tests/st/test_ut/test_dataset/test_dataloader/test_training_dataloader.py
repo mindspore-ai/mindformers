@@ -17,12 +17,11 @@ import os
 import unittest
 from unittest.mock import patch
 import pytest
-from tests.st.test_ut.test_dataset.get_test_data import get_wikitext_data, get_json_data
+from tests.st.test_ut.test_dataset.get_test_data import get_json_data
 from tests.st.test_ut.test_tokenizers.get_vocab_model import get_sp_vocab_model
 
-from mindformers.dataset.dataloader.training_dataloader import TrainingDataset, TrainingDataLoader, run_cmd
+from mindformers.dataset.dataloader.training_dataloader import TrainingDataset, run_cmd
 from mindformers import LlamaTokenizer
-from mindformers.dataset.dataloader.datareaders import wikitext_reader
 
 
 WORK_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -30,75 +29,6 @@ path = WORK_DIR
 get_sp_vocab_model("llama", path)
 tokenizer_model_path = os.path.join(path, "llama_tokenizer.model")
 tokenizer = LlamaTokenizer(vocab_file=tokenizer_model_path)
-
-
-class TestTrainingDataloader(unittest.TestCase):
-    """ A test class for testing Training dataloader"""
-
-    @classmethod
-    def setUpClass(cls):
-        get_wikitext_data(path)
-        cls.path = os.path.join(path, "wiki.train.tokens")
-        cls.tokenizer = tokenizer
-
-    @pytest.mark.level1
-    @pytest.mark.platform_x86_cpu
-    @pytest.mark.env_onecard
-    def test_default(self):
-        """test default logic"""
-        dataloader = TrainingDataLoader(
-            self.path,
-            column_names=["input_ids", "attention_mask"],
-            dataset_name="wikitext",
-            file_format="tokens",
-            tokenizer=self.tokenizer,
-            max_length=8,
-            shuffle=False
-        )
-        dataloader = dataloader.batch(1)
-        for item in dataloader:
-            assert len(item) == 2
-            assert all(item[0][0].asnumpy() == [1, 83, 88, 135, 57, 58, 187, 135])
-            assert all(item[1][0].asnumpy() == [1, 1, 1, 1, 1, 1, 1, 1])
-            break
-
-    @pytest.mark.level1
-    @pytest.mark.platform_x86_cpu
-    @pytest.mark.env_onecard
-    def test_max_length(self):
-        """test max length logic"""
-        with pytest.raises(TypeError):
-            assert TrainingDataLoader(
-                self.path,
-                column_names=["input_ids", "attention_mask"],
-                dataset_name="wikitext",
-                file_format="tokens",
-                tokenizer=self.tokenizer,
-                max_length=0,
-                shuffle=False
-            )
-
-    @pytest.mark.level1
-    @pytest.mark.platform_x86_cpu
-    @pytest.mark.env_onecard
-    def test_other(self):
-        """test other logic"""
-        dataloader = TrainingDataLoader(
-            path,
-            column_names=["input_ids", "attention_mask"],
-            dataset_name="wikitext",
-            file_format="tokens",
-            tokenizer=self.tokenizer,
-            max_length=8,
-            shuffle=False,
-            read_function=wikitext_reader,
-        )
-        dataloader = dataloader.batch(1)
-        for item in dataloader:
-            assert len(item) == 2
-            assert all(item[0][0].asnumpy() == [1, 83, 88, 135, 57, 58, 187, 135])
-            assert all(item[1][0].asnumpy() == [1, 1, 1, 1, 1, 1, 1, 1])
-            break
 
 
 class TestTrainingDataSet(unittest.TestCase):
@@ -158,10 +88,6 @@ class TestTrainingDataSet(unittest.TestCase):
         dataset._reset_iter_index()
         assert dataset.iter_index == 0
         assert all(dataset.current_samples[0] == [83, 88, 135, 57, 58, 187, 135, 89])
-        res = dataset._check_tokenizer({
-            "type": "LlamaTokenizer", "vocab_file": os.path.join(self.path, "llama_tokenizer.model")
-        })
-        assert isinstance(res, LlamaTokenizer)
 
 
 class MockRun:

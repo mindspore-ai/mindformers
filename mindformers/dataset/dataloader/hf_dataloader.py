@@ -25,8 +25,6 @@ import numpy as np
 import datasets
 from datasets.distributed import split_dataset_by_node
 
-import mindspore as ms
-from mindspore import Tensor, ops
 from mindspore.dataset import GeneratorDataset
 
 from mindformers.tools.register import MindFormerRegister, MindFormerModuleType
@@ -38,33 +36,7 @@ from mindformers.tools.utils import get_real_rank
 from mindformers.tools.utils import FILE_PERMISSION
 from mindformers.dataset.balance_metadata import checked_indices, attention_load
 
-from .utils import is_dataset_built_on_rank
-from .mock_dataloader import BaseMockDataLoader
 from .balance_adapter import build_balanced_generator
-
-# Mapping between integer codes and NumPy data type strings
-DATASET_DTYPE_MAP = {
-    1: 'int32',
-    2: 'float32',
-    3: 'int64',
-    4: 'float16'
-}
-# Placeholder number set for broadcast dataset info
-PLACEHOLDER_ID = 0
-
-
-def parse_data_shapes(arr, delimiter=-1):
-    """Parse data shapes from broadcast data."""
-    arr = arr[arr != PLACEHOLDER_ID]
-    indices = np.where(arr == delimiter)[0]
-    parts = np.split(arr, indices + 1)
-    return [part.tolist()[:-1] for part in parts if len(part) > 0 and part[0] != delimiter]
-
-
-def parse_data_dtypes(arr):
-    """Parse data dtypes from broadcast data."""
-    arr = arr[arr != PLACEHOLDER_ID]
-    return [DATASET_DTYPE_MAP[item] for item in arr]
 
 
 def _is_pack_mode(config):
@@ -143,8 +115,7 @@ class HFDataLoaderConfig:
     Configuration object for HFDataLoader.
 
     This dataclass stores configuration parameters for loading and processing
-    HuggingFace datasets, as well as additional options for special mask handling
-    and mock data generation.
+    HuggingFace datasets, as well as additional options for special mask handling.
 
     Args:
         load (dict): Arguments for loading HuggingFace datasets.
@@ -157,8 +128,6 @@ class HFDataLoaderConfig:
             This is used in TND layout FlashAttention modules with `actual_seq_len`.
         compressed_eod_mask_length (int, optional): Maximum `actual_seq_len` length
             when `create_compressed_eod_mask` is set to True. Default is 128.
-        use_broadcast_data (bool, optional): Whether to enable broadcasted mock data
-            in data-parallel groups. Default is True.
         shuffle (bool, optional): Whether to shuffle the dataset (requires random-access input). Default: `False`.
         create_position_ids (bool, optional): Whether to generate a `position_ids` column as
             `arange(seq_len)` when the dataset lacks one in non-packed mode. Context parallel
@@ -174,8 +143,6 @@ class HFDataLoaderConfig:
     create_compressed_eod_mask: bool = False
 
     compressed_eod_mask_length: int = 128
-
-    use_broadcast_data: bool = True
 
     shuffle: bool = False
 
@@ -243,11 +210,10 @@ class HFDataLoader:
     Workflow in __new__():
         1. Process legacy arguments to ensure compatibility.
         2. Build a `HFDataLoaderConfig` object.
-        3. Optionally use mock datasets in distributed training (non-main ranks).
-        4. Load dataset from source (HF Hub or local).
-        5. Optionally process dataset (formatting, cleaning, packing, etc.).
-        6. Wrap dataset in a MindSpore `GeneratorDataset`.
-        7. Optionally synchronize and broadcast dataset info in distributed mode.
+        3. Load dataset from source (HF Hub or local).
+        4. Optionally process dataset (formatting, cleaning, packing, etc.).
+        5. Wrap dataset in a MindSpore `GeneratorDataset`.
+        6. Synchronize dataset initialization in distributed mode.
 
     Support `handler` for source datasets process method in **kwargs:
         1. rename_column: original_column_name, new_column_name;
@@ -291,10 +257,6 @@ class HFDataLoader:
         # 1. Build HFDataLoaderConfig object
         config = cls._build_config(**kwargs)
 
-        # In distributed mode: use mock dataset for non-main ranks to avoid redundant loading
-        if world_size > 1 and config.use_broadcast_data and not is_dataset_built_on_rank():
-            return cls._build_mock_dataset(config, num_shards, shard_id)
-
         # 2. Load dataset (supports HF Hub or local files)
         dataset = cls.load_dataset(config)
 
@@ -309,9 +271,6 @@ class HFDataLoader:
         if world_size > 1:
             logger.info(" > start barrier for all dataset init ... ")
             skip_barrier_controller()  # Ensure all ranks reach the same point before proceeding
-
-            if config.use_broadcast_data:
-                cls._broadcast_dataset_info(dataset.source)
 
         return dataset
 
@@ -426,7 +385,6 @@ class HFDataLoader:
         create_attention_mask = kwargs.pop('create_attention_mask', False)
         create_compressed_eod_mask = kwargs.pop('create_compressed_eod_mask', False)
         compressed_eod_mask_length = kwargs.pop('compressed_eod_mask_length', 128)
-        use_broadcast_data = kwargs.pop('use_broadcast_data', True)
         handler = kwargs.pop('handler', None)
         shuffle = kwargs.pop('shuffle', False)
         create_position_ids = kwargs.pop('create_position_ids', False)
@@ -450,7 +408,6 @@ class HFDataLoader:
                 create_attention_mask=create_attention_mask,
                 create_compressed_eod_mask=create_compressed_eod_mask,
                 compressed_eod_mask_length=compressed_eod_mask_length,
-                use_broadcast_data=use_broadcast_data,
                 shuffle=shuffle,
                 create_position_ids=create_position_ids,
                 streaming=streaming,
@@ -467,73 +424,9 @@ class HFDataLoader:
             create_attention_mask=create_attention_mask,
             create_compressed_eod_mask=create_compressed_eod_mask,
             compressed_eod_mask_length=compressed_eod_mask_length,
-            use_broadcast_data=use_broadcast_data,
             shuffle=shuffle,
             create_position_ids=create_position_ids,
         )
-
-    @staticmethod
-    def _build_mock_dataset(config, num_shards=None, shard_id=None):
-        """Build a mock dataset for distributed training (non-main ranks)."""
-        logger.info(" > start barrier for all dataset init ... ")
-        skip_barrier_controller()  # mock dataset only support parallel mode
-
-        logger.info(" > start receive dataset info from main rank.")
-        # Initialize placeholder tensors for broadcast reception
-        received_data = (
-            Tensor([PLACEHOLDER_ID], dtype=ms.int32),
-            Tensor([PLACEHOLDER_ID], dtype=ms.int32),
-            Tensor([PLACEHOLDER_ID], dtype=ms.int32),
-        )
-
-        # Receive dataset metadata from main rank (rank 0)
-        dataset_size, num_columns, seq_length = ops.Broadcast(0)(received_data)
-        mock_data = {
-            'dataset_size': dataset_size.numpy()[0],  # Total number of samples
-            'num_columns': num_columns.numpy()[0],  # Number of dataset columns
-            'seq_length': seq_length.numpy()[0]  # Sequence length of each sample
-        }
-
-        logger.info(f"\n > received dataset info: \n"
-                    f"   size:        {mock_data.get('dataset_size')} \n"
-                    f"   num_columns: {mock_data.get('num_columns')} \n"
-                    f"   seq_length:  {mock_data.get('seq_length')}")
-
-        mock_dataloader = MockHFDataLoader(config, **mock_data)
-        mock_dataloader = GeneratorDataset(
-            mock_dataloader,
-            column_names=mock_dataloader.mock_columns,
-            num_shards=num_shards,
-            shard_id=shard_id)
-        return mock_dataloader
-
-    @classmethod
-    def _broadcast_dataset_info(cls, dataset):
-        """
-        Broadcast dataset metadata from the main rank to all other ranks
-        in a distributed training environment.
-        This method is typically called after the real dataset has been
-        built on the main rank. Other ranks will receive this metadata
-        and use it to construct a mock dataset with the same structure.
-        """
-        # iter dataset
-        sample = next(iter(itertools.tee(dataset, 1)[0]))
-        sample_columns = dataset.column_names
-
-        dataset_size = len(dataset)
-        num_columns = len(sample_columns)
-        seq_length = len(sample[0])  # Assuming the first column is `input_ids`
-
-        logger.info(f"\n > build real dataset completed, broadcast dataset info: \n"
-                    f"   size:       {dataset_size} \n"
-                    f"   columns:    {sample_columns} \n"
-                    f"   seq_length: {seq_length}")
-        dataset_size = Tensor(dataset_size, dtype=ms.int32)
-        num_columns = Tensor(num_columns, dtype=ms.int32)
-        seq_length = Tensor(seq_length, dtype=ms.int32)
-
-        logger.info(" > start broadcast dataset info to other rank.")
-        ops.Broadcast(0)((dataset_size, num_columns, seq_length))
 
 
 class HFDataset:
@@ -546,7 +439,7 @@ class HFDataset:
     Args:
         config (HFDataLoaderConfig): Configuration object defining dataset handling,
                                          including packed mode and mask options.
-        dataset (dict-like): Loaded dataset, typically from Hugging Face or a mock loader.
+        dataset (dict-like): Loaded dataset, typically from Hugging Face.
     """
 
     def __init__(self, config, dataset):
@@ -669,60 +562,9 @@ class HFDataset:
             raise ValueError(
                 f"Currently, only columns `{supported_columns}` are supported. The processed data contains "
                 f"unsupported column(s): `{invalid_columns}`. If you need to use these columns to train a custom "
-                f"model, you may remove this restriction and disable the `use_broadcast_data` feature. "
+                f"model, you may remove this restriction. "
                 f"This will not affect normal dataset iteration."
             )
-
-
-class MockHFDataLoader(BaseMockDataLoader):
-    """
-    Mock version of HFDataLoader used for distributed training or testing
-    without requiring the real dataset.
-
-    This class simulates a dataset with the same column structure, shapes, and
-    data types as the real dataset, enabling non-main ranks to work with mock
-    data in parallel or to test dataset pipelines.
-
-    Args:
-        config (HFDataLoaderConfig): Configuration object containing packed mode and mask settings.
-        dataset_size (int): Number of samples in the mock dataset.
-        num_columns (int): Number of columns in the mock dataset (used for non-packed mode).
-        seq_length (int): Sequence length of the mock dataset.
-    """
-
-    def __init__(self, config: HFDataLoaderConfig, dataset_size, num_columns, seq_length):
-        if _is_pack_mode(config):
-            # Define mock column names for packed datasets
-            mock_columns = ['input_ids', 'labels', 'loss_mask', 'position_ids']
-
-            # Set data shapes for each packed column
-            data_shapes = [
-                [seq_length],  # input_ids
-                [seq_length],  # labels
-                [seq_length],  # loss_mask
-                [seq_length]  # position_ids
-            ]
-            if config.create_compressed_eod_mask:
-                mock_columns.append('actual_seq_len')
-                data_shapes.append([config.compressed_eod_mask_length])
-            else:
-                mock_columns.append('attention_mask')
-                data_shapes.append([1, seq_length, seq_length])
-
-        elif num_columns == 1:
-            mock_columns = ['input_ids']
-            data_shapes = [[seq_length]]
-        elif num_columns == 2:
-            mock_columns = ['input_ids', 'labels']
-            data_shapes = [[seq_length], [seq_length]]
-        else:
-            raise ValueError("For `MockHFDataLoader`, currently only the two columns `input_ids` and `labels` "
-                             "are supported, but more than 2 columns were received.")
-
-        # All columns use int32 dtype
-        data_dtypes = ['int32'] * len(mock_columns)
-
-        super().__init__(mock_columns, data_shapes, data_dtypes, dataset_size)
 
 
 def _resume_hf_iterable_dataset(dataset, step):

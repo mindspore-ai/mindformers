@@ -19,7 +19,6 @@ import pytest
 from mindformers.tools.check_rules import (
     _restore_net_type,
     _rule_fa_only_for_train,
-    _check_keyword_gen_dataset,
     _check_context_parallel_algo_valid,
     _check_recompute
     )
@@ -71,33 +70,6 @@ def test_check_context_parallel_algo_valid():
     with pytest.raises(ValueError, match=r"cp \* mp <= attention head"):
         _check_context_parallel_algo_valid(config=config, cp=8, mp=8)
 
-@pytest.mark.level1
-@pytest.mark.platform_x86_cpu
-@pytest.mark.env_onecard
-def test_check_keyword_gen_dataset():
-    """
-    Feature: Check rules
-    Description: Test check_rules.
-    Expectation: Run successfully.
-    """
-    config = MindFormerConfig()
-    config.set_value('model.model_config.seq_length', 101)
-    config.set_value('do_eval', False)
-    config.set_value('metric', [{"type": "ADGENMetric"}, {"type": "PerplexityMetric"}])
-
-    # train dataset
-    config.set_value('train_dataset.data_loader.type', "ADGenDataLoader")
-    config.set_value('train_dataset.max_source_length', 50)
-    config.set_value('train_dataset.max_target_length', 50)
-
-    # eval dataset
-    config.set_value('eval_dataset.data_loader.type', "ADGenDataLoader")
-    config.set_value('eval_dataset.data_loader.phase', "eval")
-    config.set_value('eval_dataset.max_source_length', 101)
-    config.set_value('eval_dataset.max_target_length', 20)
-    config.set_value('eval_dataset_task.dataset_config.data_loader.phase', "eval")
-
-    _check_keyword_gen_dataset(config=config, mode='train')
 
 @pytest.mark.level1
 @pytest.mark.platform_x86_cpu
