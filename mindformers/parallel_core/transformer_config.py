@@ -1600,6 +1600,17 @@ class TransformerConfig:
         }
     )
 
+    dsa_dense_fa_tnd_softmax: bool = field(
+        default=False,
+        metadata={
+            "description": "Use V4 TND-native softmax statistics for dense DSA teacher attention. "
+                           "TND consumers in one process must agree on this layout.",
+            "usage": ParamUsage.TRAINING,
+            "source": ParamSource.MF,
+            "mode": ParamMode.COMMON,
+        }
+    )
+
     dsa_indexer_topk_freq: int = field(
         default=1,
         metadata={

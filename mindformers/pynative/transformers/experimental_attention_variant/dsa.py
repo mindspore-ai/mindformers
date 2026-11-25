@@ -27,6 +27,8 @@ from hyper_parallel import DTensor
 from mindformers.parallel_core.utils.spec_utils import ModuleSpec, build_module
 from mindformers.parallel_core.transformer_config import MLATransformerConfig
 from mindformers.pynative.layers.identity_op import IdentityOp
+from mindformers.pynative.layers.max_logit_tracker import MaxAttentionLogitTracker
+from mindformers.pynative.layers.tnd_softmax_out import request_tnd_softmax_out, local_v4_varlen_flash_attention
 from mindformers.pynative.transformers.experimental_attention_variant.dsa_indexer_loss import DSAIndexerLoss
 
 
@@ -71,7 +73,7 @@ class DSADenseFlashAttention(nn.Cell):
 
     def __init__(
             self, input_layout: str, head_num: int, softmax_scale: float,
-            sparse_mode: int, softmax_converter: nn.Cell
+            sparse_mode: int, softmax_converter: nn.Cell, tnd_softmax_out: bool = False
     ):
         super().__init__()
         self.input_layout = input_layout
@@ -79,6 +81,9 @@ class DSADenseFlashAttention(nn.Cell):
         self.softmax_scale = softmax_scale
         self.sparse_mode = sparse_mode
         self.softmax_converter = softmax_converter
+        self.tnd_softmax_out = bool(tnd_softmax_out) and input_layout == "TND"
+        if input_layout == "TND":
+            request_tnd_softmax_out(self.tnd_softmax_out, "dsa_dense_fa_tnd_softmax")
         self._build_flash_attention()
 
     def _build_flash_attention(self):
@@ -98,15 +103,22 @@ class DSADenseFlashAttention(nn.Cell):
             actual_seq_qlen=None, actual_seq_kvlen=None
     ):
         """Run dense FlashAttention and return its output and LSE statistics."""
-        softmax_max, softmax_sum, _, attention_output = self.flash_attention(
-            query, key, value,
-            None, None, None,
-            attn_mask=attention_mask,
-            actual_seq_qlen=actual_seq_qlen,
-            actual_seq_kvlen=actual_seq_kvlen,
-        )
+        if self.tnd_softmax_out and not isinstance(query, DTensor):
+            # CP dispatch performs its own folding; only plain tensors bypass the primitive.
+            attention_output, softmax_max, softmax_sum = local_v4_varlen_flash_attention(
+                query, key, value, attention_mask, actual_seq_qlen, actual_seq_kvlen,
+                softmax_scale=self.softmax_scale, head_num=self.head_num, sparse_mode=self.sparse_mode)
+        else:
+            softmax_max, softmax_sum, _, attention_output = self.flash_attention(
+                query, key, value,
+                None, None, None,
+                attn_mask=attention_mask,
+                actual_seq_qlen=actual_seq_qlen,
+                actual_seq_kvlen=actual_seq_kvlen,
+            )
         softmax_max, softmax_sum = self.softmax_converter.to_cp_layout(
-            softmax_max[..., :1], softmax_sum[..., :1], actual_seq_qlen
+            softmax_max[..., :1], softmax_sum[..., :1], actual_seq_qlen,
+            tnd_native=self.tnd_softmax_out,
         )
         return attention_output, softmax_max, softmax_sum
 
@@ -135,11 +147,11 @@ class DSASoftmaxConverter(nn.Cell):
         """Set current rank's index inside the context-parallel mesh."""
         self.cp_rank = int(cp_rank)
 
-    def construct(self, softmax_max, softmax_sum, actual_seq_len=None):
+    def construct(self, softmax_max, softmax_sum, actual_seq_len=None, tnd_native=False):
         """Return stats as ``[N, T, 1]`` for dense TND indexer loss."""
         if not self.is_tnd:
             return softmax_max, softmax_sum
-        if actual_seq_len is None:
+        if tnd_native or actual_seq_len is None:
             return self.transpose(softmax_max, (1, 0, 2)), self.transpose(softmax_sum, (1, 0, 2))
 
         t, n, _ = softmax_max.shape
@@ -164,9 +176,9 @@ class DSASoftmaxConverter(nn.Cell):
         softmax_sum = self.reshape(self.stack(softmax_sums), (n, t, 1))
         return softmax_max, softmax_sum
 
-    def to_cp_layout(self, softmax_max, softmax_sum, actual_seq_len=None):
+    def to_cp_layout(self, softmax_max, softmax_sum, actual_seq_len=None, tnd_native=False):
         """Canonicalize LSE stats to the attention output's sequence/head axes."""
-        softmax_max, softmax_sum = self(softmax_max, softmax_sum, actual_seq_len)
+        softmax_max, softmax_sum = self(softmax_max, softmax_sum, actual_seq_len, tnd_native=tnd_native)
         if self.is_tnd:
             # Indexer-loss layout [N, T, 1] -> generic CP layout [T, N, 1].
             axes = (1, 0, 2)
@@ -223,7 +235,7 @@ def dsa_layer_is_index_leader(config: MLATransformerConfig, layer_number):
     return leaders[layer_number]
 
 
-class DSAttention(nn.Cell):
+class DSAttention(MaxAttentionLogitTracker, nn.Cell):
     """
     Sparse attention mechanism using DSA Indexer for pynative mode.
 
@@ -311,7 +323,13 @@ class DSAttention(nn.Cell):
                 input_layout=self.input_layout,
                 sparse_mode=config.sparse_mode,
                 softmax_converter=DSASoftmaxConverter(self.input_layout),
+                tnd_softmax_out=getattr(config, "dsa_dense_fa_tnd_softmax", False),
             )
+        # Muon's qk_clip needs the per-head max attention logit, and DSA's attention is not
+        # the ordinary FlashAttention layer that used to be the only cell tracking it -- so a
+        # DSA model tracked nothing and qk_clip silently clipped nobody (``GPTModel`` collects
+        # by ``hasattr(core_attention, "max_logits_val")`` and returns early on an empty set).
+        self.init_max_logits_tracking(getattr(config, "track_max_attention_logit", False))
 
     def construct(
             self, query, key, value, topk_indices, attention_mask=None,
@@ -349,6 +367,11 @@ class DSAttention(nn.Cell):
             attention_output = _to_local_tensor(attention_output)
             softmax_max = _to_local_tensor(softmax_max)
             softmax_sum = _to_local_tensor(softmax_sum)
+            if self.track_max_attention_logit:
+                # The sparse kernel carries the head **last**: ``(?, T, N)`` under TND and
+                # ``(B, ?, ?, N)`` otherwise -- the layout hyper-parallel shards with ``tp``
+                # on the final axis.
+                self.update_max_logits(softmax_max, -1)
         else:
             attention_output, softmax_max, softmax_sum = self.dense_flash_attention(
                 query, key, value,
@@ -361,4 +384,10 @@ class DSAttention(nn.Cell):
             softmax_max, softmax_sum = self.dense_flash_attention.softmax_converter.from_cp_layout(
                 softmax_max, softmax_sum
             )
+            if self.track_max_attention_logit:
+                # ``from_cp_layout`` leaves the indexer-loss layout, which puts the head
+                # first: ``(N, T, 1)`` under TND and ``(B, N, S, 1)`` otherwise. Tracking
+                # here and not in ``DSASelfAttention`` is deliberate -- the TP-sequence
+                # transform and the CP fold applied there reshuffle the very axes this reads.
+                self.update_max_logits(softmax_max, 0 if self.is_tnd else 1)
         return attention_output, softmax_max, softmax_sum

@@ -25,11 +25,17 @@ from mindspore.common.tensor import Tensor
 from mindspore.nn.cell import Cell
 from mindspore.ops.operations.nn_ops import FlashAttentionScore
 
+from hyper_parallel import DTensor
+
 from mindformers.parallel_core.transformer_config import TransformerConfig, MLATransformerConfig
-from mindformers.pynative.dtensor_compat import local_shard, to_local
+from mindformers.pynative.layers.max_logit_tracker import MaxAttentionLogitTracker
+from mindformers.pynative.layers.tnd_softmax_out import (
+    local_v4_varlen_flash_attention,
+    request_tnd_softmax_out,
+)
 
 
-class FlashAttention(Cell):
+class FlashAttention(MaxAttentionLogitTracker, Cell):
     """
     FlashAttention Layer.
 
@@ -124,22 +130,17 @@ class FlashAttention(Cell):
         self.fa_out_transpose = mint.permute
         self.cast = ops.cast
 
-        self.track_max_attention_logit = getattr(config, "track_max_attention_logit", False)
-        if self.track_max_attention_logit:
-            # Recomputed every step, so it is not model state: keep it non-persistent.
-            self._init_max_logits_val()
-            self.amax = mint.amax
-            self.maximum = mint.maximum
+        self.init_max_logits_tracking(getattr(config, "track_max_attention_logit", False))
+        # Under TND the stock kernel returns its statistics in NTD order while declaring them
+        # ``(T, N, G)``, so the per-head reduction below would silently max across every head
+        # (each index of the declared head axis lands on a strided slice of all of them).
+        # Ask for the V4 kernel, whose statistics really are in the declared order. Gated on
+        # tracking so a run that never reads the statistics keeps the stock kernel bit for bit.
+        self.tnd_softmax_out = self.track_max_attention_logit and self.input_layout == "TND"
+        if self.tnd_softmax_out:
+            request_tnd_softmax_out(True, "Muon qk_clip on a TND FlashAttention layer")
 
-    def _init_max_logits_val(self):
-        """(Re)create the per-head max-logit buffer, sized to this rank's head partition."""
-        self.register_buffer(
-            "max_logits_val",
-            mint.zeros((self.head_num,), dtype=mstype.float32),
-            persistent=False,
-        )
-
-    def construct(self,
+    def construct(self,  # pylint: disable=arguments-differ
                   query: Tensor,
                   key: Tensor,
                   value: Tensor,
@@ -154,17 +155,40 @@ class FlashAttention(Cell):
             attention_mask = self.cast(attention_mask, ms.uint8)
 
         if self.input_layout == "TND":
-            softmax_val, _, _, output = self.flash_attention(query=query,
-                                                             key=key,
-                                                             value=value,
-                                                             real_shift=alibi_mask,
-                                                             padding_mask=padding_mask,
-                                                             attn_mask=attention_mask,
-                                                             prefix=prefix,
-                                                             actual_seq_qlen=actual_seq_qlen,
-                                                             actual_seq_kvlen=actual_seq_kvlen)
+            if self.tnd_softmax_out and not isinstance(query, DTensor):
+                # hyper-parallel swaps V4 in inside its *distributed* operator, i.e. only
+                # behind a context-parallel boundary that hands this cell DTensors. With
+                # cp == 1 there is no such boundary, so nothing would swap the kernel and the
+                # statistics would come back in v1's NTD order while the reduction below
+                # reads them as TND -- shapes match, nothing raises, every head gets the same
+                # mixed maximum. Call the same kernel directly instead.
+                if alibi_mask is not None or padding_mask is not None or prefix is not None:
+                    # The varlen V4 entry point takes none of these. Dropping them silently
+                    # is the same class of bug this path exists to fix, so say so instead.
+                    raise NotImplementedError(
+                        "TND-ordered softmax statistics (Muon qk_clip) use the aclnn V4 varlen "
+                        "kernel, which takes no alibi mask, padding mask or prefix."
+                    )
+                output, softmax_val, _ = local_v4_varlen_flash_attention(
+                    query, key, value, attention_mask, actual_seq_qlen, actual_seq_kvlen,
+                    softmax_scale=self.scalar_value,
+                    head_num=self.head_num,
+                    sparse_mode=self.sparse_mode,
+                )
+            else:
+                softmax_val, _, _, output = self.flash_attention(query=query,
+                                                                 key=key,
+                                                                 value=value,
+                                                                 real_shift=alibi_mask,
+                                                                 padding_mask=padding_mask,
+                                                                 attn_mask=attention_mask,
+                                                                 prefix=prefix,
+                                                                 actual_seq_qlen=actual_seq_qlen,
+                                                                 actual_seq_kvlen=actual_seq_kvlen)
             if self.track_max_attention_logit:
-                self._update_max_logits(softmax_val, (0, 2))
+                # ``(T, N, G)`` -- genuinely so, because ``tnd_softmax_out`` put the V4 kernel
+                # on this path; the stock kernel's NTD order would make this reduction mix heads.
+                self.update_max_logits(softmax_val, 1)
             return output
 
         input_already_in_layout = bool(getattr(self, "_mf_runtime_input_already_in_fa_layout", False))
@@ -223,7 +247,7 @@ class FlashAttention(Cell):
                                                          actual_seq_qlen=actual_seq_qlen,
                                                          actual_seq_kvlen=actual_seq_kvlen)
         if self.track_max_attention_logit:
-            self._update_max_logits(softmax_val, (0, 2, 3))
+            self.update_max_logits(softmax_val, 1)
 
         if self.input_layout == "BNSD":
             if input_already_in_layout:
@@ -255,15 +279,3 @@ class FlashAttention(Cell):
         x_merge = self.reshape(x, new_shape)
         x_merge = self.fa_out_transpose(x_merge, (1, 0, 2))
         return x_merge
-
-    def _update_max_logits(self, softmax_val, reduce_dims):
-        """Accumulate this step's per-head max attention logit into this rank's CP row, for qk_clip."""
-        max_logits = self.amax(to_local(softmax_val), dim=reduce_dims, keepdim=False)
-        tracked = self.max_logits_val.view(-1, int(max_logits.shape[0]))
-        mine = local_shard(softmax_val, 1, int(tracked.shape[0]))
-        tracked[mine] = self.maximum(tracked[mine], max_logits.detach())
-
-    def reset_parameter(self):
-        """Recreate the max-logit buffer: delayed init, and the per-step qk_clip reset."""
-        if self.track_max_attention_logit:
-            self._init_max_logits_val()
