@@ -191,9 +191,7 @@ class TrainingDataset:
     @staticmethod
     def _check_tokenizer(tokenizer):
         """Check and create the `tokenizer`."""
-        if isinstance(tokenizer, str):
-            return build_tokenizer({"type": tokenizer})
-        if isinstance(tokenizer, dict):
+        if isinstance(tokenizer, (str, dict)):
             return build_tokenizer(tokenizer)
         return tokenizer
 

@@ -204,22 +204,8 @@ class Partition:
 
 def get_tokenizer(args):
     """Get tokenizer according to args."""
-    if args.tokenizer_type == 'HuggingFaceTokenizer':
-        return build_tokenizer(pretrained_model_dir=args.tokenizer_dir,
-                               trust_remote_code=args.trust_remote_code)
-    if args.tokenizer_type == 'AutoRegister':
-        tokenizer_config = {
-            'type': args.auto_register.split('.')[-1],
-            'vocab_file': args.vocab_file,
-            'merges_file': args.merges_file,
-            'tokenizer_file': args.tokenizer_file,
-            'eos_token': args.eos_token,
-            'add_bos_token': args.add_bos_token,
-            'add_eos_token': args.add_eos_token,
-            'auto_register': args.auto_register
-        }
-        return build_tokenizer(tokenizer_config)
-    raise NotImplementedError(f"Currently, `--tokenizer_type` does not support {args.tokenizer_type}.")
+    return build_tokenizer(pretrained_model_dir=args.tokenizer_dir,
+                           trust_remote_code=args.trust_remote_code)
 
 
 def get_args():
@@ -237,7 +223,7 @@ def get_args():
 
     group = parser.add_argument_group(title='tokenizer')
     group.add_argument('--tokenizer-type', type=str, required=True,
-                       choices=['AutoRegister', 'HuggingFaceTokenizer'],
+                       choices=['HuggingFaceTokenizer'],
                        help='The tokenizer of the corresponding model.')
     group.add_argument('--vocab-file', type=str, default=None,
                        help='Path to the vocab file or tokenizer.model')
@@ -258,12 +244,6 @@ def get_args():
                        help='Append an <eod> token to the end of a document.')
     group.add_argument('--lang', type=str, default='english',
                        help='Language to use for NLTK-powered sentence splitting.')
-    group.add_argument('--register_path', type=str, default=None,
-                       help='the register path of outer tokenizer.')
-    group.add_argument('--auto_register', type=str, default=None,
-                       help='the import order of tokenizer according to register_path. '
-                            'For example, auto_register="qwen2_tokenizer.Qwen2Tokenizer" '
-                            'with register_path="research/qwen2".')
 
     group = parser.add_argument_group(title='output data')
     group.add_argument('--output-prefix', type=str, required=True,
@@ -281,17 +261,9 @@ def get_args():
                        help='Ensure ordering of samples in .jsonl files is preserved when using partitions>1.')
     args = parser.parse_args()
     args.keep_empty = False
-    if args.tokenizer_type == 'AutoRegister':
-        if not args.register_path or not args.auto_register:
-            raise ValueError('When tokenizer_type = "AutoRegister", register_path and auto_register should be set.')
-        os.environ["REGISTER_PATH"] = args.register_path
-        if args.register_path not in sys.path:
-            sys.path.append(args.register_path)
-        print(f'The tokenizer {args.auto_register} in the path {args.register_path} will be applied.')
-    elif args.tokenizer_type == 'HuggingFaceTokenizer':
-        if not args.tokenizer_dir:
-            raise ValueError('When tokenizer_type = "HuggingFaceTokenizer", tokenizer_dir should be set.')
-        print(f'The directory {args.tokenizer_dir} will be applied to build HuggingFace tokenizer.')
+    if not args.tokenizer_dir:
+        raise ValueError('When tokenizer_type = "HuggingFaceTokenizer", tokenizer_dir should be set.')
+    print(f'The directory {args.tokenizer_dir} will be applied to build HuggingFace tokenizer.')
 
     # some default/dummy values for the tokenizer
     args.rank = 1
