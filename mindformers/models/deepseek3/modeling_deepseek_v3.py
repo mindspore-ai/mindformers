@@ -13,16 +13,10 @@
 # limitations under the License.
 # ============================================================================
 """Deepseek-V3 Model."""
-import os
-import mindspore as ms
-
 from mindformers.tools.logger import logger
-from mindformers.core.context.build_context import get_context
 from mindformers.tools.register import MindFormerRegister, MindFormerModuleType
 
 from .configuration_deepseek_v3 import DeepseekV3Config
-from .modeling_deepseek_v3_train import TrainingDeepseekV3ForCausalLM
-from .modeling_deepseek_v3_infer import InferenceDeepseekV3ForCausalLM
 
 try:
     from .modeling_deepseek_v3_pynative import PyNativeDeepseekV3ForCausalLM
@@ -31,7 +25,7 @@ except ImportError as e:
     logger.warning(f"Import PyNativeDeepseekV3ForCausalLM failed: {e}.")
 
 
-@MindFormerRegister.register(MindFormerModuleType.MODELS)
+@MindFormerRegister.register(MindFormerModuleType.MODELS, search_names=DeepseekV3Config.model_type)
 class DeepseekV3ForCausalLM:
     r"""
     Provide DeepseekV3 Model for training and inference.
@@ -43,11 +37,4 @@ class DeepseekV3ForCausalLM:
     """
 
     def __new__(cls, config: DeepseekV3Config, *args, **kwargs):  # pylint: disable=unused-argument
-        # get run mode to init different model.
-        # predict mode used to deploy.
-        # when predict mode not supported, we can use online_predict mode to do inference task.
-        if os.environ.get("RUN_MODE") == "predict":
-            return InferenceDeepseekV3ForCausalLM(config=config)
-        if get_context("mode") == ms.context.PYNATIVE_MODE:
-            return PyNativeDeepseekV3ForCausalLM(config=config)
-        return TrainingDeepseekV3ForCausalLM(config=config)
+        return PyNativeDeepseekV3ForCausalLM(config=config)

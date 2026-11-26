@@ -40,7 +40,6 @@ from mindformers.models.utils import format_type
 from mindformers.models.tokenization_utils import PreTrainedTokenizer
 from mindformers.generation.streamers import BaseStreamer
 from mindformers.generation.utils import softmax_with_threads, GenerateOutput, InferOutput, convert_pin
-from mindformers.modules.block_tables import BlockTables
 from mindformers.tools.logger import logger
 from mindformers.tools.utils import is_pynative
 from mindformers.tools.debug_info import DetailedLatency, Profiling
@@ -104,12 +103,9 @@ class GenerationMixin:
         self._exec_add_flags = True
 
     def _set_block_mgr(self, batch_size, seq_length):
-        """ Set model block table mgr function. """
-        if not self.block_mgr:
-            self.block_mgr = BlockTables(self.config.num_blocks, self.config.block_size, seq_length)
-
-        if self.block_mgr:
-            self.block_mgr.init_cache_engine(batch_size)
+        """Set model block table mgr function."""
+        raise RuntimeError("The static-graph paged attention inference (`BlockTables`) has been removed, "
+                           "please use the pynative Trainer for inference.")
 
     def _set_kv_cache(self):
         """Initial key cache and value cache."""

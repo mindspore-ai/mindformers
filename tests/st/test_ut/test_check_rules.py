@@ -26,7 +26,7 @@ class TestCheckYamlDepthBeforeLoading(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.yaml_path = os.path.join(MindFormerBook.get_project_path(), 'configs', 'glm4', 'predict_glm4_9b_chat.yaml')
+        cls.yaml_path = os.path.join(MindFormerBook.get_project_path(), 'configs', 'qwen3', 'finetune_qwen3.yaml')
         cls.yaml_str = """
         a:
             b:
@@ -58,10 +58,10 @@ class TestCheckYamlDepthBeforeLoading(unittest.TestCase):
             check_yaml_depth_before_loading(fp)
             fp.seek(0)
             cfg_dict = yaml.safe_load(fp)
-            assert cfg_dict["model"]["model_config"]["num_layers"] == 40
+            assert cfg_dict["model"]["model_config"]["qkv_concat"] is True
             fp.seek(0)
             cfg_dict = yaml.load(fp, Loader=yaml.SafeLoader)
-            assert cfg_dict["model"]["model_config"]["num_layers"] == 40
+            assert cfg_dict["model"]["model_config"]["qkv_concat"] is True
             fp.seek(0)
             cfg_dict = yaml.safe_load(fp.read())
-            assert cfg_dict["model"]["model_config"]["num_layers"] == 40
+            assert cfg_dict["model"]["model_config"]["qkv_concat"] is True

@@ -20,12 +20,7 @@ from mindformers.mindformer_book import MindFormerBook
 
 
 def get_default_yaml_file(model_name):
-    default_yaml_file = ""
-    for model_dict in MindFormerBook.get_trainer_support_task_list().values():
-        if model_name in model_dict:
-            default_yaml_file = model_dict.get(model_name)
-            break
-    return default_yaml_file
+    return MindFormerBook.get_model_config_path(model_name)
 
 
 def set_default_yaml_file(yaml_name, yaml_file):

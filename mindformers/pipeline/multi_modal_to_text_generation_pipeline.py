@@ -16,7 +16,7 @@
 from typing import Optional, Union, Dict, List
 
 from mindspore import Model
-from mindformers.models import PreTrainedModel, BaseXModalToTextProcessor
+from mindformers.models import PreTrainedModel, ProcessorMixin
 from mindformers.tools.register import MindFormerRegister, MindFormerModuleType
 
 from .base_pipeline import Pipeline
@@ -31,8 +31,8 @@ class MultiModalToTextPipeline(Pipeline):
     Args:
         model (Union[PretrainedModel, Model]):
             The model used to perform task, the input should be a model instance inherited from PretrainedModel.
-        processor (BaseXModalToTextProcessor, optional):
-            The image_processor of model, it could be None if the model do not need image_processor. Default: ``None``.
+        processor (ProcessorMixin, optional):
+            A callable processor with ``output_columns`` and a ``post_process`` method.
 
     Returns:
         A pipeline for MultiModalToTextPipeline.
@@ -44,10 +44,13 @@ class MultiModalToTextPipeline(Pipeline):
             If the input model is not in support list.
     """
     def __init__(self, model: Union[PreTrainedModel, Model],
-                 processor: Optional[BaseXModalToTextProcessor] = None,
+                 processor: Optional[ProcessorMixin] = None,
                  **kwargs):
         if processor is None:
             raise ValueError("MultiModalToTextPipeline requires a processor.")
+        if not callable(processor) or not hasattr(processor, "output_columns") or \
+                not callable(getattr(processor, "post_process", None)):
+            raise TypeError("The processor must be callable and provide output_columns and post_process.")
         self.processor = processor
         self.output_columns = self.processor.output_columns
         super().__init__(model, processor=processor, **kwargs)

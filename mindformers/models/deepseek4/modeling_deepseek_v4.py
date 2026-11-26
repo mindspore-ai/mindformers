@@ -26,7 +26,7 @@ except ImportError as e:
     _PYNATIVE_IMPORT_ERROR = e
     logger.warning(f"Import PyNativeDeepseekV4ForCausalLM failed: {e}.")
 
-@MindFormerRegister.register(MindFormerModuleType.MODELS)
+@MindFormerRegister.register(MindFormerModuleType.MODELS, search_names=DeepseekV4Config.model_type)
 class DeepseekV4ForCausalLM:
     r"""
     Provide DeepseekV4 Model for training and inference.

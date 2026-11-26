@@ -79,52 +79,33 @@ class MindFormerBook:
     _DEFAULT_CHECKPOINT_SAVE_FOLDER = os.path.join('.', 'checkpoint_save')
 
     _TRAINER_SUPPORT_TASKS_LIST = OrderedDict([
-        ("general", OrderedDict([
-            ("common", os.path.join(
-                _PROJECT_PATH, "configs/general/run_general_task.yaml"))])
-         ),
-        ("text_generation", OrderedDict([
-            ("glm4_9b", os.path.join(
-                _PROJECT_PATH, "configs/glm4/predict_glm4_9b_chat.yaml")),
-            ("common", os.path.join(
-                _PROJECT_PATH, "configs/general/run_general_task.yaml"))])
-         )
     ])
 
     _PIPELINE_SUPPORT_TASK_LIST = OrderedDict([
-        ("text_generation", OrderedDict([
-            ("glm4_9b", os.path.join(
-                _PROJECT_PATH, "configs/glm4/predict_glm4_9b_chat.yaml")),
-            ("common", os.path.join(
-                _PROJECT_PATH, "configs/general/run_general_task.yaml"))
-        ]))
     ])
 
+    _MODEL_CONFIG_PATHS = {
+        "deepseekv3_671b": "configs/deepseek3/pretrain_deepseek3_671b.yaml",
+        "deepseekv4_flash": "configs/deepseek4/pretrain_deepseek4_flash.yaml",
+        "deepseekv4_pro": "configs/deepseek4/pretrain_deepseek4_pro.yaml",
+        "qwen3_32b": "configs/qwen3/pretrain_qwen3_32b_4k.yaml",
+        "xing4_29b": "configs/xing4/pretrain_xing4_29b.yaml",
+        "xing4_285b": "configs/xing4/pretrain_xing4_285b.yaml",
+    }
     _CONFIG_SUPPORT_LIST = OrderedDict([
-        ('glm4', [
-            'glm4_9b',
-        ]),
-        ('deepseekv3', [
-            'deepseekv3_671b',
-        ])
+        ("deepseekv3", ["deepseekv3_671b"]),
+        ("deepseekv4", ["deepseekv4_flash", "deepseekv4_pro"]),
+        ("qwen3", ["qwen3_32b"]),
+        ("xing4", ["xing4_29b", "xing4_285b"]),
     ])
 
     _MODEL_SUPPORT_LIST = OrderedDict([
-        ('glm4', [
-            'glm4_9b',
-        ])
     ])
 
     _PROCESSOR_SUPPORT_LIST = OrderedDict([
-        ('glm4', [
-            'glm4_9b',
-        ])
     ])
 
     _TOKENIZER_SUPPORT_LIST = OrderedDict([
-        ('glm4', [
-            'glm4_9b',
-        ])
     ])
 
     _MODEL_CONFIG_TO_NAME = OrderedDict([
@@ -143,14 +124,13 @@ class MindFormerBook:
     ])
 
     _TOKENIZER_NAME_TO_PROCESSOR = OrderedDict([
-        ('ChatGLM4Tokenizer', 'GLMProcessor')
     ])
 
     @classmethod
     def show_trainer_support_model_list(cls, task=None):
         """show_trainer_support_model_list"""
         all_list = copy.deepcopy(cls._TRAINER_SUPPORT_TASKS_LIST)
-        all_list.pop("general")
+        all_list.pop("general", None)
         for key, val in all_list.items():
             val.pop("common")
             temp_list = []
@@ -338,6 +318,12 @@ class MindFormerBook:
     def get_config_support_list(cls):
         """get_config_support_list function"""
         return cls._CONFIG_SUPPORT_LIST
+
+    @classmethod
+    def get_model_config_path(cls, model_name):
+        """Return the bundled YAML path for a registered model name."""
+        config_path = cls._MODEL_CONFIG_PATHS.get(model_name)
+        return os.path.join(cls._PROJECT_PATH, config_path) if config_path else ""
 
     @classmethod
     def show_model_support_list(cls):

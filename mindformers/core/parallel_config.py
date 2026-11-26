@@ -16,7 +16,6 @@
 from mindspore.parallel._cost_model_context import _set_rp_matmul_mem_coef
 
 from mindformers.tools.register.config import MindFormerConfig
-from mindformers.modules.transformer.moe import MoEConfig
 from mindformers.modules.transformer import TransformerOpParallelConfig, TransformerRecomputeConfig, \
     TransformerSwapConfig
 from mindformers.tools.logger import logger
@@ -37,7 +36,11 @@ def build_parallel_config(config):
                 with its moe_config, recompute_config and parallel_config
                 are initialized from dict or assigned with a default one.
     """
-    if not config.moe_config:
+    if config.moe_config:
+        if not isinstance(config.moe_config, MindFormerConfig):
+            logger.info("initial moe_config from dict: %s", config.moe_config)
+            config.moe_config = MindFormerConfig(**config.moe_config)
+    else:
         config.moe_config = MindFormerConfig()
 
     if config.swap_config:
@@ -80,12 +83,9 @@ def reset_parallel_config(config, reset_diff_config=True):
         config (Union[MindFormerConfig, Dict]) - Input config.
         reset_diff_config (bool, optional): Only reset diff config. Defaults to True.
     """
-    if config.moe_config and isinstance(config.moe_config, MoEConfig):
+    if config.moe_config and isinstance(config.moe_config, MindFormerConfig):
         logger.info("reset moe_config to dict: %s", config.moe_config)
-        if reset_diff_config:
-            config.moe_config = config.moe_config.to_diff_dict()
-        else:
-            config.moe_config = config.moe_config.to_dict()
+        config.moe_config = config.moe_config.to_dict()
     if config.recompute_config and isinstance(config.recompute_config, TransformerRecomputeConfig):
         logger.info("reset recompute_config to dict: %s", config.recompute_config)
         if reset_diff_config:

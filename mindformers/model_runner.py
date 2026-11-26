@@ -29,19 +29,21 @@ from mindspore.common.initializer import Zero
 from mindspore._c_expression import swap_cache
 from mindspore.nn.utils import no_init_parameters
 
-from mindformers import models, MindFormerRegister, MindFormerModuleType
-from mindformers import build_context, build_parallel_config, GenerationConfig
-from mindformers import AutoModel, AutoConfig, AutoTokenizer
+from mindformers import models
+from mindformers.core.context import build_context
+from mindformers.core.parallel_config import build_parallel_config
+from mindformers.generation import GenerationConfig
+from mindformers.models import AutoModel, AutoConfig, AutoTokenizer, build_processor, PretrainedConfig
 from mindformers.models.utils import convert_mstype, str_to_ms_type
 from mindformers.utils import contains_safetensors_files
 
 from mindformers.tools.logger import logger
+from mindformers.tools.register import MindFormerRegister, MindFormerModuleType
 from mindformers.tools.register.config import MindFormerConfig
 from mindformers.trainer.utils import transform_and_load_checkpoint, convert_checkpoint_config
 from mindformers.tools.hub.dynamic_module_utils import get_class_from_dynamic_module
 from mindformers.generation.parallel_decoding import parallel_decoding_control
 from mindformers.version_control import need_nz
-from mindformers.models import build_processor, PretrainedConfig
 from mindformers.utils.load_checkpoint_utils import get_load_path_after_hf_convert
 
 __all__ = ["ModelRunner"]
@@ -229,6 +231,8 @@ class MindIEModelRunner:
             raise ValueError("plugin params should be str type!")
         self.dynamic_kv_cache_whitelist = ["ParallelLlamaForCausalLM", "InferenceDeepseekV3ForCausalLM"]
         self.config = MindFormerConfig(config_path)
+        if self.config.context is None:
+            self.config.context = MindFormerConfig()
         self.warmup_step = 2
         self.is_multi_modal_model = is_multi_modal_model(self.config)
         # register to Auto Class

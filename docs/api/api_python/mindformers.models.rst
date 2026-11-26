@@ -12,27 +12,17 @@ mindformers.models
     mindformers.models.PretrainedConfig
     mindformers.models.PreTrainedTokenizer
     mindformers.models.PreTrainedTokenizerFast
-    mindformers.models.multi_modal.ModalContentTransformTemplate
 
-Llama
--------
-.. mscnautosummary::
-    :toctree: models
-    :nosignatures:
-
-    mindformers.models.LlamaForCausalLM
-    mindformers.models.LlamaConfig
-    mindformers.models.LlamaTokenizer
-    mindformers.models.LlamaTokenizerFast
-
-GLM
----------------------
+动态图模型
+--------------------
 
 .. mscnautosummary::
     :toctree: models
     :nosignatures:
 
-    mindformers.models.ChatGLM2ForConditionalGeneration
-    mindformers.models.ChatGLM2Config
-    mindformers.models.ChatGLM3Tokenizer
-    mindformers.models.ChatGLM4Tokenizer
+    mindformers.models.DeepseekV3Config
+    mindformers.models.DeepseekV3ForCausalLM
+    mindformers.models.DeepseekV4Config
+    mindformers.models.DeepseekV4ForCausalLM
+    mindformers.models.Qwen3Config
+    mindformers.models.Qwen3ForCausalLM

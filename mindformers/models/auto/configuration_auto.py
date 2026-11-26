@@ -25,32 +25,45 @@ from typing import List, Union
 
 from mindformers.models.utils import CONFIG_NAME
 from mindformers.mindformer_book import print_dict, MindFormerBook
-from mindformers.models.build_config import get_model_config
+from mindformers.models.build_config import extract_model_section, get_model_config
 from mindformers.models.configuration_utils import PretrainedConfig
 from mindformers.models.auto.utils import set_default_yaml_file
 from mindformers.tools.logger import logger
 from mindformers.tools.hub import resolve_trust_remote_code, get_class_from_dynamic_module
 from mindformers.tools.generic import experimental_mode_func_checker, is_experimental_mode
-from mindformers.tools.register import MindFormerConfig
+from mindformers.tools.register.config import MindFormerConfig
 
 CONFIG_MAPPING_NAMES = OrderedDict(
     [
-        ("glm2", "ChatGLM2Config"),
-        ("llama", "LlamaConfig"),
-        ("qwen2", "Qwen2Config")
+        ("deepseek_v3", "DeepseekV3Config"),
+        ("deepseek_v4", "DeepseekV4Config"),
+        ("qwen3", "Qwen3Config"),
+        ("xing4_v4", "Xing4V4Config"),
+        ("xing4_v41", "Xing4V41Config"),
     ]
 )
 
 MODEL_NAMES_MAPPING = OrderedDict(
     [
-        ("glm2", "ChatGLM2Model"),
-        ("llama", "LlamaModel"),
-        ("qwen2", "Qwen2Model")
+        ("deepseek_v3", "DeepSeek-V3"),
+        ("deepseek_v4", "DeepSeek-V4"),
+        ("qwen3", "Qwen3"),
+        ("xing4_v4", "Xing4 29B"),
+        ("xing4_v41", "Xing4.1-Preview 285B"),
     ]
 )
 
+MODEL_TYPE_TO_MODULE = {
+    "deepseek_v3": "deepseek3",
+    "deepseek_v4": "deepseek4",
+    "xing4_v4": "xing4",
+    "xing4_v41": "xing4",
+}
+
+MODEL_TYPE_ALIASES = {"xing4_0": "xing4_v4", "Xing4.1-Preview": "xing4_v41"}
+
 EXP_ERROR_MSG = "The input yaml_name_or_path should be a path to yaml file, e.g. " \
-                "'run_xxx_model.yaml', or a model name supported, e.g. glm4_9b."
+                "'run_xxx_model.yaml', or a supported model name such as qwen3_32b."
 
 
 def config_class_to_model_type(config):
@@ -84,7 +97,8 @@ class _LazyConfigMapping(OrderedDict):
             raise KeyError(key)
         value = self._mapping[key]
         if key not in self._modules:
-            self._modules[key] = importlib.import_module(f".{key}", "mindformers.models")
+            module_name = MODEL_TYPE_TO_MODULE.get(key, key)
+            self._modules[key] = importlib.import_module(f".{module_name}", "mindformers.models")
         if hasattr(self._modules[key], value):
             return getattr(self._modules[key], value)
 
@@ -222,6 +236,7 @@ class AutoConfig:
             # such as "mindspore/vit_base_p16"
             yaml_name_or_path = yaml_name_or_path.split('/')[cls._model_name]
 
+        yaml_name_or_path = os.path.basename(yaml_name_or_path)
         if not yaml_name_or_path.split('_')[cls._model_type] in cls._support_list.keys():
             return True
 
@@ -246,6 +261,7 @@ class AutoConfig:
 
     @classmethod
     def for_model(cls, model_type: str, *args, **kwargs):
+        model_type = MODEL_TYPE_ALIASES.get(model_type, model_type)
         if model_type in CONFIG_MAPPING:
             config_class = CONFIG_MAPPING[model_type]
             return config_class(*args, **kwargs)
@@ -290,8 +306,6 @@ class AutoConfig:
             raise TypeError(f"yaml_name_or_path should be a str,"
                             f" but got {type(yaml_name_or_path)}.")
 
-        yaml_name_or_path = os.path.realpath(yaml_name_or_path)
-
         if os.path.exists(yaml_name_or_path):
             if not yaml_name_or_path.endswith(".yaml"):
                 raise ValueError(f"{yaml_name_or_path} should be a .yaml file for model"
@@ -328,12 +342,9 @@ class AutoConfig:
             set_default_yaml_file(yaml_name, yaml_file)
 
             config_args = MindFormerConfig(yaml_file)
-        if config_args.get("pretrained_model_dir", None):
-            config_args.model.pretrained_model_dir = config_args.pretrained_model_dir
-        if config_args.get("generation_config", None):
-            config_args.model.generation_config = config_args.generation_config
-        config_args.model.model_config.update(**kwargs)
-        return get_model_config(config_args.model)
+        model = extract_model_section(config_args)
+        model.model_config.update(**kwargs)
+        return get_model_config(model)
 
     @classmethod
     @experimental_mode_func_checker(EXP_ERROR_MSG)
@@ -363,7 +374,9 @@ class AutoConfig:
 
         config_dict, unused_kwargs = PretrainedConfig.get_config_dict(pretrained_model_name_or_path, **kwargs)
         has_remote_code = "auto_map" in config_dict and "AutoConfig" in config_dict["auto_map"]
-        has_local_code = "model_type" in config_dict and config_dict["model_type"] in CONFIG_MAPPING
+        model_type = config_dict.get("model_type")
+        model_type = MODEL_TYPE_ALIASES.get(model_type, model_type)
+        has_local_code = model_type in CONFIG_MAPPING
         trust_remote_code = resolve_trust_remote_code(
             trust_remote_code, pretrained_model_name_or_path, has_local_code, has_remote_code
         )
@@ -377,7 +390,7 @@ class AutoConfig:
                 config_class.register_for_auto_class()
             return config_class.from_pretrained(pretrained_model_name_or_path, **kwargs)
         if "model_type" in config_dict:
-            config_class = CONFIG_MAPPING[config_dict["model_type"]]
+            config_class = CONFIG_MAPPING[model_type]
             return config_class.from_dict(config_dict, **unused_kwargs)
         # Fallback: use pattern matching on the string.
         # We go from longer names to shorter names to catch roberta before bert (for instance)

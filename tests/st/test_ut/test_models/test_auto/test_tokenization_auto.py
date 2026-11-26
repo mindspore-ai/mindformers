@@ -21,6 +21,9 @@ from unittest.mock import patch, MagicMock
 import yaml
 import pytest
 import sentencepiece as spm
+from tokenizers import Tokenizer
+from tokenizers.models import WordLevel
+from tokenizers.pre_tokenizers import Whitespace
 from mindformers.models.auto.tokenization_auto import AutoTokenizer, is_experimental_mode
 from mindformers.models.auto.configuration_auto import AutoConfig
 from mindformers.models.auto.tokenization_auto import TOKENIZER_MAPPING
@@ -29,6 +32,19 @@ from mindformers.models.auto.tokenization_auto import tokenizer_class_from_name
 # Add project root to path
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
+
+
+@pytest.mark.level1
+@pytest.mark.platform_x86_cpu
+def test_auto_tokenizer_local_fast(tmp_path):
+    """Load the MindFormers fast tokenizer from local files."""
+    tokenizer = Tokenizer(WordLevel({"[UNK]": 0, "hello": 1}, unk_token="[UNK]"))
+    tokenizer.pre_tokenizer = Whitespace()
+    tokenizer.save(str(tmp_path / "tokenizer.json"))
+    (tmp_path / "tokenizer_config.json").write_text(
+        json.dumps({"tokenizer_class": "PreTrainedTokenizerFast", "unk_token": "[UNK]"}), encoding="utf-8")
+    loaded = AutoTokenizer.from_pretrained(str(tmp_path))
+    assert loaded.encode("hello", add_special_tokens=False) == [1]
 
 
 class TestAutoTokenizer:
@@ -181,17 +197,13 @@ class TestAutoTokenizer:
         mock_tokenizer_cls.from_pretrained.return_value = mock_tokenizer_instance
         mock_class_from_name.return_value = mock_tokenizer_cls
 
-        # 'llama' is a known key in TOKENIZER_MAPPING_NAMES
-        # Origin or Exp mode check happens first, but tokenizer_type argument logic inside AutoTokenizer
-        # usually shortcuts or guides the class selection.
+        with patch.dict("mindformers.models.auto.tokenization_auto.TOKENIZER_MAPPING_NAMES",
+                        {"mocktok": ("MockSlowTokenizer", "MockFastTokenizer")}, clear=True):
+            dummy_path = "dummy_path_not_exist"
+            tokenizer = AutoTokenizer.from_pretrained(dummy_path, tokenizer_type="mocktok")
 
-        dummy_path = "dummy_path_not_exist"
-        # This triggers experimental mode because it doesn't exist locally (usually) and not in support list
-
-        tokenizer = AutoTokenizer.from_pretrained(dummy_path, tokenizer_type="llama")
-
-        # Verify "llama" -> "LlamaTokenizerFast" (default preference) mapping usage
-        mock_class_from_name.assert_called_with("LlamaTokenizerFast")
+        # Verify "mocktok" -> "MockFastTokenizer" (default preference) mapping usage
+        mock_class_from_name.assert_called_with("MockFastTokenizer")
         assert tokenizer == mock_tokenizer_instance
 
     @pytest.mark.level1
@@ -278,7 +290,8 @@ class TestAutoTokenizer:
             mock_set_yaml.return_value = None
 
             # 1. Mindspore prefix
-            AutoTokenizer.get_class_from_origin_mode("mindspore/glm4_9b")
+            with patch("mindformers.models.auto.tokenization_auto.AutoTokenizer.invalid_yaml_name", return_value=False):
+                AutoTokenizer.get_class_from_origin_mode("mindspore/glm4_9b")
             # Check that it tried to access the download folder, confirming logic path
             mock_book.get_xihe_checkpoint_download_folder.assert_called()
 

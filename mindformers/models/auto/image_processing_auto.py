@@ -36,8 +36,6 @@ EXP_ERROR_MSG = "AutoImageProcessor is in experimental, AutoProcessor is recomme
 
 IMAGE_PROCESSOR_MAPPING_NAMES = OrderedDict(
     [
-        ("clip", "CLIPImageProcessor"),
-        ("sam", "SamImageProcessor"),
     ]
 )
 

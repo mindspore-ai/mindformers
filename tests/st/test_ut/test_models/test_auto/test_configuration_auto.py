@@ -31,27 +31,6 @@ from mindformers.models.auto.configuration_auto import (
 from mindformers.models.configuration_utils import PretrainedConfig
 
 
-class DummyMindFormerConfig(dict):
-    """Stub MindFormerConfig for unit tests."""
-
-    def __init__(self, has_pretrained=False, has_generation=False):
-        super().__init__()
-        self.model = SimpleNamespace(
-            model_config={"type": "DemoConfig"},
-            arch=SimpleNamespace(type="demo_arch"),
-        )
-        if has_pretrained:
-            self["pretrained_model_dir"] = "pretrained_dir"
-            self.pretrained_model_dir = "pretrained_dir"
-        else:
-            self.pretrained_model_dir = None
-        if has_generation:
-            self["generation_config"] = {"gen": True}
-            self.generation_config = {"gen": True}
-        else:
-            self.generation_config = None
-
-
 @pytest.fixture(autouse=True)
 def restore_extra_content():
     """Ensure CONFIG_MAPPING extra registrations are restored between tests."""
@@ -68,7 +47,7 @@ class TestConfigurationAuto:
     @pytest.mark.platform_x86_cpu
     def test_config_class_to_model_type_core_and_extra(self, monkeypatch):
         """config_class_to_model_type should inspect default and extra registries."""
-        assert config_class_to_model_type("LlamaConfig") == "llama"
+        assert config_class_to_model_type("LlamaConfig") is None
         dummy_class = type("NewConfig", (), {})
         # Accessing protected member for test setup is intentional
         monkeypatch.setitem(CONFIG_MAPPING._extra_content, "custom", dummy_class)  # pylint: disable=W0212,protected-access
@@ -91,8 +70,10 @@ class TestConfigurationAuto:
 
     @pytest.mark.level1
     @pytest.mark.platform_x86_cpu
-    def test_list_model_options_and_docstring_replacement(self):
+    def test_list_model_options_and_docstring_replacement(self, monkeypatch):
         """_list_model_options and decorator should update docstrings or raise errors."""
+        monkeypatch.setitem(auto_cfg.CONFIG_MAPPING_NAMES, "llama", "LlamaConfig")
+        monkeypatch.setitem(auto_cfg.MODEL_NAMES_MAPPING, "llama", "LlamaModel")
         doc = _list_model_options("  ", {"llama": ["LlamaConfig"]}, use_model_types=False)
         assert "LlamaConfig" in doc
 
@@ -174,35 +155,46 @@ class TestConfigurationAuto:
 
     @pytest.mark.level1
     @pytest.mark.platform_x86_cpu
-    def test_get_config_origin_mode_auxiliary_fields(self, monkeypatch, tmp_path):
-        """Config loading should preserve auxiliary fields without a legacy flag."""
-        dummy = DummyMindFormerConfig(has_pretrained=True, has_generation=True)
-        monkeypatch.setattr(auto_cfg, "MindFormerConfig", lambda *_: dummy)
-        built = {}
-        monkeypatch.setattr(auto_cfg, "get_model_config",
-                            lambda model: built.setdefault("model", model))
+    @pytest.mark.parametrize("model_yaml", [
+        "model:\n  model_config:\n    model_type: qwen3\n",
+        "model:\n  model_type: qwen3\n",
+    ])
+    def test_get_config_origin_mode(self, tmp_path, model_yaml):
+        """Build the same dynamic config from nested and PyNative YAML."""
         yaml_file = tmp_path / "model.yaml"
-        yaml_file.write_text("model: {}", encoding="utf-8")
-        AutoConfig.get_config_origin_mode(str(yaml_file), hidden_size=128)
-        assert dummy.model.model_config["hidden_size"] == 128
-        assert dummy.model.pretrained_model_dir == "pretrained_dir"
-        assert dummy.model.generation_config == {"gen": True}
-        assert built["model"] is dummy.model
+        yaml_file.write_text(model_yaml, encoding="utf-8")
+        config = AutoConfig.from_pretrained(str(yaml_file), hidden_size=128)
+        assert config.model_type == "qwen3"
+        assert config.hidden_size == 128
 
     @pytest.mark.level1
     @pytest.mark.platform_x86_cpu
-    def test_get_config_origin_mode_nonlegacy_flow(self, monkeypatch, tmp_path):
-        """Config loading should use get_model_config without a legacy flag."""
-        dummy = DummyMindFormerConfig()
-        monkeypatch.setattr(auto_cfg, "MindFormerConfig", lambda *_: dummy)
-        marker = {}
-        monkeypatch.setattr(auto_cfg, "get_model_config",
-                            lambda model: marker.setdefault("model", model) or "new_config")
+    def test_get_config_origin_mode_auxiliary_fields(self, monkeypatch, tmp_path):
+        """Preserve the checkpoint directory and generation options in YAML."""
         yaml_file = tmp_path / "model.yaml"
-        yaml_file.write_text("model: {}", encoding="utf-8")
-        AutoConfig.get_config_origin_mode(str(yaml_file), dropout=0.1)
-        assert dummy.model.model_config["dropout"] == 0.1
-        assert marker["model"] == dummy.model
+        yaml_file.write_text(
+            "pretrained_model_dir: weights\ngeneration_config:\n  max_new_tokens: 4\n"
+            "model:\n  model_type: qwen3\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(auto_cfg, "get_model_config", lambda config: config)
+        config = AutoConfig.get_config_origin_mode(str(yaml_file), hidden_size=128)
+        assert config.model_config.hidden_size == 128
+        assert config.pretrained_model_dir == "weights"
+        assert config.generation_config.max_new_tokens == 4
+
+    @pytest.mark.level1
+    @pytest.mark.platform_x86_cpu
+    @pytest.mark.parametrize(("model_type", "expected"), [
+        ("xing4_0", "xing4_v4"),
+        ("Xing4.1-Preview", "xing4_v41"),
+    ])
+    def test_xing4_hf_model_types(self, tmp_path, model_type, expected):
+        """Recognize both Xing4 releases from their HF config identifiers."""
+        (tmp_path / "config.json").write_text(
+            f'{{"model_type": "{model_type}"}}', encoding="utf-8"
+        )
+        assert AutoConfig.from_pretrained(str(tmp_path)).model_type == expected
 
     @pytest.mark.level1
     @pytest.mark.platform_x86_cpu

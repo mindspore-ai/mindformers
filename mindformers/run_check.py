@@ -20,20 +20,15 @@ import subprocess
 import sys
 import time
 import json
+from importlib import import_module
 from io import StringIO
 from pathlib import Path
 from packaging.version import parse
 
 import numpy as np
 import mindspore as ms
-from mindspore import JitConfig
-from mindspore.dataset import GeneratorDataset
 
-import mindformers as mf
-from mindformers.models.llama import LlamaForCausalLM, LlamaConfig
-from mindformers.trainer.optimizer_grouped_parameters import get_optimizer_grouped_parameters
-from mindformers import Trainer, TrainingArguments
-from mindformers.core.optim.adamw import AdamW
+from mindformers.core.context import build_context
 from mindformers.tools.logger import logger
 
 
@@ -105,10 +100,12 @@ class MSCheck(BaseCheck):
 
 
 class MFCheck(BaseCheck):
-    """Mindformers run test."""
+    """MindFormers run test with a tiny pynative Qwen3 model forward and backward."""
 
-    def __init__(self, start, version_mapping=None, batch_size=1, num_train_epochs=1, num_layers=2, seq_length=2,
-                 step_num=1, vocab_size=32000):
+    def __init__(self, start, version_mapping=None, batch_size=1, seq_length=8,
+                 num_hidden_layers=2, vocab_size=128, hidden_size=64,
+                 intermediate_size=128, num_attention_heads=4, num_key_value_heads=4,
+                 head_dim=16, max_position_embeddings=128):
         """
         init function.
 
@@ -116,77 +113,82 @@ class MFCheck(BaseCheck):
             start (float): The start time of run_check.
             version_mapping (dict): The version compatibility dict. Default is None.
             batch_size (int): The batch size.
-            num_train_epochs (int): The train epochs.
-            num_layers (int): The number of layers.
             seq_length (int): The sequence length.
-            step_num (int): The step number.
+            num_hidden_layers (int): The number of hidden layers.
             vocab_size (int): The vocab size.
+            hidden_size (int): The hidden size.
+            intermediate_size (int): The MLP intermediate size.
+            num_attention_heads (int): The number of attention heads.
+            num_key_value_heads (int): The number of key/value heads.
+            head_dim (int): The attention head dimension.
+            max_position_embeddings (int): The maximum position embeddings.
         """
         super().__init__(start, version_mapping)
 
-        self.step_num = step_num
-        self.vocab_size = vocab_size
-        self.args = TrainingArguments(batch_size=batch_size, num_train_epochs=num_train_epochs, sink_mode=False,
-                                      loss_scale_value=1024)
-        self.model_config = LlamaConfig(num_layers=num_layers, seq_length=seq_length, use_flash_attention=True)
+        self.batch_size = batch_size
+        self.seq_length = seq_length
+        self.ignore_token_id = -100
+        self.model_config_kwargs = {
+            "seq_length": seq_length,
+            "vocab_size": vocab_size,
+            "pad_token_id": 0,
+            "bos_token_id": 1,
+            "eos_token_id": 2,
+            "hidden_size": hidden_size,
+            "intermediate_size": intermediate_size,
+            "num_hidden_layers": num_hidden_layers,
+            "num_attention_heads": num_attention_heads,
+            "num_key_value_heads": num_key_value_heads,
+            "head_dim": head_dim,
+            "max_position_embeddings": max_position_embeddings,
+        }
 
-    def generator_train(self):
-        """train dataset generator."""
-        size = (self.step_num * self.args.batch_size, self.model_config.seq_length + 1,)
-        input_ids = np.random.randint(low=0, high=self.vocab_size, size=size).astype(np.int32)
-        for _, input_id in enumerate(input_ids):
-            yield input_id
+    def _build_model(self):
+        """Build a tiny pynative Qwen3 model for the self-check."""
+        from mindformers.models.qwen3.configuration_qwen3 import Qwen3Config
+        from mindformers.models.qwen3.modeling_qwen3_train_pynative import PyNativeQwen3ForCausalLM
 
-    def _train(self, jit_level='O1'):
-        """
-        Construct trainer and start training.
+        model_config = Qwen3Config(**self.model_config_kwargs)
+        model = PyNativeQwen3ForCausalLM(model_config)
+        model.set_train(True)
+        return model
 
-        Args:
-            jit_level (str): The jit level, could be O0, O1 or O2.
-        """
-        train_dataset = GeneratorDataset(self.generator_train, column_names=["input_ids"])
-        self.train_dataset = train_dataset.batch(batch_size=self.args.batch_size)
-        self.model = LlamaForCausalLM(self.model_config)
-        self.model.set_jit_config(JitConfig(jit_level=jit_level))
-        group_params = get_optimizer_grouped_parameters(model=self.model)
-        trainer = Trainer(task='text_generation',
-                          model=self.model,
-                          args=self.args,
-                          train_dataset=self.train_dataset,
-                          callbacks=None,
-                          optimizers=AdamW(params=group_params))
-        trainer.config.callbacks = trainer.config.callbacks[:1]
-        trainer.train()
+    def _forward_backward(self, model):
+        """Run one forward and backward pass on the tiny model."""
+        vocab_size = self.model_config_kwargs['vocab_size']
+        input_ids = np.random.randint(1, vocab_size, size=(self.batch_size, self.seq_length)).astype(np.int32)
+        labels = np.concatenate(
+            [input_ids[:, 1:], np.full((self.batch_size, 1), self.ignore_token_id, dtype=np.int32)], axis=1)
+        input_ids = ms.Tensor(input_ids)
+        labels = ms.Tensor(labels)
+
+        def forward_fn(ids, lbl):
+            output = model(input_ids=ids, labels=lbl)
+            return output[0] if isinstance(output, (tuple, list)) else output
+
+        grad_fn = ms.value_and_grad(forward_fn, grad_position=None,
+                                    weights=ms.ParameterTuple(model.trainable_params()))
+        return grad_fn(input_ids, labels)
 
     def check(self):
-        """Run mindformers test."""
-        logger.info('------------------------------Starting Pretrain Test------------------------------')
+        """Run mindformers forward/backward test."""
+        logger.info('------------------------------Starting MindFormers Forward/Backward Test'
+                    '------------------------------')
         try:
-            self._train(jit_level='O1')
-
-        # pylint: disable=W0702
+            model = self._build_model()
+            loss, grads = self._forward_backward(model)
+            if not np.isfinite(loss.asnumpy()).all():
+                raise RuntimeError(f"loss is not finite, got {loss}.")
+            if not grads or all(grad is None for grad in grads):
+                raise RuntimeError("no gradient is generated in the backward pass.")
         except Exception as e:
-            self._error(error_flag='Pretrain')
-            version_checker = VersionCheck(self.start, error_flag='Pretrain')
+            self._error(error_flag='Forward/Backward')
+            version_checker = VersionCheck(self.start, error_flag='Forward/Backward')
             version_checker.check()
             raise RuntimeError(f"Run check failed: {e}") from e
 
-        self._success(test='Pretrain')
-
-        logger.info('------------------------------Starting Predict Test------------------------------')
-        try:
-            self.model.generate([1], do_sample=False, use_past=False)
-            self.model.generate([2], do_sample=False, use_past=True)
-
-        # pylint: disable=W0702
-        except:
-            self._error(error_flag='Predict')
-            version_checker = VersionCheck(self.start, error_flag='Predict')
-            version_checker.check()
-
-        else:
-            self._success(test='Predict')
-            self._next()
+        self._success(test='Forward/Backward')
+        self._next()
 
     def _error(self, **kwargs):
         sys.stdout = sys.__stdout__
@@ -278,7 +280,7 @@ class VersionCheck(BaseCheck):
         """Check whether the software versions are matched."""
         logger.info('------------------------------Searching Environment Info------------------------------')
         try:
-            mf_version = mf.__version__
+            mf_version = import_module(__package__).__version__
             ms_version = ms.__version__
             logger.info(f'MindFormers version: {mf_version}')
             logger.info(f'MindSpore version: {ms_version}')
@@ -353,7 +355,7 @@ class VersionCheck(BaseCheck):
     def version_match_check(self, ms_version, cann_version, driver_version, recommend_version_dict):
         """Check whether the given versions are valid."""
         if not (ms_version == recommend_version_dict['ms_version'] or ms_version in
-                self.version_mapping['mf'][mf.__version__]['support']):
+                self.version_mapping['mf'][import_module(__package__).__version__]['support']):
             return False
         if not cann_version == self.version_mapping['ms'][ms_version]['prefer']:
             return False
@@ -406,7 +408,7 @@ def run_check():
     os.environ['MS_ALLOC_CONF'] = "enable_vmm:False"
 
     start = time.perf_counter()
-    mf.build_context({"context": {"mode": 0}})
+    build_context({"context": {"mode": 1}})
 
     ms_checker = MSCheck(start, version_mapping=version_mapping)
     mf_checker = MFCheck(start, version_mapping=version_mapping)

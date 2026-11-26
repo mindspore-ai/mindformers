@@ -13,22 +13,20 @@
 # limitations under the License.
 # ============================================================================
 """test training dataloader"""
+from contextlib import ExitStack
+import json
 import os
+import tempfile
 import unittest
 from unittest.mock import patch
+
 import pytest
-from tests.st.test_ut.test_dataset.get_test_data import get_json_data
-from tests.st.test_ut.test_tokenizers.get_vocab_model import get_sp_vocab_model
+from tokenizers import Tokenizer
+from tokenizers.models import WordLevel
+from tokenizers.pre_tokenizers import WhitespaceSplit
 
+from mindformers import PreTrainedTokenizerFast
 from mindformers.dataset.dataloader.training_dataloader import TrainingDataset, run_cmd
-from mindformers import LlamaTokenizer
-
-
-WORK_DIR = os.path.dirname(os.path.abspath(__file__))
-path = WORK_DIR
-get_sp_vocab_model("llama", path)
-tokenizer_model_path = os.path.join(path, "llama_tokenizer.model")
-tokenizer = LlamaTokenizer(vocab_file=tokenizer_model_path)
 
 
 class TestTrainingDataSet(unittest.TestCase):
@@ -36,9 +34,16 @@ class TestTrainingDataSet(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.path = path
-        get_json_data(cls.path)
-        cls.tokenizer = tokenizer
+        resources = ExitStack()
+        cls.addClassCleanup(resources.close)
+        cls.path = resources.enter_context(tempfile.TemporaryDirectory())
+        text = "one two three four five six seven eight nine"
+        tokens = ["[UNK]", "[PAD]", *text.split()]
+        backend = Tokenizer(WordLevel({token: index for index, token in enumerate(tokens)}, unk_token="[UNK]"))
+        backend.pre_tokenizer = WhitespaceSplit()
+        cls.tokenizer = PreTrainedTokenizerFast(tokenizer_object=backend, unk_token="[UNK]", pad_token="[PAD]")
+        with open(os.path.join(cls.path, "train.json"), "w", encoding="utf-8") as sample:
+            json.dump({"input": [text]}, sample)
 
     @pytest.mark.level1
     @pytest.mark.platform_x86_cpu
@@ -52,9 +57,11 @@ class TestTrainingDataSet(unittest.TestCase):
             tokenizer=self.tokenizer,
             max_length=8,
             text_col="input",
-            shuffle=False)
+            shuffle=False,
+            process_num=1,
+        )
         assert hasattr(dataset, "current_samples")
-        assert all(dataset.current_samples[0] == [83, 88, 135, 57, 58, 187, 135, 89])
+        assert dataset.current_samples[0].tolist() == [2, 3, 4, 5, 6, 7, 8, 9]
         assert dataset.column_names == ['input_ids', 'attention_mask']
         assert dataset.text_col == "input"
 
@@ -71,23 +78,24 @@ class TestTrainingDataSet(unittest.TestCase):
             tokenizer=self.tokenizer,
             max_length=8,
             text_col="input",
-            shuffle=False
+            shuffle=False,
+            process_num=1,
         )
         res = next(dataset)
-        assert res == ([1, 83, 88, 135, 57, 58, 187, 135], [1, 1, 1, 1, 1, 1, 1, 1])
+        assert res == ([2, 3, 4, 5, 6, 7, 8, 9], [1] * 8)
         res = dataset._check_format(dataset_dir=dataset.dataset_dir, file_format=dataset.format)
         assert res == "json"
         res = dataset._check_format(dataset_dir=dataset.dataset_dir, file_format="")
         assert res == "json"
         with pytest.raises(ValueError):
             assert dataset._check_format(dataset_dir=self.path, file_format="txt")
-        res = dataset._tokenizer_func("An increasing sequence: one, two, three。")
-        assert res == [48, 87, 85, 157, 65, 135, 67, 135, 80, 167]
+        res = dataset._tokenizer_func("one two three")
+        assert res == [2, 3, 4]
         res = dataset._get_all_samples_number()
         assert res == 1
         dataset._reset_iter_index()
         assert dataset.iter_index == 0
-        assert all(dataset.current_samples[0] == [83, 88, 135, 57, 58, 187, 135, 89])
+        assert dataset.current_samples[0].tolist() == [2, 3, 4, 5, 6, 7, 8, 9]
 
 
 class MockRun:

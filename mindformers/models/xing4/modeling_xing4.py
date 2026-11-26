@@ -24,10 +24,11 @@ from mindformers.pynative.base_models.gpt.parallelize import parallelize_gptmode
 from mindformers.pynative.distributed.parallelize import register_parallelize
 from mindformers.parallel_core.utils.model_mixin import TrainModelMixin
 
-from .configuration_xing4 import Xing4Config
+from .configuration_xing4 import Xing4Config, Xing4V4Config, Xing4V41Config
 
 
-@MindFormerRegister.register(MindFormerModuleType.MODELS)
+@MindFormerRegister.register(MindFormerModuleType.MODELS,
+                            search_names=(Xing4V4Config.model_type, Xing4V41Config.model_type))
 @register_parallelize(parallelize_gptmodel)
 class Xing4ForCausalLM(TrainModelMixin, Xing4PreTrainedModel):
     """Xing4 model for training"""

@@ -12,21 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""
-NOTE:
-Transformer Networks.
-This is an experimental interface that is subject to change or deletion.
-"""
-
+"""Transformer parallel/recompute/swap configuration classes."""
 
 from .transformer import (
+    ContextParallelAlgo,
     EmbeddingOpParallelConfig,
-    LowerTriangularMaskWithDynamic,
     TransformerOpParallelConfig,
     TransformerRecomputeConfig,
-    TransformerSwapConfig
+    TransformerSwapConfig,
+    default_transformer_config
 )
-from .moe import MoEConfig
 from .op_parallel_config import OpParallelConfig
 
-__all__ = []
+__all__ = [
+    "ContextParallelAlgo",
+    "EmbeddingOpParallelConfig",
+    "OpParallelConfig",
+    "TransformerOpParallelConfig",
+    "TransformerRecomputeConfig",
+    "TransformerSwapConfig",
+    "default_transformer_config",
+]

@@ -317,8 +317,6 @@ class LlamaConverter(SpmConverter):
 
 
 SLOW_TO_FAST_CONVERTERS = {
-    "CLIPTokenizer": CLIPConverter,
-    "LlamaTokenizer": LlamaConverter,
 }
 
 

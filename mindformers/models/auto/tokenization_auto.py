@@ -30,13 +30,12 @@ from mindformers.tools import (
     extract_commit_hash,
 )
 from mindformers.tools.hub import get_class_from_dynamic_module, resolve_trust_remote_code
-from mindformers.utils.import_utils import is_sentencepiece_available, is_tokenizers_available
+from mindformers.utils.import_utils import is_tokenizers_available
 from mindformers.tools.logger import logger
 from mindformers.models.auto.configuration_auto import (
     CONFIG_MAPPING_NAMES,
     PretrainedConfig,
-    AutoConfig,
-    config_class_to_model_type
+    AutoConfig
 )
 from mindformers.models.auto.auto_factory import _LazyAutoMapping
 from mindformers.models.auto.utils import set_default_yaml_file
@@ -44,8 +43,7 @@ from mindformers.mindformer_book import MindFormerBook, print_dict
 
 TOKENIZER_SUPPORT_LIST = MindFormerBook.get_tokenizer_support_list()
 
-EXP_ERROR_MSG = "The input yaml_name_or_path should be a path to directory which has " \
-                "yaml file, or a model name supported, e.g. glm4_9b."
+EXP_ERROR_MSG = "The input yaml_name_or_path should be a YAML file or a directory containing tokenizer files."
 
 
 def is_experimental_mode(path):
@@ -77,23 +75,6 @@ else:
 
 TOKENIZER_MAPPING_NAMES = OrderedDict(
     [
-        (
-            "clip",
-            (
-                "CLIPTokenizer",
-                None if is_tokenizers_available() else None,
-            ),
-        ),
-        ("glm", ("ChatGLMTokenizer", None)),
-        ("glm2", ("ChatGLM2Tokenizer", None)),
-        ("glm3", ("ChatGLM3Tokenizer", None)),
-        (
-            "llama",
-            (
-                "LlamaTokenizer" if is_sentencepiece_available() else None,
-                "LlamaTokenizerFast" if is_tokenizers_available() else None,
-            ),
-        ),
     ]
 )
 
@@ -563,8 +544,7 @@ class AutoTokenizer:
                 )
             return tokenizer_class.from_pretrained(pretrained_model_name_or_path, *inputs, **kwargs)
 
-        model_type = config_class_to_model_type(type(config).__name__)
-        if model_type is not None:
+        if type(config) in TOKENIZER_MAPPING:
             tokenizer_class_py, tokenizer_class_fast = TOKENIZER_MAPPING[type(config)]
             if tokenizer_class_fast and (use_fast or tokenizer_class_py is None):
                 return tokenizer_class_fast.from_pretrained(pretrained_model_name_or_path, *inputs, **kwargs)
@@ -574,7 +554,6 @@ class AutoTokenizer:
                 "This tokenizer cannot be instantiated. Please make sure you have `sentencepiece` installed "
                 "in order to use this tokenizer."
             )
-
         raise ValueError(
             f"Unrecognized configuration class {config.__class__} to build an AutoTokenizer.\n"
             f"Model type should be one of {', '.join(c.__name__ for c in TOKENIZER_MAPPING.keys())}."

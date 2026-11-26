@@ -13,8 +13,10 @@
 #  limitations under the License.
 #  ============================================================================
 """Test for run_check function"""
+import subprocess
+import sys
+
 import pytest
-from mindformers import run_check
 
 
 @pytest.mark.level0
@@ -23,7 +25,13 @@ from mindformers import run_check
 def test_run_check():
     """
     Feature: Test run_check function
-    Description: Call run_check to check if MindSpore, MindFormers, CANN and driver versions are compatible
-    Expectation: No exceptions raised, all checks pass
+    Description: Run the environment check and the tiny Qwen3 PyNative forward and backward.
+    Expectation: The check reaches the PyNative model and produces gradients.
     """
-    run_check()
+    result = subprocess.run(
+        [sys.executable, "-c", "from mindformers import run_check; run_check()"],
+        capture_output=True, text=True, check=False,
+    )
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    assert "Forward/Backward test passed!" in output

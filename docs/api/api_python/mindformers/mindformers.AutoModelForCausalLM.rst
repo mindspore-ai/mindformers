@@ -20,8 +20,7 @@ mindformers.AutoModelForCausalLM
         参数：
             - **config** (Union[MindFormerConfig, PretrainedConfig, str]) - `MindFormerConfig` 实例，yaml文件路径，或者 `PretrainedConfig` 实例（实验特性）。实例化得到的模型类将基于以下配置类进行选择：
 
-              - `ChatGLM2Config` 配置类： `ChatGLM2Model` ( `ChatGLM2Model` 模型)
-              - `LlamaConfig` 配置类： `LlamaModel` ( `LlamaModel` 模型)
+              - DeepSeek V3/V4、Qwen3 和 Xing4 的配置类。
 
             - **kwargs** (Dict[str, Any], 可选) - 传入的配置信息将会覆盖config中的配置信息。
 
@@ -35,8 +34,7 @@ mindformers.AutoModelForCausalLM
 
         实例化的模型会基于配置对象（通过参数传入，或在存在的情况下从目录 `pretrained_model_name_or_dir` 中载入）的 `model_type` 属性选择模型类别。若配置对象缺失，则会对 `pretrained_model_name_or_dir` 进行模式匹配：
 
-        - **glm2** - `ChatGLM2Model` ( `ChatGLM2Model` 模型)
-        - **llama** - `LlamaModel` ( `LlamaModel` 模型)
+        - ``deepseek_v3``、``deepseek_v4``、``qwen3``、``xing4_v4``、``xing4_v41``。
 
         模型会默认调用 `model.eval()` 以设置为评估模式（例如dropout模块被停用）。要训练模型，您应该首先使用 `model.train()` 将其设置回训练模式。
 

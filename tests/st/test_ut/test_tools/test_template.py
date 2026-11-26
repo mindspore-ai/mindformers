@@ -17,7 +17,6 @@ import inspect
 import pytest
 from mindformers.modules.transformer import TransformerOpParallelConfig, TransformerRecomputeConfig, \
     TransformerSwapConfig
-from mindformers.modules.transformer import MoEConfig as MoEConfig_cls
 from mindformers.tools.register.config import MindFormerConfig
 from mindformers.tools.register.template import CONFIG_NAME_TO_CLASS, CallbackConfig, ConfigTemplate, ContextConfig, \
     EvalDatasetConfig, EvalDatasetTaskConfig, GeneralConfig, LrScheduleConfig, MetricConfig, \
@@ -245,16 +244,6 @@ class TestMoEConfig:
                 assert config[key] == getattr(MoEConfig, key)
         for key in config.keys():
             assert key in MoEConfig.keys()
-
-    @pytest.mark.level0
-    @pytest.mark.platform_x86_cpu
-    @pytest.mark.env_onecard
-    def test_attribute_equal_to_class(self):
-        cls_init_params = get_class_init_params_and_defaults(MoEConfig_cls)
-        assert len(cls_init_params) == len(MoEConfig.keys())
-        for key in MoEConfig.keys():
-            assert getattr(MoEConfig, key) == cls_init_params[key]
-
 
 class TestRunnerConfig:
     """test runner_config"""

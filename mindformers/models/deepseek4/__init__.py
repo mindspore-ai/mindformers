@@ -15,6 +15,6 @@
 """The export function for deepseek4"""
 
 from .configuration_deepseek_v4 import DeepseekV4Config
-from .modeling_deepseek_v4 import DeepseekV4ForCausalLM
+from .modeling_deepseek_v4 import DeepseekV4ForCausalLM, PyNativeDeepseekV4ForCausalLM
 
 __all__ = ['DeepseekV4Config', 'DeepseekV4ForCausalLM']

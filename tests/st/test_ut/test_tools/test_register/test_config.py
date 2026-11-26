@@ -21,7 +21,6 @@ import copy
 
 import pytest
 
-from mindformers.tools.register import config as config_module
 from mindformers.tools.register.config import (
     ActionDict,
     DictConfig,
@@ -64,9 +63,8 @@ class TestConfig:
 
     @pytest.mark.level1
     @pytest.mark.platform_x86_cpu
-    def test_mindformer_config_loads_yaml_with_base(self, monkeypatch, tmp_path):
-        """MindFormerConfig should merge base yaml files and convert dict to config."""
-        monkeypatch.setattr(config_module.ConfigTemplate, "apply_template", lambda _: None)
+    def test_mindformer_config_loads_yaml_with_base(self, tmp_path):
+        """Merge inherited model YAML as written."""
         base_content = {"alpha": 1, "nested": {"from_base": True}}
         base_file = tmp_path / "base.yaml"
         base_file.write_text(yaml.safe_dump(base_content), encoding="utf-8")
@@ -75,6 +73,7 @@ class TestConfig:
             BASE_CONFIG: "base.yaml",
             "beta": 2,
             "nested": {"from_child": True},
+            "model": {"model_type": "qwen3"},
         }
         child_file = tmp_path / "child.yaml"
         child_file.write_text(yaml.safe_dump(child_content), encoding="utf-8")
@@ -83,13 +82,15 @@ class TestConfig:
         assert cfg.alpha == 1
         assert cfg.beta == 2
         assert isinstance(cfg.nested, MindFormerConfig)
+        assert cfg.nested.from_base
         assert cfg.nested.from_child
+        assert cfg.model.model_type == "qwen3"
+        assert set(cfg) == {"alpha", "beta", "nested", "model"}
 
     @pytest.mark.level1
     @pytest.mark.platform_x86_cpu
-    def test_mindformer_config_merge_and_set(self, monkeypatch):
+    def test_mindformer_config_merge_and_set(self):
         """merge_from_dict and set_value should correctly update nested fields."""
-        monkeypatch.setattr(config_module.ConfigTemplate, "apply_template", lambda _: None)
         cfg = MindFormerConfig(model={"model_config": {"type": "Demo"}})
         cfg.merge_from_dict({"model.arch": "DemoArch", "new.branch.leaf": 10})
         assert cfg.model.arch == "DemoArch"
