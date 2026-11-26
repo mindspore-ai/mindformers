@@ -36,7 +36,6 @@ DATASET_CONFIG = {
         "size": 6,
         "dataset_state_dir": f"{WORK_DIR}/saved_state",
         "handler": None,
-        "use_broadcast_data": False,
         "create_compressed_eod_mask": False,
         "compressed_eod_mask_length": 128,
         "shuffle": False,

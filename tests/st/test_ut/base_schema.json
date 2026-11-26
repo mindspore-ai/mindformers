@@ -257,12 +257,6 @@
     "mindformers.CausalLanguageModelDataset.perform_token_counting": {
         "signature": "(top_n=10, min_token_id=0, max_token_id=inf, save_path='output/token_counts_output_csv/')"
     },
-    "mindformers.KeyWordGenDataset": {
-        "signature": "(dataset_config: Optional[dict] = None, data_loader: Union[Callable, dict] = None, tokenizer: Union[Callable, dict] = None, input_columns: List[str] = None, batch_size: int = 8, drop_remainder: bool = True, num_parallel_workers: int = 8, repeat: int = 1, ignore_pad_token_for_loss: bool = True, max_source_length: int = None, max_target_length: int = None, phase: str = 'train', version: int = 1, seed: int = 0, prefetch_size: int = 1, numa_enable: bool = False, auto_tune: bool = False, filepath_prefix: str = './autotune', autotune_per_step: int = 10, profile: bool = False, **kwargs)"
-    },
-    "mindformers.MultiTurnDataset": {
-        "signature": "(dataset_config: dict)"
-    },
     "mindformers.GenerationConfig": {
         "signature": "(**kwargs)"
     },

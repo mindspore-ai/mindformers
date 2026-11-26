@@ -13,7 +13,6 @@ mindformers.tools.register.MindFormerModuleType
     CONTEXT              'context'              上下文
     DATASET              'dataset'              数据集
     DATASET_LOADER       'dataset_loader'       数据集加载器
-    DATASET_SAMPLER      'dataset_sampler'      数据集采样器
     DATA_HANDLER         'data_handler'         数据处理器
     ENCODER              'encoder'              编码器
     FEATURE_EXTRACTOR    'feature_extractor'    特征提取器

@@ -36,7 +36,7 @@ def dynamic_import(full_path: str) -> type:
         return obj
     except (ImportError, AttributeError) as e:
         raise ImportError(f"Cannot import {full_path}: \"{e}\"."
-                          f"If its import path is modified, modify the interface_map in this test case. ")
+                          f"If its import path is modified, modify the interface_map in this test case. ") from e
 
 
 def has_custom_init(cls: type) -> bool:
@@ -165,8 +165,6 @@ class TestDocstring:
             "mindformers.core.PerplexityMetric": ["clear", "eval", "update"],
             "mindformers.core.PromptAccMetric": ["clear", "eval", "update"],
             "mindformers.dataset.CausalLanguageModelDataset": None,
-            "mindformers.dataset.KeyWordGenDataset": None,
-            "mindformers.dataset.MultiTurnDataset": None,
             "mindformers.generation.GenerationConfig": None,
             "mindformers.generation.GenerationMixin": ["chat", "forward", "generate", "infer", "postprocess"],
             "mindformers.models.PreTrainedModel": ["can_generate", "from_pretrained", "post_init",
@@ -352,5 +350,5 @@ class TestDocstring:
                 self.check_method_docstring(obj, class_or_func_path)
 
         if self.error_list:
-            raise AssertionError(f"Checking arguments consistency failed! The inconsistencies are listing below:\n" +
+            raise AssertionError("Checking arguments consistency failed! The inconsistencies are listing below:\n" +
                                  " ".join(f"{i + 1}. {s}" for i, s in enumerate(self.error_list)))

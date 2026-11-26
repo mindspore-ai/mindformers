@@ -11,5 +11,3 @@ mindformers.dataset
     :nosignatures:
 
     mindformers.dataset.CausalLanguageModelDataset
-    mindformers.dataset.KeyWordGenDataset
-    mindformers.dataset.MultiTurnDataset

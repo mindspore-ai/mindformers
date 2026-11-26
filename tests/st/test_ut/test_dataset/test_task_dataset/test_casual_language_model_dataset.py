@@ -16,28 +16,14 @@
 import os
 import copy
 import tempfile
+from contextlib import ExitStack
 import unittest
 from unittest.mock import patch
 import numpy as np
 import pytest
-from mindformers.dataset.base_dataset import BaseDataset
-from mindformers import MindFormerConfig, CausalLanguageModelDataset, LlamaTokenizer
+from mindformers import MindFormerConfig, CausalLanguageModelDataset
 from mindformers.dataset.causal_language_model_dataset import dyn_batch_wrapper, get_input_data_batch_slice_map
 from tests.st.test_ut.test_dataset.get_test_data import get_mindrecord_data
-from tests.st.test_ut.test_tokenizers.get_vocab_model import get_sp_vocab_model
-
-
-temp_dir = tempfile.TemporaryDirectory()
-path = temp_dir.name
-get_sp_vocab_model("llama", path)
-tokenizer_model_path = os.path.join(path, "llama_tokenizer.model")
-tokenizer = LlamaTokenizer(vocab_file=tokenizer_model_path)
-
-
-class MockBaseDataset(BaseDataset):
-    """mock BaseDataset"""
-    def _is_data_parallel(self):
-        return True
 
 
 class TestCausalLanguageModelDataset(unittest.TestCase):
@@ -45,8 +31,9 @@ class TestCausalLanguageModelDataset(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.temp_dir = tempfile.TemporaryDirectory()
-        cls.path = cls.temp_dir.name
+        cls.resources = ExitStack()
+        cls.addClassCleanup(cls.resources.close)
+        cls.path = cls.resources.enter_context(tempfile.TemporaryDirectory())
         get_mindrecord_data(cls.path)
         cls.default_config = MindFormerConfig(
             **{
@@ -70,7 +57,7 @@ class TestCausalLanguageModelDataset(unittest.TestCase):
     def test_default(self):
         """test default logic"""
         dataset = CausalLanguageModelDataset(self.default_config)
-        for item in dataset:
+        for item in dataset.create_tuple_iterator():
             assert item[0].shape == (1, 16)
             assert list(item[0][0].asnumpy()) == [44, 47, 53, 0, 3, 59, 3, 39, 9, 19, 21, 50, 36, 23, 6, 24]
             assert len(item) == 1
@@ -78,7 +65,7 @@ class TestCausalLanguageModelDataset(unittest.TestCase):
         config = copy.deepcopy(self.default_config)
         config.data_loader.dataset_dir = os.path.join(self.path, "test.mindrecord")
         dataset = CausalLanguageModelDataset(config)
-        for item in dataset:
+        for item in dataset.create_tuple_iterator():
             assert item[0].shape == (1, 16)
             assert list(item[0][0].asnumpy()) == [44, 47, 53, 0, 3, 59, 3, 39, 9, 19, 21, 50, 36, 23, 6, 24]
             assert len(item) == 1
@@ -95,7 +82,7 @@ class TestCausalLanguageModelDataset(unittest.TestCase):
             assert CausalLanguageModelDataset(config)
         config.data_loader.dataset_files = [os.path.join(self.path, "test.mindrecord")]
         dataset = CausalLanguageModelDataset(config)
-        for item in dataset:
+        for item in dataset.create_tuple_iterator():
             assert item[0].shape == (1, 16)
             assert list(item[0][0].asnumpy()) == [44, 47, 53, 0, 3, 59, 3, 39, 9, 19, 21, 50, 36, 23, 6, 24]
             assert len(item) == 1
@@ -109,7 +96,7 @@ class TestCausalLanguageModelDataset(unittest.TestCase):
         config = copy.deepcopy(self.default_config)
         config.dynamic_batch = True
         dataset = CausalLanguageModelDataset(config)
-        for item in dataset:
+        for item in dataset.create_tuple_iterator():
             assert item[0].shape == (1, 16)
             assert list(item[0][0].asnumpy()) == [44, 47, 53, 0, 3, 59, 3, 39, 9, 19, 21, 50, 36, 23, 6, 24]
             assert len(item) == 1
@@ -134,7 +121,7 @@ class TestCausalLanguageModelDataset(unittest.TestCase):
         config.eod_token_id = 0
         config.output_columns = ["input_ids", "position_id", "attention_mask"]
         dataset = CausalLanguageModelDataset(config)
-        for item in dataset:
+        for item in dataset.create_tuple_iterator():
             assert item[0].shape == (1, 16)
             assert list(item[0][0].asnumpy()) == [44, 47, 53, 0, 3, 59, 3, 39, 9, 19, 21, 50, 36, 23, 6, 24]
             assert list(item[1][0].asnumpy()) == [0, 1, 2, 3, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
@@ -157,26 +144,6 @@ class TestCausalLanguageModelDataset(unittest.TestCase):
         assert list(res[1][0]) == [0, 1, 2, 3, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
         assert list(res[2][-1][-1]) == [0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
 
-    @pytest.mark.level1
-    @pytest.mark.platform_x86_cpu
-    @pytest.mark.env_onecard
-    def test_process_raw_text_data(self):
-        """test process_raw_text_data logic"""
-        from tests.st.test_ut.test_dataset.get_test_data import get_wikitext_data
-        get_wikitext_data(self.path)
-        config = copy.deepcopy(self.default_config)
-        config.data_loader.type = "TrainingDataLoader"
-        config.data_loader.dataset_dir = os.path.join(self.path, "wiki.train.tokens")
-        config.data_loader.column_names = ["input_ids"]
-        config.data_loader.dataset_name = "wikitext"
-        config.data_loader.file_format = "tokens"
-        config.data_loader.tokenizer = tokenizer
-        config.data_loader.max_length = 8
-        dataset = CausalLanguageModelDataset(config)
-        for item in dataset:
-            assert len(item) == 1
-            assert item[0].shape == (1, 8)
-            break
 
     @pytest.mark.level1
     @pytest.mark.platform_x86_cpu
@@ -196,26 +163,26 @@ class TestCausalLanguageModelDataset(unittest.TestCase):
         )
         config.data_loader = dataloader
         dataset = CausalLanguageModelDataset(config)
-        for item in dataset:
+        for item in dataset.create_tuple_iterator():
             assert list(item[0][0].asnumpy()) == [44, 47, 53, 0, 3, 59, 3, 39, 9, 19, 21, 50, 36, 23, 6, 24]
             break
 
-    @patch("mindformers.dataset.base_dataset.BaseDataset", MockBaseDataset)
+    @patch.object(CausalLanguageModelDataset, "_is_data_parallel", return_value=True)
     @pytest.mark.level1
     @pytest.mark.platform_x86_cpu
     @pytest.mark.env_onecard
-    def test_is_data_parallel(self):
+    def test_is_data_parallel(self, mock_is_data_parallel):
         """test is data_parallel logic"""
         config = copy.deepcopy(self.default_config)
         config.eod_reset = True
         config.eod_token_id = 0
         config.output_columns = ["input_ids", "position_id", "attention_mask"]
         dataset = CausalLanguageModelDataset(config)
-        for item in dataset:
+        mock_is_data_parallel.assert_called_once_with()
+        for item in dataset.create_tuple_iterator():
             assert list(item[0][0].asnumpy()) == [44, 47, 53, 0, 3, 59, 3, 39, 9, 19, 21, 50, 36, 23, 6, 24]
             break
 
-    @patch("mindformers.dataset.base_dataset.BaseDataset", MockBaseDataset)
     @pytest.mark.level1
     @pytest.mark.platform_x86_cpu
     @pytest.mark.env_onecard
@@ -224,7 +191,7 @@ class TestCausalLanguageModelDataset(unittest.TestCase):
         config = copy.deepcopy(self.default_config)
         config.token_monitor = True
         dataset = CausalLanguageModelDataset(config)
-        for item in dataset:
+        for item in dataset.create_tuple_iterator():
             assert item[0].shape == (1, 16)
             assert list(item[0][0].asnumpy()) == [44, 47, 53, 0, 3, 59, 3, 39, 9, 19, 21, 50, 36, 23, 6, 24]
             assert len(item) == 1

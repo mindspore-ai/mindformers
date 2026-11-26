@@ -12,5 +12,3 @@ Dataset
     :template: classtemplate.rst
 
     mindformers.dataset.CausalLanguageModelDataset
-    mindformers.dataset.KeyWordGenDataset
-    mindformers.dataset.MultiTurnDataset

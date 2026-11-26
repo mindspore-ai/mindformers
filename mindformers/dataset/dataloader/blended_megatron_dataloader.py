@@ -18,7 +18,6 @@ import os
 from enum import Enum
 from typing import Callable, List, Union
 
-import mindspore as ms
 from mindspore.dataset import GeneratorDataset
 
 from mindformers.dataset.blended_datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
@@ -29,17 +28,12 @@ from mindformers.tools.logger import logger
 from mindformers.tools.register.register import MindFormerModuleType, MindFormerRegister
 from mindformers.version_control import skip_barrier_controller
 from mindformers.utils.file_utils import is_publicly_accessible_path
-from mindformers.core.context.build_context import get_context
 from mindformers.tools.utils import (
-    MODE,
-    get_dp_from_dataset_strategy,
     get_real_group_size,
     get_real_rank,
     get_real_local_rank
 )
 
-from .utils import is_dataset_built_on_rank
-from .mock_dataloader import BaseMockDataLoader
 from .balance_adapter import build_balanced_generator
 
 
@@ -78,7 +72,7 @@ class MegatronDatasetBuilder:
         tokenizer(Union[dict, Callable]): tokenizer config or tokenizer instance.
 
     Returns:
-        MegatronDataset instance or Fakedataset instance.
+        MegatronDataset instance.
     """
     # supported megatron dataset
     supported_megatron_datasets_type_list = ['GPTDataset']
@@ -154,29 +148,7 @@ class MegatronDatasetBuilder:
                                            num_parallel_workers=kwargs.get('num_parallel_workers', 1))
             return gen_dataset
 
-        if get_real_group_size() > 1 and get_context('mode') != MODE['PYNATIVE_MODE']:
-            global_rank_id = get_real_rank()
-            stage_num = ms.get_auto_parallel_context("pipeline_stages")
-            total_device_num = get_real_group_size() // stage_num
-            dp = get_dp_from_dataset_strategy()
-            tp = total_device_num // dp
-            if is_dataset_built_on_rank():
-                logger.info(f"This rank is {global_rank_id}, tensor parallel = {tp}, \
-                            pipeline stage = {global_rank_id//(dp *tp )}, this rank will build real data.")
-                gen_dataset = build_gpt_dataset()
-            else:
-                logger.info(f"This rank is {global_rank_id}, tensor parallel = {tp}, \
-                            pipeline stage = {global_rank_id//(dp *tp )}, this rank will build empty data.")
-                source = MockBlendedMegatron(blended_config, sizes[0])
-                gen_dataset = GeneratorDataset(
-                    source,
-                    column_names=source.cols(),
-                    shuffle=False,
-                    num_shards=num_shards,
-                    shard_id=shard_id)  # keep the same sharding as real dataset
-                skip_barrier_controller(times=2)
-        else:
-            gen_dataset = build_gpt_dataset()
+        gen_dataset = build_gpt_dataset()
         return gen_dataset
 
     def init_gpt_dataset_config(self) -> GPTDatasetConfig:
@@ -217,45 +189,6 @@ class MegatronDatasetBuilder:
             eod=self.config.get("eod", -1),
             pad=self.config.get("pad", -1),
         )
-
-
-class MockBlendedMegatron(BaseMockDataLoader):
-
-    """
-    The mock GPTDataset
-
-    Args:
-        config (GPTDatasetConfig): Dataset configurations.
-        size (int): Total number of samples in the dataset.
-    """
-
-    def __init__(self, config, size):
-        self.seq_length = config.sequence_length
-        self.create_attention_mask = config.create_attention_mask
-        self.create_compressed_eod_mask = config.create_compressed_eod_mask
-
-        # Define column names and shapes for each column based on configuration
-        mock_columns = ["input_ids", "labels", "loss_mask", "position_ids"]
-        mock_shapes = [
-            [self.seq_length],  # input_ids
-            [self.seq_length],  # labels
-            [self.seq_length],  # loss_mask
-            [self.seq_length]   # position_ids
-        ]
-        if self.create_compressed_eod_mask:
-            mock_columns.append('actual_seq_len')
-            mock_shapes.append([config.eod_pad_length])
-        elif self.create_attention_mask:
-            mock_columns.append('attention_mask')
-            mock_shapes.append([1, self.seq_length, self.seq_length])
-
-        # Define data types: all fields use int32
-        mock_dtypes = ['int32'] * len(mock_columns)
-        super().__init__(mock_columns, mock_shapes, mock_dtypes, size)
-
-    def cols(self):
-        """Returns the list of column names generated during initialization."""
-        return self.mock_columns
 
 
 @MindFormerRegister.register(MindFormerModuleType.DATASET_LOADER)

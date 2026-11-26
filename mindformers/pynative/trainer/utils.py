@@ -538,7 +538,6 @@ def _build_dataset(
         dataset = BlendedMegatronDatasetDataLoader(**dataloader_config)
         create_compressed_eod_mask = dataloader_config['config']['create_compressed_eod_mask']
     elif dataloader_type == "HFDataLoader":
-        dataloader_config['use_broadcast_data'] = False
         # Context parallel requires position_ids; plain SFT datasets usually lack it.
         # Batches are consumed by column name here, so the extra column is harmless otherwise.
         dataloader_config.setdefault('create_position_ids', True)

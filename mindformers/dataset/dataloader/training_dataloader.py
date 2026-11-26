@@ -26,88 +26,9 @@ from pyarrow.csv import read_csv, ParseOptions
 from pyarrow.parquet import ParquetDataset
 from pyarrow.lib import Table
 
-from mindspore.dataset import GeneratorDataset
-from mindspore._checkparam import args_type_check
-from mindformers.tools.register import MindFormerRegister, MindFormerModuleType
 from mindformers.models.build_tokenizer import build_tokenizer
 from mindformers.dataset.dataloader.datareaders import _DATA_READER_MAP
 from mindformers.tools.logger import logger
-
-
-@MindFormerRegister.register(MindFormerModuleType.DATASET_LOADER)
-class TrainingDataLoader:
-    """Training DataLoader."""
-    @args_type_check(dataset_dir=str, column_names=list, tokenizer=(str, dict, Callable), dataset_name=str,
-                     is_align=bool, max_length=int, text_col=str, file_format=str, read_function=Callable,
-                     shuffle=bool, samples_num=int, skip_num=int, file_limit=int)
-    def __new__(cls,
-                dataset_dir: str,
-                column_names: list,
-                tokenizer: Union[str, dict, Callable],
-                dataset_name: str = "",
-                is_align: bool = True,
-                max_length: int = 1025,
-                text_col: str = "",
-                file_format: str = None,
-                read_function: Callable = None,
-                shuffle: bool = False,
-                samples_num: int = 10000,
-                skip_num: int = 0,
-                file_limit: int = 1,
-                process_num: int = 64,
-                **kwargs):
-        r"""
-        Training DataLoader API.
-
-        Args:
-            dataset_dir (str): The directory path to parquet text with hdfs.
-            column_names(list): Column names contained in the created dataset.
-            tokenizer (Union[str, dict, Callable]): Tokenizer configuration.
-            dataset_name (str): Dataset name. Currently, ["wikitext"] is supported.
-            is_align (bool): Indicates whether to align input_ids to `max_length`.
-            max_length (int): Maximum length of a token.
-            text_col (str): Column name of the dataset to be trained.
-            file_format (str): Retrieves the end character of the desired file name.
-            read_function (Callable): User-defined functions for reading data.
-                The input parameter is the path of the dataset file.
-                The return value is a dictionary. Key indicates the column name,
-                    and value indicates the value of the column.
-            shuffle (bool): Whether to perform shuffle on the dataset.
-                Random accessible input is required.
-                Default: True, expected order behavior shown in the table below.
-            samples_num(int): Specifies the number of samples to be trained.
-            skip_num(int): Skip the first N elements of the dataset.
-            file_limit(int): Limit on the number of files read at a time.
-
-        Return:
-            A GeneratorDataset object.
-
-        Raises:
-            ValueError: Error input for dataset_dir.
-            TypeError: Type error for column_names.
-        """
-        dataset_dir = os.path.realpath(dataset_dir)
-        if max_length <= 0:
-            raise TypeError("max_length should be an integer greater than 0.")
-
-        logger.info("dataset_dir: %s, samples_num: %s", dataset_dir, samples_num)
-        training_dataset = TrainingDataset(dataset_dir, column_names=column_names, tokenizer=tokenizer,
-                                           dataset_name=dataset_name, is_align=is_align, max_length=max_length,
-                                           text_col=text_col, file_format=file_format, read_function=read_function,
-                                           shuffle=shuffle, samples_num=samples_num, file_limit=file_limit,
-                                           process_num=process_num)
-
-        dataset_args = {
-            'num_samples': kwargs.get('num_samples', None),
-            'num_parallel_workers': kwargs.get('num_parallel_workers', 1),
-            'python_multiprocessing': kwargs.get('python_multiprocessing', True),
-            'num_shards': None,
-            'shard_id': None,
-        }
-        gen_dataset = GeneratorDataset(training_dataset, column_names=column_names, shuffle=shuffle, **dataset_args)
-        logger.info("NOTE: The sample of Dataset will skip %s", skip_num)
-        gen_dataset = gen_dataset.skip(skip_num)
-        return gen_dataset
 
 
 def run_cmd(command, pipeline=None):

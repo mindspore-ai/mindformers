@@ -46,8 +46,6 @@ def _check_mode(config, mode, **kwargs):
             config.model.model_config.use_past = False
             logger.warning("use_past could not be used in train mode, "
                            "it has been forced to False")
-        if config.metric:
-            _check_keyword_gen_dataset(config, mode, **kwargs)
     elif mode == 'predict':
         _restore_net_type(config)
         _rule_bs_divisible_by_dp(config, **kwargs)
@@ -55,9 +53,6 @@ def _check_mode(config, mode, **kwargs):
         _restore_net_type(config)
         _rule_fa_only_for_train(config, mode)
         _rule_pp_only_for_train(config, mode)
-
-        if config.metric:
-            _check_keyword_gen_dataset(config, mode, **kwargs)
 
         _rule_bs_divisible_by_dp(config, **kwargs)
     elif mode == 'predict_with_train_model':
@@ -225,69 +220,6 @@ def _check_parallel(config):
         return
     raise ValueError("It is not supported that pipeline_scheduler is seqvpp when seq_split_num is 1, "
                      "please set pipeline_scheduler to seqpipe.")
-
-
-def _check_keyword_gen_dataset(config, mode, **kwargs):
-    """
-    check seq_len keyword_gen_dataset satisfy
-    `seq_length = max_source_length + max_target_length + 1` in train_dataset or
-    `seq_length = max_source_length` in eval_dataset
-    """
-    dataset = kwargs.get('dataset', None)
-    model = kwargs.get('network', None)
-    # if model or dataset was not generate from config,
-    # skip this verification
-    if model or dataset:
-        return
-
-    train_dataset = config.train_dataset
-    eval_dataset = config.eval_dataset
-    seq_length = config.model.model_config.seq_length
-
-    def raise_error_msg(phase, max_source_length, max_target_length, dataset_phase):
-        """generate error message"""
-        if phase == "train" and max_source_length + max_target_length + 1 != seq_length:
-            raise ValueError(f"make sure `seq_length = max_source_length + max_target_length + 1`, "
-                             f"but got seq_length={seq_length}, "
-                             f"max_source_length={max_source_length}, "
-                             f"max_target_length={max_target_length} in {dataset_phase}.")
-        if phase == "eval" and max_source_length != seq_length:
-            raise ValueError(f"make sure `seq_length = max_source_length`, "
-                             f"but got seq_length={seq_length}, "
-                             f"max_source_length={max_source_length} in {dataset_phase}.")
-
-    for metric_config in config.metric:
-        if mode == 'train' and train_dataset and train_dataset.data_loader.type == "ADGenDataLoader":
-            # verify train_dataset
-            raise_error_msg("train", train_dataset.max_source_length,
-                            train_dataset.max_target_length, "train_dataset")
-
-            # when do_eval == True, using ADGENMetric, verify eval_dataset
-            if config.do_eval and metric_config['type'] == "ADGENMetric":
-                raise_error_msg("eval", eval_dataset.max_source_length,
-                                eval_dataset.max_target_length, "eval_dataset")
-
-            # when do_eval == True, using PerplexityMetric, verify eval_dataset
-            if config.do_eval and metric_config['type'] == "PerplexityMetric":
-                raise_error_msg("train", eval_dataset.max_source_length,
-                                eval_dataset.max_target_length, "eval_dataset")
-
-        if mode == 'eval' and eval_dataset and eval_dataset.data_loader.type == "ADGenDataLoader":
-            # verify eval_dataset
-            if metric_config['type'] == "ADGENMetric":
-                raise_error_msg("eval", eval_dataset.max_source_length,
-                                eval_dataset.max_target_length, "eval_dataset")
-
-            if metric_config['type'] == "PerplexityMetric":
-                raise_error_msg("train", eval_dataset.max_source_length,
-                                eval_dataset.max_target_length, "eval_dataset")
-
-        # when do_eval == True, eval_dataset should be in train mode
-        if metric_config['type'] == "PerplexityMetric" and \
-                eval_dataset and eval_dataset.data_loader.phase != 'train':
-            logger.warning("when using 'PerplexityMetric', eval_dataset.data_loader.phase would be set to 'train'.")
-            eval_dataset.data_loader.phase = 'train'
-            config.eval_dataset_task.dataset_config.data_loader.phase = eval_dataset.data_loader.phase
 
 
 def _rule_recompute(pp, recompute, key):

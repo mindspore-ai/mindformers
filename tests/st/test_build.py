@@ -48,13 +48,6 @@ class TestDataset:
         self.dataset_config = dataset_config
 
 
-@MindFormerRegister.register(MindFormerModuleType.DATASET_SAMPLER)
-class TestSampler:
-    """Test Sampler API For Register."""
-    def __init__(self):
-        pass
-
-
 @MindFormerRegister.register(MindFormerModuleType.TRANSFORMS)
 class TestTransforms1:
     """Test Transforms API For Register."""

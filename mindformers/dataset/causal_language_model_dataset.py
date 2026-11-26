@@ -47,9 +47,6 @@ def _use_compressed_eod_mask(data_loader):
     if (hasattr(data_loader, 'create_compressed_eod_mask') and
             data_loader.create_compressed_eod_mask):
         return True
-    if (hasattr(data_loader, 'adaptor_config') and data_loader.adaptor_config and
-            data_loader.adaptor_config.compress_mask):  # common dataloader
-        return True
     return False
 
 
@@ -306,6 +303,8 @@ class CausalLanguageModelDataset(BaseDataset):
                 token_monitor: bool = False,
                 token_monitor_config: Optional[dict] = None,
                 **kwargs):
+        # Parameters are forwarded through locals() to the config builder.
+        # pylint: disable=unused-argument
         logger.info("Now Create Causal Language Model Dataset.")
         dataset_config = cls.check_dataset_config(dataset_config, locals())
         dataset_config = copy.deepcopy(dataset_config)
@@ -324,7 +323,7 @@ class CausalLanguageModelDataset(BaseDataset):
 
         type_cast_op = TypeCast(mstype.int32)
         if dataset_config.eod_reset:
-            if cls._is_semi_full_batch() or cls._is_data_parallel():
+            if cls._is_data_parallel():
                 shard_id = 0
                 dis = dataset_config.batch_size
             else:
@@ -424,8 +423,7 @@ class CausalLanguageModelDataset(BaseDataset):
             raise ValueError(f"data_loader must contain dataset_dir or dataset_files,"
                              f"but get {dataset_config.data_loader}.")
 
-        if not cls._is_full_batch():
-            dataset_config = cls._reset_num_samples(dataset_config)
+        dataset_config = cls._reset_num_samples(dataset_config)
 
         dataset = build_dataset_loader(
             dataset_config.data_loader, default_args={'dataset_files': dataset_files,
@@ -436,14 +434,14 @@ class CausalLanguageModelDataset(BaseDataset):
 
     @classmethod
     def _reset_num_samples(cls, dataset_config):
-        """reset num_samples for full_batch=False"""
+        """Set each data-parallel shard's sample count."""
         num_samples = dataset_config.data_loader.get('num_samples')
         if num_samples is None:
             return dataset_config
 
         # dataset_config.device_num is equal to dp
         cur_num_samples = num_samples // dataset_config.num_shards
-        logger.info(f"If set full_batch=False and num_samples, "
+        logger.info(f"If num_samples is configured, "
                     f"num_samples will reset from {num_samples} to {cur_num_samples}.")
         dataset_config.data_loader.num_samples = cur_num_samples
         return dataset_config

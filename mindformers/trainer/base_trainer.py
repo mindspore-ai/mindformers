@@ -958,8 +958,8 @@ class BaseTrainer:
             self._set_dataset_broadcast_opt_level(config)
             dataloader_config = dataloader_config.get('config')
 
-        # Case 2: HFDataLoader or CommonDataLoader
-        if dataloader_type in ['HFDataLoader', 'CommonDataLoader']:
+        # Case 2: HFDataLoader
+        if dataloader_type == 'HFDataLoader':
             # Collect handler types if present
             handler = []
             if dataloader_config.handler is not None:
@@ -974,9 +974,6 @@ class BaseTrainer:
                 for callback in config.callbacks:
                     if callback.get('type') == 'CheckpointMonitor':
                         dataloader_config.save_step = int(config.checkpoint.save_interleaved_steps)
-
-            if dataloader_config.get('use_broadcast_data', True):
-                self._set_dataset_broadcast_opt_level(config)
 
         config, dataset_strategy, column_names, construct_args_key = self._get_columns_with_strategy(
             config, dataloader_config, dataloader_type)
@@ -1177,7 +1174,7 @@ class BaseTrainer:
         dataloader_config = config.train_dataset.get('data_loader', {})
         dataloader_type = dataloader_config.get('type')
         if (config.resume_training or not config.checkpoint.no_load_optim) and \
-                dataloader_type in ['HFDataLoader', 'CommonDataLoader']:
+                dataloader_type == 'HFDataLoader':
             resume_step = config.runner_config.initial_step
             _resume_hf_iterable_dataset(dataset, resume_step)
 

@@ -17,39 +17,6 @@
 import os
 from typing import List, Union
 
-import mindspore as ms
-
-from mindformers.core.context.build_context import get_context
-from mindformers.tools.utils import (
-    get_dp_from_dataset_strategy,
-    get_real_group_size,
-    get_real_rank
-)
-
-
-def is_dataset_built_on_rank() -> bool:
-    """check which rank need to build dataset."""
-    ds_broadcast_level = get_context("dataset_broadcast_opt_level")
-
-    global_rank_id = get_real_rank()
-    stage_num = ms.get_auto_parallel_context("pipeline_stages")
-    total_device_num = get_real_group_size() // stage_num
-    dp = get_dp_from_dataset_strategy()
-    tp = int(total_device_num // dp)
-
-    local_stage_num = int(global_rank_id // (dp * tp))
-
-    # when not stage 0 or last stage, no need to build dataset.
-    if 0 < local_stage_num < (stage_num - 1) and ds_broadcast_level in [3, 1]:
-        return False
-
-    # In tp group, only need one card to build dataset, others don't need to build dataset.
-    if global_rank_id % tp != 0 and ds_broadcast_level in [3, 2]:
-        return False
-
-    return True
-
-
 def _get_mindrecord_files(dataset_files: Union[str, List[str]]) -> List[str]:
     """
     Get all MindRecord format files from given file paths or directories.

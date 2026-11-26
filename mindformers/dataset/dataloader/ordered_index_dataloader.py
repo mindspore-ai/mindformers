@@ -23,22 +23,17 @@ from dataclasses import dataclass
 import numpy as np
 from tqdm import tqdm
 
-import mindspore as ms
-from mindspore import Tensor, ops
 from mindspore.dataset import GeneratorDataset
 
 from mindformers.tools.register import MindFormerRegister, MindFormerModuleType
 from mindformers.tools.logger import logger
 from mindformers.version_control import skip_barrier_controller
-from mindformers.tools.utils import get_real_group_size, get_real_rank, get_output_root_path, MODE
-from mindformers.core.context.build_context import get_context
+from mindformers.tools.utils import get_real_group_size, get_real_rank, get_output_root_path
 from mindformers.dataset.blended_datasets.indexed_dataset import IndexedDataset
 from mindformers.dataset.balance_metadata import (
     DocumentEodIndex, attention_load, checked_indices, eod_boundaries, file_versions, fingerprint,
 )
 
-from .utils import is_dataset_built_on_rank
-from .blended_megatron_dataloader import MockBlendedMegatron
 from .balance_adapter import build_balanced_generator
 
 
@@ -120,63 +115,10 @@ class OrderedIndexDataLoader:
         if balance_spec is not None and not config.create_compressed_eod_mask:
             raise ValueError('Ordered balance requires compressed EOD and does not support seq_len_vector.')
 
-        world_size = get_real_group_size()
-        if world_size > 1 and get_context('mode') == MODE['PYNATIVE_MODE']:
-            dataset = OrderedIndexDataset(config)
-            if balance_spec is not None:
-                return build_balanced_generator(dataset, kwargs.get('column_names'), balance_spec,
-                                                 False, kwargs.get('num_parallel_workers', 1))
-            return GeneratorDataset(
-                dataset,
-                column_names=kwargs.get('column_names'),
-                num_parallel_workers=kwargs.get("num_parallel_workers", 1),
-                python_multiprocessing=kwargs.get("python_multiprocessing", False),
-                shard_id=kwargs.get("shard_id"),
-                num_shards=kwargs.get("num_shards"),
-                shuffle=False,
-            )
-        if  world_size > 1:
-            is_main_rank = is_dataset_built_on_rank()
-        else:
-            is_main_rank = True
-        enable_dryrun = os.environ.get('MS_SIMULATION_LEVEL', '0') != '0'
-        if world_size > 1 and not is_main_rank and not enable_dryrun:
-            if config.use_cache and config.cache_dir:
-                # Pair with the barrier rank 0 executes inside _build_index_map,
-                # so every rank runs the same number of barriers; otherwise the
-                # collective hangs on unmatched participation.
-                skip_barrier_controller()  # barrier
-            skip_barrier_controller()  # barrier
-
-            logger.info(" > Start receive dataset size from main rank.")
-            received_data = (Tensor([0], dtype=ms.int32),)
-            dataset_size = ops.Broadcast(0)(received_data)[0].numpy()[0]
-            logger.info(f" > Received dataset size: {dataset_size}")
-
-            setattr(config, 'eod_pad_length', config.compressed_eod_mask_length)
-            dataset = MockBlendedMegatron(config, dataset_size)
-            return GeneratorDataset(
-                dataset,
-                column_names=kwargs.get('column_names'),
-                num_parallel_workers=kwargs.get("num_parallel_workers", 1),
-                python_multiprocessing=kwargs.get("python_multiprocessing", False),
-                shard_id=kwargs.get("shard_id"),
-                num_shards=kwargs.get("num_shards"),
-                shuffle=False,
-            )
-
         dataset = OrderedIndexDataset(config)
-
         if balance_spec is not None:
             return build_balanced_generator(dataset, kwargs.get('column_names'), balance_spec,
                                              False, kwargs.get('num_parallel_workers', 1))
-
-        if world_size > 1:
-            skip_barrier_controller()  # barrier
-            dataset_size = Tensor(len(dataset), dtype=ms.int32)
-            logger.info(f" > Start broadcast dataset size: {dataset_size}")
-            ops.Broadcast(0)((dataset_size,))
-
         return GeneratorDataset(
             dataset,
             column_names=kwargs.get('column_names'),
