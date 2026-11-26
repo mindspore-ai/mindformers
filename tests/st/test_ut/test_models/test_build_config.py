@@ -13,16 +13,15 @@
 # limitations under the License.
 # ============================================================================
 """test build config."""
-from mindformers import MindFormerConfig
 from mindformers.models.build_config import build_model_config
-from mindformers.models.llama import LlamaConfig
+from mindformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
 
 class TestBuildModelConfig:
     """A test class for testing build_model_config() method."""
 
-    def test_build_llama_config(self):
-        """test build llama config from yaml."""
-        config = MindFormerConfig("research/llama3_1/llama3_1_8b/finetune_llama3_1_8b.yaml")
-        model_config = build_model_config(config.model.model_config)
-        assert isinstance(model_config, LlamaConfig)
+    def test_build_qwen3_config(self):
+        """Build a registered PyNative configuration without legacy YAML."""
+        model_config = build_model_config({"model_type": "qwen3", "hidden_size": 128})
+        assert isinstance(model_config, Qwen3Config)
+        assert model_config.hidden_size == 128

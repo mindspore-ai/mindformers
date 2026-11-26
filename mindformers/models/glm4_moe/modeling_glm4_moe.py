@@ -24,7 +24,7 @@ from mindformers.models.glm4_moe.utils import Glm4MoePreTrainedModel
 from mindformers.models.glm4_moe.modeling_glm4_moe_infer import InferenceGlm4MoeForCausalLM
 
 
-@MindFormerRegister.register(MindFormerModuleType.MODELS, legacy=False)
+@MindFormerRegister.register(MindFormerModuleType.MODELS)
 class Glm4MoeForCausalLM(Glm4MoePreTrainedModel):
     r"""
     Provide Glm4Moe Model for training and inference.

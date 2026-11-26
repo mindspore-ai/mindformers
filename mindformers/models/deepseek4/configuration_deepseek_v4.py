@@ -37,7 +37,7 @@ from mindformers.models.model_config_utils import (
 DEEPSEEK_PRETRAINED_CONFIG_ARCHIVE_MAP = {}
 
 
-@MindFormerRegister.register(MindFormerModuleType.CONFIG, legacy=False, search_names=['deepseek_v4', 'deepseek_mtp_v4'])
+@MindFormerRegister.register(MindFormerModuleType.CONFIG, search_names=['deepseek_v4', 'deepseek_mtp_v4'])
 class DeepseekV4Config(PretrainedConfig):
     r"""
     This is the configuration class to store the configuration of a [`DeepseekV4Model`].

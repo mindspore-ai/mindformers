@@ -59,7 +59,6 @@ from mindformers.tools.register import MindFormerModuleType, MindFormerRegister
 def test_build_model_syncs_compression_before_layout_selection(
         monkeypatch, loader, model_enabled, expected_enabled):
     """Exercise the model builder/converter in PyNative mode without allocating weights."""
-    monkeypatch.setattr("mindformers.tools.register.register.is_legacy_model", lambda: False)
     config = TrainConfig.from_dict({
         "model": {
             "model_type": "deepseek_v4",

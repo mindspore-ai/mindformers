@@ -26,7 +26,6 @@ import pytest
 import mindspore as ms
 from mindspore import Tensor, Parameter, nn, dtype as mstype
 
-from mindformers.pynative.optimizer import muon as muon_mod
 from mindformers.pynative.optimizer.muon import Muon
 
 
@@ -75,10 +74,8 @@ class TestMuonMasterWeights:
     """CPU tests for Muon fp32 master-weights creation, sync and reload."""
 
     def setup_method(self):
-        """Fresh net + Muon per test; stub is_legacy_model to False (restored in teardown)."""
+        """Fresh net and Muon per test."""
         ms.set_context(mode=ms.PYNATIVE_MODE)
-        self._orig_is_legacy_model = muon_mod.core_context.is_legacy_model
-        muon_mod.core_context.is_legacy_model = lambda: False
         self.net = MixedNet()
         self.opt = Muon(
             self.net.trainable_params(),
@@ -86,8 +83,6 @@ class TestMuonMasterWeights:
             comm_strategy="allgather",
         )
 
-    def teardown_method(self):
-        muon_mod.core_context.is_legacy_model = self._orig_is_legacy_model
 
     @pytest.mark.level0
     @pytest.mark.platform_x86_cpu

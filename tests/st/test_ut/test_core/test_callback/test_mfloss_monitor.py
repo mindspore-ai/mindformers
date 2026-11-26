@@ -14,16 +14,24 @@
 # ============================================================================
 """Test test_mfloss_monitor.py"""
 import builtins
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 import unittest
 import numpy as np
-import mindspore as ms
 import pytest
 from mindspore import Tensor
 from mindformers.core.callback.callback import MFLossMonitor
+from mindformers.parallel_core.transformer_config import TransformerConfig
 
 # pylint: disable=protected-access
 # pylint: disable=unused-argument   # for mock logic
+
+
+def make_pynative_network():
+    """A bounded model fixture for dynamic FLOPs calculation and router reset."""
+    config = TransformerConfig(num_layers=2, hidden_size=8, num_attention_heads=2,
+                               ffn_hidden_size=32, vocab_size=32, seq_length=8)
+    return SimpleNamespace(get_gpt_transformer_config=lambda: config)
 
 
 class TestMFLossMonitor(unittest.TestCase):
@@ -124,36 +132,6 @@ class TestMFLossMonitor(unittest.TestCase):
             # Should divide by micro_size
             self.assertEqual(fixed_loss, 1.0)
 
-    @pytest.mark.level1
-    @pytest.mark.platform_x86_cpu
-    @pytest.mark.env_onecard
-    def test_can_calculate_model_flops_train_mode(self):
-        """Test _can_calculate_model_flops in train mode"""
-        mock_cb_params = Mock()
-        mock_cb_params.mode = 'train'
-        mock_cb_params.train_network = Mock()
-        mock_cb_params.train_network.current_phase = 'train_phase'
-
-        with patch('mindformers.core.callback.callback.get_context') as mock_get_context:
-            mock_get_context.return_value = ms.GRAPH_MODE
-
-            result = self.monitor._can_calculate_model_flops(mock_cb_params)
-
-            self.assertTrue(result)
-            self.assertEqual(self.monitor.current_phase, 'train_phase')
-
-    @pytest.mark.level1
-    @pytest.mark.platform_x86_cpu
-    @pytest.mark.env_onecard
-    def test_can_calculate_model_flops_invalid_mode(self):
-        """Test _can_calculate_model_flops with invalid mode"""
-        mock_cb_params = Mock()
-        mock_cb_params.mode = 'invalid'
-
-        result = self.monitor._can_calculate_model_flops(mock_cb_params)
-
-        self.assertFalse(result)
-
 
 class TestMFLossMonitorIntegration(unittest.TestCase):
     """MFLossMonitor integration tests"""
@@ -188,6 +166,8 @@ class TestMFLossMonitorIntegration(unittest.TestCase):
         mock_cb_params.dataset_sink_mode = False
         mock_cb_params.initial_step = 0
         mock_cb_params.mode = 'train'
+        mock_cb_params.train_network = make_pynative_network()
+        mock_cb_params.get.return_value = None
         mock_run_context.original_args.return_value = mock_cb_params
 
         # Mock auto parallel context
@@ -423,9 +403,11 @@ class TestMFLossMonitorOnTrainStepEnd:
         cb_params.dataset_sink_mode = False
         cb_params.net_outputs = (0.5, False, 1024.0, 0.001, 2.5)
         cb_params.get.return_value = None
+        cb_params.mode = 'train'
+        cb_params.train_network = make_pynative_network()
         run_context.original_args.return_value = cb_params
 
-        separate_loss_mock = (np.array([0.3]), np.array([0.1]), np.array([0.1]))
+        separate_loss_mock = (np.array([0.3]), np.array([0.1]), np.array([0.1]), np.array([0.0]))
         loss_patch = 'mindformers.core.callback.callback._get_separate_loss'
         with patch(loss_patch, return_value=separate_loss_mock):
             monitor.on_train_step_end(run_context)
@@ -473,59 +455,12 @@ class TestMFLossMonitorOnTrainStepEnd:
         cb_params.net_outputs = 0.5
         cb_params.get.return_value = None
         cb_params.mode = 'train'
-        cb_params.train_network = Mock()
-        cb_params.train_network.current_phase = 'train_phase'
+        cb_params.train_network = make_pynative_network()
         run_context.original_args.return_value = cb_params
 
-        with patch.object(monitor, '_calculate_model_flops'):
-            monitor.on_train_step_end(run_context)
-
-
-class TestMFLossMonitorCalculateFlops:
-    """Test MFLossMonitor._calculate_model_flops"""
-
-    @pytest.mark.level1
-    @pytest.mark.platform_x86_cpu
-    @patch('mindformers.core.callback.callback.get_real_group_size', return_value=8)
-    @patch('mindformers.core.callback.callback.get_tensorboard_writer', return_value=None)
-    @patch('mindformers.core.callback.callback.get_tensorboard_args', return_value={})
-    @patch('mindformers.core.callback.callback.flops_collection')
-    @patch('mindformers.core.callback.callback.auto_parallel_context')
-    @patch('mindformers.core.callback.callback.get_group_size', return_value=8)
-    def test_calculate_model_flops_standalone(
-            self, mock_group_size, mock_auto_context, mock_flops, *mocks):
-        """Test _calculate_model_flops in standalone mode"""
-
-        monitor = MFLossMonitor()
-        monitor.current_phase = 'train_phase'
-
-        mock_flops.return_value = (1000000.0, 0, 500000.0, 0, False)
-        mock_auto_context.return_value.get_pipeline_stages.return_value = 1
-        mock_auto_context.return_value.get_parallel_mode.return_value = 'stand_alone'
-
-        monitor._calculate_model_flops()
-
+        monitor.on_train_step_end(run_context)
         assert monitor.mf_calculated
-        assert monitor.full_model_flops == 1000000.0
-
-    @pytest.mark.level1
-    @pytest.mark.platform_x86_cpu
-    @patch('mindformers.core.callback.callback.get_real_group_size', return_value=8)
-    @patch('mindformers.core.callback.callback.get_tensorboard_writer', return_value=None)
-    @patch('mindformers.core.callback.callback.get_tensorboard_args', return_value={})
-    @patch('mindformers.core.callback.callback.flops_collection')
-    def test_calculate_model_flops_runtime_error(self, mock_flops, *mocks):
-        """Test _calculate_model_flops with RuntimeError"""
-
-        monitor = MFLossMonitor()
-        monitor.current_phase = 'train_phase'
-        monitor.mf_support = True
-
-        mock_flops.side_effect = RuntimeError("Flops calculation failed")
-
-        monitor._calculate_model_flops()
-
-        assert not monitor.mf_support
+        assert monitor.full_model_flops > 0
 
 
 class TestMFLossMonitorPrintOutputInfo:
@@ -572,8 +507,7 @@ class TestMFLossMonitorPrintOutputInfo:
     @pytest.mark.level1
     @pytest.mark.platform_x86_cpu
     @patch('mindformers.core.callback.callback.get_group_size', return_value=8)
-    @patch('mindformers.core.callback.callback.is_legacy_model', return_value=False)
-    def test_print_output_info_with_separate_loss(self, mock_legacy, mock_group_size, *mocks):
+    def test_print_output_info_with_separate_loss(self, mock_group_size, *mocks):
         """Test print_output_info with separate loss (MoE and MTP)"""
 
         monitor = MFLossMonitor(
@@ -642,119 +576,6 @@ class TestMFLossMonitorGetPipelineGroup:
         assert rank_list_str == "2-6"
 
 
-class TestMFLossMonitorCanCalculateFlops:
-    """Test MFLossMonitor._can_calculate_model_flops"""
-
-    @pytest.mark.level1
-    @pytest.mark.platform_x86_cpu
-    @patch('mindformers.core.callback.callback.get_real_group_size', return_value=1)
-    @patch('mindformers.core.callback.callback.get_tensorboard_writer', return_value=None)
-    @patch('mindformers.core.callback.callback.get_tensorboard_args', return_value={})
-    @patch('mindformers.core.callback.callback.get_context', return_value=0)  # GRAPH_MODE
-    @patch('mindformers.core.callback.callback.is_legacy_model', return_value=True)
-    def test_can_calculate_flops_train_mode(self, mock_legacy, mock_get_context, *mocks):
-        """Test _can_calculate_model_flops in train mode"""
-
-        monitor = MFLossMonitor()
-        monitor.is_moe_model = False
-
-        cb_params = Mock()
-        cb_params.mode = 'train'
-        cb_params.train_network = Mock()
-        cb_params.train_network.current_phase = 'train_phase'
-
-        result = monitor._can_calculate_model_flops(cb_params)
-
-        assert result
-        assert monitor.current_phase == 'train_phase'
-
-    @pytest.mark.level1
-    @pytest.mark.platform_x86_cpu
-    @patch('mindformers.core.callback.callback.get_real_group_size', return_value=1)
-    @patch('mindformers.core.callback.callback.get_tensorboard_writer', return_value=None)
-    @patch('mindformers.core.callback.callback.get_tensorboard_args', return_value={})
-    @patch('mindformers.core.callback.callback.get_context', return_value=1)  # PYNATIVE_MODE
-    @patch('mindformers.core.callback.callback.logger')
-    def test_can_calculate_flops_pynative_mode(self, mock_logger, mock_get_context, *mocks):
-        """Test _can_calculate_model_flops in pynative mode (should fail)"""
-
-        monitor = MFLossMonitor()
-
-        cb_params = Mock()
-        cb_params.mode = 'train'
-        cb_params.train_network = Mock()
-
-        result = monitor._can_calculate_model_flops(cb_params)
-
-        assert not result
-        mock_logger.warning.assert_called()
-
-    @pytest.mark.level1
-    @pytest.mark.platform_x86_cpu
-    @patch('mindformers.core.callback.callback.get_real_group_size', return_value=1)
-    @patch('mindformers.core.callback.callback.get_tensorboard_writer', return_value=None)
-    @patch('mindformers.core.callback.callback.get_tensorboard_args', return_value={})
-    @patch('mindformers.core.callback.callback.logger')
-    def test_can_calculate_flops_invalid_mode(self, mock_logger, *mocks):
-        """Test _can_calculate_model_flops with invalid mode"""
-
-        monitor = MFLossMonitor()
-
-        cb_params = Mock()
-        cb_params.mode = 'predict'  # Invalid mode
-
-        result = monitor._can_calculate_model_flops(cb_params)
-
-        assert not result
-        mock_logger.warning.assert_called()
-
-    @pytest.mark.level1
-    @pytest.mark.platform_x86_cpu
-    @patch('mindformers.core.callback.callback.get_real_group_size', return_value=1)
-    @patch('mindformers.core.callback.callback.get_tensorboard_writer', return_value=None)
-    @patch('mindformers.core.callback.callback.get_tensorboard_args', return_value={})
-    @patch('mindformers.core.callback.callback.get_context', return_value=0)
-    @patch('mindformers.core.callback.callback.logger')
-    def test_can_calculate_flops_no_current_phase(self, mock_logger, mock_get_context, *mocks):
-        """Test _can_calculate_model_flops when network has no current_phase"""
-
-        monitor = MFLossMonitor()
-
-        cb_params = Mock()
-        cb_params.mode = 'train'
-        cb_params.train_network = Mock(spec=[])  # No current_phase attribute
-
-        result = monitor._can_calculate_model_flops(cb_params)
-
-        assert not result
-        mock_logger.warning.assert_called()
-
-    @pytest.mark.level1
-    @pytest.mark.platform_x86_cpu
-    @patch('mindformers.core.callback.callback.get_real_group_size', return_value=1)
-    @patch('mindformers.core.callback.callback.get_tensorboard_writer', return_value=None)
-    @patch('mindformers.core.callback.callback.get_tensorboard_args', return_value={})
-    @patch('mindformers.core.callback.callback.get_context', return_value=0)
-    @patch('mindformers.core.callback.callback.is_legacy_model', return_value=False)
-    @patch('mindformers.core.callback.callback.logger')
-    def test_can_calculate_flops_moe_model_non_legacy(
-            self, mock_logger, mock_legacy, mock_get_context, *mocks):
-        """Test _can_calculate_model_flops with MoE model in non-legacy mode"""
-
-        monitor = MFLossMonitor()
-        monitor.is_moe_model = True
-
-        cb_params = Mock()
-        cb_params.mode = 'train'
-        cb_params.train_network = Mock()
-        cb_params.train_network.current_phase = 'train_phase'
-
-        result = monitor._can_calculate_model_flops(cb_params)
-
-        assert not result
-        mock_logger.warning.assert_called()
-
-
 class TestMFLossMonitorPrintOutputInfoLearningRate:
     """Test MFLossMonitor.print_output_info learning rate scenarios"""
 
@@ -791,7 +612,7 @@ class TestMFLossMonitorPrintOutputInfoLearningRate:
     @patch('mindformers.core.callback.callback.get_real_group_size', return_value=1)
     @patch('mindformers.core.callback.callback.get_tensorboard_writer', return_value=None)
     @patch('mindformers.core.callback.callback.get_tensorboard_args', return_value={})
-    @patch('mindformers.core.callback.callback.context.get_context', return_value='Ascend')
+    @patch('mindformers.core.callback.callback.get_context', return_value='Ascend')
     def test_print_output_info_lr_schedule_ascend(self, mock_get_context, *mocks):
         """Test print_output_info with LearningRateSchedule on Ascend"""
 
@@ -889,88 +710,6 @@ class TestMFLossMonitorPrintOutputInfoLearningRate:
         assert not monitor.print_warning_flag
 
 
-class TestMFLossMonitorCalculateFlopsWithPipeline:
-    """Test MFLossMonitor._calculate_model_flops with pipeline parallel"""
-
-    @pytest.mark.level1
-    @pytest.mark.platform_x86_cpu
-    @patch('mindformers.core.callback.callback.get_real_group_size', return_value=8)
-    @patch('mindformers.core.callback.callback.get_tensorboard_writer', return_value=None)
-    @patch('mindformers.core.callback.callback.get_tensorboard_args', return_value={})
-    @patch('mindformers.core.callback.callback.flops_collection')
-    @patch('mindformers.core.callback.callback.auto_parallel_context')
-    @patch('mindformers.core.callback.callback.get_group_size', return_value=8)
-    @patch('mindformers.core.callback.callback.create_group')
-    @patch('mindformers.core.callback.callback.AllReduceNet')
-    @patch('mindformers.core.callback.callback.Tensor')
-    def test_calculate_flops_with_pipeline_dynamic_shape(self, mock_tensor, mock_allreduce_net,
-                                                         mock_create_group, mock_group_size,
-                                                         mock_auto_context, mock_flops, *mocks):
-        """Test _calculate_model_flops with pipeline and dynamic shape"""
-
-        monitor = MFLossMonitor()
-        monitor.current_phase = 'train_phase'
-
-        mock_flops.return_value = (1000000.0, 0, 500000.0, 0, True)  # is_dynamic_shape=True
-        mock_auto_context.return_value.get_pipeline_stages.return_value = 2
-
-        # Mock AllReduceNet to return is_dynamic_shape > 0
-        mock_allreduce_instance = Mock()
-        mock_result = Mock()
-        mock_result.asnumpy.return_value = [1]  # is_dynamic_shape > 0
-        mock_allreduce_instance.return_value = mock_result
-        mock_allreduce_net.return_value = mock_allreduce_instance
-
-        monitor._calculate_model_flops()
-
-        # Should set mf_support to False due to dynamic shape
-        assert not monitor.mf_support
-
-    @pytest.mark.level1
-    @pytest.mark.platform_x86_cpu
-    @patch('mindformers.core.callback.callback.get_real_group_size', return_value=8)
-    @patch('mindformers.core.callback.callback.get_tensorboard_writer', return_value=None)
-    @patch('mindformers.core.callback.callback.get_tensorboard_args', return_value={})
-    @patch('mindformers.core.callback.callback.flops_collection')
-    @patch('mindformers.core.callback.callback.auto_parallel_context')
-    @patch('mindformers.core.callback.callback.get_group_size', return_value=8)
-    @patch('mindformers.core.callback.callback.create_group')
-    @patch('mindformers.core.callback.callback.AllReduceNet')
-    @patch('mindformers.core.callback.callback.Tensor')
-    def test_calculate_flops_with_pipeline_success(self, mock_tensor, mock_allreduce_net,
-                                                   mock_create_group, mock_group_size,
-                                                   mock_auto_context, mock_flops, *mocks):
-        """Test _calculate_model_flops with pipeline parallel success"""
-
-        monitor = MFLossMonitor()
-        monitor.current_phase = 'train_phase'
-
-        mock_flops.return_value = (1000000.0, 0, 500000.0, 0, False)  # is_dynamic_shape=False
-        mock_auto_context.return_value.get_pipeline_stages.return_value = 2
-        mock_auto_context.return_value.get_parallel_mode.return_value = 'semi_auto_parallel'
-
-        # Mock AllReduceNet
-        mock_allreduce_instance = Mock()
-
-        # First call: is_dynamic_shape check
-        mock_is_dynamic_result = Mock()
-        mock_is_dynamic_result.asnumpy.return_value = [0]
-
-        # Second call: flops aggregation
-        mock_flops_result = Mock()
-        mock_flops_result.asnumpy.return_value = [2000000.0]
-
-        mock_allreduce_instance.side_effect = [mock_is_dynamic_result, mock_flops_result]
-        mock_allreduce_net.return_value = mock_allreduce_instance
-
-        monitor._calculate_model_flops()
-
-        # Should aggregate flops across pipeline stages and divide by group size
-        assert monitor.mf_calculated
-        # 2000000.0 / 8 = 250000.0
-        assert monitor.full_model_flops == 250000.0
-
-
 class TestMFLossMonitorPrintOutputInfoDataSinkMode:
     """Test MFLossMonitor.print_output_info in dataset sink mode"""
 
@@ -1041,12 +780,11 @@ class TestMFLossMonitorMcoreFlops:
     @patch('mindformers.core.callback.callback.get_tensorboard_args', return_value={})
     @patch('mindformers.core.callback.callback.get_auto_parallel_context')
     @patch('mindformers.core.callback.callback.set_auto_parallel_context')
-    @patch('mindformers.core.callback.callback.is_legacy_model', return_value=False)
     @patch('mindformers.core.callback.callback.get_real_models')
     @patch('mindformers.core.callback.callback.check_arf_status', return_value=False)
     @patch('time.time')
     def test_mcore_flops_calculation(
-            self, mock_time, mock_arf, mock_get_real_models, mock_mcore,
+            self, mock_time, mock_arf, mock_get_real_models,
             mock_set_context, mock_get_context, *mocks):
         """Test mcore FLOPs calculation and verify the result is reasonable"""
 
@@ -1134,12 +872,11 @@ class TestMFLossMonitorMcoreFlops:
     @patch('mindformers.core.callback.callback.get_tensorboard_args', return_value={})
     @patch('mindformers.core.callback.callback.get_auto_parallel_context')
     @patch('mindformers.core.callback.callback.set_auto_parallel_context')
-    @patch('mindformers.core.callback.callback.is_legacy_model', return_value=False)
     @patch('mindformers.core.callback.callback.get_real_models')
     @patch('mindformers.core.callback.callback.check_arf_status', return_value=False)
     @patch('time.time')
     def test_mcore_flops_calculation_hybrid_model(
-            self, mock_time, mock_arf, mock_get_real_models, mock_mcore,
+            self, mock_time, mock_arf, mock_get_real_models,
             mock_set_context, mock_get_context, *mocks):
         """Test mcore FLOPs calculation for hybrid model"""
 

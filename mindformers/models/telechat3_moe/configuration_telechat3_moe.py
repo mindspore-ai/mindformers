@@ -35,7 +35,7 @@ from mindformers.models.telechat3_moe.config_converter_telechat3_moe import Tele
 from mindformers.tools.register import MindFormerRegister, MindFormerModuleType
 
 
-@MindFormerRegister.register(MindFormerModuleType.CONFIG, legacy=False, search_names=['telechat3_moe', 'telechat3_mtp'])
+@MindFormerRegister.register(MindFormerModuleType.CONFIG, search_names=['telechat3_moe', 'telechat3_mtp'])
 class TeleChat3MoeConfig(PretrainedConfig):
     """
     This is the configuration class to store the configuration of a [`TeleChat3Model`].

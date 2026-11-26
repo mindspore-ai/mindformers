@@ -9,7 +9,6 @@ use_parallel: True
 run_mode: 'train'
 train_precision_sync: True
 load_ckpt_format: 'safetensors'
-use_legacy: False
 # trainer config
 trainer:
   type: CausalLanguageModelingTrainer

@@ -25,7 +25,6 @@ from mindformers.checkpoint import checkpoint as checkpoint_module
 from mindformers.checkpoint.checkpoint import load_parameters
 from mindformers.pynative.optimizer.adamw import AdamW
 from mindformers.pynative.optimizer.muon import Muon
-from mindformers.pynative.optimizer import muon as muon_module
 
 
 class ResumeNet(nn.Cell):
@@ -45,12 +44,11 @@ _split._muon_schema = ()
 
 
 @pytest.fixture(name="resume_optimizer", params=["muon", "adamw"])
-def create_resume_optimizer(request, monkeypatch):
+def create_resume_optimizer(request):
     """Exercise the shared resume code through both production optimizers."""
     ms.set_context(mode=ms.PYNATIVE_MODE, device_target="CPU")
     net = ResumeNet()
     if request.param == "muon":
-        monkeypatch.setattr(muon_module.core_context, "is_legacy_model", lambda: False)
         model = SimpleNamespace(
             get_gpt_transformer_config=lambda: SimpleNamespace(multi_latent_attention=True),
             make_model_muon_fns=lambda: (_split, lambda *_: None),

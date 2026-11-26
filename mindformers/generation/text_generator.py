@@ -35,7 +35,6 @@ from mindformers.generation.logits_process import (LogitNormalization, LogitsPro
                                                    TemperatureLogitsWarper, TopKLogitsWarper,
                                                    TopPLogitsWarper, MinLengthLogitsProcessor,
                                                    MinNewTokensLengthLogitsProcessor)
-from mindformers.core.context import is_legacy_model
 from mindformers.version_control import is_310p
 from mindformers.models.utils import format_type
 from mindformers.models.tokenization_utils import PreTrainedTokenizer
@@ -268,7 +267,7 @@ class GenerationMixin:
         self.add_flags_recursive(is_prefill=is_prefill)
 
     @staticmethod
-    def update_model_kwargs_before_generate(input_ids, model_kwargs: dict):
+    def update_model_kwargs_before_generate(input_ids, model_kwargs: dict):  # pylint: disable=unused-argument
         """
         update model kwargs before generate.
         If your model needs to update model kwargs before generate, implement
@@ -628,16 +627,10 @@ class GenerationMixin:
         if use_past_tmp is not None:
             logger.warning("use_past should be defined in model config, it will not take effect when passed to "
                            ".generate() method.")
-        use_legacy = is_legacy_model()
         # Handle `generation_config` and kwargs that might update it
         # priority: `generation_config` argument > `model.generation_config` (default config)
         if generation_config is None:
-            # legacy: users may modify the model configuration to control generation
-            # model attribute accordingly, if it was created from the model config
-            if use_legacy:
-                generation_config = GenerationConfig.from_model_config(self.config)
-            else:
-                generation_config = self.generation_config
+            generation_config = self.generation_config
         generation_config = copy.deepcopy(generation_config)
         model_kwargs = generation_config.update(
             **kwargs
@@ -703,7 +696,7 @@ class GenerationMixin:
         generation_config.generation_mode = self._get_generation_mode(generation_config)
         logger.info(f"The generation mode will be **{generation_config.generation_mode.upper()}**.")
 
-        if not use_legacy and not hasattr(self, "is_train_model"):
+        if not hasattr(self, "is_train_model"):
             self._set_block_mgr(batch_size, self.config.seq_length)
             self._set_kv_cache()
             self._set_lower_triangle_mask()
@@ -795,12 +788,9 @@ class GenerationMixin:
             self.detailed_latency.start_preprocess_timer()
             block_tables = None
             slot_mapping = None
-            if (not use_legacy or generation_config.use_past) and not hasattr(self, "is_train_model"):
+            if not hasattr(self, "is_train_model"):
                 if prefill:
-                    if (use_legacy and self.is_pynative and self.config.is_dynamic):
-                        max_input_length = len(origin_inputs[0])
-                    else:
-                        max_input_length = self.config.seq_length
+                    max_input_length = self.config.seq_length
                     block_tables, slot_mapping = self.block_mgr.assemble_pa_full_inputs(max_input_length,
                                                                                         valid_length_each_example,
                                                                                         is_finished)
@@ -808,7 +798,7 @@ class GenerationMixin:
                     block_tables, slot_mapping = self.block_mgr.assemble_pa_inc_inputs(valid_length_each_example,
                                                                                        is_finished)
             self.profile.start_profiling(valid_length_each_example[0] - input_ids_length)
-            if use_legacy or (hasattr(self, "is_train_model") and self.is_train_model):
+            if hasattr(self, "is_train_model") and self.is_train_model:
                 infer_output, is_finished = self.infer(input_ids=input_ids,
                                                        valid_length_each_example=valid_length_each_example,
                                                        generation_config=generation_config,
@@ -842,10 +832,9 @@ class GenerationMixin:
                     raw_logits += (infer_output["logits"],)
             else:
                 target_list = infer_output
-            if not use_legacy or generation_config.use_past:
-                if prefill and "origin_inputs" in model_kwargs:
-                    model_kwargs.pop("origin_inputs")
-                prefill = False
+            if prefill and "origin_inputs" in model_kwargs:
+                model_kwargs.pop("origin_inputs")
+            prefill = False
 
             for i in range(batch_size):
                 if is_finished[i]:
@@ -1360,7 +1349,7 @@ class GenerationMixin:
                     is_finished,
                     res,
                     generation_config: GenerationConfig,
-                    valid_length_each_example,
+                    valid_length_each_example,  # pylint: disable=unused-argument
                     current_index: Optional[Union[List[int], List[List[int]]]],
                     logits_processor: Optional[LogitsProcessorList] = None,
                     logits_warper: Optional[LogitsProcessorList] = None,

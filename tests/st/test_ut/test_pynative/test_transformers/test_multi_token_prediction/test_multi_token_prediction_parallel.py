@@ -21,7 +21,7 @@ import pytest
 import numpy as np
 from mindformers.tools.logger import logger
 from tests.utils.double_benchmark import DoubleBenchmarkStandard, DoubleBenchmarkComparator
-from tests.st.test_ut.test_parallel_core.test_training_graph.test_transformer.test_multi_token_prediction.data_gen_utils import GOLDEN_DATA, GPU_DATA
+from tests.st.test_ut.test_pynative.test_transformers.test_multi_token_prediction.data_gen_utils import GOLDEN_DATA, GPU_DATA
 
 BATCH_SIZE = 2
 SEQ_LENGTH = 4

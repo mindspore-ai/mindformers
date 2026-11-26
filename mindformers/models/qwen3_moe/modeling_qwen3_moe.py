@@ -24,7 +24,7 @@ from mindformers.models.qwen3_moe.utils import Qwen3MoePreTrainedModel
 from mindformers.models.qwen3_moe.modeling_qwen3_moe_infer import InferenceQwen3MoeForCausalLM
 from mindformers.models.qwen3_moe.modeling_qwen3_moe_train import TrainingQwen3MoeForCausalLM
 
-@MindFormerRegister.register(MindFormerModuleType.MODELS, legacy=False)
+@MindFormerRegister.register(MindFormerModuleType.MODELS)
 class Qwen3MoeForCausalLM(Qwen3MoePreTrainedModel):
     r"""
     Provide Qwen3Moe Model for training and inference.

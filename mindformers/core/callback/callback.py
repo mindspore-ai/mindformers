@@ -62,7 +62,7 @@ from mindspore.mint.distributed import all_to_all_single
 
 from mindformers.wrapper.wrapper import get_real_models
 from mindformers.checkpoint.sharded_tensor import get_all_sharded_tensor_on_rank0
-from mindformers.core.context.build_context import get_context, is_legacy_model
+from mindformers.core.context.build_context import get_context
 from mindformers.tools import get_output_root_path
 from mindformers.tools.logger import logger
 from mindformers.tools.register import MindFormerRegister, MindFormerModuleType
@@ -417,9 +417,6 @@ class MFLossMonitor(Callback):
         self.print_separate_loss = print_separate_loss
         self.is_moe_model = kwargs.get("is_moe_model", False)
         self.is_mtp_model = kwargs.get("is_mtp_model", False)
-        if self.print_separate_loss and is_legacy_model():
-            logger.warning("print_separate_loss = True, is not supported when use_legacy = True.")
-            self.print_separate_loss = False
         if self.print_separate_loss and not self.is_moe_model and not self.is_mtp_model:
             self.print_separate_loss = False
 
@@ -484,12 +481,8 @@ class MFLossMonitor(Callback):
         if not scaling_sens:
             scaling_sens = "unavailable"
 
-        # Choose calculation method based on legacy model status
-        if is_legacy_model():
-            self._calculate_flops_legacy(cb_params)
-        else:
-            self._calculate_flops_mcore(cb_params)
-            self._reset_accu_gbs_fi(cb_params)
+        self._calculate_flops_mcore(cb_params)
+        self._reset_accu_gbs_fi(cb_params)
 
         origin_epochs = self.origin_epochs
 
@@ -717,10 +710,7 @@ class MFLossMonitor(Callback):
 
         global_step = cur_step_num + (cur_epoch_num - 1) * steps_per_epoch
         if self.mf_calculated:
-            if is_legacy_model():
-                throughput_per_npu = self.full_model_flops / per_step_seconds / 1e9
-            else:
-                throughput_per_npu = self.full_model_flops / per_step_seconds / 1e9 / self.device_num
+            throughput_per_npu = self.full_model_flops / per_step_seconds / 1e9 / self.device_num
             throughput_info = f', train_throughput_per_npu: {throughput_per_npu:.3f}T'
             if self.tensor_writer is not None:
                 self.tensor_writer.add_scalar('model-flops-throughput-per-npu',

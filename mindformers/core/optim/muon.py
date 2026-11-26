@@ -30,7 +30,6 @@ from mindspore.ops.auto_generate import Chunk
 from mindspore import get_auto_parallel_context
 
 from mindformers.tools.register import MindFormerRegister, MindFormerModuleType
-from mindformers.core.context import is_legacy_model
 from mindformers.tools.logger import logger
 
 _muon_opt = C.MultitypeFuncGraph("muon_opt")
@@ -323,8 +322,6 @@ class Muon(Optimizer):
         if model is None:
             raise ValueError("Model must be provided for Muon optimizer.")
 
-        if is_legacy_model():
-            raise ValueError("Muon does not support Legacy Model.")
 
         config = model.get_gpt_transformer_config()
 

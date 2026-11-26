@@ -14,7 +14,7 @@
 # ============================================================================
 """test model_mixin.py"""
 import threading
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock
 import numpy as np
 import pytest
 from mindspore import Tensor
@@ -41,20 +41,17 @@ class TestModelMixin:
         """Test convert_concat_name method"""
         mixin = ModelMixin()
 
-        # Patch the is_legacy_model function correctly
-        with patch('mindformers.parallel_core.utils.model_mixin.is_legacy_model', return_value=False):
-            # Test with linear_q
-            assert mixin.convert_concat_name(".linear_q.") == ".linear_qkv."
-            # Test with linear_k
-            assert mixin.convert_concat_name(".linear_k.") == ".linear_qkv."
-            # Test with linear_v
-            assert mixin.convert_concat_name(".linear_v.") == ".linear_qkv."
-            # Test with mlp.gating
-            assert mixin.convert_concat_name(".mlp.gating.") == ".mlp.linear_fc1."
-            # Test with mlp.hidden
-            assert mixin.convert_concat_name(".mlp.hidden.") == ".mlp.linear_fc1."
-            # Test with unchanged name
-            assert mixin.convert_concat_name(".other.") == ".other."
+        assert mixin.convert_concat_name(".linear_q.") == ".linear_qkv."
+        # Test with linear_k
+        assert mixin.convert_concat_name(".linear_k.") == ".linear_qkv."
+        # Test with linear_v
+        assert mixin.convert_concat_name(".linear_v.") == ".linear_qkv."
+        # Test with mlp.gating
+        assert mixin.convert_concat_name(".mlp.gating.") == ".mlp.linear_fc1."
+        # Test with mlp.hidden
+        assert mixin.convert_concat_name(".mlp.hidden.") == ".mlp.linear_fc1."
+        # Test with unchanged name
+        assert mixin.convert_concat_name(".other.") == ".other."
 
     @pytest.mark.level0
     @pytest.mark.platform_x86_cpu
@@ -67,9 +64,8 @@ class TestModelMixin:
             weight_mapping = [("hf_name", "mcore_name")]
 
         mixin = TestModel()
-        with patch('mindformers.parallel_core.utils.model_mixin.is_legacy_model', return_value=False):
-            assert mixin.convert_name("test.hf_name.test") == "test.mcore_name.test"
-            assert mixin.convert_name("test.other.test") == "test.other.test"
+        assert mixin.convert_name("test.hf_name.test") == "test.mcore_name.test"
+        assert mixin.convert_name("test.other.test") == "test.other.test"
 
     @pytest.mark.level0
     @pytest.mark.platform_x86_cpu

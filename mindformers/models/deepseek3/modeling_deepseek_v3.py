@@ -31,7 +31,7 @@ except ImportError as e:
     logger.warning(f"Import PyNativeDeepseekV3ForCausalLM failed: {e}.")
 
 
-@MindFormerRegister.register(MindFormerModuleType.MODELS, legacy=False)
+@MindFormerRegister.register(MindFormerModuleType.MODELS)
 class DeepseekV3ForCausalLM:
     r"""
     Provide DeepseekV3 Model for training and inference.

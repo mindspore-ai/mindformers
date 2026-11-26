@@ -20,7 +20,6 @@ import mindspore.common.dtype as mstype
 import numpy as np
 
 from mindformers.tools.logger import logger
-from mindformers.core.context.build_context import is_legacy_model
 
 
 class ModelMixin:
@@ -50,8 +49,6 @@ class ModelMixin:
             weight_name: converted weight names.
 
         """
-        if is_legacy_model():
-            raise RuntimeError(f"{self.__class__.__name__} does not implemented convert_name method.")
         for split_name, concat_name in self.concat_mapping:
             if split_name in weight_name:
                 weight_name = weight_name.replace(split_name, concat_name)
@@ -68,8 +65,6 @@ class ModelMixin:
             weight_name: converted weight names.
 
         """
-        if is_legacy_model():
-            raise RuntimeError(f"{self.__class__.__name__} does not implemented convert_name method.")
         for hf_name, mcore_name in self.weight_mapping:
             if hf_name in weight_name:
                 weight_name = weight_name.replace(hf_name, mcore_name)

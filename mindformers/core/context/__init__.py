@@ -20,7 +20,6 @@ from .build_context import (
     get_context,
     init_context,
     set_context,
-    is_legacy_model
 )
 
 __all__ = ['build_context', 'get_context', 'init_context', 'set_context']

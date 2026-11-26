@@ -35,7 +35,7 @@ except ImportError as e:
     logger.warning(f"Import PyNativeQwen3ForCausalLM failed: {e}.")
 
 
-@MindFormerRegister.register(MindFormerModuleType.MODELS, legacy=False)
+@MindFormerRegister.register(MindFormerModuleType.MODELS)
 class Qwen3ForCausalLM(Qwen3PreTrainedModel):
     r"""
     Provide Qwen3 Model for training and inference.

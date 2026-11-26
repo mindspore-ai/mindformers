@@ -138,8 +138,6 @@ class AlpacaInstructDataHandler(BaseInstructDataHandler):
         """
         # Determine the maximum sequence length
         max_length = self.seq_length
-        if self.use_legacy:
-            max_length += 1
 
         if self.padding and len(input_ids) < max_length:
             input_ids += [self.pad_token_id] * (max_length - len(input_ids))

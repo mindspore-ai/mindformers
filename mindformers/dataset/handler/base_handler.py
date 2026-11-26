@@ -18,7 +18,6 @@ from abc import ABC, abstractmethod
 
 from mindformers.tools.logger import logger
 from mindformers.models.build_tokenizer import build_tokenizer
-from mindformers.core.context import is_legacy_model
 
 
 class BaseInstructDataHandler(ABC):
@@ -31,14 +30,13 @@ class BaseInstructDataHandler(ABC):
     """
 
     def __init__(self, **kwargs):
-        self.use_legacy = is_legacy_model()
         tokenize_args = kwargs.get('tokenizer')
         self.tokenizer = self.build_tokenizer(tokenize_args)
 
         if self.tokenizer is not None and getattr(self.tokenizer, 'pad_token_id', None) is not None:
             self.pad_token_id = self.tokenizer.pad_token_id
         else:
-            logger.info(f"tokenizer not set or it have no pad_token_id, set 0 as `pad_token_id`.")
+            logger.info("tokenizer not set or it have no pad_token_id, set 0 as `pad_token_id`.")
             self.pad_token_id = kwargs.get('pad_token_id', 0)
 
         self.ignore_token_id = kwargs.get('ignore_token_id', -100)
@@ -65,7 +63,6 @@ class BaseInstructDataHandler(ABC):
         pretrained_model_dir = config.pop("pretrained_model_dir", None)
         trust_remote_code = config.pop("trust_remote_code", False)
         tokenizer = build_tokenizer(config,
-                                    use_legacy=self.use_legacy,
                                     pretrained_model_dir=pretrained_model_dir,
                                     trust_remote_code=trust_remote_code)
         if hasattr(tokenizer, 'padding_side'):

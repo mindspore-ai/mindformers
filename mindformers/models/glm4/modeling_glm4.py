@@ -21,7 +21,7 @@ from .utils import Glm4PreTrainedModel
 from .modeling_glm4_infer import InferenceGlm4ForCausalLM
 
 
-@MindFormerRegister.register(MindFormerModuleType.MODELS, legacy=False)
+@MindFormerRegister.register(MindFormerModuleType.MODELS)
 class Glm4ForCausalLM(Glm4PreTrainedModel):
     r"""
     Provide Glm4 Model for training and inference.

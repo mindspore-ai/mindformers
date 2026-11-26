@@ -30,7 +30,6 @@ from mindspore.graph.api import _no_grad
 from mindformers.checkpoint.checkpoint import save_checkpoint, CommonInfo
 from mindformers.pynative.config import TrainConfig
 from mindformers.pynative.trainer.utils import _build_model
-from mindformers.pynative.trainer.trainer import patch_pynative_modules
 
 from tests.utils.generate_dataset import generate_mindrecord_file
 SEED = 42
@@ -215,7 +214,6 @@ def save_model_checkpoints(config, save_path):
         save_path (Path): The path where the checkpoint will be saved.
     """
     set_random_seed()
-    patch_pynative_modules()
     if os.path.isdir(save_path):
         return
     with _shared_artifact_lock(str(save_path)):

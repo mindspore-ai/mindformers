@@ -933,10 +933,10 @@
         "signature": "()"
     },
     "mindformers.MindFormerRegister.register": {
-        "signature": "(module_type='tools', alias=None, legacy=True, search_names=None)"
+        "signature": "(module_type='tools', alias=None, search_names=None)"
     },
     "mindformers.MindFormerRegister.register_cls": {
-        "signature": "(register_class, module_type='tools', alias=None, legacy=True, search_names=None)"
+        "signature": "(register_class, module_type='tools', alias=None, search_names=None)"
     },
     "mindformers.MindFormerRegister.is_exist": {
         "signature": "(module_type, class_name=None)"

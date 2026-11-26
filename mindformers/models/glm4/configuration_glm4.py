@@ -23,7 +23,7 @@ from mindformers.models.model_config_utils import (
 from mindformers.tools.register import MindFormerRegister, MindFormerModuleType
 
 
-@MindFormerRegister.register(MindFormerModuleType.CONFIG, legacy=False, search_names='glm4')
+@MindFormerRegister.register(MindFormerModuleType.CONFIG, search_names='glm4')
 class Glm4Config(PretrainedConfig):
     r"""
     This is the configuration class to store the configuration of a [`Glm4Model`]. It is used to instantiate an Glm4

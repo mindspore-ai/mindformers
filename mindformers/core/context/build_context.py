@@ -540,14 +540,11 @@ class MFContextOperator(MFContextConfig):
             supported_kwargs = self._handle_data()
             logger.debug('MFContextConfig load configs: %s', supported_kwargs)
             super().__init__(**supported_kwargs)
-            use_past = self.config.get_value(
-                "model.model_config.use_past", False
-            )
             if not hasattr(self, 'train_precision_sync'):
                 self.train_precision_sync = None
             if not hasattr(self, 'infer_precision_sync'):
                 self.infer_precision_sync = None
-            self.set_env(use_past)
+            self.set_env()
             self._initialized = True
 
     @classmethod
@@ -647,7 +644,7 @@ class MFContextOperator(MFContextConfig):
             'LCCL_DETERMINISTIC': lccl_deterministic or '0',
         }
 
-    def set_env(self, use_past=False):
+    def set_env(self):
         """Update environment variables."""
 
         env = self._get_precision_env()
@@ -657,12 +654,9 @@ class MFContextOperator(MFContextConfig):
         run_mode = (
             self.run_mode if hasattr(self, "run_mode") else None
         )
-        use_legacy = self.config.get_value('use_legacy', True)
-        infer_flag = not use_legacy or use_past
         if (
             run_mode is not None
             and RunMode(run_mode) in [RunMode.PREDICT, RunMode.EVAL]
-            and infer_flag
         ):
             ms_alloc_conf = os.environ.get('MS_ALLOC_CONF', 'enable_vmm:False')
             cpu_affinity = os.environ.get('CPU_AFFINITY', 'True')
@@ -680,7 +674,6 @@ class MFContextOperator(MFContextConfig):
         if (
             run_mode is not None
             and RunMode(run_mode) in [RunMode.TRAIN, RunMode.FINETUNE]
-            and not use_legacy
         ):
             env["MS_DEV_JIT_SYNTAX_LEVEL"] = "0"
 
@@ -1020,13 +1013,3 @@ def build_parallel_context(config: Union[dict, MindFormerConfig]):
 
     execute_validator(mf_config)
     return ParallelOperator(mf_config)
-
-
-def is_legacy_model():
-    """Determine whether it is use_legacy mode."""
-    mf_ctx_instance = MFContextOperator.get_mf_ctx_instance()
-    if mf_ctx_instance is not None:
-        is_use_legacy = mf_ctx_instance.get_context("use_legacy")
-        if is_use_legacy is not None:
-            return is_use_legacy
-    return True

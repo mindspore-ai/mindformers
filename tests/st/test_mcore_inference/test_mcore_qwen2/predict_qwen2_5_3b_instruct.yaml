@@ -6,7 +6,6 @@ auto_trans_ckpt: True  # If true, auto transform load_checkpoint to load in dist
 resume_training: False
 use_parallel: False
 run_mode: 'predict'
-use_legacy: False
 load_ckpt_format: "safetensors"
 
 # trainer config

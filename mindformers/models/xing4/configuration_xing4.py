@@ -198,7 +198,7 @@ class Xing4Config(PretrainedConfig):
         return Xing4ConfigConverter.convert(self.to_dict(), is_mla_model=is_mla_model)
 
 
-@MindFormerRegister.register(MindFormerModuleType.CONFIG, legacy=False, search_names=["xing4_v4"])
+@MindFormerRegister.register(MindFormerModuleType.CONFIG, search_names=["xing4_v4"])
 class Xing4V4Config(Xing4Config):
     """Xing4 29B: mHC, independent DSA indexers and one plain MTP layer."""
 
@@ -218,7 +218,7 @@ class Xing4V4Config(Xing4Config):
     }
 
 
-@MindFormerRegister.register(MindFormerModuleType.CONFIG, legacy=False,
+@MindFormerRegister.register(MindFormerModuleType.CONFIG,
                             search_names=["xing4_v41", "Xing4.1-Preview"])
 class Xing4V41Config(Xing4Config):
     """Xing4.1-Preview 285B configuration with independent DSA indexers."""

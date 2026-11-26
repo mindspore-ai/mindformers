@@ -25,7 +25,7 @@ from typing import List, Union
 
 from mindformers.models.utils import CONFIG_NAME
 from mindformers.mindformer_book import print_dict, MindFormerBook
-from mindformers.models.build_config import build_model_config, get_model_config
+from mindformers.models.build_config import get_model_config
 from mindformers.models.configuration_utils import PretrainedConfig
 from mindformers.models.auto.utils import set_default_yaml_file
 from mindformers.tools.logger import logger
@@ -328,18 +328,12 @@ class AutoConfig:
             set_default_yaml_file(yaml_name, yaml_file)
 
             config_args = MindFormerConfig(yaml_file)
-        use_legacy = config_args.get_value('use_legacy', True)
         if config_args.get("pretrained_model_dir", None):
             config_args.model.pretrained_model_dir = config_args.pretrained_model_dir
         if config_args.get("generation_config", None):
             config_args.model.generation_config = config_args.generation_config
         config_args.model.model_config.update(**kwargs)
-        if not use_legacy:
-            config = get_model_config(config_args.model)
-            return config
-        config = build_model_config(config_args.model.model_config)
-        MindFormerBook.set_model_config_to_name(id(config), config_args.model.arch.type)
-        return config
+        return get_model_config(config_args.model)
 
     @classmethod
     @experimental_mode_func_checker(EXP_ERROR_MSG)

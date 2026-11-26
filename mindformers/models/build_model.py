@@ -13,10 +13,9 @@
 # limitations under the License.
 # ============================================================================
 """Build Model API."""
-from mindformers.core.context import is_legacy_model
 from mindformers.generation.generation_config import GenerationConfig
 from mindformers.tools.register import MindFormerRegister, MindFormerModuleType, MindFormerConfig
-from .build_config import build_model_config, get_model_config
+from .build_config import get_model_config
 
 
 def build_model(
@@ -48,19 +47,14 @@ def build_model(
         return MindFormerRegister.get_instance(module_type, class_name, **kwargs)
 
     if config is not None:
-        use_legacy = is_legacy_model()
-
         if isinstance(config, dict) and not isinstance(config, MindFormerConfig):
             config = MindFormerConfig(**config)
         if default_args is None:
             default_args = {}
         if isinstance(config.model_config, MindFormerConfig):
-            if not use_legacy:
-                moe_config = default_args.pop('moe_config', {})
-                default_args.update(moe_config)
-                model_config = get_model_config(config, default_args=default_args)
-            else:
-                model_config = build_model_config(config.model_config, default_args=default_args)
+            moe_config = default_args.pop('moe_config', {})
+            default_args.update(moe_config)
+            model_config = get_model_config(config, default_args=default_args)
         else:
             model_config = config.model_config
 
@@ -70,9 +64,6 @@ def build_model(
                     model_config.__setattr__(key, value)
                 default_args = {}
             default_args.setdefault('config', model_config)
-            if use_legacy:
-                return MindFormerRegister.get_instance_from_cfg(
-                    config.arch, MindFormerModuleType.MODELS, default_args=default_args)
             return MindFormerRegister.get_instance_from_cfg(
                 model_config.to_dict(), MindFormerModuleType.MODELS, default_args=default_args)
         return None

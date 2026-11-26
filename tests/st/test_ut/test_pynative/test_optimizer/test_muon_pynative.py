@@ -144,7 +144,6 @@ class TestMuonConfig:
                 calls.append(value)
 
         monkeypatch.setattr(muon_mod, "op_precision", _FakeOpPrecision(), raising=False)
-        monkeypatch.setattr(muon_mod.core_context, "is_legacy_model", lambda: False)
 
         net = _TwoWeightNet(np.ones((2, 2), np.float32), np.zeros(2, np.float32))
         optimizer = _build_optimizer(net)
@@ -584,23 +583,18 @@ class TestMuonConfig:
             multi_latent_attention is rejected.
         Expectation: both cases raise ValueError.
         """
-        orig = muon_mod.core_context.is_legacy_model
-        muon_mod.core_context.is_legacy_model = lambda: False
-        try:
-            with pytest.raises(ValueError):
-                Muon._verify_model(None)
+        with pytest.raises(ValueError):
+            Muon._verify_model(None)
 
-            class _NoMlaCfg:
-                multi_latent_attention = False
+        class _NoMlaCfg:
+            multi_latent_attention = False
 
-            class _NoMlaModel:
-                def get_gpt_transformer_config(self):
-                    return _NoMlaCfg()
+        class _NoMlaModel:
+            def get_gpt_transformer_config(self):
+                return _NoMlaCfg()
 
-            with pytest.raises(ValueError):
-                Muon._verify_model(_NoMlaModel())
-        finally:
-            muon_mod.core_context.is_legacy_model = orig
+        with pytest.raises(ValueError):
+            Muon._verify_model(_NoMlaModel())
 
 
 # --------------------------------------------------------------------------- #
@@ -852,11 +846,6 @@ class TestMuonSingleCardUpdate:
 
     def setup_method(self):
         ms.set_context(mode=ms.PYNATIVE_MODE)
-        self._orig_is_legacy_model = muon_mod.core_context.is_legacy_model
-        muon_mod.core_context.is_legacy_model = lambda: False
-
-    def teardown_method(self):
-        muon_mod.core_context.is_legacy_model = self._orig_is_legacy_model
 
     @pytest.mark.level0
     @pytest.mark.platform_arm_ascend910b_training
@@ -1091,13 +1080,10 @@ class TestMuonDeredundencyBatchedPath:
 
     def setup_method(self):
         ms.set_context(mode=ms.PYNATIVE_MODE)
-        self._orig_is_legacy_model = muon_mod.core_context.is_legacy_model
         self._orig_get_rank = muon_mod.get_rank
-        muon_mod.core_context.is_legacy_model = lambda: False
         muon_mod.get_rank = lambda *args, **kwargs: 0
 
     def teardown_method(self):
-        muon_mod.core_context.is_legacy_model = self._orig_is_legacy_model
         muon_mod.get_rank = self._orig_get_rank
 
     @pytest.mark.level0

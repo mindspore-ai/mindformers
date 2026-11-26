@@ -27,7 +27,7 @@ from mindformers.parallel_core.utils.model_mixin import TrainModelMixin
 from .configuration_xing4 import Xing4Config
 
 
-@MindFormerRegister.register(MindFormerModuleType.MODELS, legacy=False)
+@MindFormerRegister.register(MindFormerModuleType.MODELS)
 @register_parallelize(parallelize_gptmodel)
 class Xing4ForCausalLM(TrainModelMixin, Xing4PreTrainedModel):
     """Xing4 model for training"""
