@@ -25,39 +25,28 @@ from mindformers.models.auto.auto_factory import (
 )
 from mindformers.models.auto.configuration_auto import CONFIG_MAPPING_NAMES
 
-MODEL_MAPPING_NAMES = OrderedDict(
-    [
-        # Base model mapping
-        ("glm2", "ChatGLM2Model"),
-        ("llama", "LlamaModel")
-    ]
-)
-
 MODEL_FOR_PRETRAINING_MAPPING_NAMES = OrderedDict(
     [
         # Model for pre-training mapping
-        ("bert", "BertForPreTraining"),
-        ("glm", "GLMForPreTraining")
     ]
 )
 
 MODEL_WITH_LM_HEAD_MAPPING_NAMES = OrderedDict(
     [
         # Model with LM heads mapping
-        ("bert", "BertForMaskedLM"),
-        ("glm", "GLMChatModel"),
-        ("glm2", "ChatGLM2ForConditionalGeneration"),
-        ("llama", "LlamaForCausalLM")
     ]
 )
 
 MODEL_FOR_CAUSAL_LM_MAPPING_NAMES = OrderedDict(
     [
-        # Model with LM heads mapping
-        ("glm2", "ChatGLM2ForConditionalGeneration"),
-        ("llama", "LlamaForCausalLM")
+        ("deepseek_v3", "PyNativeDeepseekV3ForCausalLM"),
+        ("deepseek_v4", "PyNativeDeepseekV4ForCausalLM"),
+        ("qwen3", "PyNativeQwen3ForCausalLM"),
+        ("xing4_v4", "Xing4ForCausalLM"),
+        ("xing4_v41", "Xing4ForCausalLM"),
     ]
 )
+MODEL_MAPPING_NAMES = MODEL_FOR_CAUSAL_LM_MAPPING_NAMES.copy()
 
 MODEL_FOR_SEQ_TO_SEQ_CAUSAL_LM_MAPPING_NAMES = OrderedDict(
     [
@@ -145,7 +134,7 @@ class AutoModel(_BaseAutoModelClass):
     _model_mapping = MODEL_MAPPING
 
 
-AutoModel = auto_class_update(AutoModel, checkpoint_for_example="glm4_9b")
+AutoModel = auto_class_update(AutoModel)
 
 
 class AutoModelForPreTraining(_BaseAutoModelClass):
@@ -172,20 +161,14 @@ class AutoModelForCausalLM(_BaseAutoModelClass):
     _model_mapping = MODEL_FOR_CAUSAL_LM_MAPPING
 
 
-AutoModelForCausalLM = auto_class_update(
-    AutoModelForCausalLM,
-    checkpoint_for_example="glm4_9b",
-    head_doc="causal language modeling"
-)
+AutoModelForCausalLM = auto_class_update(AutoModelForCausalLM, head_doc="causal language modeling")
 
 
 class AutoModelForSeq2SeqLM(_BaseAutoModelClass):
     _model_mapping = MODEL_FOR_SEQ_TO_SEQ_CAUSAL_LM_MAPPING
 
 
-AutoModelForSeq2SeqLM = auto_class_update(
-    AutoModelForSeq2SeqLM, head_doc="sequence-to-sequence language modeling", checkpoint_for_example="t5-base"
-)
+AutoModelForSeq2SeqLM = auto_class_update(AutoModelForSeq2SeqLM, head_doc="sequence-to-sequence language modeling")
 
 
 class AutoModelForSequenceClassification(_BaseAutoModelClass):
@@ -216,14 +199,14 @@ AutoModelForMultipleChoice = auto_class_update(AutoModelForMultipleChoice, head_
 class AutoModelWithLMHead(_AutoModelWithLMHead):
     """AutoModelWithLMHead Class"""
     @classmethod
-    def from_config(cls, config):
+    def from_config(cls, config, **kwargs):
         warnings.warn(
             "The class `AutoModelWithLMHead` is deprecated and will be removed in a future version. Please use "
             "`AutoModelForCausalLM` for causal language models, `AutoModelForMaskedLM` for masked language models and "
             "`AutoModelForSeq2SeqLM` for encoder-decoder models.",
             FutureWarning,
         )
-        return super().from_config(config)
+        return super().from_config(config, **kwargs)
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_dir, *model_args, **kwargs):

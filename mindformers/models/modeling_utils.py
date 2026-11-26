@@ -27,7 +27,6 @@ import numpy as np
 import mindspore as ms
 from mindspore import nn
 from mindspore import load_checkpoint, load_param_into_net
-from mindspore import context, Model
 
 import mindformers.models.auto as auto_module
 from mindformers.tools.check_rules import check_yaml_depth_before_loading
@@ -44,14 +43,7 @@ from mindformers.tools.hub.dynamic_module_utils import custom_object_save
 from mindformers.generation import GenerationConfig, GenerationMixin
 from mindformers.tools.logger import logger
 from mindformers.tools.register import MindFormerConfig, DictConfig
-from mindformers.tools.ckpt_transform import TransformCkpt, make_soft_link
-from mindformers.tools.utils import (
-    get_real_rank,
-    get_output_root_path,
-    FILE_PERMISSION
-)
-from mindformers.utils.file_utils import clear_auto_trans_output, remake_folder
-from mindformers.utils.parallel_utils import barrier_world
+from mindformers.tools.utils import FILE_PERMISSION
 from mindformers.models.utils import DEFAULT_CHECKPOINT_SAVE_FOLDER
 from mindformers.parallel_core.utils.model_mixin import ModelMixin
 from ..mindformer_book import MindFormerBook, print_path_or_list
@@ -255,6 +247,7 @@ class PreTrainedModel(nn.Cell, ModelMixin, GenerationMixin, PushToHubMixin):
         return "ms"
 
     def __init__(self, config: PretrainedConfig, *inputs, **kwargs):
+        del inputs
         super().__init__(**kwargs)
         GenerationMixin.__init__(self)
         if not isinstance(config, PretrainedConfig):
@@ -974,7 +967,6 @@ class PreTrainedModel(nn.Cell, ModelMixin, GenerationMixin, PushToHubMixin):
         subfolder = kwargs.pop("subfolder", "")
         commit_hash = kwargs.pop("_commit_hash", None)
         variant = kwargs.pop("variant", None)
-        auto_trans_ckpt = kwargs.pop("auto_trans_ckpt", None)
 
         if trust_remote_code is True:
             logger.warning(
@@ -1160,57 +1152,6 @@ class PreTrainedModel(nn.Cell, ModelMixin, GenerationMixin, PushToHubMixin):
 
         network = cls(config, *model_args, **model_kwargs)
 
-        if ms.context.get_auto_parallel_context('parallel_mode') in \
-                ['semi_auto_parallel', 'auto_parallel', 'hybrid_parallel'] and auto_trans_ckpt:
-            logger.info(".........Remake strategy and transformed_checkpoint dir.........")
-            clear_auto_trans_output()
-
-            logger.info(".........Remake src_checkpoint dir.........")
-            src_checkpoint_dir = os.path.join(get_output_root_path(), "src_checkpoint")
-            remake_folder(src_checkpoint_dir, permissions=0o750)
-            src_checkpoint = os.path.join(src_checkpoint_dir, "mindspore_model.ckpt")
-
-            logger.info(".........Set strategy save dir.........")
-            rank_id = get_real_rank()
-            strategy_ckpt_save_dir = os.path.join(get_output_root_path(), "strategy")
-            dst_strategy = os.path.join(strategy_ckpt_save_dir, f"ckpt_strategy_rank_{rank_id}.ckpt")
-            context.set_auto_parallel_context(strategy_ckpt_save_file=dst_strategy)
-            logger.info(f"set strategy path to '{dst_strategy}'")
-
-            model = Model(network)
-            if network.config:
-                batch_size = network.config.batch_size
-                seq_length = network.config.seq_length
-            else:
-                batch_size = config.model.model_config.batch_size
-                seq_length = config.model.model_config.seq_length
-            input_ids = np.ones(shape=tuple([batch_size, seq_length]))
-            # pylint: disable=E1111
-            infer_data = network.prepare_inputs_for_predict_layout(input_ids)
-            logger.info(".........Building model.........")
-            model.infer_predict_layout(*infer_data)
-
-            logger.info(".........Get src checkpoint.........")
-            if rank_id == 0:
-                src_checkpoint = cls._get_src_checkpoint(
-                    state_dict=state_dict,
-                    resolved_archive_file=resolved_archive_file,
-                    src_checkpoint=src_checkpoint,
-                )
-            barrier_world("Get src checkpoint by rank 0.")
-
-            logger.info(".........Transform checkpoint.........")
-            # transform sharded checkpoint to one or state_dict to one checkpoint
-            transform_ckpt = TransformCkpt(auto_trans_ckpt=True)
-            transformed_checkpoint = transform_ckpt(
-                src_checkpoint=src_checkpoint,
-                src_strategy=None,
-            )
-            resolved_archive_file = os.path.join(transformed_checkpoint,
-                                                 os.path.basename(src_checkpoint).split(".")[0],
-                                                 f"rank_{get_real_rank()}",
-                                                 f"checkpoint_{get_real_rank()}.ckpt")
-
         # load params into net
         (
             network,
@@ -1246,32 +1187,6 @@ class PreTrainedModel(nn.Cell, ModelMixin, GenerationMixin, PushToHubMixin):
             return network, loading_info
 
         return network
-
-    @classmethod
-    def _get_src_checkpoint(
-            cls,
-            state_dict,
-            resolved_archive_file,
-            src_checkpoint
-    ):
-        """Get src checkpoint for ckpt transform."""
-        if state_dict is None:
-            if isinstance(resolved_archive_file, str):
-                if not os.path.exists(resolved_archive_file):
-                    raise ValueError(f"resolved_archive_file:{resolved_archive_file} not found!")
-                make_soft_link(src_checkpoint, resolved_archive_file)
-                return src_checkpoint
-            if isinstance(resolved_archive_file, (list, tuple)):
-                state_dict = {}
-                for resolved_archive_file_ in resolved_archive_file:
-                    if not os.path.exists(resolved_archive_file_):
-                        raise ValueError(f"resolved_archive_file_:{resolved_archive_file_} not found!")
-                    state_dict.update(load_checkpoint(resolved_archive_file_))
-            else:
-                raise ValueError(f"`resolved_archive_file` should be str, list or tuple,"
-                                 f" but get {type(resolved_archive_file)}.")
-        ms.save_checkpoint(state_dict, src_checkpoint)
-        return src_checkpoint
 
     @classmethod
     def _load_pretrained_model(

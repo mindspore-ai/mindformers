@@ -17,16 +17,11 @@ __all__ = [
     'Qwen3ForCausalLM',
 ]
 
-import os
-
-import mindspore as ms
-
 from mindformers.tools.logger import logger
-from mindformers.core.context.build_context import get_context
 from mindformers.tools.register import MindFormerRegister, MindFormerModuleType
+
+from .configuration_qwen3 import Qwen3Config
 from .utils import Qwen3PreTrainedModel
-from .modeling_qwen3_infer import InferenceQwen3ForCausalLM
-from .modeling_qwen3_train import TrainingQwen3ForCausalLM
 
 try:
     from .modeling_qwen3_train_pynative import PyNativeQwen3ForCausalLM
@@ -35,7 +30,7 @@ except ImportError as e:
     logger.warning(f"Import PyNativeQwen3ForCausalLM failed: {e}.")
 
 
-@MindFormerRegister.register(MindFormerModuleType.MODELS)
+@MindFormerRegister.register(MindFormerModuleType.MODELS, search_names=Qwen3Config.model_type)
 class Qwen3ForCausalLM(Qwen3PreTrainedModel):
     r"""
     Provide Qwen3 Model for training and inference.
@@ -48,21 +43,13 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel):
 
     def __new__(cls, config):
         r"""
-        get run mode to init different model.
+        get pynative model.
 
         Args:
             config (Qwen3Config): The config of qwen3 model.
-
-        Raises:
-            NotImplementedError: Train mode is not supported for Qwen3 model.
 
         Returns:
             Tensor, the loss or logits of the network
 
         """
-        if os.environ.get("RUN_MODE") == "predict":
-            return InferenceQwen3ForCausalLM(config=config)
-
-        if get_context("mode") == ms.context.PYNATIVE_MODE:
-            return PyNativeQwen3ForCausalLM(config=config)
-        return TrainingQwen3ForCausalLM(config=config)
+        return PyNativeQwen3ForCausalLM(config=config)

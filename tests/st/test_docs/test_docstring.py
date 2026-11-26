@@ -36,7 +36,7 @@ def dynamic_import(full_path: str) -> type:
         return obj
     except (ImportError, AttributeError) as e:
         raise ImportError(f"Cannot import {full_path}: \"{e}\"."
-                          f"If its import path is modified, modify the interface_map in this test case. ") from e
+                          "If its import path is modified, modify the interface_map in this test case. ") from e
 
 
 def has_custom_init(cls: type) -> bool:
@@ -178,23 +178,6 @@ class TestDocstring:
             "mindformers.models.PreTrainedTokenizerFast": ["convert_ids_to_tokens", "convert_tokens_to_ids",
                                                            "get_added_vocab", "num_special_tokens_to_add",
                                                            "set_truncation_and_padding", "train_new_from_iterator"],
-            "mindformers.models.multi_modal.ModalContentTransformTemplate": ["batch", "build_conversation_input_text",
-                                                                             "build_labels", "build_modal_context",
-                                                                             "get_need_update_output_items",
-                                                                             "post_process", "process_predict_query",
-                                                                             "process_train_item"],
-            "mindformers.models.LlamaForCausalLM": None,
-            "mindformers.models.LlamaConfig": None,
-            "mindformers.models.LlamaTokenizer": ["build_inputs_with_special_tokens",
-                                                  "create_token_type_ids_from_sequences",
-                                                  "get_special_tokens_mask"],
-            "mindformers.models.LlamaTokenizerFast": ["build_inputs_with_special_tokens",
-                                                      "save_vocabulary",
-                                                      "update_post_processor"],
-            "mindformers.models.ChatGLM2ForConditionalGeneration": None,
-            "mindformers.models.ChatGLM2Config": None,
-            "mindformers.models.ChatGLM3Tokenizer": None,
-            "mindformers.models.ChatGLM4Tokenizer": None,
             "mindformers.modules.OpParallelConfig": None,
             "mindformers.pet.models.LoraModel": None,
             "mindformers.pet.pet_config.PetConfig": None,

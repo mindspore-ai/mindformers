@@ -344,6 +344,7 @@ def test_get_ms_experimental_pipeline_builds_components(monkeypatch):
     monkeypatch.setattr(pipeline_module, "cached_file", lambda *_, **__: "cfg")
     monkeypatch.setattr(pipeline_module, "extract_commit_hash", lambda *_: "commit")
     monkeypatch.setattr(pipeline_module, "set_context", lambda **kwargs: created.setdefault("context", kwargs))
+    monkeypatch.setattr(pipeline_module, "set_device", lambda **kwargs: created.setdefault("device", kwargs))
 
     monkeypatch.setattr(pipeline_module, "TOKENIZER_MAPPING", {DummyModelConfig: None})
     monkeypatch.setattr(pipeline_module, "IMAGE_PROCESSOR_MAPPING", {DummyModelConfig: None})
@@ -367,6 +368,7 @@ def test_get_ms_experimental_pipeline_builds_components(monkeypatch):
     assert pipeline_obj.kwargs["tokenizer"] == "TOKENIZER"
     assert pipeline_obj.kwargs["image_processor"] == "IMAGE_PROCESSOR"
     assert created["context"] == {"mode": 0}
+    assert created["device"] == {"device_target": "Ascend", "device_id": 1}
 
 
 @pytest.mark.level1

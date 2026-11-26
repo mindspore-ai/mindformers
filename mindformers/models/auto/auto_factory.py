@@ -14,7 +14,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """ auto factory """
-import copy
 import functools
 import importlib
 import os
@@ -23,11 +22,12 @@ from collections import OrderedDict
 
 from mindformers.models.auto.configuration_auto import (
     AutoConfig,
+    MODEL_TYPE_TO_MODULE,
     replace_list_option_in_docstrings,
 )
 from mindformers.models.configuration_utils import PretrainedConfig
 from mindformers.models.utils import CONFIG_NAME
-from mindformers.modules.transformer import TransformerOpParallelConfig
+from mindformers.models.build_config import extract_model_section
 from mindformers.tools.generic import experimental_mode_func_checker
 from mindformers.tools.hub import (
     cached_file,
@@ -44,7 +44,7 @@ from ...mindformer_book import MindFormerBook, print_dict
 from ..build_model import build_network
 
 EXP_ERROR_MSG = "Please use AutoModel.from_pretrained(), and the input pretrained_model_name_or_dir " \
-                "should be a path to directory which has yaml file, or a model name supported, e.g. glm4_9b."
+                "should be a local model directory or a model ID."
 
 CLASS_DOCSTRING = """
     This is a generic model class that will be instantiated as one of the model classes of the library when created
@@ -77,14 +77,6 @@ FROM_CONFIG_DOCSTRING = """
         Returns:
             A model, which inherited from PreTrainedModel.
 
-        Examples:
-            >>> from mindformers import AutoConfig, BaseAutoModelClass
-            >>> import mindspore as ms
-            >>> # set mindspore context
-            >>> ms.set_context(mode=ms.GRAPH_MODE)
-            >>> # Download configuration from openmind and cache.
-            >>> config = AutoConfig.from_pretrained("checkpoint_placeholder")
-            >>> model = BaseAutoModelClass.from_config(config)
 """
 
 FROM_PRETRAINED_MINDFORMERS_DOCSTRING = r"""
@@ -155,17 +147,6 @@ FROM_PRETRAINED_MINDFORMERS_DOCSTRING = r"""
         Returns:
             A model, which inherited from PreTrainedModel.
 
-        Examples:
-            >>> from mindformers import AutoConfig, BaseAutoModelClass
-            >>> import mindspore as ms
-            >>> # set mindspore context
-            >>> ms.set_context(mode=ms.GRAPH_MODE)
-            >>> # Download model and configuration from openmind and cache.
-            >>> model = BaseAutoModelClass.from_pretrained("checkpoint_placeholder")
-            >>> # Update configuration during loading
-            >>> model = BaseAutoModelClass.from_pretrained("checkpoint_placeholder", num_layers=2)
-            >>> model.config.num_layers
-            2
 """
 
 
@@ -357,19 +338,11 @@ class _BaseAutoModelClass:
             raise ValueError("config should be inherited from PretrainedConfig,"
                              " or a path to .yaml file for model config.")
 
-        config_args.model.model_config.update(**kwargs)
+        model_config = extract_model_section(config_args)
+        model_config.model_config.update(**kwargs)
         if not download_checkpoint:
-            config_args.model.model_config.checkpoint_name_or_path = None
-        if config_args.get("pretrained_model_dir", None):
-            config_args.model.pretrained_model_dir = config_args.pretrained_model_dir
-        if config_args.get("generation_config", None):
-            config_args.model.generation_config = config_args.generation_config
-        if config_args.get("parallel_config", None):
-            if isinstance(config_args.parallel_config, dict):
-                config_args.parallel_config = TransformerOpParallelConfig(
-                    **config_args.parallel_config)
-            config_args.model.model_config.parallel_config = config_args.parallel_config
-        model = build_network(config_args.model)
+            model_config.model_config.checkpoint_name_or_path = None
+        model = build_network(model_config)
         logger.info("model built successfully!")
         return model
 
@@ -445,11 +418,11 @@ class _BaseAutoModelClass:
             ckpt_file = os.path.join(pretrained_model_name_or_dir, ckpt_list[cls._model_type])
 
             config_args = MindFormerConfig(yaml_file)
-            kwargs["checkpoint_name_or_path"] = kwargs.get("checkpoint_name_or_path") \
-                if "checkpoint_name_or_path" in kwargs.keys() else ckpt_file
-            config_args.model.model_config.update(**kwargs)
+            kwargs.setdefault("checkpoint_name_or_path", ckpt_file)
+            config_args = extract_model_section(config_args)
+            config_args.model_config.update(**kwargs)
             logger.info("model config: %s and checkpoint_name_or_path: %s are used for "
-                        "model building.", yaml_file, config_args.model.model_config.checkpoint_name_or_path)
+                        "model building.", yaml_file, config_args.model_config.checkpoint_name_or_path)
         else:
             pretrained_checkpoint_name = pretrained_model_name_or_dir
             if pretrained_model_name_or_dir.startswith('mindspore'):
@@ -477,9 +450,9 @@ class _BaseAutoModelClass:
 
             try_sync_file(yaml_file)
             config_args = MindFormerConfig(yaml_file)
-            kwargs["checkpoint_name_or_path"] = kwargs.get("checkpoint_name_or_path") \
-                if "checkpoint_name_or_path" in kwargs.keys() else pretrained_model_name_or_dir
-            config_args.model.model_config.update(**kwargs)
+            kwargs.setdefault("checkpoint_name_or_path", pretrained_model_name_or_dir)
+            config_args = extract_model_section(config_args)
+            config_args.model_config.update(**kwargs)
         return config_args
 
     @classmethod
@@ -559,7 +532,7 @@ class _BaseAutoModelClass:
         hub_kwargs = {name: kwargs.pop(name) for name in hub_kwargs_names if name in kwargs}
         code_revision = kwargs.pop("code_revision", None)
         commit_hash = kwargs.pop("_commit_hash", None)
-        adapter_kwargs = kwargs.pop("adapter_kwargs", None)
+        kwargs.pop("adapter_kwargs", None)
 
         token = hub_kwargs.pop("token", None)
         use_auth_token = hub_kwargs.pop("use_auth_token", None)
@@ -588,8 +561,6 @@ class _BaseAutoModelClass:
                 commit_hash = getattr(config, "_commit_hash", None)
 
         if not isinstance(config, PretrainedConfig):
-            kwargs_orig = copy.deepcopy(kwargs)
-
             config, kwargs = AutoConfig.from_pretrained(
                 pretrained_model_name_or_path,
                 return_unused_kwargs=True,
@@ -656,10 +627,9 @@ class _BaseAutoModelClass:
             raise TypeError(f"pretrained_model_name_or_dir should be a str,"
                             f" but got {type(pretrained_model_name_or_dir)}")
         config_args = cls._get_config_args(pretrained_model_name_or_dir, **kwargs)
-        config_args.model.model_config.parallel_config = config_args.parallel_config
         if not download_checkpoint:
-            config_args.model.model_config.checkpoint_name_or_path = None
-        model = build_network(config_args.model)
+            config_args.model_config.checkpoint_name_or_path = None
+        model = build_network(config_args)
         cls.default_checkpoint_download_path = model.default_checkpoint_download_path
 
         logger.info("model built successfully!")
@@ -710,7 +680,7 @@ def insert_head_doc(docstring, head_doc=""):
     )
 
 
-def auto_class_update(cls, checkpoint_for_example="bert-base-cased", head_doc=""):
+def auto_class_update(cls, head_doc=""):
     """Create a new class with the right name from the base class"""
     model_mapping = cls._model_mapping  # pylint: disable=W0212
     name = cls.__name__
@@ -722,7 +692,6 @@ def auto_class_update(cls, checkpoint_for_example="bert-base-cased", head_doc=""
     from_config = copy_func(_BaseAutoModelClass.from_config)
     from_config_docstring = insert_head_doc(FROM_CONFIG_DOCSTRING, head_doc=head_doc)
     from_config_docstring = from_config_docstring.replace("BaseAutoModelClass", name)
-    from_config_docstring = from_config_docstring.replace("checkpoint_placeholder", checkpoint_for_example)
     from_config.__doc__ = from_config_docstring
     from_config = replace_list_option_in_docstrings(
         model_mapping._model_mapping,  # pylint: disable=W0212
@@ -733,9 +702,6 @@ def auto_class_update(cls, checkpoint_for_example="bert-base-cased", head_doc=""
     from_pretrained = copy_func(_BaseAutoModelClass.from_pretrained)
     from_pretrained_docstring = insert_head_doc(from_pretrained_docstring, head_doc=head_doc)
     from_pretrained_docstring = from_pretrained_docstring.replace("BaseAutoModelClass", name)
-    from_pretrained_docstring = from_pretrained_docstring.replace("checkpoint_placeholder", checkpoint_for_example)
-    shortcut = checkpoint_for_example.split("/")[-1].split("-")[0]
-    from_pretrained_docstring = from_pretrained_docstring.replace("shortcut_placeholder", shortcut)
     from_pretrained.__doc__ = from_pretrained_docstring
     from_pretrained = replace_list_option_in_docstrings(
         model_mapping._model_mapping,  # pylint: disable=W0212
@@ -796,6 +762,7 @@ class _LazyAutoMapping(OrderedDict):
         raise KeyError(key)
 
     def _load_attr_from_module(self, module_name, attr):
+        module_name = MODEL_TYPE_TO_MODULE.get(module_name, module_name)
         if module_name not in self._modules:
             self._modules[module_name] = importlib.import_module(f".{module_name}", "mindformers.models")
         return _getattribute_from_module(self._modules[module_name], attr)

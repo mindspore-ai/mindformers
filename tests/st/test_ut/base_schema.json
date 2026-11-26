@@ -9,7 +9,7 @@
         "signature": "(task: str = None, model: Union[NoneType, Tuple[str, str], mindformers.models.modeling_utils.PreTrainedModel, mindspore.train.model.Model, str] = None, tokenizer: Optional[mindformers.models.tokenization_utils_base.PreTrainedTokenizerBase] = None, image_processor: Optional[mindformers.models.image_processing_utils.BaseImageProcessor] = None, audio_processor: Optional[mindformers.models.base_processor.BaseAudioProcessor] = None, backend: Optional[str] = 'ms', **kwargs: Any)"
     },
     "mindformers.MultiModalToTextPipeline": {
-        "signature": "(model: Union[mindformers.models.modeling_utils.PreTrainedModel, mindspore.train.model.Model], processor: Optional[mindformers.models.multi_modal.base_multi_modal_processor.BaseXModalToTextProcessor] = None, **kwargs)"
+        "signature": "(model: Union[mindformers.models.modeling_utils.PreTrainedModel, mindspore.train.model.Model], processor: Optional[mindformers.models.processing_utils.ProcessorMixin] = None, **kwargs)"
     },
     "mindformers.MultiModalToTextPipeline.preprocess": {
         "signature": "(self, inputs: Union[List[Dict[str, str]], List[List[Dict[str, str]]]], **preprocess_params)"

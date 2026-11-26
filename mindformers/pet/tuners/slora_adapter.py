@@ -28,7 +28,6 @@ from mindspore.nn import Cell
 from mindspore._checkparam import args_type_check
 import mindspore.common.dtype as mstype
 
-from mindformers.modules.layers import Linear
 from mindformers.pet.pet_config import SLoraConfig
 from mindformers.tools.logger import logger
 from mindformers.version_control import need_nz, is_310p
@@ -52,7 +51,7 @@ class SLoraLinear(Cell):
     def __init__(self, input_linear: Cell, slora_inputs: dict, config: SLoraConfig):
         super().__init__()
         self.lora_group_list = slora_inputs.get("group_list")
-        self.input_cell_type = str(type(input_linear)).split(".")[-1].split("'")[0]
+        self.input_cell_type = type(input_linear).__name__
         self.has_act_quant = False
         if hasattr(input_linear, "layer"):
             if self.input_cell_type != "AllQuantLinearInferCell":
@@ -305,7 +304,7 @@ class SLoraHead(Cell):
         Outputs:
             Tensor of shape :math:`(batch, seq_length, lora_vocab_size)`.
     """
-    def __init__(self, linear: Linear, slora_inputs: dict, config: SLoraConfig):
+    def __init__(self, linear: Cell, slora_inputs: dict, config: SLoraConfig):
         super().__init__()
         self.group_list = slora_inputs.get('head_group_list')
         self.lora_num = config.lora_num
@@ -474,7 +473,7 @@ class SLoraAdapter(abc.ABC):
                 raise TypeError(f"target_modules should be list type, but get {type(config['target_modules'])} type.")
             max_rank = max(max_rank, int(config["r"]))
             if not all(isinstance(module, str) for module in config["target_modules"]):
-                raise TypeError(f"target_modules should be string type, but get wrong type.")
+                raise TypeError("target_modules should be string type, but get wrong type.")
             target_modules_set.update(config["target_modules"])
         if is_310p():
             if max_rank % 16 != 0:
@@ -492,8 +491,8 @@ class SLoraAdapter(abc.ABC):
                     lora_extra_vocab_size = len(added_tokens)
                     break
             if lora_extra_vocab_size == 0:
-                logger.warning(f"There is no added_token.json in the given path"
-                               f"Model will be running with no added token")
+                logger.warning("There is no added_token.json in the given path. "
+                               "Model will be running with no added token.")
 
         # read alpha, dropout from the first lora.
         config_path = os.path.join(path_dict[list(path_dict.keys())[0]], "adapter_config.json")
@@ -533,7 +532,7 @@ class SLoraAdapter(abc.ABC):
                 self.registered_loras["lm_head.lora_b"] = network.lm_head.lora_b_shape
                 if network.lm_head.lora_extra_vocab_size != 0:
                     self.registered_loras["lm_head.lora_embedding"] = network.lm_head.lora_embedding_shape
-                logger.info(f"Apply LoRA to lm_head.")
+                logger.info("Apply LoRA to lm_head.")
             else:
                 logger.warning("The base model must has an attribute named in \'lm_head\'.")
         self.build()
@@ -561,7 +560,7 @@ class SLoraAdapter(abc.ABC):
             return cell, True
         if re.match(self.slora_config.target_modules, cell_name) or \
             (re.match('.*embeddings', cell_name) and ("embed_tokens" in self.slora_config.target_modules)):
-            cell_type = str(type(cell)).split(".")[-1].split("'")[0]
+            cell_type = type(cell).__name__
             wrap_lora = self.common_lora_cell.get(cell_type)
             if wrap_lora:
                 logger.info(f"Apply LoRA to {cell_name}.")

@@ -26,7 +26,7 @@ from collections import OrderedDict
 from typing import Optional, Union, List
 from dataclasses import asdict, dataclass, field, fields
 
-from mindformers.modules.transformer import TransformerRecomputeConfig, TransformerOpParallelConfig, MoEConfig
+from mindformers.modules.transformer import TransformerRecomputeConfig, TransformerOpParallelConfig
 from mindformers.tools.register import MindFormerConfig
 from mindformers.tools.logger import logger
 from mindformers.tools.utils import get_real_rank, get_real_group_size
@@ -1403,9 +1403,9 @@ class TrainingArguments:
         Get moe config.
 
         Returns:
-            An instance of MoEConfig.
+            An instance of MindFormerConfig.
         """
-        moe_config = MoEConfig(
+        moe_config = MindFormerConfig(
             expert_num=self.expert_num,
             capacity_factor=self.capacity_factor,
             aux_loss_factor=self.aux_loss_factor,

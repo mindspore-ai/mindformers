@@ -23,7 +23,6 @@ from typing import Union
 
 import yaml
 from mindformers.tools.check_rules import check_yaml_depth_before_loading
-from .template import ConfigTemplate
 
 BASE_CONFIG = 'base_config'
 
@@ -103,20 +102,16 @@ class MindFormerConfig(DictConfig):
         cfg_dict = {}
 
         # load from file
-        load_from_file = False
         for arg in args:
             if isinstance(arg, str):
                 if arg.endswith('yaml') or arg.endswith('yml'):
                     raw_dict = MindFormerConfig._file2dict(arg)
                     cfg_dict.update(raw_dict)
-                    load_from_file = True
 
         # load dictionary configs
         if kwargs is not None:
             cfg_dict.update(kwargs)
 
-        if load_from_file:
-            ConfigTemplate.apply_template(cfg_dict)
         MindFormerConfig._dict2config(self, cfg_dict)
 
     def merge_from_dict(self, options):
@@ -191,13 +186,13 @@ class MindFormerConfig(DictConfig):
             base_filenames = base_filenames if isinstance(
                 base_filenames, list) else [base_filenames]
 
-            cfg_dict_list = list()
+            cfg_dict_list = []
             for base_filename in base_filenames:
                 cfg_dict_item = MindFormerConfig._file2dict(
                     os.path.join(cfg_dir, base_filename))
                 cfg_dict_list.append(cfg_dict_item)
 
-            base_cfg_dict = dict()
+            base_cfg_dict = {}
             for cfg in cfg_dict_list:
                 base_cfg_dict.update(cfg)
 

@@ -24,44 +24,33 @@ from mindformers.models.auto.utils import get_default_yaml_file, set_default_yam
 
 class TestYamlFileFunctions:
     """ A test class for testing utils."""
-    @pytest.fixture
-    def mock_trainer_support_list(self):
-        """Mock the trainer support task list"""
-        return {
-            "text_generation": {
-                "model1": "/path/to/model1.yaml",
-                "model2": "/path/to/model2.yaml"
-            }
-        }
+    @pytest.fixture(autouse=True)
+    def mock_config_paths(self, monkeypatch):
+        """Use the model YAML catalog without legacy task tables."""
+        monkeypatch.setattr(MindFormerBook, "_MODEL_CONFIG_PATHS", {"model1": "/path/to/model1.yaml"})
 
     @pytest.mark.level1
     @pytest.mark.platform_x86_cpu
     @pytest.mark.env_onecard
-    def test_get_default_yaml_file_found(self, mock_trainer_support_list):
+    def test_get_default_yaml_file_found(self):
         """Test getting default yaml file when model exists"""
-        with patch.object(
-                MindFormerBook, 'get_trainer_support_task_list', return_value=mock_trainer_support_list):
-            result = get_default_yaml_file("model1")
-            assert result == "/path/to/model1.yaml"
+        result = get_default_yaml_file("model1")
+        assert result == "/path/to/model1.yaml"
 
     @pytest.mark.level1
     @pytest.mark.platform_x86_cpu
     @pytest.mark.env_onecard
-    def test_get_default_yaml_file_not_found(self, mock_trainer_support_list):
+    def test_get_default_yaml_file_not_found(self):
         """Test getting default yaml file when model doesn't exist"""
-        with patch.object(
-                MindFormerBook, 'get_trainer_support_task_list', return_value=mock_trainer_support_list):
-            result = get_default_yaml_file("nonexistent_model")
-            assert result == ""
+        result = get_default_yaml_file("nonexistent_model")
+        assert result == ""
 
     @pytest.mark.level1
     @pytest.mark.platform_x86_cpu
     @pytest.mark.env_onecard
-    def test_set_default_yaml_file_success(self, mock_trainer_support_list):
+    def test_set_default_yaml_file_success(self):
         """Test setting default yaml file when source exists and target doesn't"""
-        with patch.object(
-                MindFormerBook, 'get_trainer_support_task_list', return_value=mock_trainer_support_list), \
-                patch('os.path.exists') as mock_exists, \
+        with patch('os.path.exists') as mock_exists, \
                 patch('os.path.realpath', return_value='/real/path/to/model1.yaml'), \
                 patch('shutil.copy') as mock_copy, \
                 patch('mindformers.models.auto.utils.logger') as mock_logger:
@@ -73,11 +62,9 @@ class TestYamlFileFunctions:
     @pytest.mark.level1
     @pytest.mark.platform_x86_cpu
     @pytest.mark.env_onecard
-    def test_set_default_yaml_file_source_not_found(self, mock_trainer_support_list):
+    def test_set_default_yaml_file_source_not_found(self):
         """Test setting default yaml file when source file doesn't exist"""
-        with (patch.object(
-                MindFormerBook, 'get_trainer_support_task_list', return_value=mock_trainer_support_list), \
-                patch('os.path.exists') as mock_exists, patch('os.path.realpath', return_value=''), \
+        with (patch('os.path.exists') as mock_exists, patch('os.path.realpath', return_value=''), \
                 patch('shutil.copy') as mock_copy):
             mock_exists.side_effect = lambda path: False
             with pytest.raises(

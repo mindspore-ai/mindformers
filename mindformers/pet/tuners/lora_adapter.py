@@ -23,9 +23,13 @@ from typing import Union
 from mindspore._checkparam import args_type_check
 from mindspore.parallel._utils import _is_in_auto_parallel_mode
 from mindspore import nn
-from mindpet.delta.lora import LoRADense
+try:
+    from mindpet.delta.lora import LoRADense
+except ImportError:
+    # mindpet 1.0.4 depends on the deleted `mindformers.modules.layers`; the legacy
+    # pet path is removed in static-graph sunset step 4, so only fail when LoRA is used.
+    LoRADense = None
 
-from mindformers.modules.layers import Linear
 from mindformers.tools.logger import logger
 from mindformers.parallel_core.training_graph.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from mindformers.parallel_core.training_graph.tensor_parallel.lora_layers import (
@@ -38,20 +42,9 @@ from ..utils import re_match_list
 
 
 def get_dtype(cell, config):
-    """get param_init_type and compute_dtype from cell and lora config."""
-    if config.param_init_type:
-        param_init_type = config.param_init_type
-    elif isinstance(cell, nn.Dense):
-        param_init_type = cell.weight.dtype
-    elif isinstance(cell, Linear):
-        param_init_type = cell.param_init_type
-
-    if config.compute_dtype:
-        compute_dtype = config.compute_dtype
-    elif isinstance(cell, nn.Dense):
-        compute_dtype = cell.weight.dtype
-    elif isinstance(cell, Linear):
-        compute_dtype = cell.dtype
+    """Use the dense layer's weight dtype for unset LoRA dtypes."""
+    param_init_type = config.param_init_type or cell.weight.dtype
+    compute_dtype = config.compute_dtype or cell.weight.dtype
 
     return param_init_type, compute_dtype
 
@@ -65,7 +58,7 @@ def recursive_replace_dense_cell(net, config):
             if re_match_list(name, config.exclude_layers):
                 continue
             if re.match(config.target_modules, name):
-                if not isinstance(cell, (nn.Dense, Linear, ColumnParallelLinear, RowParallelLinear)):
+                if not isinstance(cell, (nn.Dense, ColumnParallelLinear, RowParallelLinear)):
                     continue
                 if isinstance(cell, ColumnParallelLinear):
                     dest_cell = ColumnParallelLinearWithLoRA(
@@ -95,6 +88,9 @@ def recursive_replace_dense_cell(net, config):
                         lora_dropout=config.lora_dropout,
                     )
                 else:
+                    if LoRADense is None:
+                        raise RuntimeError("mindpet LoRADense is unavailable since "
+                                           "`mindformers.modules.layers` has been removed in static-graph sunset.")
                     in_channels = cell.in_channels
                     out_channels = cell.out_channels
                     param_init_type, compute_dtype = get_dtype(cell, config)
@@ -116,32 +112,6 @@ def recursive_replace_dense_cell(net, config):
                     if cell.has_bias:
                         dest_cell.bias = cell.bias
                         dest_cell.bias_add = cell.bias_add
-
-                # Shard strategies now only support loaded by linear layers.
-                if isinstance(cell, Linear) and _is_in_auto_parallel_mode():
-                    strategy_matmul = cell.matmul.in_strategy
-
-                    dest_cell.lora_dropout.dropout.shard((strategy_matmul[0],))
-                    if cell.transpose_b:
-                        dest_cell.lora_a_matmul.shard((strategy_matmul[0], (1, strategy_matmul[1][1])))
-                        dest_cell.lora_b_matmul.shard(((strategy_matmul[0][0], 1), (strategy_matmul[1][0], 1)))
-                        dest_cell.mul.shard(((strategy_matmul[0][0], strategy_matmul[1][0]), ()))
-                        dest_cell.add.shard(
-                            (
-                                (strategy_matmul[0][0], strategy_matmul[1][0]),
-                                (strategy_matmul[0][0], strategy_matmul[1][0]),
-                            )
-                        )
-                    else:
-                        dest_cell.lora_a_matmul.shard((strategy_matmul[0], (strategy_matmul[1][0], 1)))
-                        dest_cell.lora_b_matmul.shard(((strategy_matmul[0][0], 1), (1, strategy_matmul[1][1])))
-                        dest_cell.mul.shard(((strategy_matmul[0][0], strategy_matmul[1][1]), ()))
-                        dest_cell.add.shard(
-                            (
-                                (strategy_matmul[0][0], strategy_matmul[1][1]),
-                                (strategy_matmul[0][0], strategy_matmul[1][1]),
-                            )
-                        )
 
                 # pylint: disable=W0212
                 net._cells[name] = dest_cell

@@ -23,6 +23,23 @@ from mindformers.tools.register import MindFormerRegister, MindFormerModuleType,
 from mindformers.models.utils import CONFIG_NAME, dict_from_json_file
 
 
+def extract_model_section(config):
+    """Return the model factory input for flat PyNative and nested YAML files."""
+    model = config.get("model") or config
+    if model.get("model_config") is None:
+        model = MindFormerConfig(model_config=model if model.get("model_type") else {})
+    for key in ("pretrained_model_dir", "generation_config"):
+        if key in config:
+            model[key] = config[key]
+    if config.get("parallel_config"):
+        from mindformers.modules.transformer import TransformerOpParallelConfig
+        parallel_config = config["parallel_config"]
+        if isinstance(parallel_config, dict):
+            parallel_config = TransformerOpParallelConfig(**parallel_config)
+        model.model_config.parallel_config = parallel_config
+    return model
+
+
 def build_model_config(
         config: dict = None, default_args: dict = None,
         module_type: str = 'config', class_name: str = None,
@@ -103,7 +120,7 @@ def get_model_config(
             if use_model_config:
                 model_config = config.model_config
             else:
-                model_config = []
+                model_config = {}
             merged_model_config = merge_model_config(
                 config.pretrained_model_dir, model_config
             )

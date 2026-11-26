@@ -109,32 +109,12 @@ from mindformers.models import (
     BaseAudioProcessor,
     BaseConfig,
     BaseImageProcessor,
-    BaseImageToTextImageProcessor,
     BaseModel,
     BaseProcessor,
-    BaseTextContentBuilder,
-    BaseXModalToTextModel,
-    BaseXModalToTextProcessor,
-    BaseXModalToTextTransform,
     CONFIG_MAPPING,
     CONFIG_MAPPING_NAMES,
-    ChatGLM2Config,
-    ChatGLM2ForConditionalGeneration,
-    ChatGLM2Model,
-    ChatGLM2Tokenizer,
-    ChatGLM2WithPtuning2,
-    ChatGLM3Tokenizer,
-    ChatGLM4Tokenizer,
-    GLMProcessor,
     IMAGE_PROCESSOR_MAPPING,
     ImageProcessingMixin,
-    LlamaConfig,
-    LlamaForCausalLM,
-    LlamaModel,
-    LlamaProcessor,
-    LlamaTokenizer,
-    LlamaTokenizerFast,
-    ModalContentTransformTemplate,
     PreTrainedModel,
     PreTrainedTokenizer,
     PreTrainedTokenizerBase,
@@ -143,18 +123,8 @@ from mindformers.models import (
     TOKENIZER_MAPPING,
 )
 from mindformers.modules import (
-    AlibiTensor,
-    AlibiTensorV2,
-    Dropout,
     EmbeddingOpParallelConfig,
-    FixedSparseAttention,
-    LayerNorm,
-    Linear,
-    LocalBlockSparseAttention,
-    LowerTriangularMaskWithDynamic,
-    MoEConfig,
     OpParallelConfig,
-    RotaryEmbedding,
     TransformerOpParallelConfig,
     TransformerRecomputeConfig
 )
@@ -214,7 +184,7 @@ from mindformers.run_check import run_check
 from mindformers.mindformer_book import MindFormerBook
 
 __all__ = ['ModelRunner', 'run_check', 'pipeline', 'MultiModalToTextPipeline']
-__all__.extend(core.__all__)
+__all__.extend(name for name in core.__all__ if name in globals())
 __all__.extend(dataset.__all__)
 __all__.extend(generation.__all__)
 __all__.extend(models.__all__)

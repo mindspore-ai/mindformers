@@ -73,7 +73,7 @@ from .config_args import (
 )
 
 __all__ = ["AdamW"]
-__all__.extend(callback.__all__)
+__all__.extend(name for name in callback.__all__ if name in globals())
 __all__.extend(context.__all__)
 __all__.extend(loss.__all__)
 __all__.extend(lr.__all__)

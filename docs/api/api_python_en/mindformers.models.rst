@@ -13,29 +13,18 @@ Base Classes
     mindformers.models.PretrainedConfig
     mindformers.models.PreTrainedTokenizer
     mindformers.models.PreTrainedTokenizerFast
-    mindformers.models.multi_modal.ModalContentTransformTemplate
 
-Llama
--------
-.. autosummary::
-    :toctree: models
-    :nosignatures:
-    :template: classtemplate.rst
-
-    mindformers.models.LlamaForCausalLM
-    mindformers.models.LlamaConfig
-    mindformers.models.LlamaTokenizer
-    mindformers.models.LlamaTokenizerFast
-
-GLM
----------------------
+PyNative Models
+--------------------
 
 .. autosummary::
     :toctree: models
     :nosignatures:
     :template: classtemplate.rst
 
-    mindformers.models.ChatGLM2ForConditionalGeneration
-    mindformers.models.ChatGLM2Config
-    mindformers.models.ChatGLM3Tokenizer
-    mindformers.models.ChatGLM4Tokenizer
+    mindformers.models.DeepseekV3Config
+    mindformers.models.DeepseekV3ForCausalLM
+    mindformers.models.DeepseekV4Config
+    mindformers.models.DeepseekV4ForCausalLM
+    mindformers.models.Qwen3Config
+    mindformers.models.Qwen3ForCausalLM

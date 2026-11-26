@@ -49,8 +49,7 @@ def build_model(
     if config is not None:
         if isinstance(config, dict) and not isinstance(config, MindFormerConfig):
             config = MindFormerConfig(**config)
-        if default_args is None:
-            default_args = {}
+        default_args = dict(default_args or {})
         if isinstance(config.model_config, MindFormerConfig):
             moe_config = default_args.pop('moe_config', {})
             default_args.update(moe_config)
@@ -59,13 +58,16 @@ def build_model(
             model_config = config.model_config
 
         if model_config is not None:
-            if default_args is not None:
-                for key, value in default_args.items():
-                    model_config.__setattr__(key, value)
-                default_args = {}
-            default_args.setdefault('config', model_config)
-            return MindFormerRegister.get_instance_from_cfg(
-                model_config.to_dict(), MindFormerModuleType.MODELS, default_args=default_args)
+            for key, value in default_args.items():
+                setattr(model_config, key, value)
+            if model_config.architectures:
+                return MindFormerRegister.get_instance_from_cfg(
+                    model_config.to_dict(), MindFormerModuleType.MODELS,
+                    default_args={'config': model_config})
+            model_type = model_config.model_type
+            if model_type and MindFormerRegister.is_exist(MindFormerModuleType.MODELS, model_type):
+                return MindFormerRegister.get_instance(MindFormerModuleType.MODELS, model_type, config=model_config)
+            raise ValueError("Specify 'architectures' to build a model from an unregistered configuration.")
         return None
     return None
 
@@ -73,10 +75,9 @@ def build_model(
 def build_network(
         config: dict = None, default_args: dict = None):
     """Create the quant/pet network For MindFormer"""
-    ckpt_cfg = config.model_config.checkpoint_name_or_path
-    pet_config = config.model_config.pet_config
-    quant_config = config.model_config.quantization_config
     network = build_model(config, default_args=default_args)
+    ckpt_cfg = getattr(network.config, "checkpoint_name_or_path", None)
+    pet_config = getattr(network.config, "pet_config", None)
     if network.can_generate() and config.get("pretrained_model_dir", None):
         network.generation_config = GenerationConfig.from_pretrained(
             config.pretrained_model_dir,
@@ -85,10 +86,6 @@ def build_network(
         merged_dict = network.generation_config.to_dict()
         merged_dict.update(config.generation_config.to_dict())
         network.generation_config = GenerationConfig.from_dict(merged_dict)
-    if quant_config:
-        from mindformers.modules.quantizers import AutoQuantizer
-        quantizer = AutoQuantizer.from_config(quant_config)
-        network = quantizer.preprocess_model(network, config=config)
     if pet_config:
         from mindformers.pet import get_pet_model, is_supported_pet_type
         if is_supported_pet_type(pet_config.pet_type):

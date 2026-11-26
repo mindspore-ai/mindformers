@@ -196,11 +196,7 @@ class TestModelingUtils:
         mock_get_auto_parallel_context.return_value = "stand_alone"
         self.mock_config.parallel_config.pipeline_stage = 2  # pp > 1
 
-        # Should not raise any exception
-        try:
-            self.model.check_pipeline_stage()
-        except Exception as e:
-            pytest.fail(f"check_pipeline_stage() raised an exception unexpectedly: {e}")
+        self.model.check_pipeline_stage()
 
     @pytest.mark.level1
     @pytest.mark.platform_x86_cpu
@@ -212,11 +208,7 @@ class TestModelingUtils:
         mock_get_auto_parallel_context.return_value = "semi_auto_parallel"
         self.mock_config.parallel_config.pipeline_stage = 1  # pp <= 1
 
-        # Should not raise any exception
-        try:
-            self.model.check_pipeline_stage()
-        except Exception as e:
-            pytest.fail(f"check_pipeline_stage() raised an exception unexpectedly: {e}")
+        self.model.check_pipeline_stage()
 
     @pytest.mark.level1
     @pytest.mark.platform_x86_cpu
@@ -268,11 +260,7 @@ class TestModelingUtils:
         self.mock_config.parallel_config.pipeline_stage = 3  # pp = 3
         self.mock_config.num_layers = 6  # num_layers > pp
 
-        # Should not raise any exception
-        try:
-            self.model.check_pipeline_stage()
-        except Exception as e:
-            pytest.fail(f"check_pipeline_stage() raised an exception unexpectedly: {e}")
+        self.model.check_pipeline_stage()
 
     @pytest.mark.level1
     @pytest.mark.platform_x86_cpu
@@ -290,11 +278,7 @@ class TestModelingUtils:
         self.mock_config.pp_interleave_num = 2  # pp_interleave_num = 2
         # pp * pp_interleave_num = 4, which is < num_layers (6) - should be valid
 
-        # Should not raise any exception
-        try:
-            self.model.check_pipeline_stage()
-        except Exception as e:
-            pytest.fail(f"check_pipeline_stage() raised an exception unexpectedly: {e}")
+        self.model.check_pipeline_stage()
 
     @pytest.mark.level1
     @pytest.mark.platform_x86_cpu
@@ -1077,41 +1061,6 @@ class TestPreTrainedModelLoading:
                 "test_model"
             )
         assert "resolved_archive_file:test not found!" in str(context.value)
-
-    @pytest.mark.level1
-    @pytest.mark.platform_x86_cpu
-    @pytest.mark.env_onecard
-    @patch('mindformers.models.modeling_utils.os.path.exists')
-    def test_get_src_checkpoint_with_string_path(self, mock_exists):
-        """Test _get_src_checkpoint with string path"""
-        mock_exists.return_value = True
-
-        with patch('mindformers.models.modeling_utils.make_soft_link') as mock_link:
-            result = self.model_class._get_src_checkpoint(
-                state_dict=None,
-                resolved_archive_file='/path/to/checkpoint.ckpt',
-                src_checkpoint='/path/to/src_checkpoint.ckpt'
-            )
-
-            mock_link.assert_called_once()
-            assert result == '/path/to/src_checkpoint.ckpt'
-
-    @pytest.mark.level1
-    @pytest.mark.platform_x86_cpu
-    @pytest.mark.env_onecard
-    @patch('mindformers.models.modeling_utils.os.path.exists')
-    def test_get_src_checkpoint_with_list_path(self, mock_exists):
-        """Test _get_src_checkpoint with list path"""
-        mock_exists.return_value = True
-
-        with pytest.raises(ValueError) as context:
-            self.model_class._get_src_checkpoint(
-                state_dict=None,
-                resolved_archive_file=['/path/to/checkpoint.ckpt'],
-                src_checkpoint='/path/to/src_checkpoint.ckpt'
-            )
-
-        assert "Failed to read the checkpoint file /path/to/checkpoint.ckpt" in str(context.value)
 
     @pytest.mark.level1
     @pytest.mark.platform_x86_cpu
