@@ -13,6 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """optimizer modules"""
+from . import lr_schedule
 from .muon import Muon
 
 __all__ = ['Muon']

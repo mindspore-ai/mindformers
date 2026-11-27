@@ -1,27 +1,6 @@
 {
-    "mindformers.ModelRunner": {
-        "signature": "(model_path, npu_mem_size, cpu_mem_size, block_size, rank_id=0, world_size=1, npu_device_ids=None, plugin_params=None)"
-    },
     "mindformers.run_check": {
         "signature": "()"
-    },
-    "mindformers.pipeline": {
-        "signature": "(task: str = None, model: Union[NoneType, Tuple[str, str], mindformers.models.modeling_utils.PreTrainedModel, mindspore.train.model.Model, str] = None, tokenizer: Optional[mindformers.models.tokenization_utils_base.PreTrainedTokenizerBase] = None, image_processor: Optional[mindformers.models.image_processing_utils.BaseImageProcessor] = None, audio_processor: Optional[mindformers.models.base_processor.BaseAudioProcessor] = None, backend: Optional[str] = 'ms', **kwargs: Any)"
-    },
-    "mindformers.MultiModalToTextPipeline": {
-        "signature": "(model: Union[mindformers.models.modeling_utils.PreTrainedModel, mindspore.train.model.Model], processor: Optional[mindformers.models.processing_utils.ProcessorMixin] = None, **kwargs)"
-    },
-    "mindformers.MultiModalToTextPipeline.preprocess": {
-        "signature": "(self, inputs: Union[List[Dict[str, str]], List[List[Dict[str, str]]]], **preprocess_params)"
-    },
-    "mindformers.MultiModalToTextPipeline.postprocess": {
-        "signature": "(self, model_outputs, **postprocess_params)"
-    },
-    "mindformers.AdamW": {
-        "signature": "(params, learning_rate=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0, use_fused=False, amsgrad=False, maximize=False, swap=False)"
-    },
-    "mindformers.AdamW.get_actual_adamw_cls": {
-        "signature": "(use_fused)"
     },
     "mindformers.CheckpointMonitor": {
         "signature": "(prefix='CKP', directory=None, config=None, save_checkpoint_steps=1, save_checkpoint_seconds=0, keep_checkpoint_max=5, keep_checkpoint_per_n_minutes=0, integrated_save=True, save_network_params=False, save_trainable_params=False, async_save=False, saved_network=None, append_info=None, enc_key=None, enc_mode='AES-GCM', exception_save=False, global_batch_size=None, checkpoint_format='ckpt', remove_redundancy=False, embedding_size=4096, embedding_local_norm_threshold=1.0, use_checkpoint_health_monitor=False, health_ckpts_record_dir='./output', use_legacy_format=True, save_optimizer=True)"
@@ -121,135 +100,6 @@
     },
     "mindformers.set_context": {
         "signature": "(run_mode=None, **kwargs)"
-    },
-    "mindformers.CrossEntropyLoss": {
-        "signature": "(parallel_config=<mindformers.modules.transformer.op_parallel_config.OpParallelConfig object>, calculate_per_token_loss=False, seq_split_num=1, **kwargs)"
-    },
-    "mindformers.CrossEntropyLoss.construct": {
-        "signature": "(self, logits, label, input_mask)"
-    },
-    "mindformers.LearningRateWiseLayer": {
-        "signature": "(base_lr, lr_scale)"
-    },
-    "mindformers.LearningRateWiseLayer.construct": {
-        "signature": "(self, global_step)"
-    },
-    "mindformers.ConstantWarmUpLR": {
-        "signature": "(learning_rate: float, warmup_steps: int = None, warmup_lr_init: float = 0.0, warmup_ratio: float = None, total_steps: int = None, **kwargs)"
-    },
-    "mindformers.ConstantWarmUpLR.construct": {
-        "signature": "(self, global_step)"
-    },
-    "mindformers.LinearWithWarmUpLR": {
-        "signature": "(learning_rate: float, total_steps: int, warmup_steps: int = None, warmup_lr_init: float = 0.0, warmup_ratio: float = None, **kwargs)"
-    },
-    "mindformers.LinearWithWarmUpLR.construct": {
-        "signature": "(self, global_step)"
-    },
-    "mindformers.CosineWithWarmUpLR": {
-        "signature": "(learning_rate: float, warmup_steps: int = 0, total_steps: int = None, num_cycles: float = 0.5, lr_end: float = 0.0, warmup_lr_init: float = 0.0, warmup_ratio: float = None, decay_steps: int = None, decay_ratio: float = None, **kwargs)"
-    },
-    "mindformers.CosineWithWarmUpLR.construct": {
-        "signature": "(self, global_step)"
-    },
-    "mindformers.CosineWithRestartsAndWarmUpLR": {
-        "signature": "(learning_rate: float, warmup_steps: int = None, total_steps: int = None, num_cycles: float = 1.0, lr_end: float = 0.0, warmup_lr_init: float = 0.0, warmup_ratio: float = None, decay_steps: int = None, **kwargs)"
-    },
-    "mindformers.CosineWithRestartsAndWarmUpLR.construct": {
-        "signature": "(self, global_step)"
-    },
-    "mindformers.PolynomialWithWarmUpLR": {
-        "signature": "(learning_rate: float, total_steps: int, warmup_steps: int = None, lr_end: float = 1e-07, power: float = 1.0, warmup_lr_init: float = 0.0, warmup_ratio: float = None, decay_steps: int = None, **kwargs)"
-    },
-    "mindformers.PolynomialWithWarmUpLR.construct": {
-        "signature": "(self, global_step)"
-    },
-    "mindformers.CosineAnnealingLR": {
-        "signature": "(base_lr: float, t_max: int, eta_min: float = 0.0, **kwargs)"
-    },
-    "mindformers.CosineAnnealingLR.construct": {
-        "signature": "(self, global_step)"
-    },
-    "mindformers.CosineAnnealingWarmRestarts": {
-        "signature": "(base_lr: float, t_0: int, t_mult: int = 1, eta_min: float = 0.0, **kwargs)"
-    },
-    "mindformers.CosineAnnealingWarmRestarts.construct": {
-        "signature": "(self, global_step)"
-    },
-    "mindformers.EmF1Metric": {
-        "signature": "()"
-    },
-    "mindformers.EmF1Metric.clear": {
-        "signature": "(self)"
-    },
-    "mindformers.EmF1Metric.update": {
-        "signature": "(self, *inputs)"
-    },
-    "mindformers.EmF1Metric.eval": {
-        "signature": "(self)"
-    },
-    "mindformers.EmF1Metric.mixed_segmentation": {
-        "signature": "(self, in_str, rm_punc=False)"
-    },
-    "mindformers.EmF1Metric.remove_punctuation": {
-        "signature": "(self, in_str)"
-    },
-    "mindformers.EmF1Metric.find_lcs": {
-        "signature": "(self, s1, s2)"
-    },
-    "mindformers.EmF1Metric.calc_f1_score": {
-        "signature": "(self, answers, prediction)"
-    },
-    "mindformers.EmF1Metric.calc_em_score": {
-        "signature": "(self, answers, prediction)"
-    },
-    "mindformers.EmF1Metric.evaluate_pairs": {
-        "signature": "(self, pred_, ans_)"
-    },
-    "mindformers.EntityScore": {
-        "signature": "()"
-    },
-    "mindformers.EntityScore.clear": {
-        "signature": "(self)"
-    },
-    "mindformers.EntityScore.update": {
-        "signature": "(self, *inputs)"
-    },
-    "mindformers.EntityScore.eval": {
-        "signature": "(self)"
-    },
-    "mindformers.EntityScore.compute": {
-        "signature": "(self, origin, found, right)"
-    },
-    "mindformers.EntityScore.get_entities_bios": {
-        "signature": "(self, seq)"
-    },
-    "mindformers.PerplexityMetric": {
-        "signature": "()"
-    },
-    "mindformers.PerplexityMetric.clear": {
-        "signature": "(self)"
-    },
-    "mindformers.PerplexityMetric.update": {
-        "signature": "(self, *inputs)"
-    },
-    "mindformers.PerplexityMetric.eval": {
-        "signature": "(self)"
-    },
-    "mindformers.PromptAccMetric": {
-        "signature": "()"
-    },
-    "mindformers.PromptAccMetric.clear": {
-        "signature": "(self)"
-    },
-    "mindformers.PromptAccMetric.calculate_circle": {
-        "signature": "(self, *inputs)"
-    },
-    "mindformers.PromptAccMetric.update": {
-        "signature": "(self, *inputs)"
-    },
-    "mindformers.PromptAccMetric.eval": {
-        "signature": "(self)"
     },
     "mindformers.CausalLanguageModelDataset": {
         "signature": "(dataset_config: Optional[dict] = None, data_loader: Union[Callable, dict] = None, input_columns: List[str] = None, output_columns: List[str] = None, batch_size: int = 8, drop_remainder: bool = True, num_parallel_workers: int = 8, python_multiprocessing: bool = False, repeat: int = 1, seed: int = 0, prefetch_size: int = 1, numa_enable: bool = False, eod_reset: bool = False, eod_token_id: Optional[int] = None, auto_tune: bool = False, filepath_prefix: str = './autotune', autotune_per_step: int = 10, profile: bool = False, token_monitor: bool = False, token_monitor_config: Optional[dict] = None, **kwargs)"
@@ -1005,7 +855,7 @@
         "signature": "(self, commit_message: Optional[str] = 'End of training', blocking: bool = True) -> str"
     },
     "mindformers.TrainingArguments": {
-        "signature": "(output_dir: str = './output', overwrite_output_dir: bool = False, seed: int = 42, data_seed: Optional[int] = None, only_save_strategy: bool = False, auto_trans_ckpt: bool = False, src_strategy: Optional[str] = None, transform_process_num: int = 1, resume_from_checkpoint: Optional[str] = None, resume_training: Union[NoneType, bool, str] = None, ignore_data_skip: bool = False, data_skip_steps: Optional[int] = None, do_train: bool = False, do_eval: bool = False, do_predict: bool = False, check_for_nan_in_loss_and_grad: bool = False, calculate_per_token_loss: bool = False, remote_save_url: Optional[str] = None, batch_size: Optional[int] = None, num_train_epochs: float = 3.0, sink_mode: bool = True, sink_size: int = 2, gradient_accumulation_steps: int = 1, mode: int = 0, use_cpu: bool = False, device_id: int = 0, device_target: str = 'Ascend', max_call_depth: int = 10000, max_device_memory: str = '1024GB', save_graphs: bool = False, save_graphs_path: str = './graph', use_parallel: bool = False, parallel_mode: int = 1, gradients_mean: bool = False, loss_repeated_mean: bool = False, enable_alltoall: bool = False, full_batch: bool = True, dataset_strategy: Union[str, tuple] = 'full_batch', search_mode: str = 'sharding_propagation', enable_parallel_optimizer: bool = False, gradient_accumulation_shard: bool = False, parallel_optimizer_threshold: int = 64, optimizer_weight_shard_size: int = -1, strategy_ckpt_save_file: str = './ckpt_strategy.ckpt', data_parallel: int = 1, model_parallel: int = 1, expert_parallel: int = 1, pipeline_stage: int = 1, micro_batch_num: int = 1, gradient_aggregation_group: int = 4, micro_batch_interleave_num: int = 1, use_seq_parallel: bool = False, vocab_emb_dp: bool = True, expert_num: int = 1, capacity_factor: float = 1.05, aux_loss_factor: float = 0.05, num_experts_chosen: int = 1, recompute: bool = False, select_recompute: bool = False, parallel_optimizer_comm_recompute: bool = False, mp_comm_recompute: bool = True, recompute_slice_activation: bool = False, optim: Union[mindformers.trainer.utils.OptimizerType, str] = 'AdamW', adam_beta1: float = 0.9, adam_beta2: float = 0.999, adam_epsilon: float = 1e-08, weight_decay: float = 0.0, layer_scale: bool = False, layer_decay: float = 0.65, lr_scheduler_type: Union[mindformers.trainer.utils.LrSchedulerType, str] = 'cosine', learning_rate: float = 5e-05, lr_end: float = 1e-06, warmup_lr_init: float = 0.0, warmup_epochs: Optional[int] = None, warmup_ratio: Optional[float] = None, warmup_steps: int = 0, total_steps: int = -1, lr_scale: bool = False, lr_scale_factor: int = 256, dataset_task: Optional[str] = None, dataset_type: Optional[str] = None, train_dataset: Optional[str] = None, train_dataset_in_columns: Optional[List[str]] = None, train_dataset_out_columns: Optional[List[str]] = None, eval_dataset: Optional[str] = None, eval_dataset_in_columns: Optional[List[str]] = None, eval_dataset_out_columns: Optional[List[str]] = None, shuffle: bool = True, dataloader_drop_last: bool = True, repeat: int = 1, per_device_train_batch_size: int = 8, per_device_eval_batch_size: int = 8, prediction_loss_only: bool = False, dataloader_num_workers: int = 8, python_multiprocessing: bool = False, numa_enable: bool = False, prefetch_size: int = 1, wrapper_type: str = 'MFTrainOneStepCell', scale_sense: Union[float, str] = 'DynamicLossScaleUpdateCell', loss_scale_value: int = 65536, loss_scale_factor: int = 2, loss_scale_window: int = 1000, use_clip_grad: bool = True, max_grad_norm: float = 1.0, max_scale_window: int = 1000, min_scale_window: int = 20, metric_type: Union[List[str], NoneType, str] = None, logging_strategy: Union[mindformers.trainer.utils.LoggingIntervalStrategy, str] = 'steps', logging_steps: int = 1, save_prefix: str = 'CKP', save_directory: Optional[str] = None, save_strategy: Union[mindformers.trainer.utils.SaveIntervalStrategy, str] = 'steps', save_steps: int = 500, save_seconds: Optional[int] = None, save_total_limit: Optional[int] = 5, keep_checkpoint_per_n_minutes: int = 0, save_on_each_node: bool = True, integrated_save: bool = None, save_network_params: bool = True, save_trainable_params: bool = False, async_save: bool = False, evaluation_strategy: Union[mindformers.trainer.utils.IntervalStrategy, str] = 'no', eval_steps: Optional[float] = None, eval_epochs: Optional[int] = None, profile: bool = False, profile_start_step: int = 1, profile_end_step: int = 10, init_start_profile: bool = False, profile_communication: bool = False, profile_memory: bool = True, auto_tune: bool = False, filepath_prefix: str = './autotune', autotune_per_step: int = 10, push_to_hub: bool = False, hub_model_id: Optional[str] = None, hub_strategy: Union[mindformers.trainer.utils.HubStrategy, str] = 'every_save', hub_token: Optional[str] = None, hub_private_repo: bool = False, hub_always_push: bool = False) -> None"
+        "signature": "(output_dir: str = './output', overwrite_output_dir: bool = False, seed: int = 42, data_seed: Optional[int] = None, only_save_strategy: bool = False, auto_trans_ckpt: bool = False, src_strategy: Optional[str] = None, transform_process_num: int = 1, resume_from_checkpoint: Optional[str] = None, resume_training: Union[NoneType, bool, str] = None, ignore_data_skip: bool = False, data_skip_steps: Optional[int] = None, do_train: bool = False, do_eval: bool = False, do_predict: bool = False, check_for_nan_in_loss_and_grad: bool = False, calculate_per_token_loss: bool = False, remote_save_url: Optional[str] = None, batch_size: Optional[int] = None, num_train_epochs: float = 3.0, sink_mode: bool = True, sink_size: int = 2, gradient_accumulation_steps: int = 1, mode: int = 0, use_cpu: bool = False, device_id: int = 0, device_target: str = 'Ascend', max_call_depth: int = 10000, max_device_memory: str = '1024GB', save_graphs: bool = False, save_graphs_path: str = './graph', use_parallel: bool = False, parallel_mode: int = 1, gradients_mean: bool = False, loss_repeated_mean: bool = False, enable_alltoall: bool = False, full_batch: bool = True, dataset_strategy: Union[str, tuple] = 'full_batch', search_mode: str = 'sharding_propagation', enable_parallel_optimizer: bool = False, gradient_accumulation_shard: bool = False, parallel_optimizer_threshold: int = 64, optimizer_weight_shard_size: int = -1, strategy_ckpt_save_file: str = './ckpt_strategy.ckpt', data_parallel: int = 1, model_parallel: int = 1, expert_parallel: int = 1, pipeline_stage: int = 1, micro_batch_num: int = 1, gradient_aggregation_group: int = 4, micro_batch_interleave_num: int = 1, use_seq_parallel: bool = False, vocab_emb_dp: bool = True, expert_num: int = 1, capacity_factor: float = 1.05, aux_loss_factor: float = 0.05, num_experts_chosen: int = 1, recompute: bool = False, select_recompute: bool = False, parallel_optimizer_comm_recompute: bool = False, mp_comm_recompute: bool = True, recompute_slice_activation: bool = False, optim: Union[mindformers.trainer.utils.OptimizerType, str] = 'AdamW', adam_beta1: float = 0.9, adam_beta2: float = 0.999, adam_epsilon: float = 1e-08, weight_decay: float = 0.0, layer_scale: bool = False, layer_decay: float = 0.65, lr_scheduler_type: Union[mindformers.trainer.utils.LrSchedulerType, str] = 'cosine', learning_rate: float = 5e-05, lr_end: float = 1e-06, warmup_lr_init: float = 0.0, warmup_epochs: Optional[int] = None, warmup_ratio: Optional[float] = None, warmup_steps: int = 0, total_steps: int = -1, lr_scale: bool = False, lr_scale_factor: int = 256, dataset_task: Optional[str] = None, dataset_type: Optional[str] = None, train_dataset: Optional[str] = None, train_dataset_in_columns: Optional[List[str]] = None, train_dataset_out_columns: Optional[List[str]] = None, eval_dataset: Optional[str] = None, eval_dataset_in_columns: Optional[List[str]] = None, eval_dataset_out_columns: Optional[List[str]] = None, shuffle: bool = True, dataloader_drop_last: bool = True, repeat: int = 1, per_device_train_batch_size: int = 8, per_device_eval_batch_size: int = 8, prediction_loss_only: bool = False, dataloader_num_workers: int = 8, python_multiprocessing: bool = False, numa_enable: bool = False, prefetch_size: int = 1, metric_type: Union[List[str], NoneType, str] = None, logging_strategy: Union[mindformers.trainer.utils.LoggingIntervalStrategy, str] = 'steps', logging_steps: int = 1, save_prefix: str = 'CKP', save_directory: Optional[str] = None, save_strategy: Union[mindformers.trainer.utils.SaveIntervalStrategy, str] = 'steps', save_steps: int = 500, save_seconds: Optional[int] = None, save_total_limit: Optional[int] = 5, keep_checkpoint_per_n_minutes: int = 0, save_on_each_node: bool = True, integrated_save: bool = None, save_network_params: bool = True, save_trainable_params: bool = False, async_save: bool = False, evaluation_strategy: Union[mindformers.trainer.utils.IntervalStrategy, str] = 'no', eval_steps: Optional[float] = None, eval_epochs: Optional[int] = None, profile: bool = False, profile_start_step: int = 1, profile_end_step: int = 10, init_start_profile: bool = False, profile_communication: bool = False, profile_memory: bool = True, auto_tune: bool = False, filepath_prefix: str = './autotune', autotune_per_step: int = 10, push_to_hub: bool = False, hub_model_id: Optional[str] = None, hub_strategy: Union[mindformers.trainer.utils.HubStrategy, str] = 'every_save', hub_token: Optional[str] = None, hub_private_repo: bool = False, hub_always_push: bool = False) -> None"
     },
     "mindformers.TrainingArguments.check_step_rules": {
         "signature": "(steps, info='steps')"
@@ -1060,29 +910,5 @@
     },
     "mindformers.TrainingArguments.convert_args_to_mindformers_config": {
         "signature": "(self, task_config: mindformers.tools.register.config.MindFormerConfig = None)"
-    },
-    "mindformers.MFPipelineWithLossScaleCell": {
-        "signature": "(network, optimizer, use_clip_grad=True, max_grad_norm=1.0, scale_sense=1.0, micro_batch_num=1, local_norm=False, calculate_per_token_loss=False, global_norm_spike_threshold=1.0, use_skip_data_by_global_norm=False, print_separate_loss=False, **kwargs)"
-    },
-    "mindformers.MFPipelineWithLossScaleCell.construct": {
-        "signature": "(self, *inputs)"
-    },
-    "mindformers.MFPipelineWithLossScaleCell.grads_for_legacy": {
-        "signature": "(self, scaling_sens, *inputs)"
-    },
-    "mindformers.MFPipelineWithLossScaleCell.grads_for_mcore": {
-        "signature": "(self, scaling_sens, *inputs)"
-    },
-    "mindformers.MFTrainOneStepCell": {
-        "signature": "(network, optimizer, use_clip_grad=False, max_grad_norm=1.0, scale_sense=1.0, local_norm=False, calculate_per_token_loss=False, global_norm_spike_threshold=1.0, use_skip_data_by_global_norm=False, print_separate_loss=False, **kwargs)"
-    },
-    "mindformers.MFTrainOneStepCell.construct": {
-        "signature": "(self, *inputs)"
-    },
-    "mindformers.MFTrainOneStepCell.grads_for_legacy": {
-        "signature": "(self, scaling_sens, *inputs)"
-    },
-    "mindformers.MFTrainOneStepCell.grads_for_mcore": {
-        "signature": "(self, scaling_sens, *inputs)"
     }
 }

@@ -24,7 +24,6 @@ from mindformers.models import PreTrainedModel, BaseProcessor, build_processor
 from mindformers.tools.logger import logger
 from mindformers.tools.register import MindFormerRegister, MindFormerModuleType, MindFormerConfig
 from ...dataset.dataloader import build_dataset_loader
-from ...core.config_args import ConfigArguments
 from ..training_args import TrainingArguments
 from ..base_trainer import BaseTrainer
 
@@ -47,7 +46,7 @@ class MultiModalToTextGenerationTrainer(BaseTrainer):
         super(MultiModalToTextGenerationTrainer, self).__init__("multi_modal_to_text_generation", model_name)
 
     def train(self,
-              config: Optional[Union[dict, MindFormerConfig, ConfigArguments, TrainingArguments]] = None,
+              config: Optional[Union[dict, MindFormerConfig, TrainingArguments]] = None,
               network: Optional[Union[Cell, PreTrainedModel]] = None,
               dataset: Optional[Union[BaseDataset, GeneratorDataset]] = None,
               optimizer: Optional[Optimizer] = None,
@@ -58,9 +57,9 @@ class MultiModalToTextGenerationTrainer(BaseTrainer):
         Train For MultiModalToTextGenerationTrainer.
 
         Args:
-            config (Optional[Union[dict, MindFormerConfig, ConfigArguments, TrainingArguments]]):
+            config (Optional[Union[dict, MindFormerConfig, TrainingArguments]]):
                 The task config which is used to configure the dataset, the hyper-parameter, optimizer, etc.
-                It supports config dict or MindFormerConfig or TrainingArguments or ConfigArguments class.
+                It supports config dict or MindFormerConfig or TrainingArguments class.
                 Default: None.
             network (Optional[Union[Cell, PreTrainedModel]]):
                 The network for trainer.It supports model name or PreTrainedModel or MindSpore Cell class.
@@ -90,7 +89,7 @@ class MultiModalToTextGenerationTrainer(BaseTrainer):
             "The MultiModalToTextGenerationTrainer task does not support evaluate.")
 
     def predict(self,
-                config: Optional[Union[dict, MindFormerConfig, ConfigArguments, TrainingArguments]] = None,
+                config: Optional[Union[dict, MindFormerConfig, TrainingArguments]] = None,
                 input_data: Optional[Union[GeneratorDataset, list]] = None,
                 network: Optional[Union[Cell, PreTrainedModel]] = None,
                 processor: Optional[BaseProcessor] = None, **kwargs):
@@ -99,9 +98,9 @@ class MultiModalToTextGenerationTrainer(BaseTrainer):
         This function is used to predict the network.
 
         Args:
-            config (Optional[Union[dict, MindFormerConfig, ConfigArguments, TrainingArguments]]):
+            config (Optional[Union[dict, MindFormerConfig, TrainingArguments]]):
                 The task config which is used to configure the dataset, the hyper-parameter, optimizer, etc.
-                It supports config dict or MindFormerConfig or TrainingArguments or ConfigArguments class.
+                It supports config dict or MindFormerConfig or TrainingArguments class.
                 Default: None.
             input_data (Optional[Union[GeneratorDataset, list]]):
                 The dataset. It supports real dataset path or BaseDateset class or MindSpore Dataset class.

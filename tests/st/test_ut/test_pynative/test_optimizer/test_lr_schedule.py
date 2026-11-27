@@ -16,7 +16,7 @@
 import pytest
 import mindspore as ms
 from mindspore import Tensor
-from mindformers.core.lr import (
+from mindformers.pynative.optimizer.lr_schedule import (
     LinearWithWarmUpLR, CosineWithWarmUpLR, PolynomialWithWarmUpLR,
     CosineWithRestartsAndWarmUpLR, ConstantWarmUpLR, ConstantWithCoolDownLR,
     CosineAnnealingLR, CosineAnnealingWarmRestarts, WarmUpStableDecayLR)

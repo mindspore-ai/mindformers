@@ -24,15 +24,6 @@ Trainer高阶接口
     mindformers.Trainer
     mindformers.TrainingArguments
 
-pipeline高阶接口
------------------
-
-.. mscnautosummary::
-    :toctree: mindformers
-    :nosignatures:
-
-    mindformers.pipeline
-
 运行检查
 ---------
 
@@ -41,12 +32,3 @@ pipeline高阶接口
     :nosignatures:
 
     mindformers.run_check
-
-面向服务化
-----------
-
-.. mscnautosummary::
-    :toctree: mindformers
-    :nosignatures:
-
-    mindformers.ModelRunner

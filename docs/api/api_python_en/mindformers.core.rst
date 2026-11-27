@@ -1,7 +1,7 @@
 mindformers.core
 ==================
 
-core module, including Runtime Context, Loss, Optimizer, Learning Rate, Callback, and Evaluation Metrics.
+Runtime context and callbacks.
 
 Runtime Context
 -----------------
@@ -15,45 +15,6 @@ Runtime Context
     mindformers.core.get_context
     mindformers.core.init_context
     mindformers.core.set_context
-
-Loss
------
-
-.. autosummary::
-    :toctree: core
-    :nosignatures:
-    :template: classtemplate.rst
-
-    mindformers.core.CrossEntropyLoss
-
-Optimizer
-----------
-
-.. autosummary::
-    :toctree: core
-    :nosignatures:
-    :template: classtemplate.rst
-
-    mindformers.core.AdamW
-
-Learning Rate
---------------
-
-.. autosummary::
-    :toctree: core
-    :nosignatures:
-    :template: classtemplate.rst
-
-    mindformers.core.ConstantWarmUpLR
-    mindformers.core.ConstantWithCoolDownLR
-    mindformers.core.CosineAnnealingLR
-    mindformers.core.CosineAnnealingWarmRestarts
-    mindformers.core.CosineWithRestartsAndWarmUpLR
-    mindformers.core.CosineWithWarmUpLR
-    mindformers.core.LearningRateWiseLayer
-    mindformers.core.LinearWithWarmUpLR
-    mindformers.core.PolynomialWithWarmUpLR
-    mindformers.core.WarmUpStableDecayLR
 
 Callback
 --------
@@ -69,16 +30,3 @@ Callback
     mindformers.core.ProfileMonitor
     mindformers.core.SummaryMonitor
     mindformers.core.TrainingStateMonitor
-
-Evaluation Metric
--------------------
-
-.. autosummary::
-    :toctree: core
-    :nosignatures:
-    :template: classtemplate.rst
-
-    mindformers.core.EntityScore
-    mindformers.core.EmF1Metric
-    mindformers.core.PerplexityMetric
-    mindformers.core.PromptAccMetric

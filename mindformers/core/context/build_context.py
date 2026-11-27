@@ -26,8 +26,7 @@ import mindspore.context as ms_context
 from mindspore.device_context.ascend import op_precision
 import psutil
 
-import mindformers
-from mindformers.core.config_args import (
+from mindformers.core.context.config import (
     ContextConfig,
     MFContextConfig,
     ParallelContextConfig,
@@ -36,6 +35,8 @@ from mindformers.core.context.parallel import ParallelOperator
 from mindformers.core.context.validators import RunMode, execute_validator
 from mindformers.tools.logger import logger
 from mindformers.tools.register import MindFormerConfig
+from mindformers.tools import utils as tools_utils
+from mindformers.utils import cann_cores_utils
 from mindformers.tools.utils import (
     MODE,
     get_output_subpath,
@@ -745,7 +746,7 @@ def set_ms_affinity(affinity_config, affinity_cpu_list):
 
     if affinity_config:
         # Check if any device_X in affinity_config has X >= device_num
-        max_device_id = mindformers.tools.utils.get_real_group_size() - 1
+        max_device_id = tools_utils.get_real_group_size() - 1
         for key in affinity_config:
             try:
                 x = int(key.split("_")[1])
@@ -759,7 +760,7 @@ def set_ms_affinity(affinity_config, affinity_cpu_list):
                     f"Invalid device id {x} in affinity_config. "
                     f"Maximum allowed device id is {max_device_id}."
                 )
-        device_id = mindformers.tools.utils.get_real_local_rank()
+        device_id = tools_utils.get_real_local_rank()
         device_config = affinity_config.get(f'device_{device_id}', None)
         if device_config:
             affinity_cpu_list = device_config.get('affinity_cpu_list', None)
@@ -786,7 +787,7 @@ def set_cpu_affinity(rank_id, rank_size):
         used_cpus = list(
             range(rank_id * used_cpus_num, (rank_id + 1) * used_cpus_num)
         )
-        cann_used_cpus = mindformers.utils.get_cann_workqueue_cores(rank_id)
+        cann_used_cpus = cann_cores_utils.get_cann_workqueue_cores(rank_id)
         logger.info(f"cann workqueue cpus: {cann_used_cpus}")
         used_cpus = list(set(used_cpus) - set(cann_used_cpus))
         if not used_cpus:

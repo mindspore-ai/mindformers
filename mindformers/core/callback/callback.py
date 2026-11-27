@@ -60,7 +60,6 @@ from mindspore.profiler import ProfilerLevel, schedule
 from mindspore.utils import stress_detect
 from mindspore.mint.distributed import all_to_all_single
 
-from mindformers.wrapper.wrapper import get_real_models
 from mindformers.checkpoint.sharded_tensor import get_all_sharded_tensor_on_rank0
 from mindformers.core.context.build_context import get_context
 from mindformers.tools import get_output_root_path
@@ -193,6 +192,17 @@ class AllReduceNet(Cell):
 
     def construct(self, x):
         return self.allreduce_sum(x)
+
+
+def get_real_models(network):
+    """Return the underlying model from a legacy training network."""
+    while hasattr(network, 'network'):
+        network = network.network
+    if hasattr(network, '_backbone'):
+        network = network._backbone  # pylint: disable=protected-access
+    while hasattr(network, 'network'):
+        network = network.network
+    return network
 
 
 def _check_mspti_is_on():

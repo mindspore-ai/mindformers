@@ -157,11 +157,6 @@ callbacks:
     checkpoint_format: "safetensors"  # Format for saving checkpoints
 
 # Wrapper cell configuration
-runner_wrapper:
-  type: MFTrainOneStepCell
-  scale_sense: 1.0
-  use_clip_grad: True
-
 profile: False
 profile_start_step: 1
 profile_stop_step: 10

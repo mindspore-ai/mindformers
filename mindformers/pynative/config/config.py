@@ -344,7 +344,7 @@ class TrainingConfig(BaseConfig):
     use_skip_step_on_nan: bool = False
     """Skip the optimizer update of a step whose global gradient norm is NaN/Inf.
 
-    Mirrors the static-graph overflow behaviour (see ``MFTrainOneStepCell``): when the
+    When the
     gradients of a step are not finite, the optimizer is not invoked, so neither the
     parameters, the optimizer states, nor the internal ``global_step`` (and therefore the
     learning rate) advance. Gradients are still zeroed and training continues with the next

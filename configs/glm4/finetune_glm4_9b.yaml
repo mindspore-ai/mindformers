@@ -98,10 +98,6 @@ runner_config:
   sink_mode: True
   sink_size: 1
 
-runner_wrapper:
-  type: MFTrainOneStepCell
-  use_clip_grad: True
-
 # lr schedule
 lr_schedule:
   type: CosineWithWarmUpLR

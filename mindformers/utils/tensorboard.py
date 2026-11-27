@@ -14,7 +14,6 @@
 # ============================================================================
 """TENSORBOARD Module"""
 from tensorboardX import SummaryWriter
-from mindspore.nn.wrap.loss_scale import DynamicLossScaleUpdateCell
 from mindformers.tools.logger import logger
 from mindformers.tools.register import MindFormerConfig
 
@@ -31,7 +30,6 @@ def get_text_mapping():
 
 
 def _default_handle(key, value, _, writer):
-    global _GLOBAL_TENSORBOARD_TEXT_MAPPING
     writer.add_text(key, str(value), global_step=1)
     _GLOBAL_TENSORBOARD_TEXT_MAPPING.add(key)
 
@@ -56,6 +54,7 @@ def _handle_parallel(key, value, config, writer):
 
 def _handle_runner_config(key, value, config, writer):
     """Handle runner config."""
+    del key, value
     if config.runner_config.batch_size == config.runner_config.global_batch_size:
         _RUNNER_CONFIG['batch_size'] = (config.runner_config.global_batch_size //
                                         config.runner_config.gradient_accumulation_steps //
@@ -68,20 +67,6 @@ def _handle_runner_config(key, value, config, writer):
     _RUNNER_CONFIG['sink_size'] = config.runner_config.sink_size
     _RUNNER_CONFIG['gradient_accumulation_steps'] = config.runner_config.gradient_accumulation_steps
     _default_handle('runner_config', _RUNNER_CONFIG, config, writer)
-
-
-def _handle_runner_wrapper(key, value, config, writer):
-    """Write moe config."""
-    if isinstance(config.runner_wrapper['scale_sense'], DynamicLossScaleUpdateCell):
-        config.runner_wrapper['scale_sense'] = {
-            'type': DynamicLossScaleUpdateCell,
-            'loss_scale_value': config.runner_wrapper['scale_sense'].loss_scale_value,
-            'scale_factor': config.runner_wrapper['scale_sense'].scale_factor,
-            'scale_window': config.runner_wrapper['scale_sense'].scale_window,
-        }
-    else:
-        logger.info("The scale_sense of the runner_wrapper will not be logged specifically.")
-    _default_handle('runner_wrapper', config.runner_wrapper, config, writer)
 
 
 def _handle_moe_config(_, value, config, writer):
@@ -118,7 +103,6 @@ handlers = {
     'model': _handle_model,
     'parallel': _handle_parallel,
     'runner_config': _handle_runner_config,
-    'runner_wrapper': _handle_runner_wrapper,
     'moe_config': _handle_moe_config,
     'parallel_config': _handle_parallel_config,
     'recompute_config': _handle_recompute_config,
@@ -210,7 +194,6 @@ def _unset_tensorboard_writer():
 
 def write_args_to_tensorboard(config):
     """Write arguments to tensorboard."""
-    global _GLOBAL_TENSORBOARD_WRITER
     if _GLOBAL_TENSORBOARD_WRITER is None:
         raise ValueError("tensorboard writer is not set.")
     writer = get_tensorboard_writer()
@@ -218,7 +201,7 @@ def write_args_to_tensorboard(config):
         for key, value in config.items():
             if key in _TENSORBOARD_TEXT_UNWRITTEN_MAPPING:
                 continue
-            elif key in conditions:
+            if key in conditions:
                 if any(config.get_value(attr, flag) == flag for (attr, flag) in conditions[key]):
                     continue
 
@@ -234,7 +217,6 @@ def write_args_to_tensorboard(config):
 
 def update_tensorboard_args(config):
     """Update args for tensorboard writer."""
-    global _GLOBAL_TENSORBOARD_WRITER_ARGS
     for key in _GLOBAL_TENSORBOARD_WRITER_ARGS:
         if isinstance(config, MindFormerConfig):
             if config.get_value(key) is not None:
