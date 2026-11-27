@@ -152,11 +152,6 @@ runner_config:
   batch_size: 1   # Set the sample size of the batch data, which overrides the `batch_size` in the dataset configuration
 
 # wrapper cell config
-runner_wrapper:
-  type: MFTrainOneStepCell         # Set the wrapper class, generally set 'MFTrainOneStepCell'
-  scale_sense: 1.0                 # Gradient scaling configuration
-  use_clip_grad: True              # Turn on gradient clipping. Turning on to avoid cases where the inverse gradient is too large and training fails to converge
-
 profile: False                     # Whether to enable the performance analysis tool
 profile_start_step: 1              # Set the number of steps to start collecting performance data
 profile_stop_step: 10              # Set the number of steps to stop collecting performance data

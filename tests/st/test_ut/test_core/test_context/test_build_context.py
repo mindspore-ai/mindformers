@@ -447,7 +447,7 @@ def test_set_ms_affinity_with_invalid_device_id(mock_rank, mock_group_size):
         ([0, 1, 2, 3], [0, 1, 2, 3]),
     ),
 )
-@patch("mindformers.utils.get_cann_workqueue_cores")
+@patch("mindformers.utils.cann_cores_utils.get_cann_workqueue_cores")
 @patch("psutil.Process")
 @patch("psutil.cpu_count", return_value=8)
 @patch("mindspore.dataset.config.set_numa_enable")

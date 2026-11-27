@@ -475,20 +475,6 @@ class ModelConfig(Config):
     _required_keys = ["model_config"]
 
 
-class WrapperConfig(SpecConfig):
-    _name = "runner_wrapper"
-    _required_keys = ["type"]
-
-    type = "MFTrainOneStepCell"
-    use_clip_grad = True
-    scale_sense = {
-        "type": "DynamicLossScaleUpdateCell",
-        "loss_scale_value": 65536,
-        "scale_factor": 2,
-        "scale_window": 1000
-    }
-
-
 class OptimizerConfig(SpecConfig):
     _name = "optimizer"
     _required_keys = ["type"]
@@ -584,7 +570,6 @@ CONFIG_NAME_TO_CLASS = {
     "eval_dataset_task": EvalDatasetTaskConfig,
     "trainer": TrainerConfig,
     "model": ModelConfig,
-    "runner_wrapper": WrapperConfig,
     "optimizer": OptimizerConfig,
     "lr_schedule": LrScheduleConfig,
     "metric": MetricConfig,
@@ -625,7 +610,6 @@ class ConfigTemplate:
     train_configs = [
         "recompute_config",
         "swap_config",
-        "runner_wrapper",
         "optimizer",
         "lr_schedule",
         "metric",

@@ -35,7 +35,6 @@ def test_mindformer_book_show():
     Expectation: success
     """
     MindFormerBook.show_trainer_support_task_list()
-    MindFormerBook.show_pipeline_support_task_list()
     MindFormerBook.show_model_support_list()
     MindFormerBook.show_model_ckpt_url_list()
     MindFormerBook.show_model_config_url_list()
@@ -55,7 +54,6 @@ def test_mindformer_book_get():
     Expectation: success
     """
     logger.info(MindFormerBook.get_trainer_support_task_list())
-    logger.info(MindFormerBook.get_pipeline_support_task_list())
     logger.info(MindFormerBook.get_model_support_list())
     logger.info(MindFormerBook.get_model_ckpt_url_list())
     logger.info(MindFormerBook.get_model_config_url_list())

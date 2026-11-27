@@ -22,15 +22,6 @@ runner_config:
   sink_mode: False
   sink_size: 1
 
-runner_wrapper:
-  type: MFTrainOneStepCell
-  scale_sense:
-    type: DynamicLossScaleUpdateCell
-    loss_scale_value: 4096
-    scale_factor: 2
-    scale_window: 1000
-  use_clip_grad: True
-
 # parallel
 use_parallel: False
 parallel:

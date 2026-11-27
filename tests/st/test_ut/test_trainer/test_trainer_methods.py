@@ -947,16 +947,6 @@ class TestResetConfigForSave(unittest.TestCase):
     @pytest.mark.level1
     @pytest.mark.platform_x86_cpu
     @pytest.mark.env_onecard
-    def test_reset_config_for_save_with_runner_wrapper(self):
-        """test _reset_config_for_save with runner wrapper config."""
-        config = MindFormerConfig()
-        config.runner_wrapper = MindFormerConfig({'type': 'TrainOneStepCell'})
-        result = _reset_config_for_save(config)
-        assert 'runner_wrapper' in result
-
-    @pytest.mark.level1
-    @pytest.mark.platform_x86_cpu
-    @pytest.mark.env_onecard
     def test_reset_config_for_save_empty_config(self):
         """test _reset_config_for_save with empty config."""
         config = MindFormerConfig()

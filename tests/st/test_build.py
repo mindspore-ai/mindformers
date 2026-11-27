@@ -19,19 +19,14 @@ python tests/ut/test_build.py
 """
 from dataclasses import dataclass
 from typing import Callable
-from mindspore.nn import AdamWeightDecay, CosineDecayLR, Accuracy,\
-    TrainOneStepWithLossScaleCell, L1Loss
 from mindspore.train.callback import LossMonitor, TimeMonitor
 from mindspore import Parameter, Tensor
 
 from mindformers.tools.logger import logger
 from mindformers.tools import MindFormerRegister, MindFormerModuleType
-from mindformers.core import build_lr, build_optim, build_loss, build_metric
 from mindformers.models import build_model, build_processor
 from mindformers.models import PretrainedConfig, PreTrainedModel
 from mindformers.dataset import build_dataset
-from mindformers.pipeline import build_pipeline
-from mindformers.wrapper import build_wrapper
 
 
 @MindFormerRegister.register(MindFormerModuleType.DATASET_LOADER)
@@ -119,49 +114,6 @@ class TestTokenizer:
         pass
 
 
-@MindFormerRegister.register(MindFormerModuleType.OPTIMIZER)
-class TestAdamWeightDecay(AdamWeightDecay):
-    """Test AdamWeightDecay API For Register."""
-    def __init__(self, params, learning_rate=1e-3,
-                 beta1=0.9, beta2=0.999, eps=1e-6, weight_decay=0.0):
-        super().__init__(params, learning_rate=learning_rate,
-                                                  beta1=beta1, beta2=beta2, eps=eps,
-                                                  weight_decay=weight_decay)
-        self.param = params
-
-
-@MindFormerRegister.register(MindFormerModuleType.LR)
-class TestCosineDecayLR(CosineDecayLR):
-    """Test CosineDecayLR API For Register."""
-    def __init__(self, min_lr, max_lr, decay_steps):
-        super().__init__(min_lr, max_lr, decay_steps)
-        self.lr = max_lr
-
-
-@MindFormerRegister.register(MindFormerModuleType.WRAPPER)
-class TestTrainOneStepWithLossScaleCell(TrainOneStepWithLossScaleCell):
-    """Test TrainOneStepWithLossScaleCell API For Register."""
-    def __init__(self, network, optimizer, scale_sense):
-        super().__init__(network, optimizer, scale_sense)
-        self.scale_sense = scale_sense
-
-
-@MindFormerRegister.register(MindFormerModuleType.METRIC)
-class TestAccuracy(Accuracy):
-    """Test Accuracy API For Register."""
-    def __init__(self, eval_type='classification'):
-        super().__init__(eval_type)
-        self.eval = eval_type
-
-
-@MindFormerRegister.register(MindFormerModuleType.LOSS)
-class TestL1Loss(L1Loss):
-    """Test L1Loss API For Register."""
-    def __init__(self, reduction='mean'):
-        super().__init__(reduction)
-        self.reduction = reduction
-
-
 @MindFormerRegister.register(MindFormerModuleType.CALLBACK)
 class TestLLossMonitor(LossMonitor):
     """Test LossMonitor API For Register."""
@@ -176,13 +128,6 @@ class TestTimeMonitor(TimeMonitor):
     def __init__(self, data_size=1):
         super().__init__(data_size)
         self.data_size = data_size
-
-
-@MindFormerRegister.register(MindFormerModuleType.PIPELINE)
-class TestPipeline:
-    """Test Pipeline API For Register."""
-    def __init__(self):
-        pass
 
 
 @MindFormerRegister.register(MindFormerModuleType.PROCESSOR)
@@ -202,37 +147,8 @@ def test_build_from_class_name():
     build_dataset(class_name='TestDataset')
     logger.info("Test Build Dataset Success")
     # build model
-    model = build_model(class_name='TestModel', config=TestModelConfig())
+    build_model(class_name='TestModel', config=TestModelConfig())
     logger.info("Test Build Network Success")
-    # build lr
-    lr = build_lr(class_name='TestCosineDecayLR', min_lr=0., max_lr=0.001, decay_steps=1000)
-    logger.info("Test Build LR Success")
-    # build optimizer
-    if lr is not None:
-        optimizer = build_optim(class_name='TestAdamWeightDecay',
-                                params=model.trainable_params(), learning_rate=lr)
-    else:
-        optimizer = build_optim(class_name='TestAdamWeightDecay', params=model.trainable_params())
-    logger.info("Test Build Optimizer Success")
-
-    # build loss
-    build_loss(class_name='TestL1Loss')
-    logger.info("Test Build Loss Success")
-
-    # build metric
-    build_metric(class_name='TestAccuracy')
-    logger.info("Test Build Metric Success")
-
-    # build wrapper
-    scale_sense = Tensor(1.0)
-    build_wrapper(class_name='TestTrainOneStepWithLossScaleCell',
-                  network=model, optimizer=optimizer, scale_sense=scale_sense)
-    logger.info("Test Build Wrapper Success")
-
     # build processor
     build_processor(class_name='TestProcessor')
     logger.info("Test Build Processor Success")
-
-    # build pipeline
-    build_pipeline(class_name='TestPipeline')
-    logger.info("Test Build Pipeline Success")

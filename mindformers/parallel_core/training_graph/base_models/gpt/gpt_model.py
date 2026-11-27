@@ -17,7 +17,6 @@ __all__ = ['GPTModel']
 
 from typing import Literal, Optional, Union
 import numpy as np
-import regex
 
 import mindspore as ms
 from mindspore.communication import get_group_size, get_rank
@@ -62,7 +61,6 @@ from mindformers.parallel_core.utils.init_method import init_method_normal
 from mindformers.tools.logger import logger
 from mindformers.models.utils import get_current_rank_stage, get_model_parameters
 from mindformers.version_control import get_lazy_inline as lazy_inline
-from mindformers.core.optim.muon_utils import make_muon_fns
 
 MAX_REGEX_MATCH_TIME = 2
 
@@ -822,64 +820,6 @@ class GPTModel(nn.Cell):
         else:
             params.update(get_model_parameters(self, only_trainable))
         return params
-
-    def make_model_muon_fns(self,):
-        """Read values from TransformersConfig and generate schema."""
-
-        num_moe_experts = self.config.num_moe_experts
-        hidden_size = self.config.hidden_size
-        moe_ffn_hidden_size = self.config.moe_ffn_hidden_size
-        qk_head_dim = self.config.qk_head_dim
-        qk_pos_emb_head_dim = self.config.qk_pos_emb_head_dim
-        num_attention_heads = self.config.num_attention_heads
-        kv_lora_rank = self.config.kv_lora_rank
-        value_head_dim = self.config.v_head_dim
-
-        schema = [
-            # experts.weight1: reshape → split into two [num_moe_experts, hidden_size, moe_ffn_hidden_size]
-            {
-                "patterns": ["*mlp.experts.weight1*"],
-                "kind": "reshape_concat",
-                "reshape": (num_moe_experts, hidden_size, 2 * moe_ffn_hidden_size),
-            },
-            # experts.weight2: reshape → [num_moe_experts, moe_ffn_hidden_size, hidden_size]
-            {
-                "patterns": ["*mlp.experts.weight2*"],
-                "kind": "reshape_only",
-                "reshape": (num_moe_experts, moe_ffn_hidden_size, hidden_size),
-            },
-            # q_proj / q_up_proj: periodic split across heads
-            {
-                "patterns": [
-                    "*self_attention.linear_q_proj.weight*",
-                    "*self_attention.linear_q_up_proj.weight*",
-                ],
-                "kind": "periodic",
-                "parts": (qk_head_dim, qk_pos_emb_head_dim, num_attention_heads),
-            },
-            # kv_down_proj: one block
-            {
-                "patterns": ["*self_attention.linear_kv_down_proj.weight*"],
-                "kind": "periodic",
-                "parts": (kv_lora_rank, qk_pos_emb_head_dim, 1),
-            },
-            # kv_up_proj: periodic split across heads
-            {
-                "patterns": ["*self_attention.linear_kv_up_proj.weight*"],
-                "kind": "periodic",
-                "parts": (qk_head_dim, value_head_dim, num_attention_heads),
-            },
-            # fc1 and shared_fc1: alternating 1,1 split along rows
-            {
-                "patterns": [
-                    "*mlp.shared_experts.linear_fc1.weight*",
-                    "*mlp.linear_fc1.weight*",
-                ],
-                "kind": "alt_pair_periodic",
-            },
-        ]
-
-        return make_muon_fns(schema)
 
     def get_muon_filter(self):
         """Return a filter function to determine if a parameter should use Muon optimization.

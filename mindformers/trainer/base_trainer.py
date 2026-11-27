@@ -16,10 +16,8 @@
 import os
 import re
 import socket
-from pprint import pprint
-from functools import partial
 from typing import Optional, Union, List
-from collections import OrderedDict
+
 import numpy as np
 from PIL.Image import Image
 import mindspore as ms
@@ -27,70 +25,37 @@ from mindspore import Tensor
 from mindspore import get_ckpt_path_with_strategy
 from mindspore.communication import get_rank
 from mindspore.communication.management import get_group_size
-from mindspore.train.model import Model
 from mindspore.train import Callback
 from mindspore.dataset import GeneratorDataset
 from mindspore.dataset.engine.datasets import Dataset
-from mindspore.train.metrics import get_metrics
-from mindspore.nn.wrap.cell_wrapper import _VirtualDatasetCell
 from mindspore.nn import Optimizer, Cell
 from mindspore.nn.utils import no_init_parameters
+
 from mindformers.mindformer_book import MindFormerBook
-from mindformers.core import build_lr, build_optim, build_callback, build_metric
+from mindformers.core.callback import build_callback
 from mindformers.core.context.build_context import (
     get_context as mf_get_context,
     set_context as mf_set_context,
 )
-from mindformers.core.parallel_config import build_parallel_config
 from mindformers.dataset import build_dataset, check_dataset_config, check_dataset_iterable, BaseDataset
-from mindformers.models import build_network, build_processor, build_tokenizer, \
-    PreTrainedModel, PreTrainedTokenizerBase, BaseImageProcessor
-from mindformers.pipeline import pipeline
-from mindformers.wrapper import build_wrapper
-from mindformers.wrapper.wrapper import GradAccumulationCellWithMultiOutputs, PipelineCellWithMultiOutputs
+from mindformers.models import build_network, build_processor, PreTrainedModel, PreTrainedTokenizerBase, BaseImageProcessor
 from mindformers.tools.register import MindFormerConfig
-from mindformers.wrapper.wrapper import DataOrderWrapperCell
 from mindformers.tools.logger import logger
-from mindformers.utils.tensorboard import _set_tensorboard_writer, _unset_tensorboard_writer, \
-    write_args_to_tensorboard, update_tensorboard_args
-from mindformers.utils.resume_ckpt_utils import get_resume_checkpoint, load_resume_checkpoint
-from mindformers.tools.utils import count_params, get_real_rank, get_real_group_size, FILE_PERMISSION, \
-    get_output_root_path
-from mindformers.tools.check_rules import check_rules
+from mindformers.tools.utils import count_params, get_real_group_size
 from mindformers.core.callback.callback import (
-    EvalCallBack,
     MFLossMonitor,
     TrainingStateMonitor,
     CheckpointMonitor,
     ExpertMigrateCallback,
-    ExpertParallelManager,
     ColdHotExpertMonitor,
     TopkBiasBalanceCallback
 )
-from mindformers.utils.load_checkpoint_utils import get_load_path_after_hf_convert
-from mindformers.checkpoint.checkpoint import load_checkpoint, CommonInfo, load_hf_checkpoint, get_checkpoint_path
-from mindformers.checkpoint.utils import is_hf_checkpoint, get_healthy_checkpoint_path
-from mindformers.dataset.dataloader.hf_dataloader import _resume_hf_iterable_dataset
-from ..core.config_args import ConfigArguments
 from .training_args import TrainingArguments
-from .utils import (
-    check_runner_config,
-    transform_and_load_checkpoint,
-    load_resume_context_from_checkpoint,
-    get_last_checkpoint,
-    preload_ckpt,
-    mask_config_tokens
-)
-from .optimizer_grouped_parameters import get_optimizer_grouped_parameters
-from .utils import set_seed, check_train_data_loader_type, \
-    check_eval_data_loader_type, check_optimizer_and_lr_type, check_wrapper_config
-from ..version_control import check_tft_valid, check_tre_valid, check_tsp_valid, check_is_reboot_node
+from .utils import get_last_checkpoint, set_seed
 
 # pylint: disable=import-outside-toplevel
 SUPPORT_TASKS = MindFormerBook().get_trainer_support_task_list()
 SUPPORT_MODEL_NAMES = MindFormerBook().get_model_name_support_list()
-SUPPORT_PIPELINES = MindFormerBook().get_pipeline_support_task_list()
-SUPPORT_PIPELINE_INPUT_DATA = MindFormerBook().get_pipeline_support_input_data_list()
 CURRENT_PROJECT_PATH = MindFormerBook().get_project_path()
 DEFAULT_CONFIG_DIR = 'configs'
 NEED_MERGES_FILE_TOKENIZERS = ["Qwen2Tokenizer"]
@@ -162,7 +127,7 @@ class BaseTrainer:
             self.model_name = "common"
 
     def set_config(self,
-                   config: Optional[Union[dict, str, ConfigArguments, TrainingArguments]] = None,
+                   config: Optional[Union[dict, str, TrainingArguments]] = None,
                    is_full_config: bool = False):
         """Set the task config for task trainer."""
         if config is not None:
@@ -174,11 +139,9 @@ class BaseTrainer:
         else:
             self.setup_task_config()
             self.config = self.default_task_config
-        build_parallel_config(self.config)
         if os.environ.get("RUN_MODE") != "predict":
             self._check_grad_accumulation_steps()
             self._check_global_batch_size_for_auto_parallel()
-            self._reset_wrapper()
 
         return self.config
 
@@ -230,7 +193,6 @@ class BaseTrainer:
                                 pp, self.global_batch_size, batch_size, dp, micro_batch_num,
                                 micro_batch_interleave_num)
                     self.config.runner_config.batch_size = self.global_batch_size
-                    self._reset_wrapper_for_pipeline_parallel()
                 else:
                     self.global_batch_size = batch_size * dp * micro_batch_interleave_num * gradient_accumulation_steps
                     logger.info("The current parallel mode is %s, full batch is True,"
@@ -261,7 +223,6 @@ class BaseTrainer:
                     logger.info("global_batch_size = per_batch_size * data_parallel = %s * %s = %s",
                                 per_batch_size, dp, self.global_batch_size)
                     self.config.runner_config.batch_size = per_batch_size
-                    self._reset_wrapper_for_pipeline_parallel()
                 else:
                     per_batch_size = batch_size * micro_batch_interleave_num * gradient_accumulation_steps
                     self.global_batch_size = per_batch_size * dp
@@ -336,48 +297,6 @@ class BaseTrainer:
             raise ValueError("In training process, network should be configured to use_past=False, "
                              f"but got use_past={network.config.use_past}")
 
-    def _reset_wrapper(self):
-        """reset wrapper in some special cases."""
-        parallel_mode = ms.get_auto_parallel_context("parallel_mode")
-        gradient_accumulation_steps = self.config.runner_config.gradient_accumulation_steps
-        # use gradient_accumulation, reset wrapper to MFPipelineWrapper
-        if parallel_mode in ["semi_auto_parallel", "auto_parallel"] and gradient_accumulation_steps > 1:
-            self._reset_wrapper_for_grad_accu(gradient_accumulation_steps)
-
-    def _reset_wrapper_for_pipeline_parallel(self):
-        """Reset wrapper when pipeline parallel."""
-        if self.config.runner_wrapper is not None:
-            self.config.runner_wrapper.type = "MFPipelineWithLossScaleCell" \
-                if self.config.runner_wrapper.type != "MFPipelineWithLossScaleCell" else self.config.runner_wrapper.type
-            self.config.runner_wrapper.micro_batch_num = self.config.parallel_config.micro_batch_num
-            self.config.runner_wrapper.calculate_per_token_loss = self.config.calculate_per_token_loss
-            logger.warning(
-                "When using the pipeline parallel mode, "
-                "the MFPipelineWithLossScaleCell class is used by default.")
-        else:
-            logger.info(
-                "When using the pipeline parallel mode, "
-                "because the wrapper class is not specified, "
-                "MindSpore's built-in PipelineCell is used by default")
-        logger.info("PipelineWrapper under evaluate or predict mode will not take effect.")
-
-    def _reset_wrapper_for_grad_accu(self, gradient_accumulation_steps):
-        """Reset wrapper when using grad accumulation."""
-        if self.config.runner_wrapper is not None:
-            self.config.runner_wrapper.type = "MFPipelineWithLossScaleCell" \
-                if self.config.runner_wrapper.type != "MFPipelineWithLossScaleCell" else self.config.runner_wrapper.type
-            # set micro_batch_num as gradient_accumulation_steps in MFPipelineWithLossScaleCell
-            self.config.runner_wrapper.micro_batch_num = gradient_accumulation_steps
-            self.config.runner_wrapper.calculate_per_token_loss = self.config.calculate_per_token_loss
-            logger.warning(
-                "When using the gradient_accumulation_steps in semi/auto parallel mode, "
-                "the MFPipelineWithLossScaleCell class is used by default.")
-        else:
-            logger.info(
-                "When using the gradient_accumulation_steps in semi/auto parallel mode, "
-                "because the wrapper class is not specified, "
-                "MindSpore's built-in GradAccumulationCell is used by default")
-
     def _reset_dataset_batch_size(self):
         """Reset dataset batch size according to the global batch size of runner config."""
         check_dataset_config(self.config)
@@ -396,22 +315,12 @@ class BaseTrainer:
             if not args.endswith(('.yaml', '.yml')):
                 raise ValueError(f"config file must be end with .yaml or .yml, but get {args}")
             self.default_task_config = MindFormerConfig(args)
-        elif isinstance(args, ConfigArguments):
-            if hasattr(args, 'train_dataset'):
-                check_train_data_loader_type(args, self.default_task_config)
-            if hasattr(args, 'eval_dataset'):
-                check_eval_data_loader_type(args, self.default_task_config)
-            if hasattr(args, 'optimizer'):
-                check_optimizer_and_lr_type(args, self.default_task_config)
-            if hasattr(args, 'runner_wrapper'):
-                check_wrapper_config(args, self.default_task_config)
-            self.default_task_config.merge_from_dict(args.__dict__)
         elif isinstance(args, TrainingArguments):
             args.convert_args_to_mindformers_config(self.default_task_config)
         else:
             logger.warning(
                 "The type of config parameter to merge is not supported, "
-                "currently supported types are [dict, config_path(str), ConfigArguments, TrainingArguments], "
+                "currently supported types are [dict, config_path(str), TrainingArguments], "
                 "but get %s", type(args))
         return self.default_task_config
 
@@ -490,224 +399,12 @@ class BaseTrainer:
         self.network_delay_inited = True
         return network
 
-    @staticmethod
-    def warp_data_order_with_tool_cells(network, construct_args_key):
-        """For passing parameters in lexicographical order."""
-        return DataOrderWrapperCell(construct_args_key, network)
-
-    def _wrap_network_with_tool_cells(self, network):
-        """For training process, warp the network with some tool cells."""
-        micro_batch_interleave_num = self.config.micro_batch_interleave_num
-        gradient_accumulation_steps = self.config.runner_config.gradient_accumulation_steps
-        parallel_mode = ms.context.get_auto_parallel_context("parallel_mode")
-        pp = self.get_pipeline_stages()
-        if micro_batch_interleave_num > 1:
-            raise ValueError("micro_batch_interleave_num > 1, is not supported for non-legacy models.")
-
-        if not pp > 1:
-            if gradient_accumulation_steps > 1:
-                logger.info("gradient_accumulation_steps > 1, GradAccumulationCell is wrapped on network. "
-                            "It is suggested to use `Lazy Inline` feature to save compiling time.")
-                network = GradAccumulationCellWithMultiOutputs(network, gradient_accumulation_steps)
-        else:
-            micro_batch_num = self.config.parallel_config.micro_batch_num
-            seq_split_num = self.config.parallel_config.seq_split_num
-            if seq_split_num > 1:
-                if self.config.recompute_config.recompute:
-                    raise ValueError("When using seq pipe, cannot apply full recompute.")
-                raise ValueError("seq_split_num > 1, is not supported for non-legacy models.")
-            network = PipelineCellWithMultiOutputs(network, micro_size=micro_batch_num)
-        if parallel_mode in ["semi_auto_parallel", "auto_parallel"] and mf_get_context('mode') == 0:
-            network = _VirtualDatasetCell(network)
-            ds_broadcast_level = mf_get_context("dataset_broadcast_opt_level")
-            if ds_broadcast_level > 0:
-                # pylint: disable=W0212
-                network._virtual_dataset.add_prim_attr("repeat_dim_direct", "right")
-        return network
-
-    def wrap_network_with_tool_cells(self, network):
-        """For training process, warp the network with some tool cells."""
-        return self._wrap_network_with_tool_cells(network)
-
-    @staticmethod
-    def wrap_eval_network_with_tool_cells(network):
-        """For evaluate in training process, warp the network with some tool cells."""
-        parallel_mode = ms.context.get_auto_parallel_context("parallel_mode")
-        if parallel_mode in ["semi_auto_parallel", "auto_parallel"] and mf_get_context('mode') == 0:
-            network = _VirtualDatasetCell(network)
-            ds_broadcast_level = mf_get_context("dataset_broadcast_opt_level")
-            if ds_broadcast_level > 0:
-                # pylint: disable=W0212
-                network._virtual_dataset.add_prim_attr("repeat_dim_direct", "right")
-        return network
-
     def create_image_processor(self, default_args: dict = None):
         """Create the image processor for predict."""
         logger.info(".........Build Image Processor From Config..........")
         self.image_processor = build_processor(
             self.config.processor.image_processor, default_args=default_args)
         return self.image_processor
-
-    def _create_grouped_lr_scheduler(self, learning_scale, scale_factor):
-        """
-        Create learning rate (LR) schedulers for both default and parameter-grouped configurations.
-        """
-        default_config = self.config.grouped_lr_schedule.default
-        default_lr_scheduler = self.create_lr_scheduler(default_config, learning_scale, scale_factor)
-
-        grouped_lr_scheduler = []
-        grouped_config = self.config.grouped_lr_schedule.grouped
-
-        # Iterate over each grouped LR configuration
-        for lr_config in grouped_config:
-            params = lr_config.pop('params', None)
-            if not params or not isinstance(params, list):
-                raise ValueError(
-                    "Got invalid 'params' in grouped_lr_schedule.grouped: each item must include "
-                    "a non-empty 'params' list."
-                )
-
-            lr_config = MindFormerConfig(**lr_config)
-            lr_scheduler = self.create_lr_scheduler(lr_config, learning_scale, scale_factor)
-            grouped_lr_scheduler.append({
-                'params': params,
-                'lr_scheduler': lr_scheduler,
-                'lr_config': lr_config
-            })
-
-        return default_lr_scheduler, grouped_lr_scheduler
-
-    def create_optimizer_scheduler(self, network, model_params: set):
-        """Create the optimizer for training."""
-        logger.info("..........Build Optimizer From Config..........")
-        # Get learning rate scaling settings
-        learning_scale = self.config.lr_scale
-        scale_factor = self.config.lr_scale_factor
-
-        # Build the learning rate scheduler
-        if self.config.grouped_lr_schedule is not None:
-            # Create grouped LR scheduler if configured (e.g., different LRs for different parameter groups)
-            self.lr_scheduler, self.grouped_lr_scheduler = self._create_grouped_lr_scheduler(
-                learning_scale, scale_factor)
-        else:
-            # Create standard LR scheduler
-            self.lr_scheduler = self.create_lr_scheduler(
-                self.config.lr_schedule, learning_scale, scale_factor)
-
-        # Build optimizer parameter groups (apply weight decay, LR groups, etc.)
-        group_params = get_optimizer_grouped_parameters(
-            model=network,
-            weight_decay=self.config.optimizer.weight_decay,
-            dynamic_lr_schedule=self.lr_scheduler,
-            grouped_lr_schedule=self.grouped_lr_scheduler,
-            model_params=model_params,
-            optimizer_type=self.config.optimizer.type,
-            layer_scale=self.config.layer_scale,
-            layer_decay=self.config.layer_decay
-        )
-
-        # Build optimizer with dynamic lr_scheduler if available
-        if self.lr_scheduler is not None:
-            default_args = {"params": group_params, "learning_rate": self.lr_scheduler}
-            if self.config.optimizer.type == "Muon":
-                default_args["model"] = None if not hasattr(self, 'real_model') else self.real_model
-            self.optimizer = build_optim(
-                self.config.optimizer,
-                default_args=default_args)
-        else:
-            # Otherwise, create lr_scheduler with static learning rate from config
-            if self.config.optimizer.learning_rate is None:
-                raise ValueError("No learning rate specified — please set 'optimizer.learning_rate'.")
-
-            learning_rate = self.config.optimizer.learning_rate
-            if learning_scale and scale_factor is not None:
-                # reset learning_rate in optimizer with scale_factor if learning_scale is True
-                self.config.optimizer.learning_rate = self.learning_rate_scale(learning_rate, scale_factor)
-
-            default_args = {"params": group_params}
-            if self.config.optimizer.type == "Muon":
-                default_args["model"] = None if not hasattr(self, 'real_model') else self.real_model
-            # Build optimizer with fixed learning rate
-            self.optimizer = build_optim(
-                self.config.optimizer, default_args=default_args)
-
-        return self.optimizer
-
-    def create_optimizer_scheduler_without_param_init(self, network, model_params: set):
-        """Create the optimizer for training without initialize parameters."""
-        with no_init_parameters():
-            optimizer = self.create_optimizer_scheduler(network=network, model_params=model_params)
-        logger.info("Parameters are not initialized during optimizer initialization.")
-        self.optimizer_delay_inited = True
-        return optimizer
-
-    def create_lr_scheduler(self, lr_config: dict, learning_scale: bool = False, scale_factor: int = 256):
-        """Create the learning rate scheduler."""
-        logger.info("..........Build LR Schedule From Config..........")
-        train_data_size = self.get_train_data_size()
-
-        warmup_lr_init = None
-        if lr_config:
-            warmup_epochs = lr_config.warmup_epochs
-            warmup_ratio = lr_config.warmup_ratio
-            warmup_lr_init = lr_config.warmup_lr_init
-
-            # Calculate total training steps depending on sink_mode
-            if self.config.runner_config.sink_mode:
-                total_steps = int(self.config.runner_config.epochs * self.config.runner_config.sink_size)
-            else:
-                total_steps = int(self.config.runner_config.epochs * train_data_size)
-
-            # Set total_steps in `lr_schedule` if not explicitly defined
-            if lr_config.total_steps is None or lr_config.total_steps == -1:
-                lr_config.total_steps = total_steps
-            else:
-                lr_config.total_steps = int(lr_config.total_steps)
-
-            # Compute warmup steps if warmup is enabled
-            if warmup_epochs:
-                if not isinstance(warmup_epochs, int) or warmup_epochs < 0:
-                    raise ValueError("`warmup_epochs` must be a non-negative integer.")
-                if not warmup_ratio:
-                    raise ValueError("`warmup_ratio` must be specified when warmup is enabled.")
-
-                warmup_steps = int(warmup_epochs * train_data_size)
-                lr_config.warmup_steps = warmup_steps
-                logger.info(
-                    f"Get warmup_steps({warmup_steps}) = "
-                    f"int(warmup_epochs({warmup_epochs}) * train_data_size({train_data_size}))"
-                )
-
-            if learning_scale and scale_factor is not None:
-                lr_config.learning_rate = self.learning_rate_scale(lr_config.learning_rate, scale_factor)
-
-        # Build learning rate scheduler from configuration
-        lr_scheduler = build_lr(lr_config)
-
-        if lr_scheduler and hasattr(lr_scheduler, "warmup_lr_init") and warmup_lr_init is None:
-            logger.info(f"warmup_lr_init is not set. The default value {lr_scheduler.warmup_lr_init} will be applied.")
-        return lr_scheduler
-
-    def create_model_wrapper(self, network, optimizer):
-        """Create the model wrapper for training."""
-        logger.info(".........Build Model Wrapper for Train From Config..........")
-        calculate_per_token_loss = getattr(self.config, "calculate_per_token_loss", False)
-        use_skip_data_by_global_norm = getattr(self.config, "use_skip_data_by_global_norm", False)
-        print_separate_loss = getattr(self.config, "print_separate_loss", True)
-        global_norm_spike_threshold = 1.0
-        if self.config.get('monitor_config') is not None:
-            global_norm_spike_threshold = getattr(self.config.monitor_config, "global_norm_spike_threshold", 1.0)
-        model_wrapper = build_wrapper(self.config.runner_wrapper,
-                                      default_args={"network": network,
-                                                    "optimizer": optimizer,
-                                                    "parallel_config": self.config.parallel_config,
-                                                    "calculate_per_token_loss": calculate_per_token_loss,
-                                                    "global_norm_spike_threshold": global_norm_spike_threshold,
-                                                    "print_separate_loss": print_separate_loss,
-                                                    "use_skip_data_by_global_norm": use_skip_data_by_global_norm,
-                                                    "lr_scheduler": self.lr_scheduler,
-                                                    "grouped_lr_scheduler": self.grouped_lr_scheduler})
-        return model_wrapper
 
     def create_callbacks(self, default_args: dict = None):
         """Create the callback list for training."""
@@ -726,28 +423,6 @@ class BaseTrainer:
         if extend_eval_callbacks:
             self.eval_callbacks.extend(extend_eval_callbacks)
         return self.eval_callbacks
-
-    def create_metrics(self, metric_name: str = None):
-        """Create Metrics For Evaluate or Fit."""
-        if self.compute_metrics is not None:
-            self.compute_metrics = get_metrics(self.compute_metrics)
-            return self.compute_metrics
-        if self.config.metric is None:
-            raise ValueError("When `do_eval` is True and `compute_metrics` is None, \
-                              the config of metric must not be None.")
-        if isinstance(self.config.metric, dict):
-            self.config.metric = [self.config.metric]
-
-        self.compute_metrics = {}
-        for metric_config in self.config.metric:
-            if "type" not in metric_config:
-                raise ValueError("The type of metric is not found!")
-            metric = build_metric(metric_config)
-            if metric_name is None:
-                metric_name = metric.__class__.__name__
-            self.compute_metrics[metric_name] = metric
-
-        return self.compute_metrics
 
     def count_parameters(self):
         """Count network parameters number."""
@@ -1002,7 +677,7 @@ class BaseTrainer:
         with a distributed strategy.
 
         Args:
-            config (ConfigArguments): The configuration containing checkpoint and strategy settings.
+            config (MindFormerConfig): The configuration containing checkpoint and strategy settings.
 
         Returns:
             str: Path to the checkpoint file for the current rank after applying strategy.
@@ -1054,803 +729,37 @@ class BaseTrainer:
     # pylint: disable=C0330
     def training_process(
             self,
-            config: Optional[Union[dict, MindFormerConfig, ConfigArguments, TrainingArguments]] = None,
+            config: Optional[Union[dict, MindFormerConfig, TrainingArguments]] = None,
             network: Optional[Union[Cell, PreTrainedModel]] = None,
             dataset: Optional[Union[BaseDataset, GeneratorDataset]] = None,
             optimizer: Optional[Optimizer] = None,
             callbacks: Optional[Union[Callback, List[Callback]]] = None,
             compute_metrics: Optional[Union[dict, set]] = None,
             **kwargs):
-        """Train or Fine-tune for BaseTrainer in MindFormers."""
-        self.kwargs = kwargs
-
-        self.eval_dataset = kwargs.get('eval_dataset', None)
-        if dataset:
-            self.train_dataset = dataset
-        if compute_metrics:
-            self.compute_metrics = compute_metrics
-
-        # preprocess config for train dataset
-        config = self._train_dataset_preprocess(config)
-        construct_args_key = config.train_dataset.pop("construct_args_key", None)
-        is_full_config = kwargs.get("is_full_config", False)
-        config = self.set_config(config, is_full_config)
-
-        # build dataset
-        logger.info(".........Build Dataset For Train..........")
-        dataset = self.create_train_dataset()
-        # postprocess dataset
-        dataset = self._train_dataset_postprocess(dataset, config)
-        logger.info("Create train dataset finish, dataset size:%d", dataset.get_dataset_size())
-
-        append_info = None
-        use_checkpoint_health_monitor = (
-            getattr(config, "use_checkpoint_health_monitor", False)) if config.use_legacy_format else False
-        if not config.use_legacy_format:
-            if (self.config.monitor_config and self.config.monitor_config.health_checkpoint and
-                    self.config.monitor_config.health_checkpoint.embedding_local_norm_threshold):
-                use_checkpoint_health_monitor = True
-                if not config.checkpoint.no_load_optim:
-                    config.checkpoint.load_path = get_healthy_checkpoint_path()
-            if not config.checkpoint.no_load_optim and config.checkpoint.load_path and not check_is_reboot_node():
-                logger.info(".............Start load resume context from common.json..................")
-                common_file = os.path.join(config.checkpoint.load_path, 'common.json')
-                if not os.path.exists(common_file):
-                    error_msg = f"No common.json found in directory '{config.checkpoint.load_path}'."
-                    logger.error(error_msg)
-                    raise FileNotFoundError(error_msg)
-                common_info = CommonInfo.load_common(common_file)
-                step_scale = common_info.global_batch_size / config.runner_config.global_batch_size
-                config.runner_config.initial_step = int(common_info.step_num * step_scale)
-                if config.runner_config.sink_mode:
-                    config.runner_config.initial_epoch = int(common_info.epoch_num * step_scale)
-                else:
-                    data_size = dataset.get_dataset_size()
-                    not_last_step_in_epoch = int(config.runner_config.initial_step % data_size != 0)
-                    config.runner_config.initial_epoch = int(common_info.epoch_num) - not_last_step_in_epoch
-
-                resume_dict = {
-                    "step_num": config.runner_config.initial_step,
-                    "epoch_num": config.runner_config.initial_epoch,
-                    "loss_scale": 1
-                }
-                if config.runner_wrapper.scale_sense is not None:
-                    if hasattr(config.runner_wrapper.scale_sense, "loss_scale_value"):
-                        config.runner_wrapper.scale_sense.loss_scale_value = common_info.loss_scale
-                        resume_dict["loss_scale"] = config.runner_wrapper.scale_sense.loss_scale_value
-                    else:
-                        config.runner_wrapper.scale_sense = common_info.loss_scale
-                        resume_dict["loss_scale"] = config.runner_wrapper.scale_sense
-                append_info = [resume_dict]
-            else:
-                config.runner_config.initial_epoch = 0
-                config.runner_config.initial_step = 0
-        else:
-            if config.resume_training and config.checkpoint.load_path and not check_is_reboot_node():
-                logger.info(".............Start load resume context from checkpoint..................")
-                if check_tft_valid() and not config.remove_redundancy:
-                    logger.info("..............Start resume checkpoint path from strategy..............")
-                    resume_ckpt_path = self.resume_ckpt_path_with_strategy(config)
-                    if resume_ckpt_path is None:
-                        err_msg = (f"Try to resume from checkpoints with strategy in directory "
-                                   f"'{config.checkpoint.load_path}' failed, please specify load_checkpoint to "
-                                   f"specific checkpoint file to resume training.")
-                        logger.error(err_msg)
-                        raise ValueError(err_msg)
-                    config.checkpoint.load_path = resume_ckpt_path
-                load_resume_context_from_checkpoint(config, dataset)
-                resume_dict = {
-                    "step_num": config.runner_config.initial_step,
-                    "epoch_num": config.runner_config.initial_epoch,
-                }
-                if config.runner_wrapper.scale_sense is not None:
-                    if hasattr(config.runner_wrapper.scale_sense, 'loss_scale_value'):
-                        resume_dict["loss_scale"] = config.runner_wrapper.scale_sense.loss_scale_value
-                    else:
-                        resume_dict["loss_scale"] = config.runner_wrapper.scale_sense
-                else:
-                    resume_dict["loss_scale"] = 1
-                append_info = [resume_dict]
-            else:
-                config.runner_config.initial_epoch = 0
-                config.runner_config.initial_step = 0
-
-        # preload ckpt format file via MindIO
-        if config.checkpoint.load_path and config.load_ckpt_format == "ckpt":
-            preload_ckpt(config)
-
-        # check if skip datasets
-        if config.data_skip_steps or config.resume_training or not config.checkpoint.no_load_optim:
-            if not config.ignore_data_skip:
-                data_skip_steps = config.data_skip_steps if config.data_skip_steps \
-                    else config.runner_config.initial_step
-                if data_skip_steps > 0:
-                    dataset.set_init_step(data_skip_steps)
-                    logger.info("dataset skip %d steps.", data_skip_steps)
-            else:
-                logger.info("ignore dataset skip.")
-
-        # set resume training for hf iterable dataset
-        dataloader_config = config.train_dataset.get('data_loader', {})
-        dataloader_type = dataloader_config.get('type')
-        if (config.resume_training or not config.checkpoint.no_load_optim) and \
-                dataloader_type == 'HFDataLoader':
-            resume_step = config.runner_config.initial_step
-            _resume_hf_iterable_dataset(dataset, resume_step)
-
-        self.set_train_dataset(dataset)
-        check_runner_config(config, dataset)
-
-        # check rules
-        check_rules(config, mode='train', network=network, dataset=dataset)
-
-        # It is necessary to enable save strategy online before the model compilation phase,
-        # if load or save checkpoint with megatron format.
-        if not config.get('use_legacy_format', True):
-            try:
-                from mindspore.parallel.strategy import enable_save_strategy_online
-                enable_save_strategy_online()
-            except ImportError:
-                logger.warning("If you want to save or load checkpoint with new format,"
-                               "please ensure your version of mindspore > 2.7.1, "
-                               "to support 'enable_save_strategy_online'.")
-
-        # build network
-        logger.info(".........Build Net For Train..........")
-        if network is None and self.network is None:
-            calculate_per_token_loss = getattr(config, "calculate_per_token_loss", False)
-            if config.checkpoint.load_path:
-                network = self.create_network_without_param_init(
-                    default_args={"parallel_config": config.parallel_config,
-                                  "moe_config": config.moe_config,
-                                  "dataset_config": config.train_dataset,
-                                  "calculate_per_token_loss": calculate_per_token_loss})
-            else:
-                network = self.create_network(
-                    default_args={"parallel_config": config.parallel_config,
-                                  "moe_config": config.moe_config,
-                                  "dataset_config": config.train_dataset,
-                                  "calculate_per_token_loss": calculate_per_token_loss,
-                                  "batch_size": self.config.runner_config.mini_batch_size})
-        elif network is None and self.network is not None:
-            logger.info(".........Using The Existing Network For Train:: %s", self.network.__class__.__name__)
-            network = self.network
-
-        model_params = set()
-        if self.config.optimizer.type in ("PmaAdamW", "FusedPmaAdamW", "Muon"):
-            if hasattr(network, "get_model_parameters"):
-                model_params.update(network.get_model_parameters())
-            else:
-                err_msg = f"The {type(network)} has not implemented the interface: `get_model_parameters`."
-                logger.error(err_msg)
-                raise NotImplementedError(err_msg)
-        try:
-            network_parameters = network.get_model_parameters(only_trainable=False)
-            param_info = []
-            not_print_params = {'max_logits_val', 'expert_load'}
-            for p in network_parameters:
-                if any(f in p.name for f in not_print_params):
-                    continue
-                param_info.append(f" Parameter: {p.name:<60s} | Shape: {str(p.shape):<18s} |"
-                                  f" Requires Grad: {str(p.requires_grad):<5s} | Dtype: {p.dtype}")
-            logger.info("Parameters to be loaded into network on the current rank: \n" + "\n".join(param_info))
-        except (RuntimeError, TypeError) as e:
-            logger.info(
-                f"get_model_parameters is not implemented for "
-                f"{network.__class__.__name__} or not using mcore model: {e}"
-            )
-
-        is_moe_model = False
-        is_mtp_model = False
-        transformer_config = None
-        is_moe_model = network.is_moe_model()
-        is_mtp_model = network.is_mtp_model()
-        transformer_config = network.get_gpt_transformer_config()
-
-        if config.get('use_legacy_format', True):
-            config.checkpoint.load_path = get_load_path_after_hf_convert(config, network)
-        self._check_training_network_no_use_past(network)
-
-        eval_network = None
-        if network is not None:
-            eval_network = network
-            if construct_args_key is not None:
-                eval_network = self.warp_data_order_with_tool_cells(network, construct_args_key)
-            # warp network for training
-            network = self.wrap_network_with_tool_cells(eval_network)
-            eval_network = self.wrap_eval_network_with_tool_cells(eval_network)
-            self.set_network(network, is_train=True)
-
-        self.count_parameters()
-
-        # build optimizer
-        logger.info(".........Build Optimizer For Train..........")
-        if optimizer is None:
-            if config.checkpoint.load_path:
-                optimizer = self.create_optimizer_scheduler_without_param_init(network, model_params)
-            else:
-                optimizer = self.create_optimizer_scheduler(network, model_params)
-
-        # build model wrapper
-        logger.info(".........Build Running Wrapper From Config For Train..........")
-        wrapper = self.create_model_wrapper(network, optimizer)
-
-        # initial tensorboard
-        if (hasattr(config, 'tensorboard') and hasattr(config.tensorboard, 'tensorboard_dir') and
-                config.tensorboard.tensorboard_dir):
-            rank_id = get_real_rank()
-            if isinstance(config.tensorboard.tensorboard_dir, str):
-                logger.info(f"Set tensorboard path to '{config.tensorboard.tensorboard_dir}'")
-                config.tensorboard.tensorboard_dir = os.path.join(config.tensorboard.tensorboard_dir, f"rank_{rank_id}")
-                _set_tensorboard_writer(config.tensorboard)
-                update_tensorboard_args(config.tensorboard)
-                write_args_to_tensorboard(config)
-            else:
-                logger.warning("Since tensorboard_dir is not a string, tensorboard configuration will not take effect.")
-
-        # build callback
-        logger.info(".........Build Callbacks For Train..........")
-        default_callbacks = []
-        if self.config.profile:
-            default_callbacks.append(self.config.profile_cb)
-        if isinstance(self.config.runner_config.stop_step, int) and self.config.runner_config.stop_step > 0:
-            stop_step_dict = OrderedDict()
-            stop_step_dict['type'] = "TrainCallBack"
-            stop_step_dict['stop_step'] = self.config.runner_config.stop_step
-        ckpt_config = None
-        hidden_size = config.model.model_config.hidden_size
-        vocab_size = config.model.model_config.vocab_size
-        embedding_size = None
-        if use_checkpoint_health_monitor:
-            if hidden_size is None:
-                raise ValueError("You should set the hidden_size while use the checkpoint health monitor function.")
-            if vocab_size is None:
-                raise ValueError("You should set the vocab_size while use the checkpoint health monitor function.")
-            embedding_size = hidden_size * vocab_size
-
-        for callback in self.config.callbacks:
-            default_args = None
-            if "type" in callback and callback["type"] == "MFLossMonitor":
-                default_args = {
-                    "learning_rate": optimizer.learning_rate if optimizer else wrapper.optimizer.learning_rate,
-                    "origin_epochs": config.runner_config.origin_epochs,
-                    "dataset_size": config.data_size,
-                    "micro_batch_interleave_num": config.micro_batch_interleave_num,
-                    "micro_batch_num": config.parallel_config.micro_batch_num,
-                    "initial_epoch": config.runner_config.initial_epoch,
-                    "initial_step": config.runner_config.initial_step,
-                    "global_batch_size": self.global_batch_size,
-                    "gradient_accumulation_steps": self.config.runner_config.gradient_accumulation_steps,
-                    "calculate_per_token_loss": getattr(config, "calculate_per_token_loss", False),
-                    "print_separate_loss": getattr(config, "print_separate_loss", True),
-                    "is_moe_model": is_moe_model,
-                    "is_mtp_model": is_mtp_model
-                }
-            if "type" in callback and callback["type"] == "TrainingStateMonitor":
-                default_args = {
-                    "origin_epochs": config.runner_config.origin_epochs,
-                    "dataset_size": config.data_size,
-                    "initial_epoch": config.runner_config.initial_epoch,
-                    "initial_step": config.runner_config.initial_step,
-                    "micro_batch_num": config.parallel_config.micro_batch_num,
-                    "global_batch_size": self.global_batch_size,
-                    "tensor_model_parallel_size": config.parallel_config.model_parallel,
-                    "check_for_nan_in_loss_and_grad": getattr(config, "check_for_nan_in_loss_and_grad", False),
-                    "use_skip_data_by_global_norm": getattr(config, "use_skip_data_by_global_norm", False),
-                    "embedding_size": embedding_size,
-                    "use_local_norm": getattr(config.runner_wrapper, "local_norm", False)
-                }
-            elif "type" in callback and callback["type"] == "CheckpointMonitor":
-                logger.info("Recommend using weights in the safetensors format.")
-                embedding_local_norm_threshold = callback.get("embedding_local_norm_threshold", 1.0)
-                if not self.config.use_legacy_format and use_checkpoint_health_monitor:
-                    embedding_local_norm_threshold = (
-                        self.config.monitor_config.health_checkpoint.embedding_local_norm_threshold)
-                # load params into net
-                default_args = {"append_info": append_info,
-                                "global_batch_size": self.global_batch_size,
-                                "remove_redundancy": config.checkpoint.save_remove_redundancy,
-                                "checkpoint_format": callback.get("checkpoint_format", "ckpt"),
-                                "embedding_size": embedding_size,
-                                "embedding_local_norm_threshold": embedding_local_norm_threshold,
-                                "use_checkpoint_health_monitor": use_checkpoint_health_monitor,
-                                "health_ckpts_record_dir": config.output_dir,
-                                "use_legacy_format": config.get('use_legacy_format', True)
-                                }
-                if not config.use_legacy_format:
-                    default_args.update({
-                        "keep_checkpoint_max": config.checkpoint.save_max,
-                        "save_checkpoint_steps": config.checkpoint.save_interleaved_steps,
-                        "save_optimizer": not config.checkpoint.no_save_optim,
-                        "directory": config.checkpoint.save_path,
-                        "async_save": config.checkpoint.async_save,
-                        "prefix": config.checkpoint.prefix
-                    })
-                if default_args.get("checkpoint_format") == "ckpt":
-                    logger.warning(
-                        "Non-legacy models do not support saving 'ckpt' files; switching to 'safetensors'.")
-                    default_args["checkpoint_format"] = "safetensors"
-                if default_args.get("remove_redundancy") and default_args.get("checkpoint_format") == "ckpt":
-                    raise ValueError("The format of checkpoint is ckpt which is not support remove redundancy.")
-                ckpt_config = [callback, default_args]
-            elif "type" in callback and callback["type"] == "TrainFaultTolerance":
-                continue
-            elif "type" in callback and callback["type"] == "StressDetectCallBack":
-                default_args = {
-                    "dataset_size": config.data_size
-                }
-            elif "type" in callback and callback["type"] == "SDCMonitor":
-                default_args = {"initial_step": config.runner_config.initial_step}
-            default_callbacks.append(build_callback(callback, default_args=default_args))
-
-        if check_tft_valid() or check_tre_valid() or check_tsp_valid():
-            if ckpt_config is None:
-                raise ValueError("You must set CheckpointMonitor callback for TFT training!")
-            ckpt_config[1]["async_save"] = False
-            ckpt_cb_obj = build_callback(ckpt_config[0], default_args=ckpt_config[1])
-
-            # pylint:disable=W0640,W0212
-            def ckpt_save_func(cb_params, append_dict, prefix=None):
-                ckpt_cb_obj._append_dict.update(append_dict)
-                ckpt_cb_obj.save_network_params = False
-                ckpt_cb_obj.save_trainable_params = False
-                if prefix is not None:
-                    ckpt_cb_obj._prefix = prefix + "_" + ckpt_cb_obj._prefix
-                ckpt_cb_obj._save_ckpt(cb_params, True)
-
-            def ckpt_load_func():
-                logger.info('Begin to load ckpt')
-                logger.info("..........Load Checkpoint for TFT.........")
-                if use_checkpoint_health_monitor:
-                    checkpoint_dir = get_healthy_checkpoint_path()
-                    if not checkpoint_dir:
-                        raise ValueError("No healthy checkpoint found.")
-                    logger.info("Load healthy checkpoint: %s", checkpoint_dir)
-                else:
-                    checkpoint_dir = get_checkpoint_path(os.path.join(get_output_root_path(), "checkpoint"))
-                    logger.info("Load default checkpoint: %s", checkpoint_dir)
-                common_info = CommonInfo.load_common(os.path.join(checkpoint_dir, 'common.json'))
-                global_step = common_info.global_step
-                if common_info.global_batch_size != self.global_batch_size:
-                    global_step = int(common_info.global_step *
-                                      (common_info.global_batch_size / self.global_batch_size))
-                load_checkpoint(
-                    checkpoint_dir,
-                    network,
-                    optimizer,
-                    global_step,
-                    config.checkpoint.load_balanced)
-                logger.info("..........Load Checkpoint for TFT Done..........")
-                param_dict = {
-                    'epoch_num': ms.tensor(common_info.epoch_num),
-                    'step_num': ms.tensor(common_info.step_num),
-                }
-                logger.info('End to load ckpt')
-                return param_dict, None
-
-            def ckpt_load_func_legacy():
-                logger.info('Begin to load ckpt')
-                ckpt_file = get_resume_checkpoint(f'{self.config.output_dir}/checkpoint', True,
-                                                  self.config.load_ckpt_format)
-                remove_redundancy = False if config.remove_redundancy is None else config.remove_redundancy
-                param_dict = load_resume_checkpoint(ckpt_file, remove_redundancy, self.config.load_ckpt_format)
-                logger.info(f'End to load ckpt, param_dict.size={len(param_dict)}')
-                return param_dict, remove_redundancy
-
-            default_args = {
-                "ckpt_save_fn": ckpt_save_func,
-                "initial_epoch": config.runner_config.initial_epoch,
-                "initial_step": config.runner_config.initial_step,
-                "ckpt_load_fn": ckpt_load_func if not self.config.use_legacy_format else ckpt_load_func_legacy
-            }
-            default_callbacks.append(build_callback({"type": "TrainFaultTolerance"}, default_args=default_args))
-
-        if config.optimizer.type == "Muon" or config.monitor_config.max_attention_logit_format is not None:
-            logger.info(
-                f"Added MaxLogitsMonitor | optimizer={config.optimizer.type}, "
-                f"max_attention_logit_format={config.monitor_config.max_attention_logit_format}"
-            )
-            default_callbacks.append(build_callback({"type": "MaxLogitsMonitor"}))
-
-        if callbacks is not None:
-            if isinstance(callbacks, list):
-                default_callbacks.extend(callbacks)
-            if isinstance(callbacks, Callback):
-                default_callbacks.append(callbacks)
-        callbacks = self.sort_callbacks(default_callbacks)
-
-        # define compute metrics for evaluate in training
-        if config.do_eval:
-            compute_metrics = self.create_metrics()
-
-        # define Model and begin training
-        logger.info(".........Starting Init Train Model..........")
-        if wrapper is not None:
-            if config.train_dataset.dynamic_batch:
-                if self.config.parallel_config.seq_split_num > 1:
-                    raise ValueError("Cannot apply sequence pipe in dynamic shape.")
-                from mindspore import Symbol
-                divisor = config.train_dataset.divisor if config.train_dataset.divisor else 2
-                remainder = config.train_dataset.remainder if config.train_dataset.remainder else 1
-                s = Symbol(divisor=divisor, remainder=remainder)
-                dyn_inputs = []
-                for _ in config.train_dataset.input_columns:
-                    dyn_inputs.append(Tensor(shape=(config.train_dataset.batch_size, s), dtype=ms.int32))
-                wrapper.set_inputs(*dyn_inputs)
-            model = Model(wrapper, metrics=compute_metrics, eval_network=eval_network)
-        else:
-            model = Model(network, optimizer=optimizer, metrics=compute_metrics, eval_network=eval_network)
-
-        # resume checkpoint
-        if not config.use_legacy_format and config.checkpoint.load_path:
-
-            if not config.checkpoint.no_load_optim:
-                if is_hf_checkpoint(config.checkpoint.load_path):
-                    raise ValueError(
-                        "Resume training is not supported for HuggingFace checkpoints."
-                    )
-
-                logger.info(".............Start resume training from checkpoint..................")
-                global_step = common_info.global_step
-                if common_info.global_batch_size != self.global_batch_size:
-                    global_step = \
-                        int(common_info.global_step * (common_info.global_batch_size / self.global_batch_size))
-                    logger.info(
-                        f"Scaled global step: {common_info.global_step} → {global_step} "
-                        f"(batch size changed from {common_info.global_batch_size} to {self.global_batch_size})"
-                    )
-                load_checkpoint(
-                    checkpoint=config.checkpoint.load_path,
-                    network=network,
-                    optimizer=optimizer,
-                    global_step=global_step,
-                    balanced_load=config.checkpoint.load_balanced,
-                    reshard_worker_num=config.checkpoint.reshard_worker_num
-                )
-            else:
-                if is_hf_checkpoint(config.checkpoint.load_path):
-                    load_hf_checkpoint(
-                        pretrained_model_dir=config.checkpoint.load_path,
-                        network=network,
-                        balanced_load=config.checkpoint.load_balanced,
-                        reshard_worker_num=config.checkpoint.reshard_worker_num
-                    )
-                else:
-                    load_checkpoint(
-                        checkpoint=config.checkpoint.load_path,
-                        network=network,
-                        balanced_load=config.checkpoint.load_balanced,
-                        reshard_worker_num=config.checkpoint.reshard_worker_num
-                    )
-        elif (config.checkpoint.load_path or config.only_save_strategy) and not check_is_reboot_node():
-            if config.resume_training:
-                logger.info(".............Start resume training from checkpoint..................")
-                transform_and_load_checkpoint(config, model, network, dataset, optimizer=optimizer)
-            else:
-                transform_and_load_checkpoint(config, model, network, dataset)
-
-        # build evaluate in training
-        if config.do_eval:
-            logger.info(".........Build Evaluate in Training Callback..........")
-            eval_dataset = self.create_eval_dataset()
-            logger.info("Create evaluate dataset finish, dataset size:%d", eval_dataset.get_dataset_size())
-
-            eval_callback = EvalCallBack(
-                partial(
-                    self._evaluate_in_training,
-                    model=model,
-                    eval_dataset=eval_dataset,
-                ),
-                step_interval=config.eval_step_interval if config.eval_step_interval else 100,
-                epoch_interval=config.eval_epoch_interval if config.eval_epoch_interval else -1,
-            )
-            callbacks.append(eval_callback)
-
-        if transformer_config and (transformer_config.enable_expert_relocation or
-                                    transformer_config.print_expert_load):
-            rank_id = get_rank()
-            ep = transformer_config.expert_model_parallel_size
-            expert_nums = transformer_config.num_moe_experts
-            ep_group = [i + rank_id // ep * ep for i in range(ep)]
-            manager = ExpertParallelManager(ep_group, rank_id, expert_nums)
-            save_checkpoint_steps = -1
-
-            if config.optimizer.type != "AdamW":
-                raise ValueError(
-                    "Expert load balancing (print_expert_load=True or enable_expert_relocation=True) "
-                    "currently only supports 'AdamW' optimizer. Please disable expert load balancing "
-                    f"or set optimizer.type='AdamW' (optimizer.type='{config.optimizer.type}' for now)."
-                )
-
-            if config.parallel.enable_parallel_optimizer:
-                raise ValueError(
-                    "Expert load balancing (print_expert_load=True or enable_expert_relocation=True) "
-                    "is currently not supported with Optimizer Parallelism. Please disable expert load balancing "
-                    "or set enable_parallel_optimizer=False"
-                )
-
-            if transformer_config.moe_router_num_groups > 1:
-                raise ValueError(
-                    "Expert load balancing (print_expert_load=True or enable_expert_relocation=True) "
-                    "is currently not supported with n_group > 1. Please disable expert load balancing "
-                    f"or disable n_group (n_group={transformer_config.moe_router_num_groups} for now)."
-                )
-
-            for callback in config.callbacks:
-                if callback['type'] == 'CheckpointMonitor':
-                    save_checkpoint_steps = callback['save_checkpoint_steps']
-                    raise ValueError(
-                        "Expert load balancing (print_expert_load=True or enable_expert_relocation=True) "
-                        "is currently not supported with CheckpointMonitor. "
-                        "Please disable expert load balancing or remove CheckpointMonitor from callbacks."
-                    )
-
-            expert_relocation = ExpertMigrateCallback(
-                config=transformer_config,
-                print_expert_load=transformer_config.print_expert_load,
-                manager=manager,
-                enable_expert_relocation=transformer_config.enable_expert_relocation,
-                expert_relocation_initial_iteration=transformer_config.expert_relocation_initial_iteration,
-                expert_relocation_freq=transformer_config.expert_relocation_freq,
-                save_checkpoint_steps=save_checkpoint_steps
-                )
-
-            ckpt_callback_idx = -1
-            for i, callback in enumerate(callbacks):
-                if isinstance(callback, CheckpointMonitor):
-                    ckpt_callback_idx = i
-                    break
-            callbacks.insert(ckpt_callback_idx, expert_relocation)
-
-        if config.moe_config.enable_cold_hot_expert:
-            save_checkpoint_steps = -1
-            for callback in config.callbacks:
-                if callback['type'] == 'CheckpointMonitor':
-                    save_checkpoint_steps = callback['save_checkpoint_steps']
-            cold_hot_monitor = ColdHotExpertMonitor(
-                moe_config=config.moe_config,
-                hidden_size=config.model.model_config.hidden_size,
-                ffn_hidden_size=config.model.model_config.ffn_hidden_size,
-                expert_parallel=config.parallel_config.expert_parallel,
-                model_parallel=config.parallel_config.model_parallel,
-                save_checkpoint_steps=save_checkpoint_steps)
-            # ColdHotExpertMonitor needs to be placed before CheckpointMonitor
-            callbacks.insert(1, cold_hot_monitor)
-
-        if get_real_rank() % 8 == 0:
-            pprint(mask_config_tokens(config))
-        logger.info(".........Model Compiling, Please Wait a Moment...........")
-        if self.network_delay_inited:
-            logger.info(".........train network delay initialize..........")
-            network.init_parameters_data()
-        if self.optimizer_delay_inited:
-            logger.info(".........optimizer delay initialize..........")
-            optimizer.init_parameters_data()
-        logger.info(".........Starting Training Model..........")
-        model.train(config.runner_config.epochs, dataset,
-                    callbacks=callbacks,
-                    dataset_sink_mode=config.runner_config.sink_mode,
-                    sink_size=config.runner_config.sink_size,
-                    initial_epoch=config.runner_config.initial_epoch)
-
-        # close tensorboard
-        _unset_tensorboard_writer()
-        logger.info(".........Training Over!.............")
+        """Report that legacy training has been retired."""
+        raise RuntimeError("Use mindformers.pynative.trainer.Trainer for training.")
 
     def evaluate_process(
             self,
-            config: Optional[Union[dict, MindFormerConfig, ConfigArguments, TrainingArguments]] = None,
+            config: Optional[Union[dict, MindFormerConfig, TrainingArguments]] = None,
             network: Optional[Union[Cell, PreTrainedModel]] = None,
             dataset: Optional[Union[BaseDataset, GeneratorDataset]] = None,
             callbacks: Optional[Union[Callback, List[Callback]]] = None,
             compute_metrics: Optional[Union[dict, set]] = None,
             **kwargs):
-        """Evaluate for BaseTrainer in MindFormers."""
-        self.eval_dataset = dataset if dataset else self.eval_dataset
-        metric_name = kwargs.get("metric_name")
-        is_full_config = kwargs.get("is_full_config", False)
-        config = self.set_config(config, is_full_config)
-        construct_args_key = config.eval_dataset.pop("construct_args_key", None)
-
-        # build dataset
-        logger.info(".........Build Dataset For Evaluate..........")
-        dataset = self.create_eval_dataset()
-        self.set_eval_dataset(dataset)
-        logger.info("Create evaluate dataset finish, dataset size:%d", dataset.get_dataset_size())
-
-        # check rules
-        check_rules(config, mode='eval', network=network, dataset=dataset, task=self.task)
-
-        # build network
-        if network is None and self.network is None:
-            network = self.create_network_without_param_init(
-                default_args={"parallel_config": config.parallel_config,
-                              "moe_config": config.moe_config})
-        elif network is None and self.network is not None:
-            logger.info(".........Using The Existing Network For Evaluate: %s", self.network.__class__.__name__)
-            network = self.network
-        config.checkpoint.load_path = get_load_path_after_hf_convert(config, network)
-        if network is not None and construct_args_key is not None:
-            network = self.warp_data_order_with_tool_cells(network, construct_args_key)
-
-        self.set_network(network, is_train=False)
-        self.count_parameters()
-
-        # build metric
-        logger.info(".........Build Compute Metrics For Evaluate..........")
-        if compute_metrics is None:
-            compute_metrics = self.create_metrics(metric_name=metric_name)
-
-        # build callback
-        logger.info(".........Build Callbacks For Evaluate..........")
-        default_callbacks = self.create_eval_callbacks()
-        if callbacks is not None:
-            if isinstance(callbacks, list):
-                default_callbacks.extend(callbacks)
-            if isinstance(callbacks, Callback):
-                default_callbacks.append(callbacks)
-        callbacks = default_callbacks
-
-        logger.info(".........Starting Init Evaluate Model..........")
-        model = Model(network, metrics=compute_metrics, eval_network=network)
-
-        if config.checkpoint.load_path or config.only_save_strategy:
-            logger.info(".............Start load checkpoint for eval..................")
-            transform_and_load_checkpoint(config, model, network, next(dataset.create_tuple_iterator()), do_eval=True)
-
-        if self.network_delay_inited:
-            logger.info(".........eval network delay initialize..........")
-            network.init_parameters_data()
-
-        logger.info(".........Starting Evaluate Model..........")
-        if get_real_rank() % 8 == 0:
-            pprint(mask_config_tokens(config))
-        output = model.eval(dataset,
-                            callbacks=callbacks,
-                            dataset_sink_mode=config.runner_config.sink_mode)
-        logger.info('%s = %s', metric_name, str(output))
-        logger.info(".........Evaluate Over!.............")
+        """Report that legacy evaluation has been retired."""
+        raise RuntimeError("Legacy Trainer evaluation has been retired.")
 
     def predict_process(self,
-                        config: Optional[Union[dict, MindFormerConfig, ConfigArguments, TrainingArguments]] = None,
+                        config: Optional[Union[dict, MindFormerConfig, TrainingArguments]] = None,
                         input_data: Optional[Union[GeneratorDataset, Tensor, np.ndarray, Image, str, list]] = None,
                         task: str = None,
                         network: Optional[Union[Cell, PreTrainedModel]] = None,
                         tokenizer: Optional[PreTrainedTokenizerBase] = None,
                         image_processor: Optional[BaseImageProcessor] = None,
                         audio_processor: Optional[BaseImageProcessor] = None, **kwargs):
-        """Predict for BaseTrainer in MindFormers."""
-        if not self.pipeline_task:
-            is_full_config = kwargs.get("is_full_config", False)
-            config = self.set_config(config, is_full_config)
-
-            # check rules
-            check_rules(config, mode=config.run_mode, network=network, task=self.task)
-
-            if ms.context.get_auto_parallel_context('parallel_mode') in \
-                    ['semi_auto_parallel', 'auto_parallel', 'hybrid_parallel']:
-                if task not in ["translation", "text_generation", "multi_modal_to_text_generation"]:
-                    raise ValueError("Currently distributed predict only support translation and text_generation. "
-                                     "Process exit!")
-                if config.parallel_config.pipeline_stage > 1 and config.run_mode != "predict_with_train_model":
-                    raise ValueError("Currently distributed predict dose not support pipeline parallel. "
-                                     "Process exit!")
-
-            # build network
-            if network is None:
-                if config.checkpoint.load_path:
-                    network = self.create_network_without_param_init(
-                        default_args={"parallel_config": config.parallel_config,
-                                      "moe_config": config.moe_config})
-                else:
-                    logger.info('Weights are not loaded. Hence Delay Initialization is disabled.')
-                    network = self.create_network(
-                        default_args={"parallel_config": config.parallel_config,
-                                      "moe_config": config.moe_config})
-
-            self.set_network(network, is_train=False)
-            self.count_parameters()
-            config.checkpoint.load_path = get_load_path_after_hf_convert(config, network)
-
-            processor_config = config.get("processor", {})
-            tokenizer_config = processor_config.get("tokenizer", None)
-            image_processor_config = processor_config.get("image_processor", None)
-            audio_processor_config = processor_config.get("audio_processor", None)
-
-            if tokenizer is None:
-                pretrained_model_dir = config.get("pretrained_model_dir", None)
-                trust_remote_code = config.get("trust_remote_code", False)
-                tokenizer = build_tokenizer(tokenizer_config,
-                                            pretrained_model_dir=pretrained_model_dir,
-                                            trust_remote_code=trust_remote_code)
-
-            if image_processor is None and image_processor_config:
-                image_processor = build_processor(image_processor_config)
-
-            if audio_processor is None and audio_processor_config:
-                audio_processor = build_processor(audio_processor_config)
-
-            model = Model(network)
-
-            if config.checkpoint.load_path and config.run_mode != "predict_with_train_model":
-                if self.config.load_ckpt_format == 'safetensors':
-                    network.load_weights(config.checkpoint.load_path)
-                else:
-                    raise ValueError('The process of MCore does not support the weights of ckpt.')
-            else:
-                if config.checkpoint.load_path or config.only_save_strategy:
-                    if ms.context.get_auto_parallel_context('parallel_mode') in \
-                            ['semi_auto_parallel', 'auto_parallel', 'hybrid_parallel']:
-                        if network.config:
-                            src_config = network.transformer_config
-                            batch_size = src_config.batch_size
-                            seq_length = src_config.seq_length
-                        else:
-                            batch_size = config.model.model_config.batch_size
-                            seq_length = config.model.model_config.seq_length
-                        input_ids = np.ones(shape=tuple([batch_size, seq_length]))
-                        infer_data = network.prepare_inputs_for_predict_layout(input_ids)
-                        transform_and_load_checkpoint(config, model, network, infer_data, do_predict=True)
-                    else:
-                        transform_and_load_checkpoint(config, model, network, None, do_predict=True)
-
-            if self.network_delay_inited:
-                logger.info(".........predict network delay initialize..........")
-                network.init_parameters_data()
-
-            self.pipeline_task = pipeline(
-                task=task,
-                model=network,
-                tokenizer=tokenizer,
-                image_processor=image_processor,
-                audio_processor=audio_processor,
-                **kwargs
-            )
-
-        top_k = kwargs.pop("top_k", None)
-        if top_k is None:
-            if config.top_k is not None:
-                top_k = config.top_k
-            elif config.model and config.model.model_config.top_k:
-                top_k = config.model.model_config.top_k
-            else:
-                top_k = 1
-
-        save_file = kwargs.pop("save_file", None)
-        if save_file is None:
-            if config.save_file is not None:
-                save_file = config.save_file
-            else:
-                save_file = f"{task}_result.txt"
-
-        if get_real_rank() % 8 == 0:
-            pprint(mask_config_tokens(config))
-        output_results = self.pipeline_task(input_data, top_k=top_k)
-
-        output_info = []
-
-        for one_output in output_results:
-            if isinstance(one_output, dict) and "info" in one_output:
-                output_info.append(one_output["info"])
-            else:
-                output_info.append(one_output)
-        flags_ = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
-        with os.fdopen(os.open(save_file, flags_, FILE_PERMISSION), 'w') as file:
-            file.write(str(output_info))
-
-        logger.info("output result is: %s", str(output_info))
-        logger.info("output result is saved at: %s", save_file)
-        logger.info(".........Predict Over!.............")
-        return output_results
-
-    def _evaluate_in_training(self, model: Model, eval_dataset: BaseDataset):
-        origin_phase = model.eval_network.phase
-        model.eval_network.set_train(False)
-        output = model.eval(
-            eval_dataset, dataset_sink_mode=self.config.runner_config.sink_mode
-        )
-        model.eval_network.set_train(origin_phase)
-        return output
+        """Report that legacy prediction has been retired."""
+        raise RuntimeError("Use mindformers.pynative.trainer.Trainer for inference.")
 
     @staticmethod
     def sort_callbacks(default_callbacks):

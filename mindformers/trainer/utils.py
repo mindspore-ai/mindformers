@@ -286,20 +286,6 @@ def check_optimizer_and_lr_type(new_config, old_config):
                 old_config.lr_schedule = None
 
 
-def check_wrapper_config(new_config, old_config):
-    """Check wrapper config."""
-    wrapper_type = new_config.runner_wrapper.get('type')
-    if old_config.runner_wrapper is not None and wrapper_type is not None:
-        default_wrapper_type = old_config.runner_wrapper.type
-        if wrapper_type != default_wrapper_type:
-            logger.warning(
-                "wrapper type is changed to %s."
-                "The default parameters will be cleared."
-                "Please make sure to input the corresponding parameter values manually.",
-                wrapper_type)
-            old_config.runner_wrapper = {}
-
-
 def mask_config_tokens(config):
     """Return config with top-level str `*_token` values (e.g. hub_token) shown as `<HUB_TOKEN>`, for printing or saving.
 
@@ -441,14 +427,6 @@ def load_resume_context_from_checkpoint(config, dataset):
     else:
         config.runner_config.initial_epoch = 0
 
-    for callback in config.callbacks:
-        if "type" in callback and callback["type"] == "CheckpointMonitor":
-            if config.runner_wrapper.scale_sense is not None and "loss_scale" in resume_dict:
-                if hasattr(config.runner_wrapper.scale_sense, "loss_scale_value"):
-                    config.runner_wrapper.scale_sense.loss_scale_value = resume_dict["loss_scale"]
-                else:
-                    config.runner_wrapper.scale_sense = resume_dict["loss_scale"]
-            break
     logger.info("initial epoch: %d", config.runner_config.initial_epoch)
     logger.info("initial step: %d", config.runner_config.initial_step)
     logger.info("step scale: %f", config.runner_config.step_scale)

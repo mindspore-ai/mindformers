@@ -15,9 +15,11 @@
 # https://github.com/huawei-noah/Pretrained-Language-Model/blob/master/PanGu-%CE%B1/utils.py
 # https://github.com/huggingface/transformers/blob/main/src/transformers/optimization.py
 # ============================================================================
-"""Self-Define LR Schedule."""
+"""Learning rate schedules for PyNative training."""
+import inspect
 import math
 
+from mindspore.nn import learning_rate_schedule
 from mindspore._checkparam import args_type_check
 from mindspore.ops import operations as P
 import mindspore.common.dtype as mstype
@@ -125,7 +127,7 @@ class ConstantWithCoolDownLR(LearningRateSchedule):
 
     Examples:
         >>> import mindspore as ms
-        >>> from mindformers.core.lr import ConstantWithCoolDownLR
+        >>> from mindformers.pynative.optimizer.lr_schedule import ConstantWithCoolDownLR
         >>>
         >>> ms.set_context(mode=ms.GRAPH_MODE)
         >>> warmup_steps = 10
@@ -258,7 +260,7 @@ class ConstantWarmUpLR(LearningRateSchedule):
 
     Examples:
         >>> import mindspore as ms
-        >>> from mindformers.core import ConstantWarmUpLR
+        >>> from mindformers.pynative.optimizer.lr_schedule import ConstantWarmUpLR
         >>>
         >>> ms.set_context(mode=ms.GRAPH_MODE)
         >>> total_steps = 20
@@ -344,7 +346,7 @@ class LinearWithWarmUpLR(LearningRateSchedule):
 
     Examples:
         >>> import mindspore as ms
-        >>> from mindformers.core import LinearWithWarmUpLR
+        >>> from mindformers.pynative.optimizer.lr_schedule import LinearWithWarmUpLR
         >>>
         >>> ms.set_context(mode=ms.GRAPH_MODE)
         >>> total_steps = 20
@@ -440,7 +442,7 @@ class CosineWithWarmUpLR(LearningRateSchedule):
 
     Examples:
         >>> import mindspore as ms
-        >>> from mindformers.core import CosineWithWarmUpLR
+        >>> from mindformers.pynative.optimizer.lr_schedule import CosineWithWarmUpLR
         >>>
         >>> ms.set_context(mode=ms.GRAPH_MODE)
         >>> total_steps = 20
@@ -545,7 +547,7 @@ class CosineWithRestartsAndWarmUpLR(LearningRateSchedule):
 
     Examples:
         >>> import mindspore as ms
-        >>> from mindformers.core import CosineWithRestartsAndWarmUpLR
+        >>> from mindformers.pynative.optimizer.lr_schedule import CosineWithRestartsAndWarmUpLR
         >>>
         >>> ms.set_context(mode=ms.GRAPH_MODE)
         >>> total_steps = 20
@@ -662,7 +664,7 @@ class PolynomialWithWarmUpLR(LearningRateSchedule):
 
     Examples:
         >>> import mindspore as ms
-        >>> from mindformers.core import PolynomialWithWarmUpLR
+        >>> from mindformers.pynative.optimizer.lr_schedule import PolynomialWithWarmUpLR
         >>>
         >>> ms.set_context(mode=ms.GRAPH_MODE)
         >>> total_steps = 20
@@ -764,8 +766,8 @@ class LearningRateWiseLayer(LearningRateSchedule):
 
     Examples:
         >>> import mindspore as ms
-        >>> from mindformers.core import LinearWithWarmUpLR
-        >>> from mindformers.core import LearningRateWiseLayer
+        >>> from mindformers.pynative.optimizer.lr_schedule import LinearWithWarmUpLR
+        >>> from mindformers.pynative.optimizer.lr_schedule import LearningRateWiseLayer
         >>>
         >>> ms.set_context(mode=ms.GRAPH_MODE)
         >>> total_steps = 20
@@ -927,7 +929,7 @@ class CosineAnnealingLR(LearningRateSchedule):
 
     Examples:
         >>> import mindspore as ms
-        >>> from mindformers.core import CosineAnnealingLR
+        >>> from mindformers.pynative.optimizer.lr_schedule import CosineAnnealingLR
         >>>
         >>> ms.set_context(mode=ms.GRAPH_MODE)
         >>> base_lr = 0.005
@@ -995,7 +997,7 @@ class CosineAnnealingWarmRestarts(LearningRateSchedule):
 
     Examples:
         >>> import mindspore as ms
-        >>> from mindformers.core import CosineAnnealingWarmRestarts
+        >>> from mindformers.pynative.optimizer.lr_schedule import CosineAnnealingWarmRestarts
         >>>
         >>> ms.set_context(mode=ms.GRAPH_MODE)
         >>> base_lr = 0.005
@@ -1056,3 +1058,24 @@ class CosineAnnealingWarmRestarts(LearningRateSchedule):
                 self.zero_constant, 0.5 * (1.0 + self.cos(self.math_pi * t_cur / t_i)))
         learning_rate = self.eta_min + (self.base_lr - self.eta_min) * percent
         return learning_rate
+
+
+def _register_schedules():
+    """Register MindSpore schedules and the existing scheduler aliases."""
+    for name, schedule in inspect.getmembers(learning_rate_schedule, inspect.isclass):
+        if not name.startswith("__"):
+            MindFormerRegister.register_cls(schedule, MindFormerModuleType.LR)
+
+    for alias, schedule in {
+        "constant_with_warmup": ConstantWarmUpLR,
+        "linear": LinearWithWarmUpLR,
+        "cosine": CosineWithWarmUpLR,
+        "cosine_with_restarts": CosineWithRestartsAndWarmUpLR,
+        "polynomial": PolynomialWithWarmUpLR,
+        "cosine_annealing": CosineAnnealingLR,
+        "cosine_annealing_warm_restarts": CosineAnnealingWarmRestarts,
+    }.items():
+        MindFormerRegister.register_cls(schedule, MindFormerModuleType.LR, alias=alias)
+
+
+_register_schedules()

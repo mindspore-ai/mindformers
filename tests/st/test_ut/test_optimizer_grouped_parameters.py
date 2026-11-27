@@ -21,7 +21,7 @@ import mindspore as ms
 from mindspore import Tensor, Parameter, nn
 
 from mindformers.trainer.optimizer_grouped_parameters import get_optimizer_grouped_parameters
-from mindformers.core.lr.lr_schedule import LinearWithWarmUpLR
+from mindformers.pynative.optimizer.lr_schedule import LinearWithWarmUpLR
 from mindformers.tools.register.config import MindFormerConfig
 
 

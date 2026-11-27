@@ -38,7 +38,6 @@ from lm_eval.models.utils import (
 from mindformers import (
     MindFormerConfig,
     build_context,
-    build_parallel_config,
     AutoModel,
     AutoTokenizer
 )
@@ -180,7 +179,6 @@ class MFLM(TemplateLM):
 
         build_context(self._config)
         eval_logger.info("Build context finished.")
-        build_parallel_config(self._config)
 
         return self._config
 
@@ -265,7 +263,7 @@ class MFLM(TemplateLM):
         return self.tokenizer.decode(tokens, skip_special_tokens=skip_special_tokens)
 
     def _model_call(self, inps):
-        logits = self.model(input_ids=inps.astype(mindspore.int32))[0]
+        logits = self._model(input_ids=inps.astype(mindspore.int32))[0]
         return logits
 
     def _model_generate(self, context, max_length, **generation_kwargs):

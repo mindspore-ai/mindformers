@@ -23,7 +23,6 @@ from mindformers.dataset import BaseDataset
 from mindformers.models import PreTrainedModel
 from mindformers.tools.register import MindFormerRegister, \
     MindFormerModuleType, MindFormerConfig
-from ...core.config_args import ConfigArguments
 from ..training_args import TrainingArguments
 from ..base_trainer import BaseTrainer
 
@@ -73,7 +72,7 @@ class GeneralTaskTrainer(BaseTrainer):
         super(GeneralTaskTrainer, self).__init__("general", model_name)
 
     def train(self,
-              config: Optional[Union[dict, MindFormerConfig, ConfigArguments, TrainingArguments]] = None,
+              config: Optional[Union[dict, MindFormerConfig, TrainingArguments]] = None,
               network: Optional[Union[Cell, PreTrainedModel]] = None,
               dataset: Optional[Union[BaseDataset, GeneratorDataset]] = None,
               wrapper: Optional[TrainOneStepCell] = None,
@@ -87,9 +86,9 @@ class GeneralTaskTrainer(BaseTrainer):
         It also allows users to customize the network, optimizer, dataset, wrapper, callback.
 
         Args:
-            config (Optional[Union[dict, MindFormerConfig, ConfigArguments, TrainingArguments]]):
+            config (Optional[Union[dict, MindFormerConfig, TrainingArguments]]):
                 The task config which is used to configure the dataset, the hyper-parameter, optimizer, etc.
-                It supports config dict or MindFormerConfig or TrainingArguments or ConfigArguments class.
+                It supports config dict or MindFormerConfig or TrainingArguments class.
                 Default: None.
             network (Optional[Union[Cell, PreTrainedModel]]): The network for trainer.
                 It supports model name or PreTrainedModel or MindSpore Cell class.
@@ -122,7 +121,7 @@ class GeneralTaskTrainer(BaseTrainer):
             **kwargs)
 
     def evaluate(self,
-                 config: Optional[Union[dict, MindFormerConfig, ConfigArguments, TrainingArguments]] = None,
+                 config: Optional[Union[dict, MindFormerConfig, TrainingArguments]] = None,
                  network: Optional[Union[Cell, PreTrainedModel]] = None,
                  dataset: Optional[Union[BaseDataset, GeneratorDataset]] = None,
                  callbacks: Optional[Union[Callback, List[Callback]]] = None,
@@ -135,9 +134,9 @@ class GeneralTaskTrainer(BaseTrainer):
         It also allows users to customize the network, dataset, callback, compute_metrics.
 
         Args:
-            config (Optional[Union[dict, MindFormerConfig, ConfigArguments, TrainingArguments]]):
+            config (Optional[Union[dict, MindFormerConfig, TrainingArguments]]):
                 The task config which is used to configure the dataset, the hyper-parameter, optimizer, etc.
-                It supports config dict or MindFormerConfig or TrainingArguments or ConfigArguments class.
+                It supports config dict or MindFormerConfig or TrainingArguments class.
                 Default: None.
             network (Optional[Union[Cell, PreTrainedModel]]): The network for trainer.
                 It supports model name or PreTrainedModel or MindSpore Cell class.

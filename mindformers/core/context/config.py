@@ -12,10 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""MindFormers' Config API."""
+"""Configuration types used by the context operators."""
 import os
 from dataclasses import dataclass
-from typing import Optional, Union
+from typing import Union
 
 from mindformers.tools.utils import get_real_group_size
 
@@ -737,59 +737,3 @@ class ParallelConfig(BaseArgsConfig):
     # pylint: disable=W0235
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-
-
-@dataclass
-class ConfigArguments(BaseArgsConfig):
-    """MindFormers' config arguments."""
-    _support_kwargs = [
-        'output_dir',
-        'profile',
-        'auto_tune',
-        'filepath_prefix',
-        'autotune_per_step',
-        'train_dataset',
-        'eval_dataset',
-        'predict_dataset',
-        'runner_config',
-        'optimizer',
-        'lr_schedule',
-        'save_checkpoint',
-        'cloud_config',
-        'seed',
-        'runner_wrapper',
-    ]
-
-    def __init__(
-            self,
-            output_dir: str = './output',
-            profile: bool = False,
-            auto_tune: bool = False,
-            filepath_prefix: str = './autotune',
-            autotune_per_step: int = 10,
-            seed: Optional[int] = None,
-            train_dataset: Optional[Union[dict, BaseArgsConfig]] = None,
-            eval_dataset: Optional[Union[dict, BaseArgsConfig]] = None,
-            runner_config: Optional[Union[dict, BaseArgsConfig]] = None,
-            optimizer: Optional[Union[dict, BaseArgsConfig]] = None,
-            runner_wrapper: Optional[Union[dict, BaseArgsConfig]] = None,
-            lr_schedule: Optional[Union[dict, BaseArgsConfig]] = None,
-            save_checkpoint: Optional[Union[dict, BaseArgsConfig]] = None,
-            cloud_config: Optional[Union[dict, BaseArgsConfig]] = None,
-    ):
-        super().__init__(
-            output_dir=output_dir,
-            profile=profile,
-            auto_tune=auto_tune,
-            seed=seed,
-            filepath_prefix=filepath_prefix,
-            autotune_per_step=autotune_per_step,
-            train_dataset=train_dataset,
-            eval_dataset=eval_dataset,
-            runner_config=runner_config,
-            optimizer=optimizer,
-            runner_wrapper=runner_wrapper,
-            lr_schedule=lr_schedule,
-            save_checkpoint=save_checkpoint,
-            cloud_config=cloud_config
-        )

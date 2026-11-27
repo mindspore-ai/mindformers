@@ -19,7 +19,7 @@ from mindspore.communication.management import get_group_size, get_rank, init
 from mindspore.parallel import set_algo_parameters
 from mindspore.parallel._cost_model_context import _set_multi_subgraphs
 
-from mindformers.core.config_args import ParallelConfig
+from mindformers.core.context.config import ParallelConfig
 from mindformers.modules.transformer.transformer import (
     TransformerOpParallelConfig,
 )

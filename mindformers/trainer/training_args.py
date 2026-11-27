@@ -300,25 +300,6 @@ class TrainingArguments:
             processing latency when there is an imbalance in the throughput rate of adjacent operations,
             but it also consumes more system memory.
             Default: ``1``.
-        wrapper_type (str, optional):
-            Class name of wrapper. Default: ``'MFTrainOneStepCell'``.
-        scale_sense (Union[str, float], optional):
-            Value or Class name of scale sense. Default: ``'DynamicLossScaleUpdateCell'``.
-        loss_scale_value (int, optional):
-            Initial loss scaling factor. Default: ``65536``.
-        loss_scale_factor (int, optional):
-            Increment and decrement factor for loss scaling coefficient. Default: ``2``.
-        loss_scale_window (int, optional):
-            Maximum consecutive training steps to increase the loss scaling coefficient when there is no overflow.
-            Default: ``1000``.
-        use_clip_grad (bool, optional):
-            Whether enable gradient clipping. Default: ``True``.
-        max_grad_norm (float, optional):
-            Max gradient norm. Default: ``1.0``.
-        max_scale_window (int, optional):
-            Maximum scale_window of the automatic scale window list. The default value is 1000. Default: ``1000``.
-        min_scale_window (int, optional):
-            Minimum scale_window of the automatic scale window list. The default value is 20. Default: ``20``.
         metric_type (Union[List[str], str], optional):
             Whether enable gradient clipping. Default: ``None``.
         logging_strategy (Union[LoggingIntervalStrategy, str], optional):
@@ -954,49 +935,6 @@ class TrainingArguments:
                 " but it also consumes more system memory. Default: 1."
             )
         }
-    )
-
-    # wrapper config
-    wrapper_type: str = field(
-        default='MFTrainOneStepCell',
-        metadata={"help": "Class name of wrapper. Default: MFTrainOneStepCell."}
-    )
-    scale_sense: Union[str, float] = field(
-        default='DynamicLossScaleUpdateCell',
-        metadata={"help": "Value or Class name of scale sense. Default: DynamicLossScaleUpdateCell."}
-    )
-    loss_scale_value: int = field(
-        default=65536,
-        metadata={"help": "Initial loss scaling factor. Default: 65536."}
-    )
-    loss_scale_factor: int = field(
-        default=2,
-        metadata={"help": "Increment and decrement factor for loss scaling coefficient. Default: 2."}
-    )
-    loss_scale_window: int = field(
-        default=1000,
-        metadata={
-            "help": (
-                "Maximum consecutive training steps to increase the loss scaling coefficient "
-                "when there is no overflow. Default: 1000."
-            )
-        }
-    )
-    use_clip_grad: bool = field(
-        default=True,
-        metadata={"help": "Whether enable gradient clipping. Default: False."}
-    )
-    max_grad_norm: float = field(
-        default=1.0,
-        metadata={"help": "Max gradient norm."}
-    )
-    max_scale_window: int = field(
-        default=1000,
-        metadata={"help": "Maximum scale_window of the automatic scale window list. The default value is 1000."}
-    )
-    min_scale_window: int = field(
-        default=20,
-        metadata={"help": "Minimum scale_window of the automatic scale window list. The default value is 20."}
     )
 
     # metric config
@@ -1913,7 +1851,6 @@ class TrainingArguments:
         self._adapt_optimizer_config(task_config)
         self._adapt_lr_schedule_config(task_config)
         self._adapt_dataset_config(task_config)
-        self._adapt_wrapper_config(task_config)
         self._adapt_metric_config(task_config)
         self._adapt_callback_config(task_config)
         self._adapt_eval_config(task_config)
@@ -2191,37 +2128,6 @@ class TrainingArguments:
             task_config.eval_dataset_task.type, self.dataset_task)
         task_config.train_dataset_task.dataset_config = task_config.train_dataset
         task_config.eval_dataset_task.dataset_config = task_config.eval_dataset
-
-    def _adapt_wrapper_config(self, task_config):
-        """adapt wrapper config."""
-        if not _check_task_config(task_config.runner_wrapper):
-            task_config.runner_wrapper = MindFormerConfig()
-        if isinstance(self.scale_sense, str) and \
-            not _check_task_config(task_config.runner_wrapper.scale_sense):
-            task_config.runner_wrapper.scale_sense = MindFormerConfig()
-
-        task_config.runner_wrapper.type = _check_training_args(
-            task_config.runner_wrapper.type, self.wrapper_type)
-        task_config.runner_wrapper.use_clip_grad = _check_training_args(
-            task_config.runner_wrapper.use_clip_grad, self.use_clip_grad)
-        task_config.runner_wrapper.max_grad_norm = _check_training_args(
-            task_config.runner_wrapper.max_grad_norm, self.max_grad_norm)
-        if isinstance(self.scale_sense, str):
-            task_config.runner_wrapper.scale_sense.type = _check_training_args(
-                task_config.runner_wrapper.scale_sense.type, self.scale_sense)
-            task_config.runner_wrapper.scale_sense.loss_scale_value = _check_training_args(
-                task_config.runner_wrapper.scale_sense.loss_scale_value, self.loss_scale_value)
-            task_config.runner_wrapper.scale_sense.scale_factor = _check_training_args(
-                task_config.runner_wrapper.scale_sense.scale_factor, self.loss_scale_factor)
-            task_config.runner_wrapper.scale_sense.scale_window = _check_training_args(
-                task_config.runner_wrapper.scale_sense.scale_window, self.loss_scale_window)
-            if self.scale_sense == "AdaptiveLossScaleUpdateCell":
-                task_config.runner_wrapper.scale_sense.max_scale_window = _check_training_args(
-                    task_config.runner_wrapper.scale_sense.max_scale_window, self.max_scale_window)
-                task_config.runner_wrapper.scale_sense.min_scale_window = _check_training_args(
-                    task_config.runner_wrapper.scale_sense.min_scale_window, self.min_scale_window)
-        elif isinstance(self.scale_sense, (float, int)):
-            task_config.runner_wrapper.scale_sense = int(self.scale_sense)
 
     def _adapt_metric_config(self, task_config):
         """adapt metric config."""

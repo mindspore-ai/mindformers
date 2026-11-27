@@ -33,8 +33,6 @@ from mindspore.train import Callback
 from mindspore.dataset import GeneratorDataset
 from mindspore.dataset.engine.datasets import BatchDataset, RepeatDataset, Dataset
 
-from mindformers.core.parallel_config import build_parallel_config, \
-    reset_parallel_config
 from mindformers.core.callback.callback import ProfileMonitor
 from mindformers.dataset import build_dataset_loader, check_dataset_config, BaseDataset
 from mindformers.mindformer_book import MindFormerBook
@@ -74,7 +72,6 @@ PREFIX_CHECKPOINT_DIR = "checkpoint"
 SUPPORT_TASKS = MindFormerBook().get_trainer_support_task_list()
 SUPPORT_MODEL_NAMES = MindFormerBook().get_model_name_support_list()
 SUPPORT_CHECKPOINT_NAMES = MindFormerBook().get_downloadable_model_name_list()
-SUPPORT_PIPELINE_INPUT_DATA = MindFormerBook().get_pipeline_support_input_data_list()
 CURRENT_PROJECT_PATH = MindFormerBook().get_project_path()
 DEFAULT_CHECKPOINT_DIR = 'checkpoint'
 DEFAULT_CONFIG_DIR = 'configs'
@@ -274,9 +271,6 @@ class Trainer:
         if self.config.get('optimizer') and self.config.optimizer.type == "Muon":
             self.config.model.model_config.track_max_attention_logit = True
         self._reassign_monitor_config()
-        # build parallel config
-        build_parallel_config(self.config)
-
         if isinstance(args, TrainingArguments):
             ms.set_auto_parallel_context(pipeline_stages=args.pipeline_stage)
 
@@ -1034,7 +1028,6 @@ class Trainer:
         if not isinstance(self.model, PreTrainedModel):
             raise NotImplementedError("Currently only the integrated model structure in MindFormers is supported.")
 
-        build_parallel_config(self.config)
         model_config = self.model.config
         if self.reset_model or (is_train and hasattr(model_config, 'use_past') and model_config.use_past):
             logger.info("..........Reinit Model..........")
@@ -1669,7 +1662,6 @@ def _reset_config_for_save(config: dict = None):
         config = {}
     else:
         config = copy.deepcopy(config)
-        reset_parallel_config(config)
 
     config_dict = OrderedDict()
 
@@ -1708,10 +1700,6 @@ def _reset_config_for_save(config: dict = None):
     if config.get('runner_config') is not None:
         runner_config = config2dict(config.pop('runner_config'))
         config_dict.setdefault('runner_config', runner_config)
-
-    if config.get('runner_wrapper') is not None:
-        wrapper_config = config2dict(config.pop('runner_wrapper'))
-        config_dict.setdefault('runner_wrapper', wrapper_config)
 
     if config.get('optimizer') is not None:
         optim_config = config2dict(config.pop('optimizer'))

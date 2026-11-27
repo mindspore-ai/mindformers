@@ -21,7 +21,7 @@ from mindformers.tools.register.config import MindFormerConfig
 from mindformers.tools.register.template import CONFIG_NAME_TO_CLASS, CallbackConfig, ConfigTemplate, ContextConfig, \
     EvalDatasetConfig, EvalDatasetTaskConfig, GeneralConfig, LrScheduleConfig, MetricConfig, \
     MoEConfig, ModelConfig, MsParallelConfig, OptimizerConfig, ParallelConfig, ProcessorConfig, RecomputeConfig, \
-    RunnerConfig, TrainDatasetConfig, TrainDatasetTaskConfig, TrainerConfig, WrapperConfig, SwapConfig
+    RunnerConfig, TrainDatasetConfig, TrainDatasetTaskConfig, TrainerConfig, SwapConfig
 
 
 def get_class_init_params_and_defaults(cls):
@@ -513,34 +513,6 @@ class TestModelConfig:
         assert config["aaa"] == 1
 
 
-class TestWrapperConfig:
-    """test runner_wrapper"""
-    def setup_method(self):
-        self.correct_input = {"type": "type", "aaa": 1}
-        self.missing_required_input = {"aaa": 1}
-
-    def test_none_input(self):
-        config1 = WrapperConfig.apply(None)
-        config2 = WrapperConfig.apply({})
-        configs = [config1, config2]
-        for config in configs:
-            for key in WrapperConfig.keys():
-                assert key in config
-                assert config[key] == getattr(WrapperConfig, key)
-            for key in config.keys():
-                assert key in WrapperConfig.keys()
-
-    def test_missing_required_input(self):
-        with pytest.raises(KeyError, match="required"):
-            ModelConfig.apply(self.missing_required_input)
-
-    def test_correct_input(self):
-        config = WrapperConfig.apply(self.correct_input)
-        assert len(config) == 2
-        assert config["type"] == "type"
-        assert config["aaa"] == 1
-
-
 class TestOptimizerConfig:
     """test optimizer"""
     def setup_method(self):
@@ -655,7 +627,6 @@ class TestCallbackConfig:
 
 
 TRAIN_DEFAULT_CONFIGS = [
-    "runner_wrapper",
     "optimizer",
     "lr_schedule",
     "recompute_config",
@@ -792,14 +763,12 @@ class TestTemplate:
         """test overwrite default value"""
         self.train_config["seed"] = 2024
         self.train_config["parallel_config"] = {"data_parallel": 2}
-        self.train_config["runner_wrapper"] = {"type": 1}
         config = self.train_config
         ConfigTemplate.apply_template(config)
 
         assert config['seed'] == 2024
         assert config['parallel_config']["data_parallel"] == 2
         assert config['parallel_config']["model_parallel"] == 1
-        assert config['runner_wrapper']["type"] == 1
 
     def test_wrong_run_mode_1(self):
         config = MindFormerConfig()

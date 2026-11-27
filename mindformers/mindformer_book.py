@@ -81,9 +81,6 @@ class MindFormerBook:
     _TRAINER_SUPPORT_TASKS_LIST = OrderedDict([
     ])
 
-    _PIPELINE_SUPPORT_TASK_LIST = OrderedDict([
-    ])
-
     _MODEL_CONFIG_PATHS = {
         "deepseekv3_671b": "configs/deepseek3/pretrain_deepseek3_671b.yaml",
         "deepseekv4_flash": "configs/deepseek4/pretrain_deepseek4_flash.yaml",
@@ -117,9 +114,6 @@ class MindFormerBook:
     _MODEL_CONFIG_URL_LIST = OrderedDict([
     ])
 
-    _PIPELINE_INPUT_DATA_LIST = OrderedDict([
-    ])
-
     _TOKENIZER_SUPPORT_URL_LIST = OrderedDict([
     ])
 
@@ -150,28 +144,6 @@ class MindFormerBook:
             print_dict(all_list)
 
     @classmethod
-    def show_pipeline_support_model_list(cls, task=None):
-        """show_pipeline_support_model_list"""
-        all_list = copy.deepcopy(cls._PIPELINE_SUPPORT_TASK_LIST)
-        for key, val in all_list.items():
-            val.pop("common")
-            temp_list = []
-            for model_name, _ in val.items():
-                temp_list.append(model_name)
-            all_list[key] = temp_list
-
-        if task:
-            if task in all_list.keys():
-                all_list = all_list[task]
-                logger.info("Pipeline support model list for %s task is: ", str(task))
-                print_path_or_list(all_list)
-            else:
-                raise KeyError("unsupported task")
-        else:
-            logger.info("Pipeline support model list of MindFormer is: ")
-            print_dict(all_list)
-
-    @classmethod
     def show_tokenizer_name_to_processor(cls):
         """show_tokenizer_name_to_processor function"""
         logger.info("_TRAINER_SUPPORT_TASKS_LIST of MindFormer is: ")
@@ -189,31 +161,9 @@ class MindFormerBook:
         print_dict(cls._TRAINER_SUPPORT_TASKS_LIST)
 
     @classmethod
-    def show_pipeline_support_input_data_list(cls):
-        """show_pipeline_support_input_data_list function"""
-        logger.info("_PIPELINE_INPUT_DATA_LIST of MindFormer is: ")
-        print_dict(cls._PIPELINE_INPUT_DATA_LIST)
-
-    @classmethod
-    def get_pipeline_support_input_data_list(cls):
-        """get_pipeline_support_input_data_list function"""
-        return cls._PIPELINE_INPUT_DATA_LIST
-
-    @classmethod
     def get_trainer_support_task_list(cls):
         """get_trainer_support_task_list function"""
         return cls._TRAINER_SUPPORT_TASKS_LIST
-
-    @classmethod
-    def show_pipeline_support_task_list(cls):
-        """show_pipeline_support_task_list function"""
-        logger.info("_PIPELINE_SUPPORT_TASK_LIST of MindFormer is: ")
-        print_dict(cls._PIPELINE_SUPPORT_TASK_LIST)
-
-    @classmethod
-    def get_pipeline_support_task_list(cls):
-        """get_pipeline_support_task_list function"""
-        return cls._PIPELINE_SUPPORT_TASK_LIST
 
     @classmethod
     def show_model_config_to_name(cls):
