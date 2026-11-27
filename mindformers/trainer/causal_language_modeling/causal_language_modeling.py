@@ -211,7 +211,9 @@ class CausalLanguageModelingTrainer(BaseTrainer):
         # build tokenizer
         logger.info(".........Build tokenizer For Evaluate..........")
         if tokenizer is None and config.processor.tokenizer:
-            tokenizer = build_tokenizer(config.processor.tokenizer)
+            tokenizer = build_tokenizer(config.processor.tokenizer,
+                                        pretrained_model_dir=config.get("pretrained_model_dir", None),
+                                        trust_remote_code=config.get("trust_remote_code", False))
 
         logger.info(".........Starting Init Evaluate Model..........")
         model = Model(network, eval_network=network)
@@ -364,7 +366,9 @@ class CausalLanguageModelingTrainer(BaseTrainer):
             # build tokenizer
             if not hasattr(self, 'tokenizer') or self.tokenizer is None:
                 logger.info("Build tokenizer For Evaluate")
-                self.tokenizer = build_tokenizer(config.processor.tokenizer)
+                self.tokenizer = build_tokenizer(config.processor.tokenizer,
+                                                 pretrained_model_dir=config.get("pretrained_model_dir", None),
+                                                 trust_remote_code=config.get("trust_remote_code", False))
 
             self.set_network(model, is_train=False)
 

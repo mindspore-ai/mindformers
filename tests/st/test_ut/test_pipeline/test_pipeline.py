@@ -241,8 +241,8 @@ def test_get_ms_pipeline_constructs_components(monkeypatch):
         calls.setdefault("build_processor", []).append(argument)
         return f"PROC({argument})"
 
-    def fake_build_tokenizer(argument, tokenizer_name):
-        calls["build_tokenizer"] = (argument, tokenizer_name)
+    def fake_build_tokenizer(argument):
+        calls["build_tokenizer"] = argument
         return "TOKENIZER_OBJ"
 
     def fake_build_pipeline(**kwargs):
@@ -266,7 +266,7 @@ def test_get_ms_pipeline_constructs_components(monkeypatch):
 
     assert output == "PIPELINE_OBJ"
     assert calls["build_network"] == ("MODEL_CFG", {"batch_size": 4, "use_past": True})
-    assert calls["build_tokenizer"] == ("TOK_CFG", "foo")
+    assert calls["build_tokenizer"] == "TOK_CFG"
     # image/audio processors are both constructed
     assert calls["build_processor"] == ["IMG_CFG", "AUD_CFG"]
     assert calls["build_pipeline"]["model"] == "MODEL_OBJ"

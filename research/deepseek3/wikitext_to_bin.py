@@ -92,7 +92,7 @@ class Encoder:
             print("use deepseek tokenizer.")
             self.tokenizer = tokenizer_add_tokens(self.args.vocab_file)
         else:
-            self.tokenizer = build_tokenizer(get_tokenizer_config(args))
+            self.tokenizer = build_tokenizer(pretrained_model_dir=self.args.tokenizer_dir)
 
     def initializer(self):
         """initializer"""
@@ -195,7 +195,7 @@ class Partition:
                 print("use deepseek tokenizer.")
                 tokenizer = tokenizer_add_tokens(self.args.vocab_file)
             else:
-                tokenizer = build_tokenizer(get_tokenizer_config(self.args))
+                tokenizer = build_tokenizer(pretrained_model_dir=self.args.tokenizer_dir)
 
             encoded_docs = pool.imap(encoder.encode, fin, 32)
 
@@ -250,19 +250,6 @@ class Partition:
         builders[key].finalize(output_idx_files[key])
 
 
-def get_tokenizer_config(args):
-    """Return the tokenizer config"""
-    tokenizer_config = {
-        'type': args.tokenizer_type,
-        'vocab_file': args.vocab_file,
-        'merges_file': args.merges_file,
-        'tokenizer_file': args.tokenizer_file,
-        'add_bos_token': args.add_bos_token,
-        'add_eos_token': args.add_eos_token,
-    }
-    return tokenizer_config
-
-
 def chunks(lst, n):
     """yield n sized chunks from list"""
     for i in range(0, len(lst), n):
@@ -312,6 +299,9 @@ def get_args():
     group.add_argument('--tokenizer-type', type=str, default='LlamaTokenizerFast',
                        choices=['LlamaTokenizer', 'Llama3Tokenizer', 'LlamaTokenizerFast'],
                        help='The tokenizer of the corresponding model.')
+    group.add_argument('--tokenizer-dir', type=str, default=None,
+                       help='Path to the local Hugging Face tokenizer directory, required when '
+                            '--tokenizer-type is not LlamaTokenizerFast.')
     group.add_argument('--vocab-file', type=str, default=None,
                        help='Path to the vocab file or tokenizer.model')
     group.add_argument('--merges-file', type=str, default=None,
@@ -347,6 +337,9 @@ def get_args():
     group.add_argument('--keep-sequential-samples', action='store_true',
                        help='Ensure ordering of samples in .jsonl files is preserved when using partitions>1.')
     args = parser.parse_args()
+
+    if args.tokenizer_type != 'LlamaTokenizerFast' and not args.tokenizer_dir:
+        raise ValueError("`--tokenizer-dir` must be set when `--tokenizer-type` is not `LlamaTokenizerFast`.")
 
     # generate dataset json file
     output_json_file = f"{args.output_prefix}.json"

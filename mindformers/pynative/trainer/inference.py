@@ -30,7 +30,7 @@ from mindspore import Tensor
 from mindspore.graph.api import _no_grad
 from mindspore.mint.distributed import all_gather_object, broadcast_object_list
 
-from mindformers.models.build_tokenizer import build_tokenizer as _graph_build_tokenizer
+from mindformers.models.build_tokenizer import build_tokenizer
 from mindformers.pynative.distributed.style import _all_gather_dim
 from mindformers.tools.logger import logger
 from mindformers.tools.utils import FILE_PERMISSION
@@ -102,9 +102,7 @@ def build_inference_tokenizer(config):
             f"copy the tokenizer files (e.g. tokenizer.json, "
             f"tokenizer_config.json) into that directory before inference."
         )
-    tokenizer = _graph_build_tokenizer(
-        pretrained_model_dir=tokenizer_dir
-    )
+    tokenizer = build_tokenizer(pretrained_model_dir=tokenizer_dir)
     config.model.pad_token_id = _resolve_pad_token_id(tokenizer)
     return tokenizer
 

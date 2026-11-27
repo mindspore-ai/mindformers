@@ -239,10 +239,10 @@ class AutoProcessor:
 
             config_args = MindFormerConfig(yaml_file)
 
-        lib_path = yaml_name_or_path
-        if not os.path.isdir(lib_path):
-            lib_path = None
-        processor = build_processor(config_args.processor, lib_path=lib_path)
+        pretrained_model_dir = yaml_name_or_path
+        if not os.path.isdir(pretrained_model_dir):
+            pretrained_model_dir = None
+        processor = build_processor(config_args.processor, pretrained_model_dir=pretrained_model_dir)
         logger.info("processor built successfully!")
         return processor
 

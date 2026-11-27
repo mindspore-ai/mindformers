@@ -48,7 +48,13 @@ def build_processor(
             config.image_processor = build_processor(config.image_processor)
 
         if config.tokenizer is not None:
-            config.tokenizer = build_tokenizer(config.tokenizer, **kwargs)
+            tokenizer_kwargs = dict(kwargs)
+            trust_remote_code = tokenizer_kwargs.pop("trust_remote_code", False)
+            if isinstance(config.tokenizer, dict):
+                trust_remote_code = config.tokenizer.get("trust_remote_code", trust_remote_code)
+            config.tokenizer = build_tokenizer(config.tokenizer,
+                                               trust_remote_code=trust_remote_code,
+                                               **tokenizer_kwargs)
 
         return MindFormerRegister.get_instance_from_cfg(
             config, MindFormerModuleType.PROCESSOR, default_args=default_args)

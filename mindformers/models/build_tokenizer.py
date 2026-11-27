@@ -16,71 +16,42 @@
 """Build Tokenizer API."""
 import os.path
 
-from mindformers.tools.register import MindFormerRegister, MindFormerModuleType, MindFormerConfig
 from mindformers.core.context.build_context import get_context
-from ..mindformer_book import MindFormerBook
 
 
-def check_and_add_vocab_file_path(config, **kwargs):
-    """And the vocab file path to the config if there is not vocab file in the config"""
-    if 'vocab_file' in config:
-        return
-    class_name = config['type']
-    dynamic_class = MindFormerRegister.get_cls(module_type='tokenizer', class_name=class_name)
-    # If the tokenizer does not require the vocab_file, just stop
-    if not dynamic_class.vocab_files_names:
-        return
-    name_or_path = class_name
-    path = kwargs.pop('lib_path', None)
-    remote_tokenizer_support_list = MindFormerBook.get_tokenizer_url_support_list().keys()
-    if name_or_path not in remote_tokenizer_support_list and path:
-        read_vocab_file_dict, read_tokenizer_file_dict = \
-            dynamic_class.read_files_according_specific_by_tokenizer(name_or_path=path)
-        config.update(read_vocab_file_dict)
-        config.update(read_tokenizer_file_dict)
-    else:
-        if not hasattr(config, "vocab_file") or config.vocab_file is None:
-            raise ValueError("tokenizer.vocab_file in yaml file is not set, "
-                             "please set tokenizer.vocab_file a correct value.")
-        if not os.path.exists(config.vocab_file):
-            raise ValueError(f"{config.vocab_file} is not existed, "
-                             f"please check vocab_file in yaml and set a correct value.")
-
-
-def build_tokenizer(
-        config: dict = None, default_args: dict = None, module_type: str = 'tokenizer',  # pylint: disable=unused-argument
-        class_name: str = None, **kwargs):  # pylint: disable=unused-argument
+def build_tokenizer(config=None, pretrained_model_dir=None, trust_remote_code=False):
     r"""Build tokenizer For MindFormer.
-    Instantiate the tokenizer from MindFormerRegister's registry.
+    The tokenizer is always instantiated with ``transformers.AutoTokenizer`` from a local model directory.
 
     Args:
-        config (dict): The task tokenizer's config. Default: None.
-        default_args (dict): The default argument of tokenizer API. Default: None.
-        module_type (str): The module type of MindFormerModuleType. Default: 'tokenizer'.
-        class_name (str): The class name of tokenizer API. Default: None.
+        config (dict, str): The task tokenizer's config or the local directory of the tokenizer.
+            When it is a dict, the ``pretrained_model_dir`` field in it is used. Default: None.
+        pretrained_model_dir (str): The local model directory that holds the tokenizer files.
+            When it is not given, the value in ``config`` or the runtime context is used. Default: None.
+        trust_remote_code (bool): Whether to trust remote code when loading the tokenizer. Default: False.
 
     Return:
-        The function instance of tokenizer API.
+        The tokenizer instance.
 
     Examples:
         >>> from mindformers import build_tokenizer
-        >>> from mindformers.tools.register import MindFormerConfig
-        >>> config = MindFormerConfig('configs/clip/run_clip_vit_b_32_pretrain_flickr8k.yaml')
-        >>> tokenizer_from_config = build_tokenizer(config.processor.tokenizer)
+        >>> tokenizer = build_tokenizer(pretrained_model_dir='/path/to/tokenizer_dir')
     """
-    from transformers import AutoTokenizer
-    pretrained_model_dir = kwargs.get("pretrained_model_dir", None)
+    if pretrained_model_dir is None and config is not None:
+        if isinstance(config, str):
+            pretrained_model_dir = config
+        else:
+            pretrained_model_dir = config.get("pretrained_model_dir", None)
     if not pretrained_model_dir:
         pretrained_model_dir = get_context('pretrained_model_dir')
     if not pretrained_model_dir:
-        raise ValueError("The current interface supports passing a local folder path, "
-                         "but the provided path is empty or None.")
+        raise ValueError("The current interface only supports building a tokenizer from a local model "
+                         "directory, but the provided path is empty or None.")
     pretrained_model_dir = os.path.realpath(pretrained_model_dir)
     if not os.path.isdir(pretrained_model_dir):
-        raise ValueError(f"The current interface supports passing a local folder path, "
-                         f"but the provided path '{pretrained_model_dir}' is not a valid directory.")
+        raise ValueError(f"The current interface only supports building a tokenizer from a local model "
+                         f"directory, but the provided path '{pretrained_model_dir}' is not a valid directory.")
 
-    trust_remote_code = kwargs.get("trust_remote_code", False)
-    tokenizer = AutoTokenizer.from_pretrained(pretrained_model_name_or_path=pretrained_model_dir,
-                                              trust_remote_code=trust_remote_code)
-    return tokenizer
+    from transformers import AutoTokenizer
+    return AutoTokenizer.from_pretrained(pretrained_model_name_or_path=pretrained_model_dir,
+                                         trust_remote_code=trust_remote_code)

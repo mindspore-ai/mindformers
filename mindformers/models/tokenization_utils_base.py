@@ -36,9 +36,8 @@ from mindformers.tools.utils import FILE_PERMISSION
 from mindformers.tools.logger import logger
 from mindformers.tools.generic import add_model_info_to_auto_map
 from mindformers.utils.import_utils import is_tokenizers_available
-from mindformers.tools.register import MindFormerConfig
+from mindformers.tools.register import MindFormerConfig, MindFormerRegister
 from mindformers.tools.utils import set_safe_mode_for_file_or_dir
-from mindformers.models.build_tokenizer import build_tokenizer
 from mindformers.mindformer_book import MindFormerBook, print_path_or_list
 from mindformers.tools.hub import is_offline_mode, cached_file, extract_commit_hash, custom_object_save, PushToHubMixin
 from mindformers.models.utils import DEFAULT_CHECKPOINT_SAVE_FOLDER
@@ -1844,7 +1843,7 @@ class PreTrainedTokenizerBase(SpecialTokensMixin, PushToHubMixin):
         if not class_name:
             class_name = cls.__name__
         logger.info("build tokenizer class name is: %s using args %s.", class_name, tokenizer_kwargs)
-        tokenizer = build_tokenizer(class_name=class_name, **tokenizer_kwargs)
+        tokenizer = MindFormerRegister.get_instance('tokenizer', class_name, **tokenizer_kwargs)
         # Check all our special tokens are registered as "no split" token (we don't cut them) and are in the vocab
         added_tokens = tokenizer.sanitize_special_tokens()
         if added_tokens:
