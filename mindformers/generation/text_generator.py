@@ -41,9 +41,7 @@ from mindformers.models.tokenization_utils import PreTrainedTokenizer
 from mindformers.generation.streamers import BaseStreamer
 from mindformers.generation.utils import softmax_with_threads, GenerateOutput, InferOutput, convert_pin
 from mindformers.tools.logger import logger
-from mindformers.tools.utils import is_pynative
 from mindformers.tools.debug_info import DetailedLatency, Profiling
-from mindformers.generation.parallel_decoding import parallel_decoding_control, parallel_decoding_process
 from mindformers.parallel_core.inference.parallel_state import get_tensor_model_parallel_world_size
 from mindformers.parallel_core.inference.utils import (
     get_tp_world_size,
@@ -84,8 +82,6 @@ class GenerationMixin:
     def __init__(self):
         self.detailed_latency = DetailedLatency()
         self.profile = Profiling()
-        self.block_mgr = None
-        self.is_pynative = is_pynative()
         self.argmax = mint.argmax
         self._pre_set_phase = None
         self._exec_add_flags = True
@@ -101,11 +97,6 @@ class GenerationMixin:
     def _set_network_phase(self, phase):
         self._pre_set_phase = phase
         self._exec_add_flags = True
-
-    def _set_block_mgr(self, batch_size, seq_length):
-        """Set model block table mgr function."""
-        raise RuntimeError("The static-graph paged attention inference (`BlockTables`) has been removed, "
-                           "please use the pynative Trainer for inference.")
 
     def _set_kv_cache(self):
         """Initial key cache and value cache."""
@@ -196,21 +187,6 @@ class GenerationMixin:
                 np.triu(np.ones(shape=(128, 128), dtype=np.float16), 1) * mask_coeff, dtype=compute_dtype
                 )
 
-    @staticmethod
-    def _prepare_inputs_for_prefill_flatten(input_ids, batch_valid_length, slot_mapping, model_inputs):
-        """prepare inputs ids for prefill flatten"""
-        batch_valid_length_bs = batch_valid_length.shape[0]  # [bs,]
-        input_ids_list = []
-        for i in range(batch_valid_length_bs):
-            context_len = batch_valid_length[i]
-            input_ids_list.append(input_ids[i][:context_len])
-        input_ids = np.concatenate(input_ids_list, 0)
-        input_ids = input_ids.reshape((1, -1))
-        slot_mapping = np.delete(slot_mapping, np.where(slot_mapping == -1))
-        model_inputs["input_ids"] = Tensor.from_numpy(input_ids.astype(np.int32))
-        model_inputs["slot_mapping"] = Tensor.from_numpy(slot_mapping)
-        return model_inputs
-
     def prepare_inputs_for_generation(self, input_ids, **kwargs):
         """
         prepare inputs for generation.
@@ -218,23 +194,10 @@ class GenerationMixin:
         in order to use `.generate()`
 
         """
-        model_inputs = {"input_ids": Tensor.from_numpy(input_ids.astype(np.int32))}
-        if self.is_pynative:
-            model_inputs = {}
-            if self.config.is_dynamic and "origin_inputs" in kwargs and self.use_past:
-                input_ids = kwargs["origin_inputs"]
-            model_inputs["input_ids"] = Tensor.from_numpy(input_ids.astype(np.int32))
-        else:
-            if self.config.is_dynamic:
-                prefill = kwargs.get("prefill")
-                if prefill and "origin_inputs" in kwargs:
-                    origin_inputs = kwargs["origin_inputs"]
-                    batch_valid_length = kwargs.get("valid_length_each_example")
-                    slot_mapping = kwargs.get("slot_mapping")
-                    model_inputs = self._prepare_inputs_for_prefill_flatten(origin_inputs,
-                                                                            batch_valid_length,
-                                                                            slot_mapping,
-                                                                            model_inputs)
+        model_inputs = {}
+        if self.config.is_dynamic and "origin_inputs" in kwargs and self.use_past:
+            input_ids = kwargs["origin_inputs"]
+        model_inputs["input_ids"] = Tensor.from_numpy(input_ids.astype(np.int32))
         return model_inputs
 
     def update_padding_index_to_inputs(self, model_inputs):
@@ -462,14 +425,11 @@ class GenerationMixin:
             # of the increment process will trigger this.
             if self._exec_add_flags:
                 self.add_flags_custom(is_first_iteration=False)
-                if self.config.is_dynamic and not self.is_pynative:
-                    self._exec_add_flags = False
         else:
             # slice model inputs for incremental infer
             if self._pre_set_phase:
                 self.phase = f"increment_{self._pre_set_phase}"
-            if not (hasattr(self.config, 'parallel_decoding_params') and self.config.parallel_decoding_params):
-                self.slice_incremental_inputs(model_inputs, current_index, need_flatten)
+            self.slice_incremental_inputs(model_inputs, current_index, need_flatten)
             self.detailed_latency.start_predict_timer()
             model_inputs["batch_valid_length"] = Tensor.from_numpy(model_inputs["batch_valid_length"])
             model_inputs = self.convert_pin_model_inputs(model_inputs)
@@ -693,12 +653,10 @@ class GenerationMixin:
         logger.info(f"The generation mode will be **{generation_config.generation_mode.upper()}**.")
 
         if not hasattr(self, "is_train_model"):
-            self._set_block_mgr(batch_size, self.config.seq_length)
             self._set_kv_cache()
             self._set_lower_triangle_mask()
             self.set_dynamic_inputs()
         elif generation_config.use_past:
-            self._set_block_mgr(batch_size, self.config.seq_length)
             if self.config.is_dynamic:
                 self.set_dynamic_inputs()
 
@@ -784,15 +742,6 @@ class GenerationMixin:
             self.detailed_latency.start_preprocess_timer()
             block_tables = None
             slot_mapping = None
-            if not hasattr(self, "is_train_model"):
-                if prefill:
-                    max_input_length = self.config.seq_length
-                    block_tables, slot_mapping = self.block_mgr.assemble_pa_full_inputs(max_input_length,
-                                                                                        valid_length_each_example,
-                                                                                        is_finished)
-                else:
-                    block_tables, slot_mapping = self.block_mgr.assemble_pa_inc_inputs(valid_length_each_example,
-                                                                                       is_finished)
             self.profile.start_profiling(valid_length_each_example[0] - input_ids_length)
             if hasattr(self, "is_train_model") and self.is_train_model:
                 infer_output, is_finished = self.infer(input_ids=input_ids,
@@ -875,9 +824,6 @@ class GenerationMixin:
 
         # set to original phase
         self.set_train(origin_phase == "train")
-
-        if self.block_mgr:
-            self.block_mgr.clear_cache()
 
         if generation_config.return_dict_in_generate:
             result = GenerateOutput(
@@ -1040,10 +986,7 @@ class GenerationMixin:
                 decoder_attention_mask=Tensor(target_mask, mstype.float32),
             )
         else:
-            if parallel_decoding_control(self.config):
-                current_index = None
-            else:
-                current_index = valid_length_each_example - 1 + np.arange(input_ids.size, step=input_ids.shape[1])
+            current_index = valid_length_each_example - 1 + np.arange(input_ids.size, step=input_ids.shape[1])
             model_kwargs["current_index"] = current_index
             model_kwargs["prefill"] = prefill if use_past else None
             model_kwargs["valid_length_each_example"] = valid_length_each_example
@@ -1052,13 +995,8 @@ class GenerationMixin:
             # pylint: disable=E1111
             model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
             real_input_ids = model_inputs["input_ids"]
-            if parallel_decoding_control(self.config):
-                model_inputs, block_tables, slot_mapping = parallel_decoding_process(
-                    self.config, input_ids, model_inputs, **model_kwargs
-                )
-            else:
-                current_index = valid_length_each_example - 1 + np.arange(real_input_ids.numel(),
-                                                                          step=real_input_ids.shape[-1])
+            current_index = valid_length_each_example - 1 + np.arange(real_input_ids.numel(),
+                                                                      step=real_input_ids.shape[-1])
             if use_past:
                 need_flatten = False
                 if "need_flatten" in model_inputs:
@@ -1377,10 +1315,6 @@ class GenerationMixin:
             next_logits_cache, cache for logits, if needed in output.
             is_finished, whether the sequence has completed its generation task.
         """
-        if not self.is_pynative:
-            # pylint: disable=C0415
-            from mindspore.common.api import _pynative_executor
-            _pynative_executor.set_async_for_graph(True)
         batch_size = input_ids.shape[0]
         target_list = [[] for _ in range(batch_size)]
 
@@ -1470,11 +1404,6 @@ class GenerationMixin:
                 target = p_args[i][target_index]
                 target_list[i] = target
 
-        if not self.is_pynative:
-            # pylint: disable=C0415
-            from mindspore.common.api import _pynative_executor
-            _pynative_executor.sync()
-            _pynative_executor.set_async_for_graph(False)
         return target_list, next_probs_cache, next_logits_cache, is_finished
 
     def chat(self,
